@@ -1,0 +1,20 @@
+[package]
+name        = "attic-retrieval"
+description = "Attic — query classification, RetrievalPlanner, retrievers, candidate fusion, context builder"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+attic-core    = { workspace = true }
+attic-storage = { workspace = true }
+serde         = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

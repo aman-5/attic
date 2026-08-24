@@ -1,0 +1,22 @@
+[package]
+name        = "attic-indexing"
+description = "Attic — indexing orchestration, SourceRevision capture, invalidation DAG, freshness, checkpoints"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+attic-core      = { workspace = true }
+attic-storage   = { workspace = true }
+attic-discovery = { workspace = true }
+attic-analyzers = { workspace = true }
+serde           = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+tokio           = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

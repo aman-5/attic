@@ -1,0 +1,5 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\Users\\amanbansal\\scoop\\apps\\mingw\\16.2.0-rt_v14-rev1\\bin\\gcc.exe"

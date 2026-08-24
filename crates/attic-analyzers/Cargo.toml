@@ -1,0 +1,19 @@
+[package]
+name        = "attic-analyzers"
+description = "Attic — Analyzer trait, AnalyzerRegistry, GenericAnalyzer, language/format analyzers"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+attic-core = { workspace = true }
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+# Tree-sitter grammar crates added in Phase 3.
+
+[dev-dependencies]

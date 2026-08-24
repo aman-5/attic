@@ -1,0 +1,15 @@
+/target/
+/attic/target/
+Cargo.lock.bak
+*.orig
+*.swp
+.DS_Store
+.idea/
+.vscode/settings.json
+*.pdb
+
+# Attic runtime data
+.mcp/
+
+# editor
+*.rs.bk

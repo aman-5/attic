@@ -1,0 +1,3 @@
+# Clippy configuration for Attic workspace.
+# All warnings are denied at CI via: -D warnings
+msrv = "1.88"

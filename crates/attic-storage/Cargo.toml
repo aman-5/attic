@@ -1,0 +1,20 @@
+[package]
+name        = "attic-storage"
+description = "Attic — SQLite connection, migrations, DAOs, FTS5, transaction coordinator"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+attic-core = { workspace = true }
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+# SQLite binding will be chosen and added in Phase 1A after the contract decision.
+# Do NOT add it here during Bootstrap.
+
+[dev-dependencies]

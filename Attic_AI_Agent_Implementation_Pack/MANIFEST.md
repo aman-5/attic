@@ -1,0 +1,33 @@
+# Package Manifest
+
+Files:
+- `00_master/AGENT_OPERATING_MANUAL.md`
+- `00_master/EXECUTION_MAP.md`
+- `00_master/PROJECT_BASELINE.md`
+- `01_architecture/HIGH_LEVEL_CANONICAL_PLAN_DO_NOT_EDIT.md`
+- `02_contracts/CONTRACT_CHECKLIST.md`
+- `02_contracts/DEPENDENCY_POLICY.md`
+- `03_phases/PHASE_0_CONTRACTS.md`
+- `03_phases/PHASE_1A_STORAGE.md`
+- `03_phases/PHASE_1B_DISCOVERY.md`
+- `03_phases/PHASE_1C_ANALYZERS.md`
+- `03_phases/PHASE_1D_MCP_FTS.md`
+- `03_phases/PHASE_2_INCREMENTAL.md`
+- `03_phases/PHASE_3_STRUCTURAL.md`
+- `03_phases/PHASE_4_RETRIEVAL.md`
+- `03_phases/PHASE_5_SEMANTIC.md`
+- `03_phases/PHASE_6_CROSS_REPO.md`
+- `03_phases/PHASE_7_PRODUCTION.md`
+- `03_phases/PHASE_BOOTSTRAP.md`
+- `04_quality/BENCHMARK_GUIDE.md`
+- `04_quality/SECURITY_INVARIANTS.md`
+- `04_quality/TEST_AND_GATE_MATRIX.md`
+- `05_agent_prompts/PHASE_HANDOFF_TEMPLATE.md`
+- `05_agent_prompts/REVIEW_PROMPT.md`
+- `05_agent_prompts/START_HERE_PROMPT.md`
+- `06_reference/DECISION_RECORD_TEMPLATE.md`
+- `06_reference/DEPENDENCY_VERIFICATION_2026-08-24.md`
+- `06_reference/OPEN_QUESTIONS_TEMPLATE.md`
+- `06_reference/PHASE_COMPLETION_CHECKLIST.md`
+- `06_reference/PROJECT_TREE_TARGET.md`
+- `README.md`

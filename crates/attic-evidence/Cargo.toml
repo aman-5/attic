@@ -1,0 +1,18 @@
+[package]
+name        = "attic-evidence"
+description = "Attic — evidence conversion, ranking signals, validation, sufficiency, contradiction handling"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+attic-core    = { workspace = true }
+attic-storage = { workspace = true }
+serde         = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
