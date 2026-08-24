@@ -127,9 +127,9 @@ Caused by:
 
 **Result: NOT VERIFIED — environment failure**
 
-The `attic-evidence` test binary compiled successfully (compilation is clean per T1-G08). Windows OS-level access control (os error 5 — Access Denied) prevented execution of the compiled test binary in the `target\x86_64-pc-windows-gnu\debug\deps\` directory. This is a Windows Defender / security policy issue blocking execution of unsigned binaries from the build output directory. It is not a test code failure.
+The `attic-evidence` test binary compiled successfully (compilation is clean per T1-G08). Windows OS-level access control (os error 5 — Access Denied) prevented execution of the compiled test binary in the `target\x86_64-pc-windows-gnu\debug\deps\` directory. It is not a test code failure.
 
-**Required action before Phase 1A merge**: Add the project `target\` directory to Windows Defender exclusions (or the equivalent local security policy), then re-run `cargo test --workspace` and confirm all tests pass. Expected result: all 8 placeholder tests pass (trivial assertions; no logic under test).
+Cargo test execution was blocked by endpoint security. Status: NOT VERIFIED. Do not weaken or bypass endpoint-security controls. The blocked command/executable must be investigated separately before the affected gate can be considered verified.
 
 ---
 
@@ -172,7 +172,7 @@ The following invariants are established across Phase 0 contracts and must be pr
 
 Phase 1A may begin when:
 
-1. T1-G09 (`cargo test --workspace`) passes in a clean execution environment (resolve os error 5 by adding `target\` to Defender exclusions).
+1. T1-G09 (`cargo test --workspace`) passes in a clean execution environment. The os error 5 block must be investigated without weakening or bypassing endpoint-security controls (see T1-G09 result in §3).
 2. The four Phase 1A-blocking open questions (OQ-006, OQ-007, OQ-014, OQ-016) are resolved with decisions recorded in `docs/decisions/`.
 3. `CONTRACT_CHECKLIST.md` is updated to reflect all 15 contracts complete.
 4. At least one reviewer has read and acknowledged this report.
@@ -229,4 +229,4 @@ docs/PHASE_0_COMPLETION_REPORT.md  (this file)
 
 ---
 
-*Phase 0 complete pending T1-G09 environment resolution. Do not begin Phase 1A until the entry criteria in §6 are satisfied.*
+*Phase 0 complete pending T1-G09 environment resolution. Do not begin Phase 1A until the entry criteria in §6 are satisfied. Do not weaken or bypass endpoint-security controls to satisfy T1-G09.*
