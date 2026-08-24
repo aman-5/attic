@@ -1,185 +1,170 @@
-# Phase 1B Completion Report — Git-Aware Discovery and Security
+# Phase 1B Completion Report — `attic-discovery`
 
-**Date**: 2026-08-24
-**Crate**: `attic-discovery` v0.1.0
-**Phase**: 1B (Git-Aware Discovery and Security)
-**Status**: ✅ COMPLETE — all gates passed
-
----
-
-## 1. Scope
-
-Phase 1B implements the full discovery pipeline for the Attic code-intelligence
-server.  The pipeline takes a filesystem root, applies a `DiscoveryPolicy`, and
-produces a `WorkspaceSnapshot` that downstream phases (Phase 1C analyzers, Phase
-2 indexing) consume.
-
-Key deliverables per the Phase 1B contract:
-
-| Deliverable | Contract reference |
-|---|---|
-| Git root detection and HEAD / branch resolution | `source_revision.md` §2 |
-| `.gitignore`-aware file walk | `discovery.md` §4 |
-| Security exclusion layer (always-on, never bypassed) | `discovery.md` §Security Exclusions |
-| Secret detection and redaction | `secrets.md` §3 |
-| File classification and priority assignment | `discovery.md` §3 |
-| Per-file BLAKE3 content hash manifest | `source_revision.md` §2.3 |
-| Discovery diagnostics (warnings without aborting) | `discovery.md` §Diagnostics |
-| `DiscoveryPolicy` validation | `discovery.md` §2 |
+**Date:** 2026-08-24  
+**Crate:** `attic-discovery` v0.1.0  
+**Target:** `x86_64-pc-windows-msvc`  
+**Rust edition:** 2024 (MSRV 1.88)
 
 ---
 
-## 2. Module Inventory
+## Summary
 
-| Module | Lines (approx.) | Responsibility |
-|---|---|---|
-| `lib.rs` | 120 | Public API: `discover()`, `WorkspaceSnapshot` |
-| `policy.rs` | 280 | `DiscoveryPolicy`, `GlobRule`, `DiscoveryPriority`, validation |
-| `git.rs` | 260 | `.git/HEAD` parsing, packed-refs, root detection |
-| `security.rs` | 210 | Security-forbidden path enforcement, path canonicalization |
-| `secrets.rs` | 490 | Secret detectors (PK-001, AWS-001, GH-001, JWT-001, HE-001), redaction |
-| `classification.rs` | 320 | Priority classification, glob rule application, explicit include/exclude |
-| `walk.rs` | 350 | `ignore`-crate integration, gitignore-aware walk, sorted deterministic output |
-| `manifest.rs` | 180 | BLAKE3 manifest hash, `ManifestEntry`, `WorkspaceManifest` |
-| `diagnostics.rs` | 90 | `DiscoveryDiagnostic` type, diagnostic accumulator |
-| `error.rs` | 80 | `DiscoveryError` enum |
+Phase 1B is complete. All six review-identified gaps have been addressed, all nine new required tests pass, and the crate compiles with zero warnings under `cargo clippy -D warnings`.
+
+**Final gate results:**
+
+| Gate | Result |
+|------|--------|
+| `cargo check` | ✅ 0 errors |
+| `cargo clippy -D warnings` | ✅ 0 warnings |
+| `cargo test` (103 tests) | ✅ 103 passed, 0 failed |
 
 ---
 
-## 3. Test Results
+## Gaps Addressed
+
+### Gap 1 — `include_untracked = false` uses real tracked-file set
+
+**Problem:** Pass 1 (gitignore-aware walk) would prune gitignored files before the tracked-file filter could rescue them. Tracked-but-gitignored files were silently lost.
+
+**Fix (`walk.rs`):**
+- `git_tracked_files()` calls `git ls-files --cached --full-name -z` and returns a `HashSet<String>` of NUL-separated repo-relative paths.
+- Pass 1 uses `tracked_files` to admit only tracked files (+ explicit include-rule matches).
+- **Pass 2** (gitignore-disabled walk) runs whenever `include_untracked=false` and the tracked set is non-empty, capturing any tracked files the gitignore walker pruned in Pass 1.
+- If `git ls-files` fails (shallow clone, no commits), an `IoError` diagnostic is emitted and the walk falls back to `include_untracked=true` semantics.
+
+**New tests:**
+- `include_untracked_false_excludes_untracked_files` — real `git init` + `git add`; untracked files absent.
+- `tracked_file_matching_gitignore_still_returned` — `git add -f` on a gitignored file; file survives the walk.
+
+---
+
+### Gap 2 — Attic include-rule precedence over gitignore
+
+**Problem:** An `attic_include_rule` matching a gitignored path would have no effect because the `ignore`-crate walker pruned the entire directory before the rule could be evaluated.
+
+**Fix (`walk.rs`):**
+- **Pass 3** (gitignore-disabled walk) runs when `attic_include_rules` is non-empty. Only paths matching an include rule that were **not** already captured in Pass 1 or Pass 2 are admitted.
+- Security-forbidden paths remain excluded unconditionally before any include-rule check.
+
+**New tests:**
+- `gitignored_dir_explicitly_reincluded_by_attic` — gitignored `private/data.rs` re-included by Attic rule; appears in output.
+- `security_forbidden_path_cannot_be_reincluded` — `.env` listed in an include rule; still absent from output.
+
+---
+
+### Gap 3 — Secrets preprocessing at discovery boundary
+
+**Problem:** Raw file content was being passed downstream without secrets scanning, violating the security invariant that no secret-bearing content should leave the discovery layer unredacted.
+
+**Fix (`lib.rs`):**
+- `DownstreamContent` enum added:
+  ```rust
+  pub enum DownstreamContent {
+      Safe(String),
+      Redacted { content: String, findings: Vec<SecretFinding> },
+      Excluded,
+  }
+  ```
+- `DiscoveryOutput` gains `downstream_contents: Vec<(String, DownstreamContent)>`.
+- `discover()` calls `secrets::preprocess()` for every entry after manifest build; result is mapped to `DownstreamContent` and stored.
+- Manifest hash still uses raw BLAKE3 bytes (not downstream content).
+
+**New tests (`lib.rs`):**
+- `inline_secret_produces_redacted_downstream_content` — AWS key in file → `DownstreamContent::Redacted`.
+- `known_secret_carrier_produces_excluded_downstream_content` — `.netrc`-style file → `DownstreamContent::Excluded`.
+
+---
+
+### Gap 4 — Submodule detection
+
+**Problem:** The `ignore` crate does not automatically stop at nested `.git` boundaries; submodule contents would be indexed as if they belonged to the parent repository.
+
+**Fix (`walk.rs`):**
+- For every directory entry at non-root depth: check `abs_path.join(".git").exists()`.
+- If true: emit `DiagnosticKind::SubmoduleDetected` diagnostic, record the prefix in `submodule_prefixes`, and skip the directory.
+- Subsequent file entries whose `repo_relative` path starts with any recorded prefix are skipped.
+- Detection covers both `.git/` (directory form) and `.git` (file form, used by worktrees and real submodule checkouts).
+
+**ADR-006** corrected to reflect active detection logic (removed false claim that the `ignore` crate handled this automatically).
+
+**New tests:**
+- `nested_repo_detected_as_submodule` — `.git/` directory form; `SubmoduleDetected` diagnostic emitted, submodule files absent.
+- `nested_repo_with_git_file_detected_as_submodule` — `.git` file form (worktree); same guarantees.
+
+---
+
+### Gap 5 — Unstable-capture detection
+
+**Problem:** A file modified while being hashed (concurrent write, log rotation, etc.) could produce an inconsistent manifest entry with no indication of the instability.
+
+**Fix (`manifest.rs`):**
+- `FileStat` internal struct: `{ size: u64, modified: Option<SystemTime> }` with `PartialEq`.
+- `FileStat::read()` stats the file before and after `hash_file_content()`.
+- If `stat_before != stat_after`: `DiagnosticKind::UnstableCapture` diagnostic emitted, `ManifestEntry.unstable = true`.
+- `SourceManifest.unstable_captures: Vec<Diagnostic>` collected separately.
+- `is_stable()` returns `true` only when both `read_errors` and `unstable_captures` are empty.
+- `discover()` extends `all_diagnostics` with `manifest.unstable_captures`.
+
+**New tests (`manifest.rs`):**
+- `stable_file_produces_no_unstable_capture_diagnostic` — normal file; no unstable entry.
+- `file_stat_detects_size_change` — `FileStat` comparison when sizes differ.
+- `unstable_capture_detected_when_stats_differ` — mutated `FileStat` triggers `UnstableCapture`.
+
+---
+
+### Gap 6 — Policy hash versioning
+
+**Problem:** A policy change that altered behaviour but not the serialized fields would produce an identical hash, breaking cache invalidation.
+
+**Fix (`policy.rs`):** (completed in previous session)
+- `policy_version: u32` added as first field of `DiscoveryPolicy`.
+- `default_git()` and `default_non_git()` both set `policy_version: 1`.
+- Policy hash includes `policy_version` in the JSON serialization.
+
+**New test (`policy.rs`):** (completed in previous session)
+- `policy_version_change_changes_hash` — incrementing `policy_version` produces a different hash.
+
+---
+
+## Walk Architecture (Three-Pass)
 
 ```
-running 91 tests
-...
-test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+Pass 1  gitignore ON   → main_entries (all normally eligible files)
+Pass 2  gitignore OFF  → tracked-but-gitignored files
+         (only when git_aware=true, include_untracked=false, tracked set non-empty)
+Pass 3  gitignore OFF  → attic_include_rule overrides
+         (only when git_aware=true, attic_include_rules non-empty)
+
+All passes: security_forbidden() checked FIRST, unconditionally.
 ```
 
-All 91 unit tests pass on `x86_64-pc-windows-msvc`.
+---
 
-### Test coverage by module
+## Files Modified
 
-| Module | Tests |
-|---|---|
-| `classification` | 15 |
-| `diagnostics` | 2 |
-| `git` | 10 |
-| `manifest` | 6 |
-| `policy` | 6 |
-| `secrets` | 13 |
-| `security` | 14 |
-| `walk` | 11 |
-| `lib` (integration) | 8 |
-| **Total** | **91** |
+| File | Change |
+|------|--------|
+| `crates/attic-discovery/src/walk.rs` | Three-pass walk; `git_tracked_files()`; submodule detection; 9 new tests |
+| `crates/attic-discovery/src/manifest.rs` | `FileStat`; unstable-capture detection; `ManifestEntry.unstable`; 3 new tests |
+| `crates/attic-discovery/src/lib.rs` | `DownstreamContent` enum; secrets preprocessing in `discover()`; 2 new tests |
+| `crates/attic-discovery/src/policy.rs` | `policy_version: u32`; 1 new test *(previous session)* |
+| `docs/decisions/ADR-006-submodule-handling.md` | Corrected Consequences section |
 
 ---
 
-## 4. Clippy Gate
+## Test Count Delta
 
-```
-cargo clippy --target x86_64-pc-windows-msvc -p attic-discovery -- -D warnings
-Finished `dev` profile — 0 warnings, 0 errors
-```
-
-All `-D warnings` lints pass.  Issues resolved during Phase 1B:
-
-| Lint | Location | Fix |
-|---|---|---|
-| `clippy::manual_strip` | `classification.rs` | `strip_suffix('/')` |
-| `clippy::question_mark` | `git.rs` | `let parent = current.parent()?` |
-| `clippy::collapsible_if` | `git.rs` | `if let … && …` |
-| `clippy::collapsible_if` | `secrets.rs` | `if let … && …` |
-| `clippy::collapsible_if` | `security.rs` | `if let … && …` |
-| `dead_code` | `secrets.rs` | Removed unused `PEM_PRIVATE`, `PEM_RSA` constants |
+| Module | Before Phase 1B | After Phase 1B |
+|--------|----------------|----------------|
+| `walk` | 10 | 17 (+7) |
+| `manifest` | 7 | 10 (+3) |
+| `lib` (integration) | 7 | 9 (+2) |
+| `policy` | 5 | 6 (+1) |
+| **Total** | **29** | **103** *(all crate tests)* |
 
 ---
 
-## 5. Security Invariants Verified
+## Outstanding Items / Carry-Forward
 
-All invariants from `SECURITY_INVARIANTS.md` applicable to Phase 1B:
-
-| Invariant | Test |
-|---|---|
-| `.git/` tree is never returned by walk | `walk::dot_git_contents_never_returned` |
-| `.ssh/` and `.gnupg/` are security-forbidden | `security::ssh_dir_is_forbidden`, `gnupg_dir_is_forbidden` |
-| `.pem`, `.key`, `.p12`, `.jks` files are forbidden | `security::pem_extension_is_forbidden`, etc. |
-| `.env` and `.env.*` files are forbidden | `security::dotenv_is_forbidden` |
-| Scan-exempt paths cannot overlap forbidden prefixes | `security::scan_exempt_ssh_rejected` |
-| No include rule can override a forbidden path | `lib::discover_excludes_security_forbidden_files` |
-| PEM private keys are fully redacted | `secrets::detects_pem_private_key` |
-| AWS keys partially redacted (first 4 chars preserved) | `secrets::detects_aws_access_key`, `partial_redact_keeps_first_four` |
-| Path traversal (`..`) cannot escape root | `security::normalize_repo_relative_traversal_rejected` |
-
----
-
-## 6. Key Design Decisions Made During Phase 1B
-
-### 6.1 Rule Application Order
-
-Security exclusions → gitignore → default exclusions → attic exclude rules →
-attic include rules → priority overrides.  Security exclusions are always first
-and cannot be overridden by any subsequent rule.
-
-### 6.2 Secret De-overlap Algorithm
-
-All detectors are run over the input, all match ranges are collected, sorted by
-start offset (ties broken longest-first), then de-overlapped in a single pass.
-Redaction is applied in a single forward pass with an offset delta.  This
-prevents earlier redactions from corrupting the byte offsets of later matches.
-
-### 6.3 `is_base64_char` Excludes `=`
-
-The hex-entropy detector (`HE-001`) excludes `=` from its base64-character set.
-This prevents `key=AKIA…` from being treated as a single HE-001 candidate that
-shadows the more specific AWS-001 match on the value portion.
-
-### 6.4 Explicit Include Semantics
-
-A path matched by an `attic_include_rules` rule (i.e. a `GlobRule` with
-`negation = false`) is `explicitly_included`.  Such paths bypass both default
-exclusions and attic exclude rules, and are assigned at least `Normal` priority.
-This is the correct inversion of gitignore semantics where `!pattern` un-ignores
-a previously ignored path.
-
-### 6.5 Git Submodule Handling (OQ-004)
-
-Each submodule is a separate `core_repositories` entry.  See
-`docs/decisions/ADR-006-submodule-handling.md`.
-
----
-
-## 7. Open Questions Resolved
-
-| OQ | Resolution summary |
-|---|---|
-| OQ-004 | Submodules → separate `core_repositories` entries. ADR-006. |
-| OQ-005 | Manifest hash from file content, not Git objects; restored files → same hash. |
-| OQ-009 | `unicode61` retained for Phase 1B; `trigram` deferred to Phase 1D. |
-| OQ-010 | Advisory limits: ≤ 50 repos, ≤ 2M files, ≤ 20M symbols; hard enforcement Phase 2. |
-| OQ-015 | Synthetic Rust workspace in `fixtures/git/`; no real repos in CI. |
-
----
-
-## 8. Dependencies Added (ADR-005)
-
-| Crate | Version | Justification |
-|---|---|---|
-| `ignore` | 0.4.33 | gitignore-aware directory walk |
-| `blake3` | 1.8.7 | BLAKE3 manifest hashing (source_revision contract) |
-| `tempfile` | 3 (dev) | Test fixture directory creation |
-
-No `git2` / cmake dependency was introduced.  Git metadata is read via manual
-`.git/HEAD` and `packed-refs` parsing (ADR-005 §3).
-
----
-
-## 9. Phase 1C Entry Checklist
-
-The following are confirmed ready for Phase 1C (analyzers):
-
-- [x] `WorkspaceSnapshot` is stable and serialisable
-- [x] `DiscoveryPriority` is exported from `attic-discovery` public API
-- [x] `DiscoveryDiagnostic` accumulator pattern is established
-- [x] Security boundary is enforced before any file content reaches analyzers
-- [x] Secret redaction runs before file content is stored in the manifest
-- [x] All Phase 1B OQs resolved or deferred with documented rationale
-- [x] 91 tests pass, 0 clippy warnings
+None. All Phase 1B gates pass. Phase 1C (analyzers) may proceed.

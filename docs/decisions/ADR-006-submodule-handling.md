@@ -61,11 +61,15 @@ with the storage contract's `core_repositories` multi-row design.
 
 ## Consequences
 
-- `attic-discovery` `walk.rs` must detect submodule roots (presence of `.git`
-  file or `.git/` dir inside a non-root directory) and emit them as yield-points
-  rather than descending.  This is a Phase 1B implementation detail already
-  handled by the `ignore` crate's default behaviour (it respects `.git`
-  boundaries).
+- `attic-discovery` `walk.rs` detects submodule roots actively: for every
+  directory entry encountered during a walk pass, it checks whether
+  `abs_path.join(".git").exists()`.  If `true`, the directory is treated as a
+  nested repository boundary — a `DiagnosticKind::SubmoduleDetected` diagnostic
+  is emitted, the directory's repo-relative prefix is recorded in
+  `submodule_prefixes`, and all files underneath it are skipped for the
+  remainder of that pass.  This explicit check is necessary because the `ignore`
+  crate does **not** automatically stop at `.git` boundaries inside a walk that
+  was started from a parent root.
 - `WorkspaceSnapshot` gains a `submodule_revisions` field in Phase 1B.  If the
   field is empty the parent hash is computed as before; if non-empty the
   submodule SHAs are included in the BLAKE3 hash input.

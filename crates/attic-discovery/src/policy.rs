@@ -76,10 +76,19 @@ pub enum DiscoveryPriority {
 /// Its BLAKE3 hash (of canonical JSON) is stored as `discovery_policy_hash`
 /// in each `SourceRevision`.
 ///
-/// **Serialization stability:** fields are serialized by name; do not reorder
-/// or rename fields without incrementing the policy version.
+/// **Serialization stability:** `serde_json::to_string` on this struct emits
+/// fields in **field-definition order** (the order they appear in this
+/// `struct`, not alphabetically sorted).  This is deterministic for a fixed
+/// Rust struct layout.  To make representation changes intentional and
+/// detectable, increment `policy_version` whenever a field is added, removed,
+/// or semantically changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryPolicy {
+    /// Explicit version number.  Increment when the policy schema changes.
+    /// This field is included in the hashed JSON so that any schema evolution
+    /// produces a different `discovery_policy_hash`, forcing a re-walk.
+    pub policy_version: u32,
+
     /// Use Git index / `.gitignore` semantics when `.git/` is present.
     pub git_aware: bool,
 
@@ -115,6 +124,7 @@ impl DiscoveryPolicy {
     /// Construct a sensible default policy for a Git repository.
     pub fn default_git() -> Self {
         DiscoveryPolicy {
+            policy_version: 1,
             git_aware: true,
             include_untracked: true,
             default_exclusions: true,
@@ -130,6 +140,7 @@ impl DiscoveryPolicy {
     /// Construct a sensible default policy for a non-Git directory.
     pub fn default_non_git() -> Self {
         DiscoveryPolicy {
+            policy_version: 1,
             git_aware: false,
             include_untracked: true,
             default_exclusions: true,
@@ -142,9 +153,14 @@ impl DiscoveryPolicy {
         }
     }
 
-    /// Serialize to canonical JSON (keys sorted, no extra whitespace).
+    /// Serialize the policy to JSON for hashing.
     ///
-    /// Used to compute the `discovery_policy_hash`.
+    /// Fields are emitted in struct-definition order (deterministic for a
+    /// fixed Rust struct layout, **not** alphabetically sorted by key).
+    /// Increment `policy_version` for any schema change to ensure the hash
+    /// changes intentionally.
+    ///
+    /// Used to compute the `discovery_policy_hash` stored in `SourceRevision`.
     pub fn to_canonical_json(&self) -> Result<String, crate::error::DiscoveryError> {
         serde_json::to_string(self).map_err(|e| {
             crate::error::DiscoveryError::PolicySerialize(e.to_string())
@@ -210,6 +226,18 @@ mod tests {
         let mut p2 = DiscoveryPolicy::default_git();
         p2.attic_exclude_rules.push(GlobRule::exclude("vendor/**"));
         assert_ne!(p1.hash().unwrap(), p2.hash().unwrap());
+    }
+
+    #[test]
+    fn policy_version_change_changes_hash() {
+        let p1 = DiscoveryPolicy::default_git();
+        let mut p2 = DiscoveryPolicy::default_git();
+        p2.policy_version = 2;
+        assert_ne!(
+            p1.hash().unwrap(),
+            p2.hash().unwrap(),
+            "bumping policy_version must change the hash"
+        );
     }
 
     #[test]
