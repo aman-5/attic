@@ -84,23 +84,19 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-006 — SQLite WAL Checkpoint Trigger Policy
 
-**Status**: OPEN  
+**Status**: RESOLVED  
 **Owning phase**: Phase 1A  
 **Source contract**: `docs/contracts/storage.md` §5 (WAL mode), `docs/contracts/recovery.md` §4 (backup policy REC-B1)  
-**Question**: What triggers a WAL checkpoint — time-based, size-based, or both? Who initiates it — the DB writer task, a maintenance task, or SQLite's automatic checkpointing?  
-**Impact**: Affects `ops_tasks` scheduling and backup timing (REC-B1 requires checkpoint before backup copy).  
-**Suggested resolution**: Use SQLite `PRAGMA wal_autocheckpoint` (threshold 1 000 pages ≈ 4 MB) supplemented by an explicit checkpoint in the BACKUP maintenance task. Record in `docs/decisions/` at Phase 1A.
+**Resolution**: `PRAGMA wal_autocheckpoint = 1000` (PASSIVE, frame-count trigger) on the writer connection; DB Writer background loop issues `PRAGMA wal_checkpoint(PASSIVE)` every 5 minutes; BACKUP task uses `PRAGMA wal_checkpoint(FULL)` before file copy. No schema changes. See `docs/decisions/ADR-001-wal-checkpoint-policy.md`.
 
 ---
 
 ## OQ-007 — Secret Detector Pattern Versioning and Rollout
 
-**Status**: OPEN  
+**Status**: RESOLVED  
 **Owning phase**: Phase 1A  
 **Source contract**: `docs/contracts/secrets.md` §3 (V1 baseline patterns), `docs/contracts/recovery.md` R-6  
-**Question**: How are new secret patterns deployed without a full re-scan? Is there a `secret_pattern_version` column on `core_file_occurrences`? What triggers re-scan when patterns are updated?  
-**Impact**: Affects `core_index_generations` schema (a `secret_detector_version` dimension) and the migration SQL.  
-**Suggested resolution**: Add `secret_pattern_version INTEGER NOT NULL DEFAULT 1` to `core_file_occurrences`. Bump `IndexGeneration.secret_detector_version` on pattern change; compatibility class `INCOMPATIBLE` if non-migratable bump. Update migration in Phase 1A.
+**Resolution**: Added `secret_pattern_version INTEGER NOT NULL DEFAULT 1` to `core_file_occurrences` and `secret_detector_version INTEGER NOT NULL DEFAULT 1` to `core_index_generations`. Pattern version bumps trigger `PARTIALLY_REBUILDABLE`; re-scan scheduler marks affected files `PENDING`. See `docs/decisions/ADR-002-secret-pattern-versioning.md` and updated `migrations/0001_initial.sql`.
 
 ---
 
@@ -169,11 +165,10 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-014 — `ops_server_state` Single-Row Invariant Enforcement
 
-**Status**: OPEN  
+**Status**: RESOLVED  
 **Owning phase**: Phase 1A  
 **Source contract**: `migrations/0001_initial.sql` §13 (`ops_server_state` table), `docs/contracts/recovery.md` §7  
-**Question**: Should `ops_server_state` enforce its single-row intent via a `CHECK` constraint, or is that enforced at the application layer?  
-**Suggested resolution**: Add `CHECK (server_id = 'singleton')` constraint; always upsert with `server_id = 'singleton'`. Update migration in Phase 1A before the storage layer uses this table.
+**Resolution**: Added `CHECK (id = 'singleton')` inline on the `id` column in the `CREATE TABLE` DDL. Application layer always upserts with `id = 'singleton'`. See `docs/decisions/ADR-003-ops-server-state-constraint.md` and updated `migrations/0001_initial.sql`.
 
 ---
 
@@ -190,12 +185,10 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-016 — `IndexGeneration` Per-Subsystem Version Tracking
 
-**Status**: OPEN  
+**Status**: RESOLVED  
 **Owning phase**: Phase 1A  
 **Source contract**: `docs/contracts/compatibility.md` §3 (PARTIALLY_REBUILDABLE)  
-**Question**: Is there a per-subsystem hash within `IndexGeneration` to identify which artifacts need rebuilding when a single subsystem version changes?  
-**Impact**: Affects `core_index_generations` schema and invalidation propagation logic.  
-**Suggested resolution**: Add a `subsystem_versions` JSON column to `core_index_generations` mapping subsystem name → version hash. `PARTIALLY_REBUILDABLE` means ≥ 1 but not all subsystem versions changed. Update migration and compatibility.md in Phase 1A.
+**Resolution**: Added `subsystem_versions_json TEXT NOT NULL` to `core_index_generations`. This JSON map (subsystem key → version string) is the consolidated comparison target for compatibility checks. `PARTIALLY_REBUILDABLE` = ≥ 1 non-schema subsystem version changed. Subsystem key constants defined in `attic-core`. See `docs/decisions/ADR-004-index-generation-subsystem-versions.md` and updated `migrations/0001_initial.sql`.
 
 ---
 
@@ -203,12 +196,12 @@ Per the operating manual: all requirements that could not be determined from the
 
 The following questions must be resolved before Phase 1A implementation is merged:
 
-| OQ | Question | Why Phase 1A |
-|---|---|---|
-| OQ-006 | WAL checkpoint trigger policy | Affects `attic-storage` connection management implementation |
-| OQ-007 | Secret detector pattern versioning | Requires `secret_pattern_version` column addition to migration SQL |
-| OQ-014 | `ops_server_state` single-row enforcement | Minor migration SQL hardening needed before the table is used |
-| OQ-016 | `IndexGeneration` per-subsystem versions | Requires `subsystem_versions` JSON column in `core_index_generations` |
+| OQ | Question | Why Phase 1A | Status |
+|---|---|---|---|
+| OQ-006 | WAL checkpoint trigger policy | Affects `attic-storage` connection management implementation | **RESOLVED** — ADR-001 |
+| OQ-007 | Secret detector pattern versioning | Requires `secret_pattern_version` column addition to migration SQL | **RESOLVED** — ADR-002 |
+| OQ-014 | `ops_server_state` single-row enforcement | Minor migration SQL hardening needed before the table is used | **RESOLVED** — ADR-003 |
+| OQ-016 | `IndexGeneration` per-subsystem versions | Requires `subsystem_versions` JSON column in `core_index_generations` | **RESOLVED** — ADR-004 |
 
 All other questions belong to later phases and do not block Phase 1A.
 

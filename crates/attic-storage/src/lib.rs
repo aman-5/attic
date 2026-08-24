@@ -1,28 +1,23 @@
-//! Attic — storage layer skeleton.
-//!
-//! SQLite connection management, schema migrations, DAOs, FTS5 helpers,
-//! and the bounded DB-writer queue will live here.
-//!
-//! # Bootstrap state
-//! Skeleton only.  The SQLite binding is chosen and added in Phase 1A.
-
 #![forbid(unsafe_code)]
-#![deny(clippy::all)]
+#![deny(missing_docs)]
+//! `attic-storage` — SQLite-backed persistence layer for the Attic MCP server.
+//!
+//! Phase 1A implements:
+//! - S1: connection configuration (WAL, PRAGMAs, pool)
+//! - S2: migration runner
+//! - S3: core repository/file CRUD
+//! - S4: publication batch
+//! - S5: FTS helpers (external-content tables)
+//! - S6: bounded writer queue
 
-/// Placeholder module.  Real storage implementations are added in Phase 1A.
-pub mod placeholder {
-    /// Bootstrap placeholder — removed when Phase 1A begins.
-    pub fn storage_crate_present() -> bool {
-        true
-    }
-}
+pub mod connection;
+pub mod error;
+pub mod fts;
+pub mod migration;
+pub mod repository;
+pub mod writer;
 
-#[cfg(test)]
-mod tests {
-    use super::placeholder::storage_crate_present;
-
-    #[test]
-    fn crate_is_present() {
-        assert!(storage_crate_present());
-    }
-}
+pub use connection::{open_db, DbPool};
+pub use error::StorageError;
+pub use migration::run_migrations;
+pub use writer::{WriterQueue, WriterQueueHandle};

@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS core_index_generations (
     ranking_version           TEXT    NOT NULL,   -- semver string
     embedding_model_version   TEXT,               -- NULL if no semantic index in this generation
     configuration_hash        TEXT    NOT NULL,   -- SHA-256 hex of full startup configuration
+    -- OQ-007 (ADR-002): secret detector pattern version active when this generation was produced
+    secret_detector_version   INTEGER NOT NULL DEFAULT 1,
+    -- OQ-016 (ADR-004): consolidated subsystem_key → version map for compatibility checks
+    subsystem_versions_json   TEXT    NOT NULL,   -- JSON: { "schema": "1.0.0", "analyzer.<id>": "...", ... }
     created_at                INTEGER NOT NULL    -- microseconds since Unix epoch (UTC)
 );
 
@@ -119,6 +123,8 @@ CREATE TABLE IF NOT EXISTS core_file_occurrences (
     freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT',
     -- secret_scan_state enum: PENDING | IN_PROGRESS | CLEAN | HAS_SECRETS
     secret_scan_state   TEXT    NOT NULL DEFAULT 'PENDING',
+    -- OQ-007 (ADR-002): which secret detector pattern version last scanned this file to CLEAN/HAS_SECRETS
+    secret_pattern_version  INTEGER NOT NULL DEFAULT 1,
     last_indexed_at     INTEGER   -- microseconds since Unix epoch; NULL if never indexed
 );
 
@@ -499,8 +505,10 @@ CREATE INDEX IF NOT EXISTS idx_freshness_log_entity
 
 -- ops_server_state: singleton operational state (one row, always id='singleton')
 -- Stores watcher epoch and server startup metadata for crash recovery.
+-- OQ-014 (ADR-003): CHECK (id = 'singleton') enforces the single-row invariant at the DB layer.
 CREATE TABLE IF NOT EXISTS ops_server_state (
-    id              TEXT    NOT NULL PRIMARY KEY DEFAULT 'singleton',
+    id              TEXT    NOT NULL PRIMARY KEY DEFAULT 'singleton'
+                            CHECK (id = 'singleton'),
     watcher_epoch   INTEGER NOT NULL DEFAULT 0,   -- incremented on each server startup
     schema_version  TEXT    NOT NULL,             -- matches current binary's expected version
     server_version  TEXT    NOT NULL,             -- Attic binary semver

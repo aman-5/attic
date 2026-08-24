@@ -3,53 +3,29 @@ resolver = "2"
 members = [
     "crates/attic-core",
     "crates/attic-storage",
-    "crates/attic-discovery",
     "crates/attic-analyzers",
+    "crates/attic-discovery",
+    "crates/attic-evidence",
     "crates/attic-indexing",
     "crates/attic-retrieval",
-    "crates/attic-evidence",
     "crates/attic-server",
     "crates/attic-test-support",
 ]
 
 [workspace.package]
-version       = "0.1.0"
-edition       = "2024"
-rust-version  = "1.88"
-authors       = ["Attic Contributors"]
-license       = "Apache-2.0"
-repository    = "https://github.com/your-org/attic"
+edition      = "2024"
+rust-version = "1.88"
+authors      = ["Attic Contributors"]
+license      = "MIT OR Apache-2.0"
 
-# ---------------------------------------------------------------------------
-# Workspace-level dependency pins (verified 2026-08-24).
-# Update only after re-verifying on crates.io/official repositories.
-# ---------------------------------------------------------------------------
 [workspace.dependencies]
-# structured logging — used by attic-server (Bootstrap only external deps)
-tracing            = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"] }
-
-# Deferred to later phases (add back when the implementing crate actually uses them):
-# tokio     — Phase 1+ (async I/O crates)
-# serde     — Phase 0+ (domain types)
-# serde_json — Phase 0+ (domain types)
-# thiserror  — Phase 0+ (domain error types)
-
-# intra-workspace
+rusqlite           = { version = "0.40.2",  default-features = false, features = ["bundled"] }
+thiserror          = "2.0.20"
+serde              = { version = "1.0.219", features = ["derive"] }
+serde_json         = "1.0.140"
+uuid               = { version = "1.11.0",  features = ["v4", "serde"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3",     features = ["env-filter"] }
 attic-core         = { path = "crates/attic-core" }
 attic-storage      = { path = "crates/attic-storage" }
-attic-discovery    = { path = "crates/attic-discovery" }
-attic-analyzers    = { path = "crates/attic-analyzers" }
-attic-indexing     = { path = "crates/attic-indexing" }
-attic-retrieval    = { path = "crates/attic-retrieval" }
-attic-evidence     = { path = "crates/attic-evidence" }
-attic-server       = { path = "crates/attic-server" }
 attic-test-support = { path = "crates/attic-test-support" }
-
-[profile.dev]
-debug = true
-
-[profile.release]
-opt-level = 3
-lto       = "thin"
-strip     = "symbols"

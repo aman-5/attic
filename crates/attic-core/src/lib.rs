@@ -1,22 +1,27 @@
-//! Attic — pure domain model.
-//!
-//! This crate contains only domain types: IDs, enumerations, and trait
-//! signatures that are shared across all other Attic crates. It has no
-//! dependency on async runtimes, databases, parsers, or network transports.
-//!
-//! # Bootstrap state
-//! Skeleton only. Domain types are added starting in Phase 0 (contracts).
-
 #![forbid(unsafe_code)]
-#![deny(clippy::all)]
+#![deny(missing_docs)]
+//! `attic-core` — domain types and pure-logic contracts.
+//!
+//! MUST NOT depend on tokio, rusqlite, rmcp, tree-sitter, notify, or any I/O crate.
 
-/// Placeholder module — domain types are introduced in Phase 0.
-pub mod domain {}
+pub mod constants;
+pub mod domain;
+pub mod error;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_is_present() {
-        // placeholder — domain type tests added in Phase 0
-    }
-}
+pub use constants::{subsystem_keys, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION};
+pub use domain::{
+    enums::{
+        ArtifactType, Authority, CompatibilityClass, DependencyBasis, DiscoveryClass,
+        ExistenceState, FileType, FreshnessState, InvalidationReason, LexicalState, RelType,
+        Resolution, SecretScanState, SecurityState, SemanticState, SourceType, SymbolKind,
+        TaskState, TaskType, VerificationState,
+    },
+    ids::{
+        EvidenceId, FileIdentityId, FileOccurrenceId, IndexGenerationId, OpsAuditId,
+        RepositoryId, RetrievalUnitId, SchemaMigrationId, SourceRevisionId, StructuralNodeId,
+        SymbolIdentityId, SymbolOccurrenceId,
+    },
+    subsystem_versions::SubsystemVersions,
+    value_types::SourceSpan,
+};
+pub use error::CoreError;

@@ -1,16 +1,14 @@
 [package]
 name         = "attic-core"
-description  = "Attic — pure domain model (Bootstrap skeleton)"
-version.workspace      = true
-edition.workspace      = true
+version      = "0.1.0"
+edition.workspace    = true
 rust-version.workspace = true
-authors.workspace      = true
-license.workspace      = true
-repository.workspace   = true
+authors.workspace    = true
+license.workspace    = true
+description  = "Domain types and pure contracts for Attic. MUST NOT depend on I/O, SQLite, tokio, rmcp, tree-sitter, or notify."
 
-# No dependencies during Bootstrap — domain types are added in Phase 0.
-# attic-core must NEVER depend on: tokio, SQLite, rmcp, tree-sitter, notify,
-# or any I/O or transport crate.
 [dependencies]
-
-[dev-dependencies]
+thiserror.workspace  = true
+serde.workspace      = true
+serde_json.workspace = true
+uuid.workspace       = true
