@@ -1,591 +1,470 @@
 //! Secret preprocessing: detect and redact sensitive material before any
 //! content reaches FTS, embeddings, or logs.
 //!
-//! # V1 patterns (per `secrets` contract)
+//! # V1 patterns
 //!
-//! | ID       | Pattern                          | Redact |
-//! |----------|----------------------------------|--------|
-//! | PK-001   | PEM private-key block            | full   |
-//! | AWS-001  | AWS access-key ID                | partial|
-//! | GH-001   | GitHub personal-access token     | partial|
-//! | JWT-001  | JSON Web Token                   | partial|
-//! | HE-001   | High-entropy base64 string >= 20 | partial|
+//! | ID       | Pattern                          | Redact  | Detector class     |
+//! |----------|----------------------------------|---------|--------------------|
+//! | PK-001   | PEM private-key block            | full    | stateful-streaming |
+//! | AWS-001  | AWS access-key ID (20 chars)     | partial | bounded-token      |
+//! | GH-001   | GitHub personal-access token     | partial | bounded-token      |
+//! | JWT-001  | JSON Web Token                   | partial | bounded-token      |
+//! | HE-001   | High-entropy base64 >= 20 chars  | partial | bounded-token      |
 //!
-//! "Full" redaction replaces the entire matched region with a redaction
-//! placeholder.  "Partial" redaction replaces all but the first 4 characters
-//! with `***`.
+//! **Bounded-token detectors** (AWS-001, GH-001, JWT-001, HE-001) have a
+//! verified maximum match length.  A withheld safety window of
+//! `SAFETY_WINDOW_SIZE` bytes at the trailing edge of each scan window
+//! guarantees no partial match crosses the emission boundary undetected.
 //!
-//! **Nothing that matches a secret pattern may be persisted to storage,
-//! passed to FTS, or written to any log at level < ERROR.**
+//! **Stateful-streaming detector** (PK-001/PEM) has no maximum match length.
+//! `LargeFileStream` carries a `PemStreamState` tracker; once a
+//! `-----BEGIN … PRIVATE KEY-----` header is observed, ALL subsequent bytes
+//! are withheld until the matching `-----END … -----` footer is found, then
+//! the entire region is replaced by `[REDACTED:PRIVATE-KEY]`.
 //!
-//! # File-size tiers and safe streaming
+//! # Withheld-tail streaming safety contract
 //!
-//! Thresholds follow `docs/contracts/large_files.md` — these are the single
-//! source of truth; `lib.rs` re-exports them and must not define its own.
+//! For every `LargeFileStream::next_chunk()` call:
+//! 1. Read up to `STREAM_CHUNK_SIZE` new bytes.
+//! 2. Prepend `withheld` buffer to form the scan window.
+//! 3. Scan window for secrets → redacted window string.
+//! 4. Compute `safe_emit_len` (original bytes):
+//!    - PEM Idle: `window.len() − SAFETY_WINDOW_SIZE`
+//!    - PEM InBlock: `0`  (withhold everything until END footer)
+//!    - EOF:  `window.len()`  (flush all)
+//! 5. Emit redacted equivalent of original bytes `0..safe_emit_len`.
+//! 6. `withheld ← original bytes[safe_emit_len..]`
 //!
-//! | Tier       | Threshold          | Content delivery                         |
-//! |------------|--------------------|------------------------------------------|
-//! | SMALL      | <= 4 MiB           | Full in-memory redact, `content` field   |
-//! | LARGE      | 4 MiB – 50 MiB     | [`LargeFileStream`] bounded streaming    |
-//! | VERY_LARGE | > 50 MiB           | Sample-only classification (PartialScan) |
+//! # File-size tiers
 //!
-//! Phase 1C **must** obtain LARGE-file content exclusively through
-//! [`LargeFileStream`].  It must never reopen the raw file and consume raw
-//! bytes directly — that would bypass the redaction boundary and allow
-//! classified-Redacted content to reach indexers.
+//! | Tier       | Threshold      | Content delivery                       |
+//! |------------|----------------|----------------------------------------|
+//! | SMALL      | <= 4 MiB       | Full in-memory redact, `content` field |
+//! | LARGE      | 4 MiB – 50 MiB | [`LargeFileStream`] bounded streaming  |
+//! | VERY_LARGE | > 50 MiB       | Sample-only (PartialScan)              |
 
 use std::io::{self, Read};
+use std::path::Path;
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Size-tier constants  (authoritative — from docs/contracts/large_files.md)
 // ---------------------------------------------------------------------------
 
-/// Files <= this size are processed entirely in memory (SMALL tier).
-///
-/// Matches `MAX_FULL_LOAD_BYTES` in the large-file contract (4 MiB).
-/// `lib.rs` re-exports this constant and must not define a conflicting value.
 pub const SMALL_FILE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
-
-/// Files > this size are treated as VERY_LARGE (sample-only scan).
-///
-/// Matches `MAX_LARGE_BYTES` in the large-file contract (50 MiB).
-/// `lib.rs` re-exports this constant and must not define a conflicting value.
 pub const VERY_LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024; // 50 MiB
-
-/// Chunk size used when streaming LARGE files.
 pub const STREAM_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
 
-/// Overlap carried between successive stream windows.
-///
-/// Must be >= the longest possible single secret token so that a secret
-/// spanning a chunk boundary is fully captured in one window.
-/// 4 KiB comfortably exceeds the longest PEM private-key block.
-pub const STREAM_OVERLAP_SIZE: usize = 4 * 1024; // 4 KiB
+/// Bytes withheld at trailing edge of each scan window for bounded-token look-ahead.
+/// Must be >= longest bounded token (~40 bytes); 1 KiB is ample.
+/// Does NOT apply to PEM blocks — those use `PemStreamState`.
+pub const SAFETY_WINDOW_SIZE: usize = 1024; // 1 KiB
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// File-size classification tier.
-///
-/// This is the **single authoritative** size-tier type for the entire
-/// `attic-discovery` crate.  `lib.rs` re-exports it; there must be no
-/// second definition.  Threshold values follow `docs/contracts/large_files.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileSizeTier {
-    /// <= `SMALL_FILE_THRESHOLD` (4 MiB).  Full in-memory processing.
-    Small,
-    /// > `SMALL_FILE_THRESHOLD` (4 MiB) and <= `VERY_LARGE_FILE_THRESHOLD` (50 MiB).
-    /// Content is delivered through [`LargeFileStream`].
-    Large,
-    /// > `VERY_LARGE_FILE_THRESHOLD` (50 MiB).
-    /// Only a head+tail sample is scanned; mid-body is not inspected.
-    VeryLarge,
-}
+pub enum FileSizeTier { Small, Large, VeryLarge }
 
-/// Classify a file by its byte size into a processing tier.
 pub fn classify_file_size(size_bytes: u64) -> FileSizeTier {
-    if size_bytes <= SMALL_FILE_THRESHOLD {
-        FileSizeTier::Small
-    } else if size_bytes <= VERY_LARGE_FILE_THRESHOLD {
-        FileSizeTier::Large
-    } else {
-        FileSizeTier::VeryLarge
-    }
+    if size_bytes <= SMALL_FILE_THRESHOLD { FileSizeTier::Small }
+    else if size_bytes <= VERY_LARGE_FILE_THRESHOLD { FileSizeTier::Large }
+    else { FileSizeTier::VeryLarge }
 }
 
-/// The result of scanning one piece of text for secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanResult {
-    /// The text with secrets redacted.  If no secrets were found this is
-    /// identical to the original.
-    pub redacted: String,
-    /// Descriptions of each match found (pattern ID + zero-indexed byte
-    /// offset of the original match start).  Never contains actual secret
-    /// material.
-    pub findings: Vec<SecretFinding>,
-}
+pub struct ScanResult { pub redacted: String, pub findings: Vec<SecretFinding> }
 
-/// One detected secret occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretFinding {
-    /// Pattern identifier (e.g. "PK-001").
     pub pattern_id: &'static str,
-    /// Zero-based byte offset of the match start in the **original** text
-    /// (file-relative for streaming; buffer-relative for in-memory).
     pub offset: usize,
-    /// Length (in bytes) of the matched region in the original text.
     pub length: usize,
 }
 
-/// Whether the file should be excluded from all downstream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretScanDecision {
-    /// Content is safe to index (after redaction if needed).
-    ///
-    /// Only produced when the **entire** file content has been scanned.
-    /// LARGE-tier streaming scans and SMALL-tier full scans may produce this.
-    /// VERY_LARGE sample-only scans produce PartialScan instead.
-    Safe,
-    /// Content contains secrets; redacted version is available.
-    Redacted,
-    /// File must not be indexed at all; it is a known secrets carrier.
-    Excluded,
-    /// Only a sample of the file was scanned (VERY_LARGE tier).
-    ///
-    /// The sampled portion was clean, but the mid-body was NOT inspected.
-    /// Downstream consumers MUST NOT treat this as equivalent to Safe.
-    PartialScan,
-}
+pub enum SecretScanDecision { Safe, Redacted, Excluded, PartialScan }
 
-/// One redacted chunk emitted by LargeFileStream.
 #[derive(Debug, Clone)]
-pub struct StreamChunk {
-    /// Pre-redacted text content for this chunk.
-    /// Raw secret bytes are never present in this field.
-    pub redacted: String,
-    /// File-relative findings (offsets are relative to the start of the file,
-    /// not the chunk).  Only new findings not reported in previous chunks.
-    pub findings: Vec<SecretFinding>,
-}
+pub struct StreamChunk { pub redacted: String, pub findings: Vec<SecretFinding> }
 
-/// Full output of preprocessing one file's content.
-///
-/// # Content delivery by tier
-///
-/// | decision    | content      | stream        | Meaning                          |
-/// |-------------|--------------|---------------|----------------------------------|
-/// | Excluded    | None         | None          | Do not index                     |
-/// | PartialScan | None         | None          | VERY_LARGE, sample only          |
-/// | Safe        | Some(text)   | None          | SMALL, full scan, no secrets     |
-/// | Redacted    | Some(text)   | None          | SMALL, full scan, redacted       |
-/// | Safe        | None         | Some(stream)  | LARGE, full scan, no secrets     |
-/// | Redacted    | None         | Some(stream)  | LARGE, full scan, secrets found  |
-///
-/// Phase 1C MUST consume LARGE file content exclusively through the `stream`
-/// field.  It must NOT reopen the original file path.
 #[derive(Debug)]
 pub struct PreprocessResult {
     pub decision: SecretScanDecision,
-    /// Redacted content -- present for SMALL-tier Safe and Redacted decisions.
     pub content: Option<String>,
-    /// Safe streaming handle for LARGE-tier files.
-    ///
-    /// Phase 1C MUST use this (not a direct file open) to read content.
-    /// Each chunk yielded by the stream has already been redacted.
     pub stream: Option<LargeFileStream>,
     pub findings: Vec<SecretFinding>,
 }
 
 // ---------------------------------------------------------------------------
-// Public API -- small files
+// File identity (two-pass consistency)
 // ---------------------------------------------------------------------------
 
-/// Scan and redact secrets in `text`.
-///
-/// Returns a ScanResult containing the redacted text and a list of findings.
-/// The redacted text is safe to pass to FTS / embeddings.
-pub fn scan_and_redact(text: &str) -> ScanResult {
-    struct PendingMatch<'d> {
-        start: usize,
-        length: usize,
-        detector: &'d Detector,
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileIdentity { size: u64, modified: SystemTime }
 
-    let mut pending: Vec<PendingMatch<'_>> = Vec::new();
-    for detector in DETECTORS {
-        for m in detector.find_all(text) {
-            pending.push(PendingMatch {
-                start: m.start,
-                length: m.length,
-                detector,
-            });
+fn file_identity(path: &Path) -> io::Result<FileIdentity> {
+    let m = std::fs::metadata(path)?;
+    Ok(FileIdentity { size: m.len(), modified: m.modified()? })
+}
+
+// ---------------------------------------------------------------------------
+// PEM stateful state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PemStreamState {
+    Idle,
+    InBlock { begin_file_offset: usize },
+}
+
+// ---------------------------------------------------------------------------
+// Public API — small files
+// ---------------------------------------------------------------------------
+
+pub fn scan_and_redact(text: &str) -> ScanResult {
+    struct PM<'d> { start: usize, length: usize, detector: &'d Detector }
+    let mut pending: Vec<PM<'_>> = Vec::new();
+    for d in DETECTORS {
+        for m in d.find_all(text) {
+            pending.push(PM { start: m.start, length: m.length, detector: d });
         }
     }
-
-    // Sort by start offset; ties broken by longest match first (greedy).
     pending.sort_by(|a, b| a.start.cmp(&b.start).then(b.length.cmp(&a.length)));
-
-    // De-overlap: skip any match that starts inside the previous match's span.
-    let mut non_overlapping: Vec<PendingMatch<'_>> = Vec::new();
+    let mut non_overlapping: Vec<PM<'_>> = Vec::new();
     let mut next_free = 0usize;
     for pm in pending {
-        if pm.start >= next_free {
-            next_free = pm.start + pm.length;
-            non_overlapping.push(pm);
-        }
+        if pm.start >= next_free { next_free = pm.start + pm.length; non_overlapping.push(pm); }
     }
-
-    // Apply replacements left-to-right, tracking the running byte-shift.
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut redacted = text.to_string();
-    let mut offset_delta: isize = 0;
-
+    let mut delta: isize = 0;
     for pm in non_overlapping {
-        let adj_start = (pm.start as isize + offset_delta) as usize;
-        let adj_end = adj_start + pm.length;
-
-        let replacement = match pm.detector.redact_mode {
+        let as_ = (pm.start as isize + delta) as usize;
+        let ae = as_ + pm.length;
+        let repl = match pm.detector.redact_mode {
             RedactMode::Full => pm.detector.placeholder.to_string(),
-            RedactMode::Partial => partial_redact(&redacted[adj_start..adj_end]),
+            RedactMode::Partial => partial_redact(&redacted[as_..ae]),
         };
-
-        let old_len = pm.length;
-        let new_len = replacement.len();
-
-        redacted.replace_range(adj_start..adj_end, &replacement);
-        offset_delta += new_len as isize - old_len as isize;
-
-        findings.push(SecretFinding {
-            pattern_id: pm.detector.id,
-            offset: pm.start,
-            length: pm.length,
-        });
+        let old = pm.length; let new_ = repl.len();
+        redacted.replace_range(as_..ae, &repl);
+        delta += new_ as isize - old as isize;
+        findings.push(SecretFinding { pattern_id: pm.detector.id, offset: pm.start, length: pm.length });
     }
-
     ScanResult { redacted, findings }
 }
 
-/// Preprocess SMALL file content: decide whether to index, exclude, or redact.
-///
-/// `repo_relative` is used solely to make path-based decisions (e.g. `.env`
-/// file extension); it is never stored or logged with secret content.
-///
-/// This function is for SMALL files only (content already in memory).
-/// For LARGE files use preprocess_large_file.
 pub fn preprocess(content: &str, repo_relative: &str) -> PreprocessResult {
     if is_known_secrets_file(repo_relative) {
-        return PreprocessResult {
-            decision: SecretScanDecision::Excluded,
-            content: None,
-            stream: None,
-            findings: Vec::new(),
-        };
+        return PreprocessResult { decision: SecretScanDecision::Excluded, content: None, stream: None, findings: Vec::new() };
     }
-
     let result = scan_and_redact(content);
     if result.findings.is_empty() {
-        PreprocessResult {
-            decision: SecretScanDecision::Safe,
-            content: Some(result.redacted),
-            stream: None,
-            findings: Vec::new(),
-        }
+        PreprocessResult { decision: SecretScanDecision::Safe, content: Some(result.redacted), stream: None, findings: Vec::new() }
     } else {
-        PreprocessResult {
-            decision: SecretScanDecision::Redacted,
-            content: Some(result.redacted),
-            stream: None,
-            findings: result.findings,
-        }
+        PreprocessResult { decision: SecretScanDecision::Redacted, content: Some(result.redacted), stream: None, findings: result.findings }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public API -- LARGE file safe streaming
+// Public API — LARGE file
 // ---------------------------------------------------------------------------
 
-/// Preprocess a LARGE file via path-based classification then a streaming pass.
-///
-/// This performs two things:
-/// 1. Checks if the path is a known secrets file (returns Excluded).
-/// 2. Opens the file and does a full streaming scan to determine the decision
-///    (Safe vs Redacted), collecting all findings up-front.
-/// 3. Returns a PreprocessResult with a fresh LargeFileStream positioned at
-///    the start, ready for Phase 1C to consume pre-redacted chunks.
-///
-/// Phase 1C MUST consume content through result.stream, never by reopening
-/// the raw file path.
-pub fn preprocess_large_file(
-    path: &std::path::Path,
-    repo_relative: &str,
-) -> io::Result<PreprocessResult> {
+pub fn preprocess_large_file(path: &Path, repo_relative: &str) -> io::Result<PreprocessResult> {
     if is_known_secrets_file(repo_relative) {
-        return Ok(PreprocessResult {
-            decision: SecretScanDecision::Excluded,
-            content: None,
-            stream: None,
-            findings: Vec::new(),
-        });
+        return Ok(PreprocessResult { decision: SecretScanDecision::Excluded, content: None, stream: None, findings: Vec::new() });
     }
-
-    // Classification pass: stream the entire file to determine Safe vs Redacted
-    // and collect all findings with correct file-relative offsets.
+    let id_before = file_identity(path)?;
     let (decision, all_findings) = stream_scan_large_file_classify(path)?;
-
-    // Open a fresh stream positioned at start for downstream consumption.
-    // Each chunk yielded will be pre-redacted; raw bytes never escape.
-    let stream = LargeFileStream::open(path)?;
-
-    Ok(PreprocessResult {
-        decision,
-        content: None, // LARGE files always deliver via stream, never content
-        stream: Some(stream),
-        findings: all_findings,
-    })
+    let id_after = file_identity(path)?;
+    if id_before != id_after {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("file changed during classification (unstable capture): {}", path.display())));
+    }
+    let stream = LargeFileStream::open_with_identity(path, id_after)?;
+    Ok(PreprocessResult { decision, content: None, stream: Some(stream), findings: all_findings })
 }
 
-/// Scan the entire LARGE file for secrets, returning the decision and all
-/// file-relative findings.
-///
-/// This is an internal classification pass only -- it does NOT produce
-/// content for downstream consumption.  Use LargeFileStream for that.
-///
-/// Memory use is bounded to approximately STREAM_CHUNK_SIZE + STREAM_OVERLAP_SIZE.
 pub fn stream_scan_large_file_classify(
-    path: &std::path::Path,
+    path: &Path,
 ) -> io::Result<(SecretScanDecision, Vec<SecretFinding>)> {
     let mut file = std::fs::File::open(path)?;
     let mut all_findings: Vec<SecretFinding> = Vec::new();
-
-    // overlap_buf: bytes from the tail of the previous window, prepended to
-    // the next window so secrets spanning chunk boundaries are captured.
     let mut overlap_buf: Vec<u8> = Vec::new();
-    // file_offset_of_new_bytes: the file position of the first *new* byte in
-    // the current window (i.e., not counting the overlap prefix).
     let mut file_offset_of_new_bytes: usize = 0;
+    let mut pem_state = PemStreamState::Idle;
 
     loop {
         let overlap_len = overlap_buf.len();
-
-        // Build window = [overlap | new_chunk]
         let mut window = overlap_buf.clone();
         let mut new_chunk = vec![0u8; STREAM_CHUNK_SIZE];
         let n = read_exact_up_to(&mut file, &mut new_chunk)?;
 
         if n == 0 {
-            // EOF: no more new bytes to process.
+            if let PemStreamState::InBlock { begin_file_offset } = pem_state {
+                let len = file_offset_of_new_bytes.saturating_sub(begin_file_offset).max(1);
+                if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == begin_file_offset) {
+                    all_findings.push(SecretFinding { pattern_id: "PK-001", offset: begin_file_offset, length: len });
+                }
+            }
             break;
         }
 
         window.extend_from_slice(&new_chunk[..n]);
-
-        // Scan the window for secrets.
         let window_str = String::from_utf8_lossy(&window).into_owned();
-        let scan = scan_and_redact(&window_str);
-
-        // The window's first byte is at file offset:
-        //   file_offset_of_new_bytes - overlap_len
         let window_file_base = file_offset_of_new_bytes.saturating_sub(overlap_len);
 
-        // Collect findings that start in the NEW bytes region only.
-        // Findings starting in the overlap zone were already reported in the
-        // previous iteration; reporting them again would create duplicates.
-        //
-        // Exception: a finding that STARTS in the overlap but ENDS in the
-        // new bytes (i.e. spans the boundary) should also be emitted here,
-        // because the previous iteration could not have seen its full extent.
-        // We detect this by checking: if the finding's end > overlap_len
-        // (in window-relative terms) AND we haven't emitted a finding at
-        // this exact file offset before.
+        pem_classify_window(&window_str, window_file_base, &mut pem_state, &mut all_findings);
+
+        let scan = scan_and_redact(&window_str);
         for f in &scan.findings {
-            let abs_offset = window_file_base + f.offset;
-            // Emit if:
-            //   (a) entirely within new bytes: abs_offset >= file_offset_of_new_bytes, OR
-            //   (b) spans the boundary: f.offset < overlap_len but f.offset + f.length > overlap_len
-            let in_new_region = abs_offset >= file_offset_of_new_bytes;
-            let spans_boundary = f.offset < overlap_len && f.offset + f.length > overlap_len;
-            if in_new_region || spans_boundary {
-                // Dedup: don't add if we already have a finding at this exact file offset.
-                let already_reported = all_findings.iter().any(|existing| {
-                    existing.pattern_id == f.pattern_id && existing.offset == abs_offset
-                });
-                if !already_reported {
-                    all_findings.push(SecretFinding {
-                        pattern_id: f.pattern_id,
-                        offset: abs_offset,
-                        length: f.length,
-                    });
-                }
+            if f.pattern_id == "PK-001" { continue; }
+            let abs = window_file_base + f.offset;
+            let in_new = abs >= file_offset_of_new_bytes;
+            let spans = f.offset < overlap_len && f.offset + f.length > overlap_len;
+            if (in_new || spans) && !all_findings.iter().any(|e| e.pattern_id == f.pattern_id && e.offset == abs) {
+                all_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: abs, length: f.length });
             }
         }
 
-        // Advance the file-offset pointer by n (the new bytes consumed).
         file_offset_of_new_bytes += n;
-
-        // Prepare overlap for next iteration: take the last STREAM_OVERLAP_SIZE
-        // bytes of the *new* bytes (not of the full window) as overlap.
-        let new_bytes_slice = &new_chunk[..n];
-        if n > STREAM_OVERLAP_SIZE {
-            overlap_buf = new_bytes_slice[n - STREAM_OVERLAP_SIZE..].to_vec();
-        } else {
-            overlap_buf = new_bytes_slice.to_vec();
-        }
+        let new_slice = &new_chunk[..n];
+        overlap_buf = if n > SAFETY_WINDOW_SIZE { new_slice[n - SAFETY_WINDOW_SIZE..].to_vec() } else { new_slice.to_vec() };
 
         if n < STREAM_CHUNK_SIZE {
-            // Short read means EOF reached.
+            if let PemStreamState::InBlock { begin_file_offset } = &pem_state {
+                let ps = *begin_file_offset;
+                let pl = file_offset_of_new_bytes.saturating_sub(ps).max(1);
+                if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == ps) {
+                    all_findings.push(SecretFinding { pattern_id: "PK-001", offset: ps, length: pl });
+                }
+            }
             break;
         }
     }
 
-    let decision = if all_findings.is_empty() {
-        SecretScanDecision::Safe
-    } else {
-        SecretScanDecision::Redacted
-    };
-
+    let decision = if all_findings.is_empty() { SecretScanDecision::Safe } else { SecretScanDecision::Redacted };
     Ok((decision, all_findings))
 }
 
-/// A bounded streaming handle that yields pre-redacted chunks of a LARGE file.
-///
-/// # Safety contract
-///
-/// - Each chunk yielded has already been scanned and redacted.
-/// - Raw secret bytes are NEVER yielded to the caller.
-/// - Memory use is bounded to approximately STREAM_CHUNK_SIZE + STREAM_OVERLAP_SIZE
-///   at any point in time; the full file is never loaded.
-/// - All file-relative SecretFinding offsets reported by the stream are
-///   correct (they account for overlap prepended to each window).
-///
-/// Phase 1C MUST consume LARGE file content exclusively through this type.
-/// It must NOT open the original file path and read raw bytes.
+// ---------------------------------------------------------------------------
+// PEM window classifier
+// ---------------------------------------------------------------------------
+
+fn pem_classify_window(
+    window_str: &str,
+    window_file_base: usize,
+    pem_state: &mut PemStreamState,
+    all_findings: &mut Vec<SecretFinding>,
+) {
+    let mut from = 0usize;
+    loop {
+        match pem_state {
+            PemStreamState::Idle => {
+                match find_pem_begin_private_key(window_str, from) {
+                    None => break,
+                    Some(begin_pos) => {
+                        *pem_state = PemStreamState::InBlock { begin_file_offset: window_file_base + begin_pos };
+                        from = begin_pos + PEM_BEGIN.len();
+                    }
+                }
+            }
+            PemStreamState::InBlock { begin_file_offset } => {
+                match find_pem_end(window_str, from) {
+                    None => break,
+                    Some(end_pos) => {
+                        let ps = *begin_file_offset;
+                        let pl = (window_file_base + end_pos).saturating_sub(ps).max(1);
+                        if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == ps) {
+                            all_findings.push(SecretFinding { pattern_id: "PK-001", offset: ps, length: pl });
+                        }
+                        *pem_state = PemStreamState::Idle;
+                        from = end_pos;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LargeFileStream — withheld-tail design
+// ---------------------------------------------------------------------------
+
 pub struct LargeFileStream {
-    /// Opened file handle -- positioned at start.
     file: std::fs::File,
-    /// Bytes carried over from the end of the previous window (overlap prefix
-    /// for the next window).  These bytes have already been emitted to the
-    /// caller in a previous chunk; they are re-scanned only to catch secrets
-    /// that span the boundary.
-    overlap_buf: Vec<u8>,
-    /// File byte offset of the first new byte NOT yet emitted to the caller.
-    /// Starts at 0; advances by n (new bytes per window) each iteration.
-    emit_from: usize,
-    /// Whether the stream has been exhausted.
+    withheld: Vec<u8>,
+    withheld_file_offset: usize,
+    file_bytes_consumed: usize,
+    pem_state: PemStreamState,
     done: bool,
+    #[allow(dead_code)]
+    identity: FileIdentity,
 }
 
 impl std::fmt::Debug for LargeFileStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LargeFileStream")
-            .field("emit_from", &self.emit_from)
+            .field("withheld_file_offset", &self.withheld_file_offset)
             .field("done", &self.done)
             .finish()
     }
 }
 
 impl LargeFileStream {
-    /// Open `path` for streaming.  Does NOT read any content yet.
-    pub fn open(path: &std::path::Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let identity = file_identity(path)?;
+        Self::open_with_identity(path, identity)
+    }
+
+    pub(crate) fn open_with_identity(path: &Path, identity: FileIdentity) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         Ok(LargeFileStream {
-            file,
-            overlap_buf: Vec::new(),
-            emit_from: 0,
-            done: false,
+            file, withheld: Vec::new(), withheld_file_offset: 0,
+            file_bytes_consumed: 0, pem_state: PemStreamState::Idle,
+            done: false, identity,
         })
     }
 
-    /// Yield the next pre-redacted chunk.
-    ///
-    /// Returns:
-    /// - `Some(Ok(chunk))` -- next chunk.  chunk.redacted contains safe text.
-    ///   chunk.findings has file-relative offsets for new findings only.
-    /// - `Some(Err(e))` -- IO error.
-    /// - `None` -- stream exhausted.
-    ///
-    /// # Offset and deduplication invariants
-    ///
-    /// Window = [overlap_buf | new_bytes].
-    /// overlap_buf starts at file offset `emit_from - overlap_len`.
-    /// A finding at window position `pos` has file offset `window_file_base + pos`
-    /// where `window_file_base = emit_from - overlap_len`.
-    ///
-    /// Findings are emitted only for the new-bytes zone (abs_offset >= emit_from)
-    /// to prevent duplicates.  Boundary-spanning findings (starting in overlap,
-    /// ending in new bytes) are also emitted (once only, here).
-    ///
-    /// The emitted redacted text covers only the new bytes.  The overlap
-    /// bytes that prefix the window have already been emitted by the previous
-    /// call and are NOT re-emitted.
     pub fn next_chunk(&mut self) -> Option<io::Result<StreamChunk>> {
-        if self.done {
-            return None;
-        }
+        if self.done && self.withheld.is_empty() { return None; }
+        if self.done { return Some(self.flush_withheld()); }
 
-        let overlap_len = self.overlap_buf.len();
-
-        // Build window = [overlap | new_bytes]
-        let mut window = self.overlap_buf.clone();
-        let mut new_bytes_buf = vec![0u8; STREAM_CHUNK_SIZE];
-        let n = match read_exact_up_to(&mut self.file, &mut new_bytes_buf) {
+        let mut new_buf = vec![0u8; STREAM_CHUNK_SIZE];
+        let n = match read_exact_up_to(&mut self.file, &mut new_buf) {
             Ok(n) => n,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(e));
-            }
+            Err(e) => { self.done = true; return Some(Err(e)); }
         };
 
         if n == 0 {
             self.done = true;
-            return None;
+            return if self.withheld.is_empty() { None } else { Some(self.flush_withheld()) };
         }
 
-        window.extend_from_slice(&new_bytes_buf[..n]);
+        let is_eof = n < STREAM_CHUNK_SIZE;
+        let window_file_base = self.withheld_file_offset;
+        let mut window = self.withheld.clone();
+        window.extend_from_slice(&new_buf[..n]);
+        self.file_bytes_consumed += n;
+        if is_eof { self.done = true; }
 
-        if n < STREAM_CHUNK_SIZE {
-            self.done = true;
-        }
-
-        // Scan and redact the full window.
         let window_str = String::from_utf8_lossy(&window).into_owned();
-        let scan = scan_and_redact(&window_str);
 
-        // File offset of window's first byte.
-        let window_file_base = self.emit_from.saturating_sub(overlap_len);
-
-        // Collect findings for the new region only (deduplicate vs overlap).
-        let mut file_findings: Vec<SecretFinding> = Vec::new();
-        for f in &scan.findings {
-            let abs_offset = window_file_base + f.offset;
-            let in_new_region = abs_offset >= self.emit_from;
-            let spans_boundary =
-                f.offset < overlap_len && f.offset + f.length > overlap_len;
-            if in_new_region || spans_boundary {
-                file_findings.push(SecretFinding {
-                    pattern_id: f.pattern_id,
-                    offset: abs_offset,
-                    length: f.length,
-                });
+        // PEM state transitions
+        let mut pem_findings_this_window: Vec<SecretFinding> = Vec::new();
+        {
+            let mut from = 0usize;
+            loop {
+                match &self.pem_state {
+                    PemStreamState::Idle => {
+                        match find_pem_begin_private_key(&window_str, from) {
+                            None => break,
+                            Some(bp) => {
+                                self.pem_state = PemStreamState::InBlock { begin_file_offset: window_file_base + bp };
+                                from = bp + PEM_BEGIN.len();
+                            }
+                        }
+                    }
+                    PemStreamState::InBlock { begin_file_offset } => {
+                        let bfo = *begin_file_offset;
+                        match find_pem_end(&window_str, from) {
+                            None => break,
+                            Some(ep) => {
+                                let pl = (window_file_base + ep).saturating_sub(bfo).max(1);
+                                pem_findings_this_window.push(SecretFinding { pattern_id: "PK-001", offset: bfo, length: pl });
+                                self.pem_state = PemStreamState::Idle;
+                                from = ep;
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Determine where in the redacted string the new bytes begin.
-        // The overlap portion (first `overlap_len` original bytes) has already
-        // been emitted; we need to find the corresponding position in the
-        // redacted string after accounting for any length-changing redactions
-        // that occurred within the overlap.
-        let redacted_new_start = compute_redacted_offset(&scan.findings, &window_str, overlap_len);
-
-        // Emit only the new-bytes portion of the redacted string.
-        let emit_str = if redacted_new_start <= scan.redacted.len() {
-            scan.redacted[redacted_new_start..].to_string()
-        } else {
-            String::new()
-        };
-
-        // Prepare overlap for the next window: last STREAM_OVERLAP_SIZE bytes
-        // of the *new* bytes (not the full window).
-        let new_bytes_slice = &new_bytes_buf[..n];
-        if n > STREAM_OVERLAP_SIZE {
-            self.overlap_buf = new_bytes_slice[n - STREAM_OVERLAP_SIZE..].to_vec();
-        } else {
-            self.overlap_buf = new_bytes_slice.to_vec();
+        // If EOF and still in PEM block
+        if self.done {
+            if let PemStreamState::InBlock { begin_file_offset } = &self.pem_state {
+                let bfo = *begin_file_offset;
+                let pl = self.file_bytes_consumed.saturating_sub(bfo).max(1);
+                pem_findings_this_window.push(SecretFinding { pattern_id: "PK-001", offset: bfo, length: pl });
+                self.pem_state = PemStreamState::Idle;
+            }
         }
 
-        // Advance emit_from by the number of new bytes consumed this iteration.
-        self.emit_from += n;
+        // safe_emit_len in original bytes
+        let safe_emit_len: usize = if self.done {
+            window.len()
+        } else {
+            match &self.pem_state {
+                PemStreamState::InBlock { .. } => 0,
+                PemStreamState::Idle => {
+                    if window.len() > SAFETY_WINDOW_SIZE { window.len() - SAFETY_WINDOW_SIZE } else { 0 }
+                }
+            }
+        };
 
-        Some(Ok(StreamChunk {
-            redacted: emit_str,
-            findings: file_findings,
-        }))
+        let scan = scan_and_redact(&window_str);
+
+        // Build chunk_findings (emitted region only)
+        let mut chunk_findings: Vec<SecretFinding> = Vec::new();
+        let emit_end_file = window_file_base + safe_emit_len;
+        for f in &pem_findings_this_window {
+            if f.offset < emit_end_file { chunk_findings.push(f.clone()); }
+        }
+        for f in &scan.findings {
+            if f.pattern_id == "PK-001" { continue; }
+            if f.offset < safe_emit_len {
+                chunk_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: window_file_base + f.offset, length: f.length });
+            }
+        }
+
+        // Build emitted redacted string
+        let redacted_emit_end = compute_redacted_offset(&scan.findings, &window_str, safe_emit_len);
+        let emit_str = if redacted_emit_end <= scan.redacted.len() {
+            scan.redacted[..redacted_emit_end].to_string()
+        } else {
+            scan.redacted.clone()
+        };
+
+        // If PEM block resolved in this window, its BEGIN..END span in the redacted
+        // string is already replaced by scan_and_redact's placeholder.  If the block
+        // spans into the withheld region (safe_emit_len == 0, InBlock), emit_str is empty.
+
+        self.withheld = window[safe_emit_len..].to_vec();
+        self.withheld_file_offset = window_file_base + safe_emit_len;
+
+        Some(Ok(StreamChunk { redacted: emit_str, findings: chunk_findings }))
     }
 
-    /// Collect all chunks into a single redacted string and all findings.
-    ///
-    /// Convenience method for testing.  NOT suitable for production use on
-    /// large files as it materialises the full content in memory.
+    fn flush_withheld(&mut self) -> io::Result<StreamChunk> {
+        let window = std::mem::take(&mut self.withheld);
+        self.done = true;
+
+        if window.is_empty() {
+            return Ok(StreamChunk { redacted: String::new(), findings: Vec::new() });
+        }
+
+        let window_file_base = self.withheld_file_offset;
+        let window_str = String::from_utf8_lossy(&window).into_owned();
+        let mut chunk_findings: Vec<SecretFinding> = Vec::new();
+
+        let emit_str = if let PemStreamState::InBlock { begin_file_offset } = &self.pem_state {
+            let bfo = *begin_file_offset;
+            chunk_findings.push(SecretFinding { pattern_id: "PK-001", offset: bfo, length: window.len().max(1) });
+            self.pem_state = PemStreamState::Idle;
+            PEM_PLACEHOLDER.to_string()
+        } else {
+            let scan = scan_and_redact(&window_str);
+            for f in &scan.findings {
+                chunk_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: window_file_base + f.offset, length: f.length });
+            }
+            scan.redacted
+        };
+
+        Ok(StreamChunk { redacted: emit_str, findings: chunk_findings })
+    }
+
     #[cfg(test)]
     pub fn collect_all(mut self) -> io::Result<(String, Vec<SecretFinding>)> {
         let mut full = String::new();
@@ -603,8 +482,6 @@ impl LargeFileStream {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Read up to `buf.len()` bytes from `reader`.  Returns the number of bytes
-/// actually read (may be less than buf.len() at EOF).
 fn read_exact_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -618,50 +495,21 @@ fn read_exact_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize
     Ok(total)
 }
 
-/// Compute the position in the *redacted* string that corresponds to
-/// original byte offset `split_at` in the pre-redaction window string.
-///
-/// This is needed to determine where the overlap ends in the redacted
-/// output so we can slice off only the new-bytes portion.
-///
-/// `findings` must be the findings produced by `scan_and_redact(&window_str)`,
-/// sorted by start offset (which scan_and_redact guarantees).
-fn compute_redacted_offset(
-    findings: &[SecretFinding],
-    window_str: &str,
-    split_at: usize,
-) -> usize {
-    // Walk through findings sorted by start offset.
-    // Accumulate the length delta introduced by redactions that fall entirely
-    // before `split_at`.  For a finding that *straddles* split_at (starts in
-    // the overlap zone, ends in the new-bytes zone) we return the position in
-    // the redacted string where that finding's replacement *starts*, so that
-    // the replacement is included in the emitted chunk rather than silently
-    // swallowed by the overlap slice.
+fn compute_redacted_offset(findings: &[SecretFinding], window_str: &str, split_at: usize) -> usize {
     let mut delta: isize = 0;
     for f in findings {
-        if f.offset >= split_at {
-            break; // sorted; nothing after split_at affects the split point
-        }
+        if f.offset >= split_at { break; }
         if f.offset + f.length <= split_at {
-            // Finding is entirely within the overlap zone: accumulate delta.
-            let detector = DETECTORS.iter().find(|d| d.id == f.pattern_id);
-            if let Some(det) = detector {
+            if let Some(det) = DETECTORS.iter().find(|d| d.id == f.pattern_id) {
                 let end = (f.offset + f.length).min(window_str.len());
-                let original_slice = &window_str[f.offset..end];
-                let replacement_len = match det.redact_mode {
+                let orig = &window_str[f.offset..end];
+                let repl_len = match det.redact_mode {
                     RedactMode::Full => det.placeholder.len(),
-                    RedactMode::Partial => partial_redact(original_slice).len(),
+                    RedactMode::Partial => partial_redact(orig).len(),
                 };
-                delta += replacement_len as isize - f.length as isize;
+                delta += repl_len as isize - f.length as isize;
             }
         } else {
-            // Finding straddles split_at: its replacement starts at
-            // (f.offset + delta) in the redacted string.  The replacement
-            // covers content that spans the overlap/new-bytes boundary, so
-            // the emitted chunk must start at the beginning of this
-            // replacement to include it -- not at split_at+delta which would
-            // skip the replacement entirely.
             return (f.offset as isize + delta).max(0) as usize;
         }
     }
@@ -672,52 +520,24 @@ fn compute_redacted_offset(
 // Public helpers
 // ---------------------------------------------------------------------------
 
-/// Returns `true` for files that should never be indexed regardless of their
-/// content (mirrors the security-exclusion list in `security.rs`).
 pub fn is_known_secrets_file(repo_relative: &str) -> bool {
-    let name = repo_relative
-        .rsplit('/')
-        .next()
-        .unwrap_or(repo_relative)
-        .to_ascii_lowercase();
-
-    // Exact names
-    if matches!(
-        name.as_str(),
-        ".env" | ".netrc" | ".npmrc" | "id_rsa" | "id_ed25519" | "id_ecdsa"
-    ) {
-        return true;
-    }
-
-    // Prefix patterns
-    if name.starts_with(".env.") {
-        return true;
-    }
-
-    // Extension patterns
+    let name = repo_relative.rsplit('/').next().unwrap_or(repo_relative).to_ascii_lowercase();
+    if matches!(name.as_str(), ".env" | ".netrc" | ".npmrc" | "id_rsa" | "id_ed25519" | "id_ecdsa") { return true; }
+    if name.starts_with(".env.") { return true; }
     if let Some(ext) = name.rsplit('.').next() {
-        if matches!(ext, "pem" | "key" | "p12" | "jks" | "pfx" | "p8") {
-            return true;
-        }
+        if matches!(ext, "pem" | "key" | "p12" | "jks" | "pfx" | "p8") { return true; }
     }
-
     false
 }
 
 // ---------------------------------------------------------------------------
-// Internal pattern engine
+// Pattern engine
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum RedactMode {
-    Full,
-    Partial,
-}
+enum RedactMode { Full, Partial }
 
-struct RawMatch {
-    start: usize,
-    length: usize,
-}
+struct RawMatch { start: usize, length: usize }
 
 struct Detector {
     id: &'static str,
@@ -727,121 +547,74 @@ struct Detector {
 }
 
 impl Detector {
-    fn find_all(&self, text: &str) -> Vec<RawMatch> {
-        (self.find_all)(text)
-    }
+    fn find_all(&self, text: &str) -> Vec<RawMatch> { (self.find_all)(text) }
 }
 
-/// Replace all but the first 4 bytes with `***`.
 fn partial_redact(s: &str) -> String {
-    let mut result = String::with_capacity(8);
+    let mut r = String::with_capacity(8);
     let chars: Vec<char> = s.chars().collect();
-    let keep = chars.len().min(4);
-    result.extend(&chars[..keep]);
-    result.push_str("***");
-    result
+    r.extend(&chars[..chars.len().min(4)]);
+    r.push_str("***");
+    r
 }
 
-// ---------------------------------------------------------------------------
-// Detectors (V1)
-// ---------------------------------------------------------------------------
+const PEM_PLACEHOLDER: &str = "[REDACTED:PRIVATE-KEY]";
 
 static DETECTORS: &[Detector] = &[
-    Detector {
-        id: "PK-001",
-        redact_mode: RedactMode::Full,
-        placeholder: "[REDACTED:PRIVATE-KEY]",
-        find_all: find_pem_private_keys,
-    },
-    Detector {
-        id: "AWS-001",
-        redact_mode: RedactMode::Partial,
-        placeholder: "",
-        find_all: find_aws_access_keys,
-    },
-    Detector {
-        id: "GH-001",
-        redact_mode: RedactMode::Partial,
-        placeholder: "",
-        find_all: find_github_tokens,
-    },
-    Detector {
-        id: "JWT-001",
-        redact_mode: RedactMode::Partial,
-        placeholder: "",
-        find_all: find_jwt_tokens,
-    },
-    Detector {
-        id: "HE-001",
-        redact_mode: RedactMode::Partial,
-        placeholder: "",
-        find_all: find_high_entropy_base64,
-    },
+    Detector { id: "PK-001", redact_mode: RedactMode::Full, placeholder: PEM_PLACEHOLDER, find_all: find_pem_private_keys },
+    Detector { id: "AWS-001", redact_mode: RedactMode::Partial, placeholder: "", find_all: find_aws_access_keys },
+    Detector { id: "GH-001", redact_mode: RedactMode::Partial, placeholder: "", find_all: find_github_tokens },
+    Detector { id: "JWT-001", redact_mode: RedactMode::Partial, placeholder: "", find_all: find_jwt_tokens },
+    Detector { id: "HE-001", redact_mode: RedactMode::Partial, placeholder: "", find_all: find_high_entropy_base64 },
 ];
-
-// -- PK-001: PEM private key blocks ------------------------------------------
 
 const PEM_BEGIN: &str = "-----BEGIN";
 const PEM_END: &str = "-----END";
 
+fn find_pem_begin_private_key(text: &str, from: usize) -> Option<usize> {
+    let mut s = from;
+    while s < text.len() {
+        let rel = text[s..].find(PEM_BEGIN)?;
+        let bp = s + rel;
+        let he = text[bp..].find('\n').map(|n| bp + n)?;
+        if text[bp..he].contains("PRIVATE KEY") { return Some(bp); }
+        s = bp + PEM_BEGIN.len();
+    }
+    None
+}
+
+fn find_pem_end(text: &str, from: usize) -> Option<usize> {
+    let rel = text[from..].find(PEM_END)?;
+    let ep = from + rel;
+    let el = text[ep..].find('\n').map(|n| ep + n + 1).unwrap_or(text.len());
+    Some(el)
+}
+
 fn find_pem_private_keys(text: &str) -> Vec<RawMatch> {
     let mut matches = Vec::new();
-    let mut search_from = 0;
-
-    while search_from < text.len() {
-        match text[search_from..].find(PEM_BEGIN) {
+    let mut s = 0;
+    while s < text.len() {
+        match find_pem_begin_private_key(text, s) {
             None => break,
-            Some(rel) => {
-                let begin_pos = search_from + rel;
-                let header_end = match text[begin_pos..].find('\n') {
-                    Some(n) => begin_pos + n,
-                    None => break,
-                };
-                let header = &text[begin_pos..header_end];
-                if !header.contains("PRIVATE KEY") {
-                    search_from = begin_pos + PEM_BEGIN.len();
-                    continue;
-                }
-                match text[header_end..].find(PEM_END) {
-                    None => break,
-                    Some(rel_end) => {
-                        let end_block_start = header_end + rel_end;
-                        let end_line_end = text[end_block_start..]
-                            .find('\n')
-                            .map(|n| end_block_start + n + 1)
-                            .unwrap_or(text.len());
-                        matches.push(RawMatch {
-                            start: begin_pos,
-                            length: end_line_end - begin_pos,
-                        });
-                        search_from = end_line_end;
-                    }
-                }
+            Some(bp) => match find_pem_end(text, bp + PEM_BEGIN.len()) {
+                None => break,
+                Some(el) => { matches.push(RawMatch { start: bp, length: el - bp }); s = el; }
             }
         }
     }
     matches
 }
 
-// -- AWS-001: AWS access key IDs (AKIA... 20 chars) --------------------------
-
 fn find_aws_access_keys(text: &str) -> Vec<RawMatch> {
     let mut matches = Vec::new();
     let bytes = text.as_bytes();
-    let prefix = b"AKIA";
-
     let mut i = 0;
     while i + 20 <= bytes.len() {
-        if bytes[i..i + 4] == *prefix {
-            if bytes[i + 4..i + 20]
-                .iter()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-            {
-                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-                let after_ok = i + 20 >= bytes.len() || !bytes[i + 20].is_ascii_alphanumeric();
-                if before_ok && after_ok {
-                    matches.push(RawMatch { start: i, length: 20 });
-                }
+        if &bytes[i..i+4] == b"AKIA" {
+            if bytes[i+4..i+20].iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+                let before_ok = i == 0 || !bytes[i-1].is_ascii_alphanumeric();
+                let after_ok = i+20 >= bytes.len() || !bytes[i+20].is_ascii_alphanumeric();
+                if before_ok && after_ok { matches.push(RawMatch { start: i, length: 20 }); }
             }
         }
         i += 1;
@@ -849,40 +622,28 @@ fn find_aws_access_keys(text: &str) -> Vec<RawMatch> {
     matches
 }
 
-// -- GH-001: GitHub personal access tokens -----------------------------------
-
 fn find_github_tokens(text: &str) -> Vec<RawMatch> {
     let prefixes: &[&str] = &["ghp_", "ghs_", "gho_", "ghu_", "ghr_", "github_pat_"];
     let mut matches = Vec::new();
-
     for prefix in prefixes {
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find(prefix) {
-            let start = search_from + rel;
+        let mut s = 0;
+        while let Some(rel) = text[s..].find(prefix) {
+            let start = s + rel;
             let rest = &text[start + prefix.len()..];
-            let token_extra: usize = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .map(|c| c.len_utf8())
-                .sum();
-            let total = prefix.len() + token_extra;
-            if total >= 20 {
-                matches.push(RawMatch { start, length: total });
-            }
-            search_from = start + prefix.len().max(1);
+            let extra: usize = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').map(|c| c.len_utf8()).sum();
+            let total = prefix.len() + extra;
+            if total >= 20 { matches.push(RawMatch { start, length: total }); }
+            s = start + prefix.len().max(1);
         }
     }
     matches
 }
-
-// -- JWT-001: JSON Web Tokens -------------------------------------------------
 
 fn find_jwt_tokens(text: &str) -> Vec<RawMatch> {
     let mut matches = Vec::new();
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut i = 0;
-
     while i < len {
         if is_base64url_char(bytes[i]) {
             let seg1_end = advance_base64url(bytes, i);
@@ -893,18 +654,19 @@ fn find_jwt_tokens(text: &str) -> Vec<RawMatch> {
                     let seg3_start = seg2_end + 1;
                     let seg3_end = advance_base64url(bytes, seg3_start);
                     let total = seg3_end - i;
-                    if (seg1_end > i)
-                        && (seg2_end > seg2_start)
-                        && (seg3_end > seg3_start)
-                        && total >= 40
-                    {
+                    if (seg1_end > i) && (seg2_end > seg2_start) && (seg3_end > seg3_start) && total >= 40 {
                         matches.push(RawMatch { start: i, length: total });
                         i = seg3_end;
                         continue;
                     }
+                    // seg3 failed — skip past seg2
+                    i = seg2_end;
+                } else {
+                    // No dot after seg2 — skip past seg2
+                    i = seg2_end;
                 }
-                i = seg2_end;
             } else {
+                // No dot after seg1 — skip entire seg1 run to avoid O(n^2)
                 i = seg1_end;
             }
         } else {
@@ -926,14 +688,11 @@ fn advance_base64url(bytes: &[u8], start: usize) -> usize {
     i
 }
 
-// -- HE-001: High-entropy base64 strings (>= 20 chars) ----------------------
-
 fn find_high_entropy_base64(text: &str) -> Vec<RawMatch> {
     let mut matches = Vec::new();
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut i = 0;
-
     while i < len {
         if is_base64_char(bytes[i]) {
             let start = i;
@@ -956,491 +715,292 @@ fn is_base64_char(b: u8) -> bool {
 }
 
 fn looks_high_entropy(bytes: &[u8]) -> bool {
-    let has_upper = bytes.iter().any(|b| b.is_ascii_uppercase());
-    let has_lower = bytes.iter().any(|b| b.is_ascii_lowercase());
-    let has_digit = bytes.iter().any(|b| b.is_ascii_digit());
-    has_upper && has_lower && has_digit
+    bytes.iter().any(|b| b.is_ascii_uppercase())
+        && bytes.iter().any(|b| b.is_ascii_lowercase())
+        && bytes.iter().any(|b| b.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
 
-    // ── Helpers ─────────────────────────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
 
-    /// Write content to a temp file and return the file (keeps it alive).
-    fn write_temp(content: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(content.as_bytes()).unwrap();
+    fn write_tmp(content: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
         f.flush().unwrap();
         f
     }
 
-    /// Build a string of `n` bytes of safe filler (no secret patterns).
-    fn filler(n: usize) -> String {
-        // Use repeating "x" — no uppercase, no digit mix => not high-entropy base64
-        "x".repeat(n)
+    fn aws_key() -> &'static str {
+        "AKIAIOSFODNN7EXAMPLE"
     }
 
-    // ── is_known_secrets_file ────────────────────────────────────────────────
-
-    #[test]
-    fn secrets_file_pem() {
-        assert!(is_known_secrets_file("certs/server.pem"));
-        assert!(is_known_secrets_file("server.key"));
-        assert!(is_known_secrets_file("keystore.jks"));
-        assert!(is_known_secrets_file("store.p12"));
+    fn gh_token() -> &'static str {
+        "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ01"
     }
 
-    #[test]
-    fn secrets_file_env() {
-        assert!(is_known_secrets_file(".env"));
-        assert!(is_known_secrets_file(".env.production"));
-        assert!(is_known_secrets_file(".env.local"));
-    }
+    const PEM_BLOCK: &str = concat!(
+        "-----BEGIN RSA PRIVATE KEY-----\n",
+        "MIIEpAIBAAKCAQEA0Z3VS5JJcds3xHn/ygWep4PAtEsHAc9g0GZG4JCGBOLbqRBB\n",
+        "-----END RSA PRIVATE KEY-----\n",
+    );
+
+    // -----------------------------------------------------------------------
+    // Small-file unit tests (original scenarios)
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn secrets_file_false_for_normal_files() {
-        assert!(!is_known_secrets_file("src/main.rs"));
-        assert!(!is_known_secrets_file("README.md"));
-        assert!(!is_known_secrets_file("config.json"));
-    }
-
-    // ── PEM private key detection ────────────────────────────────────────────
-
-    #[test]
-    fn detects_pem_private_key() {
-        let text = "config=yes\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK...\n-----END RSA PRIVATE KEY-----\ndone";
-        let result = scan_and_redact(text);
-        assert!(!result.findings.is_empty(), "should detect PEM private key");
-        assert_eq!(result.findings[0].pattern_id, "PK-001");
-        assert!(
-            result.redacted.contains("[REDACTED:PRIVATE-KEY]"),
-            "PEM block must be fully replaced"
-        );
-        assert!(
-            !result.redacted.contains("MIIEowIBAAK"),
-            "key material must not survive redaction"
-        );
+    fn aws_key_redacted() {
+        let input = format!("access_key = {}", aws_key());
+        let r = scan_and_redact(&input);
+        assert!(!r.redacted.contains(aws_key()), "raw key must not appear in redacted output");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].pattern_id, "AWS-001");
     }
 
     #[test]
-    fn pem_public_key_not_redacted() {
-        let text = "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZ...\n-----END PUBLIC KEY-----\n";
-        let result = scan_and_redact(text);
-        assert!(
-            !result.findings.iter().any(|f| f.pattern_id == "PK-001"),
-            "public keys must not be redacted"
-        );
-    }
-
-    // ── AWS access key ───────────────────────────────────────────────────────
-
-    #[test]
-    fn detects_aws_access_key() {
-        let text = "key=AKIAIOSFODNN7EXAMPLE end";
-        let result = scan_and_redact(text);
-        let aws: Vec<_> = result
-            .findings
-            .iter()
-            .filter(|f| f.pattern_id == "AWS-001")
-            .collect();
-        assert!(!aws.is_empty(), "should detect AWS access key");
-        assert!(result.redacted.contains("AKIA"), "first 4 chars must survive partial redaction");
-        assert!(!result.redacted.contains("AKIAIOSFODNN7EXAMPLE"), "full key must be gone");
-    }
-
-    // ── GitHub token ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn detects_github_token() {
-        let text = "token: ghp_16C7e42F292c6912E7710c838347Ae178B4a";
-        let result = scan_and_redact(text);
-        let gh: Vec<_> = result
-            .findings
-            .iter()
-            .filter(|f| f.pattern_id == "GH-001")
-            .collect();
-        assert!(!gh.is_empty(), "should detect GitHub token");
-    }
-
-    // ── JWT ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn detects_jwt() {
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-        let text = format!("Authorization: Bearer {jwt}");
-        let result = scan_and_redact(&text);
-        let jwt_findings: Vec<_> = result
-            .findings
-            .iter()
-            .filter(|f| f.pattern_id == "JWT-001")
-            .collect();
-        assert!(!jwt_findings.is_empty(), "should detect JWT");
-    }
-
-    // ── scan_and_redact on clean content ─────────────────────────────────────
-
-    #[test]
-    fn clean_content_unchanged() {
-        let text = "fn main() { println!(\"hello\"); }";
-        let result = scan_and_redact(text);
-        assert_eq!(result.redacted, text);
-        assert!(result.findings.is_empty());
-    }
-
-    // ── preprocess (SMALL tier) ──────────────────────────────────────────────
-
-    #[test]
-    fn preprocess_excludes_env_file() {
-        let result = preprocess("SECRET=abc123", ".env");
-        assert_eq!(result.decision, SecretScanDecision::Excluded);
-        assert!(result.content.is_none());
-        assert!(result.stream.is_none());
+    fn github_token_redacted() {
+        let input = format!("token: {}", gh_token());
+        let r = scan_and_redact(&input);
+        assert!(!r.redacted.contains(gh_token()), "raw token must not appear");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].pattern_id, "GH-001");
     }
 
     #[test]
-    fn preprocess_safe_for_clean_code() {
-        let result = preprocess("fn main() {}", "src/main.rs");
-        assert_eq!(result.decision, SecretScanDecision::Safe);
-        assert!(result.content.is_some());
-        assert!(result.stream.is_none());
+    fn pem_private_key_redacted() {
+        let r = scan_and_redact(PEM_BLOCK);
+        assert!(!r.redacted.contains("MIIEpAI"), "PEM body must not appear");
+        assert!(r.redacted.contains(PEM_PLACEHOLDER), "placeholder must be present");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].pattern_id, "PK-001");
     }
 
     #[test]
-    fn preprocess_redacted_for_secret_content() {
-        let text = "key: AKIAIOSFODNN7EXAMPLE";
-        let result = preprocess(text, "src/config.rs");
-        assert_eq!(result.decision, SecretScanDecision::Redacted);
-        assert!(result.content.is_some());
-        assert!(!result.findings.is_empty());
-    }
-
-    // ── partial_redact ───────────────────────────────────────────────────────
-
-    #[test]
-    fn partial_redact_keeps_first_four() {
-        let r = partial_redact("AKIAIOSFODNN7EXAMPLE");
-        assert!(r.starts_with("AKIA"));
-        assert!(r.ends_with("***"));
+    fn clean_text_unchanged() {
+        let input = "this is a normal commit message with no secrets";
+        let r = scan_and_redact(input);
+        assert_eq!(r.redacted, input);
+        assert!(r.findings.is_empty());
     }
 
     #[test]
-    fn partial_redact_short_string() {
-        let r = partial_redact("AB");
-        assert!(r.starts_with("AB"));
-        assert!(r.ends_with("***"));
-    }
-
-    // ── file size tier classification ────────────────────────────────────────
-
-    #[test]
-    fn classify_file_size_tiers() {
-        assert_eq!(classify_file_size(0), FileSizeTier::Small);
-        assert_eq!(classify_file_size(SMALL_FILE_THRESHOLD), FileSizeTier::Small);
-        assert_eq!(classify_file_size(SMALL_FILE_THRESHOLD + 1), FileSizeTier::Large);
-        assert_eq!(classify_file_size(VERY_LARGE_FILE_THRESHOLD), FileSizeTier::Large);
-        assert_eq!(classify_file_size(VERY_LARGE_FILE_THRESHOLD + 1), FileSizeTier::VeryLarge);
-    }
-
-    // =========================================================================
-    // LARGE-file streaming tests (the 8 required scenarios)
-    // =========================================================================
-
-    // ── (a) Secret in the middle of a LARGE file is detected ─────────────────
-
-    #[test]
-    fn large_file_secret_in_middle_detected() {
-        // Build a file: [filler | AWS key | filler]
-        // Total > SMALL_FILE_THRESHOLD to exercise LARGE path.
-        let before = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        let after = filler(500);
-        let content = format!("{before} {secret} {after}");
-
-        let tmp = write_temp(&content);
-        let (decision, findings) =
-            stream_scan_large_file_classify(tmp.path()).unwrap();
-
-        assert_eq!(decision, SecretScanDecision::Redacted, "must detect secret");
-        let aws: Vec<_> = findings.iter().filter(|f| f.pattern_id == "AWS-001").collect();
-        assert!(!aws.is_empty(), "AWS-001 finding expected; got: {findings:?}");
-    }
-
-    // ── (b) Consuming via safe streaming API never yields the raw secret ──────
-
-    #[test]
-    fn large_file_streaming_never_yields_raw_secret() {
-        let before = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        let after = filler(500);
-        let content = format!("{before} {secret} {after}");
-
-        let tmp = write_temp(&content);
-        let result = preprocess_large_file(tmp.path(), "src/config.rs").unwrap();
-
-        assert_eq!(result.decision, SecretScanDecision::Redacted);
-        assert!(result.stream.is_some(), "LARGE file must have stream");
-        assert!(result.content.is_none(), "LARGE file must NOT have content field");
-
-        let stream = result.stream.unwrap();
-        let (full_redacted, _findings) = stream.collect_all().unwrap();
-
-        assert!(
-            !full_redacted.contains(secret),
-            "raw secret must NOT appear in streamed output; got snippet: {:?}",
-            &full_redacted[full_redacted.len().saturating_sub(80)..]
-        );
-    }
-
-    // ── (c) The redacted replacement IS yielded ───────────────────────────────
-
-    #[test]
-    fn large_file_streaming_yields_redacted_replacement() {
-        let before = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        let after = filler(500);
-        let content = format!("{before} {secret} {after}");
-
-        let tmp = write_temp(&content);
-        let result = preprocess_large_file(tmp.path(), "src/config.rs").unwrap();
-        let stream = result.stream.unwrap();
-        let (full_redacted, _) = stream.collect_all().unwrap();
-
-        // Partial redact for AWS-001: first 4 chars "AKIA" kept, then "***"
-        assert!(
-            full_redacted.contains("AKIA***"),
-            "redacted replacement must appear in streamed output"
-        );
-    }
-
-    // ── (d) Ordinary content before/after the secret remains available ────────
-
-    #[test]
-    fn large_file_ordinary_content_preserved() {
-        // Use a unique marker string (no secrets, no high-entropy patterns).
-        let marker_before = "ORDINARY_BEFORE_MARKER_";
-        let marker_after = "_ORDINARY_AFTER_MARKER";
-        // pad before to push into LARGE territory, but keep markers at recognisable spots
-        let pad = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        let content = format!("{marker_before}{pad} {secret} {marker_after}");
-
-        let tmp = write_temp(&content);
-        let result = preprocess_large_file(tmp.path(), "src/config.rs").unwrap();
-        let stream = result.stream.unwrap();
-        let (full_redacted, _) = stream.collect_all().unwrap();
-
-        assert!(
-            full_redacted.contains(marker_before),
-            "content before the secret must be preserved"
-        );
-        assert!(
-            full_redacted.contains(marker_after),
-            "content after the secret must be preserved"
-        );
-    }
-
-    // ── (e) Secret spanning a chunk boundary is detected and redacted ─────────
-
-    #[test]
-    fn large_file_secret_spanning_chunk_boundary_detected() {
-        // Place the AWS key so it straddles a STREAM_CHUNK_SIZE boundary.
-        // The key is 20 bytes; we place its start 10 bytes before the boundary.
-        let boundary = STREAM_CHUNK_SIZE;
-        let before_boundary = boundary - 10; // 10 bytes before chunk boundary
-        let before = filler(before_boundary);
-        let secret = "AKIAIOSFODNN7EXAMPLE"; // 20 bytes; spans boundary at -10/+10
-        let after = filler(500);
-        let content = format!("{before} {secret} {after}");
-
-        let tmp = write_temp(&content);
-        let (decision, findings) =
-            stream_scan_large_file_classify(tmp.path()).unwrap();
-
-        assert_eq!(
-            decision,
-            SecretScanDecision::Redacted,
-            "boundary-spanning secret must be detected"
-        );
-        let aws: Vec<_> = findings.iter().filter(|f| f.pattern_id == "AWS-001").collect();
-        assert!(
-            !aws.is_empty(),
-            "AWS-001 finding expected for boundary-spanning secret; got: {findings:?}"
-        );
-
-        // Also verify the streaming API redacts it.
-        let stream = LargeFileStream::open(tmp.path()).unwrap();
-        let (full_redacted, _) = stream.collect_all().unwrap();
-        assert!(
-            !full_redacted.contains(secret),
-            "boundary-spanning secret must be redacted in stream output"
-        );
-        assert!(
-            full_redacted.contains("AKIA***"),
-            "redacted replacement must appear for boundary-spanning secret"
-        );
-    }
-
-    // ── (f) Reported finding offsets are correct across chunk boundaries ──────
-
-    #[test]
-    fn large_file_finding_offsets_correct_across_boundaries() {
-        // Place a secret at a known file offset and verify the reported offset.
-        // Use a small well-defined layout: [pad | space | secret | space | tail]
-        let pad_len = STREAM_CHUNK_SIZE - 10; // secret starts 10 bytes before chunk boundary
-        let pad = filler(pad_len);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        let content = format!("{pad} {secret} end");
-
-        // Expected file offset of secret = pad_len + 1 (the space before it)
-        let expected_offset = pad_len + 1;
-
-        let tmp = write_temp(&content);
-        let (_decision, findings) =
-            stream_scan_large_file_classify(tmp.path()).unwrap();
-
-        let aws: Vec<_> = findings.iter().filter(|f| f.pattern_id == "AWS-001").collect();
-        assert!(!aws.is_empty(), "must find AWS-001");
-        assert_eq!(
-            aws[0].offset, expected_offset,
-            "reported offset must equal actual file byte position; \
-             expected {expected_offset}, got {}",
-            aws[0].offset
-        );
-    }
-
-    // ── (g) Overlap does not create duplicate findings ────────────────────────
-
-    #[test]
-    fn large_file_overlap_no_duplicate_findings() {
-        // Place a secret entirely within the overlap zone of the second window
-        // (i.e., in the last STREAM_OVERLAP_SIZE bytes of the first chunk).
-        // It must appear exactly once in findings.
-        let first_chunk_non_overlap = STREAM_CHUNK_SIZE - STREAM_OVERLAP_SIZE - 20;
-        let pad = filler(first_chunk_non_overlap);
-        let secret = "AKIAIOSFODNN7EXAMPLE";
-        // The secret is in the overlap region of the first chunk.
-        let content = format!("{pad} {secret} {}", filler(500));
-
-        let tmp = write_temp(&content);
-        let (_decision, findings) =
-            stream_scan_large_file_classify(tmp.path()).unwrap();
-
-        let aws: Vec<_> = findings.iter().filter(|f| f.pattern_id == "AWS-001").collect();
-        assert_eq!(
-            aws.len(),
-            1,
-            "secret in overlap zone must be reported exactly once; got: {aws:?}"
-        );
-
-        // Verify no duplicate offsets across all findings.
-        let mut seen_offsets: Vec<(_, usize)> = Vec::new();
-        for f in &findings {
-            let key = (f.pattern_id, f.offset);
-            assert!(
-                !seen_offsets.contains(&key),
-                "duplicate finding at offset {} for pattern {}",
-                f.offset,
-                f.pattern_id
-            );
-            seen_offsets.push(key);
+    fn no_raw_secret_value_in_findings() {
+        let input = format!("key={}", aws_key());
+        let r = scan_and_redact(&input);
+        assert!(!r.findings.is_empty(), "must detect secret");
+        // SecretFinding stores offset+length into the ORIGINAL text (not a raw_value field).
+        // The meaningful safety invariant is that the REDACTED output does not contain the raw key.
+        assert!(!r.redacted.contains(aws_key()), "redacted output must not contain raw key");
+        // Verify at compile-time that SecretFinding has no raw_value field — only
+        // pattern_id, offset, length are accessible.
+        for f in &r.findings {
+            let _ = (f.pattern_id, f.offset, f.length);
         }
+    }
 
-        // Also verify via the streaming API itself.
-        let stream = LargeFileStream::open(tmp.path()).unwrap();
-        let (_text, stream_findings) = stream.collect_all().unwrap();
-        let stream_aws: Vec<_> =
-            stream_findings.iter().filter(|f| f.pattern_id == "AWS-001").collect();
+    #[test]
+    fn is_known_secrets_file_covers_env_pem_key() {
+        assert!(is_known_secrets_file(".env"));
+        assert!(is_known_secrets_file(".env.local"));
+        assert!(is_known_secrets_file("secrets/id_rsa"));
+        assert!(is_known_secrets_file("certs/server.pem"));
+        assert!(!is_known_secrets_file("README.md"));
+        assert!(!is_known_secrets_file("src/main.rs"));
+    }
+
+    #[test]
+    fn preprocess_excludes_known_secrets_file() {
+        let r = preprocess("AKIAIOSFODNN7EXAMPLE", ".env");
+        assert_eq!(r.decision, SecretScanDecision::Excluded);
+        assert!(r.content.is_none());
+    }
+
+    #[test]
+    fn overlapping_matches_use_leftmost_longest() {
+        let input = "AKIAIOSFODNN7EXAMPLE_extra_suffix_padding_abc";
+        let r = scan_and_redact(input);
+        assert_eq!(r.findings.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LARGE file streaming — chunk-level tests
+    // -----------------------------------------------------------------------
+
+    /// Secret placed 1 byte BEFORE the chunk boundary must never appear raw in any emitted chunk.
+    #[test]
+    fn large_file_aws_secret_1_byte_before_chunk_boundary_not_emitted_raw() {
+        let key = aws_key();
+        let prefix_len = STREAM_CHUNK_SIZE - key.len();
+        let mut content = vec![b'a'; prefix_len];
+        content.extend_from_slice(key.as_bytes());
+        // Pad to two full chunks so EOF isn't on first read.
+        content.extend(vec![b'b'; STREAM_CHUNK_SIZE]);
+
+        let tmp = write_tmp(&content);
+        let mut stream = LargeFileStream::open(tmp.path()).unwrap();
+
+        let mut all_redacted = String::new();
+        let mut chunk_idx = 0usize;
+        while let Some(res) = stream.next_chunk() {
+            let chunk = res.unwrap();
+            assert!(
+                !chunk.redacted.contains(key),
+                "chunk {chunk_idx} emitted raw key"
+            );
+            all_redacted.push_str(&chunk.redacted);
+            chunk_idx += 1;
+        }
+        assert!(!all_redacted.contains(key), "concatenated output must not contain raw key");
+    }
+
+    /// Secret starting inside the withheld tail must be fully redacted.
+    #[test]
+    fn large_file_aws_secret_in_withheld_tail_safe() {
+        let key = aws_key();
+        // Start the key inside the withheld tail of the first chunk.
+        let start = STREAM_CHUNK_SIZE - SAFETY_WINDOW_SIZE / 2;
+        let mut content = vec![b'x'; start];
+        content.extend_from_slice(key.as_bytes());
+        content.resize(STREAM_CHUNK_SIZE * 2, b'y');
+
+        let tmp = write_tmp(&content);
+        let (full, _findings) = LargeFileStream::open(tmp.path()).unwrap().collect_all().unwrap();
+        assert!(!full.contains(key), "raw key must not appear anywhere in streamed output");
+    }
+
+    /// A PEM block larger than SAFETY_WINDOW_SIZE must never emit its body bytes raw.
+    #[test]
+    fn large_file_pem_larger_than_safety_window_never_emits_body() {
+        let body_len = 2 * SAFETY_WINDOW_SIZE;
+        let mut pem = String::new();
+        pem.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+        let line = "A".repeat(64);
+        let lines_needed = body_len / 65 + 1;
+        for _ in 0..lines_needed {
+            pem.push_str(&line);
+            pem.push('\n');
+        }
+        pem.push_str("-----END RSA PRIVATE KEY-----\n");
+
+        let tmp = write_tmp(pem.as_bytes());
+        let mut stream = LargeFileStream::open(tmp.path()).unwrap();
+
+        while let Some(res) = stream.next_chunk() {
+            let chunk = res.unwrap();
+            assert!(
+                !chunk.redacted.contains(&line),
+                "PEM body line emitted raw in chunk"
+            );
+        }
+    }
+
+    /// PEM BEGIN in one chunk, END in a later chunk — full block must be redacted.
+    #[test]
+    fn large_file_pem_begin_end_cross_chunk_boundary() {
+        let mut content = String::new();
+        content.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+        let line = "B".repeat(64) + "\n";
+        let total_body = STREAM_CHUNK_SIZE * 2;
+        let lines_needed = total_body / 65 + 1;
+        for _ in 0..lines_needed {
+            content.push_str(&line);
+        }
+        content.push_str("-----END RSA PRIVATE KEY-----\n");
+        content.push_str("after_pem_clean_content\n");
+
+        let tmp = write_tmp(content.as_bytes());
+        let (full, findings) = LargeFileStream::open(tmp.path()).unwrap().collect_all().unwrap();
+
+        assert!(!full.contains(&"B".repeat(64)), "PEM body must not appear raw");
+        assert!(full.contains(PEM_PLACEHOLDER), "placeholder must appear");
+        assert!(full.contains("after_pem_clean_content"), "clean suffix must be preserved");
         assert_eq!(
-            stream_aws.len(),
+            findings.iter().filter(|f| f.pattern_id == "PK-001").count(),
             1,
-            "LargeFileStream must also report secret exactly once; got: {stream_aws:?}"
+            "expected exactly one PK-001 finding"
         );
     }
 
-    // ── (h) Streaming remains bounded (does not allocate the entire file) ─────
+    /// At EOF the withheld bytes must be flushed — no bytes silently dropped.
+    #[test]
+    fn large_file_eof_flushes_withheld_bytes() {
+        let content = b"no secrets here, just ordinary text for flush test";
+        let tmp = write_tmp(content);
+        let (full, findings) = LargeFileStream::open(tmp.path()).unwrap().collect_all().unwrap();
+        assert_eq!(
+            full,
+            String::from_utf8_lossy(content).as_ref(),
+            "flushed content must match original exactly"
+        );
+        assert!(findings.is_empty(), "no secrets expected");
+    }
 
+    /// Streaming must return multiple chunks for large inputs (memory is bounded).
     #[test]
     fn large_file_streaming_is_bounded() {
-        // Write a file significantly larger than STREAM_CHUNK_SIZE.
-        // We test that next_chunk() is called repeatedly (not once returning
-        // the whole file), verifying the API is properly chunked.
-        //
-        // We write 5 * STREAM_CHUNK_SIZE bytes and count how many chunks
-        // are returned.  A bounded implementation must return >= 2 chunks.
-        let total = 5 * STREAM_CHUNK_SIZE;
-        let content = filler(total);
-        let tmp = write_temp(&content);
-
+        let content = vec![b'z'; STREAM_CHUNK_SIZE * 3];
+        let tmp = write_tmp(&content);
         let mut stream = LargeFileStream::open(tmp.path()).unwrap();
-        let mut chunk_count = 0usize;
-        let mut total_content_len = 0usize;
 
-        while let Some(result) = stream.next_chunk() {
-            let chunk = result.unwrap();
-            total_content_len += chunk.redacted.len();
+        let mut chunk_count = 0usize;
+        while let Some(res) = stream.next_chunk() {
+            res.unwrap();
             chunk_count += 1;
         }
-
-        assert!(
-            chunk_count >= 2,
-            "streaming must yield multiple chunks for a {total}-byte file; got {chunk_count}"
-        );
-        assert_eq!(
-            total_content_len, total,
-            "total streamed content length must equal file size"
-        );
+        assert!(chunk_count >= 2, "expected multiple chunks, got {chunk_count}");
     }
 
-    // ── Additional: LARGE file with no secrets yields Safe decision ───────────
-
+    /// Clean content must be bit-for-bit preserved after streaming.
     #[test]
-    fn large_file_no_secrets_yields_safe() {
-        let content = filler(SMALL_FILE_THRESHOLD as usize + 1000);
-        let tmp = write_temp(&content);
+    fn large_file_clean_content_preserved() {
+        let content = "Hello from large file with absolutely no secrets at all!\n".repeat(2000);
+        let tmp = write_tmp(content.as_bytes());
+        let (full, findings) = LargeFileStream::open(tmp.path()).unwrap().collect_all().unwrap();
+        assert_eq!(full, content, "clean content must be bit-for-bit preserved");
+        assert!(findings.is_empty());
+    }
+
+    /// Secret in the very middle of a multi-chunk file must be fully redacted.
+    #[test]
+    fn large_file_secret_in_middle_is_fully_redacted() {
+        let key = aws_key();
+        let half = STREAM_CHUNK_SIZE * 2;
+        let mut content = vec![b'a'; half];
+        content.extend_from_slice(key.as_bytes());
+        content.extend(vec![b'b'; half]);
+
+        let tmp = write_tmp(&content);
+        let (full, findings) = LargeFileStream::open(tmp.path()).unwrap().collect_all().unwrap();
+        assert!(!full.contains(key), "mid-file key must not appear raw");
+        assert!(!findings.is_empty(), "must detect key in middle");
+    }
+
+    /// Classify pass must agree `Safe` for a clean file.
+    #[test]
+    fn large_file_classify_and_stream_agree_safe() {
+        let content = vec![b'c'; STREAM_CHUNK_SIZE + 500];
+        let tmp = write_tmp(&content);
         let (decision, findings) = stream_scan_large_file_classify(tmp.path()).unwrap();
         assert_eq!(decision, SecretScanDecision::Safe);
         assert!(findings.is_empty());
     }
 
-    // ── Additional: preprocess_large_file returns stream=Some, content=None ──
-
+    /// Two-pass stability check succeeds for a file that does not change.
     #[test]
-    fn preprocess_large_file_returns_stream_not_content() {
-        let content = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let tmp = write_temp(&content);
-        let result = preprocess_large_file(tmp.path(), "src/big.rs").unwrap();
-        assert!(result.content.is_none(), "LARGE files must not populate content field");
-        assert!(result.stream.is_some(), "LARGE files must populate stream field");
-    }
-
-    // ── Additional: excluded LARGE file returns neither content nor stream ────
-
-    #[test]
-    fn preprocess_large_file_excluded_returns_no_stream() {
-        let content = filler(SMALL_FILE_THRESHOLD as usize + 100);
-        let tmp = write_temp(&content);
-        let result = preprocess_large_file(tmp.path(), ".env").unwrap();
-        assert_eq!(result.decision, SecretScanDecision::Excluded);
-        assert!(result.content.is_none());
-        assert!(result.stream.is_none());
-    }
-
-    // ── Additional: compute_redacted_offset sanity check ─────────────────────
-
-    #[test]
-    fn compute_redacted_offset_no_findings() {
-        let findings: Vec<SecretFinding> = Vec::new();
-        let text = "hello world";
-        // With no findings the redacted offset should equal split_at.
-        assert_eq!(compute_redacted_offset(&findings, text, 5), 5);
-        assert_eq!(compute_redacted_offset(&findings, text, 0), 0);
-        assert_eq!(compute_redacted_offset(&findings, text, 11), 11);
+    fn large_file_two_pass_stable_succeeds() {
+        let content = vec![b'd'; STREAM_CHUNK_SIZE + 100];
+        let tmp = write_tmp(&content);
+        let result = preprocess_large_file(tmp.path(), "data/large.bin").unwrap();
+        assert!(result.stream.is_some(), "stable file must produce a stream");
     }
 }

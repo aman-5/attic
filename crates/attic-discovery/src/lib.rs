@@ -273,7 +273,7 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
 /// - LARGE (`MAX_FULL_LOAD_BYTES`..`MAX_LARGE_BYTES`): the entire file is
 ///   scanned via [`secrets::stream_scan_large_file_classify`] — the single
 ///   authoritative streaming scanner.  At most
-///   `secrets::STREAM_CHUNK_SIZE + secrets::STREAM_OVERLAP_SIZE` bytes are
+///   `secrets::STREAM_CHUNK_SIZE + secrets::SAFETY_WINDOW_SIZE` bytes are
 ///   live at any one time.
 /// - VERY_LARGE (> `MAX_LARGE_BYTES`): only the first + last `MAX_SAMPLE_BYTES`
 ///   are scanned; a `PARTIAL_SECRET_SCAN` diagnostic is recorded; the
@@ -636,7 +636,7 @@ mod tests {
     ///     public preprocess_file_content API.
     #[test]
     fn preprocess_file_content_large_boundary_spanning_secret_redacted() {
-        use secrets::{STREAM_CHUNK_SIZE, STREAM_OVERLAP_SIZE};
+        use secrets::{STREAM_CHUNK_SIZE, SAFETY_WINDOW_SIZE};
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -668,7 +668,7 @@ mod tests {
             "redacted replacement must appear for boundary-spanning secret"
         );
 
-        let _ = STREAM_OVERLAP_SIZE; // suppress unused warning
+        let _ = SAFETY_WINDOW_SIZE; // suppress unused warning
     }
 
     /// (4) Finding offsets are correct through the public preprocess_file_content API.
