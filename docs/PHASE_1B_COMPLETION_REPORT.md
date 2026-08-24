@@ -2,16 +2,16 @@
 
 **Date**: 2026-08-25
 **Crate**: `attic-discovery` v0.1.0
-**Status**: COMPLETE (fourth corrective pass — all blockers resolved; 140/140 tests pass)
+**Status**: COMPLETE (fifth corrective pass — BLAKE3 source identity; 145/145 tests pass)
 
 ---
 
 ## Summary
 
 Phase 1B implements the full Git-aware, security-hardened repository discovery
-pipeline for Attic.  All findings from four rounds of post-completion review
+pipeline for Attic.  All findings from five rounds of post-completion review
 have been resolved.  The crate passes `cargo test -p attic-discovery`
-(**140/140 tests pass**) on `x86_64-pc-windows-gnu`.
+(**145/145 tests pass**) on `x86_64-pc-windows-gnu`.
 
 ---
 
@@ -97,7 +97,9 @@ the mid-body inspected.  This is a security contract violation.
   - Carries a `SAFETY_WINDOW_SIZE` (1 KiB) overlap between windows to catch
     boundary-spanning bounded tokens.
   - Uses `PemStreamState` to track cross-chunk PEM blocks.
-  - Returns `(SecretScanDecision, Vec<SecretFinding>)` — full coverage, O(1) peak memory.
+  - Returns `(SecretScanDecision, Vec<SecretFinding>, String)` — full coverage,
+    O(1) peak memory; the third element is the BLAKE3 hex hash accumulated
+    during the classify pass (see Round 5 / Fix 13).
 - `lib.rs` LARGE tier now calls `stream_scan_large_file_classify` instead of the
   old head+tail sample.
 
@@ -244,13 +246,18 @@ with the streamed content (pass 2).
 - `open_with_identity` is `pub(crate)` (not `pub`) — it accepts `FileIdentity`
   which is `pub(crate)`, preventing the `private_interfaces` compiler warning.
 
+> **Superseded by Round 5 (Fix 13)**: The size+mtime `FileIdentity` was replaced
+> by a BLAKE3 content hash.  The two-pass pre/post stat approach was replaced by
+> single-pass: the classify function now accumulates the hash while scanning, so
+> no separate `file_identity()` call is required.
+
 ---
 
 ## Test Coverage Summary
 
 ```
-running 140 tests
-... 140 passed; 0 failed; finished in 2.64s
+running 145 tests
+... 145 passed; 0 failed; finished in 2.07s
 ```
 
 | Module | Tests |
@@ -258,13 +265,13 @@ running 140 tests
 | `lib.rs` (integration) | 12 |
 | `walk.rs` | 20 |
 | `manifest.rs` | 9 |
-| `secrets.rs` | 38 |
+| `secrets.rs` | 43 |
 | `classification.rs` | 17 |
 | `security.rs` | 14 |
 | `git.rs` | 10 |
 | `policy.rs` | 8 |
 | `diagnostics.rs` | 2 |
-| **Total** | **140** |
+| **Total** | **145** |
 
 ---
 
@@ -322,7 +329,7 @@ For each call:
 | PEM spanning multiple chunks fully redacted | ✅ `large_file_pem_begin_end_cross_chunk_boundary` |
 | EOF flushes all withheld bytes | ✅ `large_file_eof_flushes_withheld_bytes` |
 | Clean content bit-for-bit preserved | ✅ `large_file_clean_content_preserved` |
-| Two-pass stability check detects changed file | ✅ `FileIdentity` comparison in `preprocess_large_file` |
+| Two-pass stability check detects changed file | ✅ BLAKE3 `FileIdentity` — `file_identity_same_content_same_hash` + `classify_hash_matches_file_identity` |
 | JWT scanner is O(n) per input | ✅ skip to `seg1_end` / `seg2_end` on non-match |
 | `include_untracked=false` + unavailable tracked set → hard error | ✅ `TrackedFileSetUnavailable` returned |
 | Submodule boundaries detected, not descended into | ✅ `SubmoduleDetected` diagnostic + `submodule_prefixes` |
@@ -330,7 +337,10 @@ For each call:
 | `source_revision.md` submodule section accurate | ✅ Phase 1B / Phase 2+ boundary documented |
 | Uncertain stat (None/None) treated as unstable | ✅ `_ => true` in manifest match |
 | `SecretFinding` struct has no `raw_value` field | ✅ `no_raw_secret_value_in_findings` — redacted output verified clean |
-| `cargo test -p attic-discovery` all pass | ✅ 140/140 |
+| `FileIdentity` hash is 64 lowercase hex characters (BLAKE3) | ✅ `file_identity_hash_is_64_hex_chars` |
+| Different content produces different BLAKE3 hash | ✅ `file_identity_different_content_different_hash` |
+| Classify-pass hash equals standalone `file_identity()` hash | ✅ `classify_hash_matches_file_identity` |
+| `cargo test -p attic-discovery` all pass | ✅ 145/145 |
 
 ---
 
@@ -369,3 +379,83 @@ For each call:
 | `crates/attic-discovery/src/secrets.rs` | **Blocker 1**: Replaced `InBlock` PEM state with `Draining { begin_file_offset, tail: Vec<u8> }` — genuinely O(1) memory for PEM blocks of any size; `tail` bounded to `SAFETY_WINDOW_SIZE`; placeholder emitted immediately on `BEGIN`; `withheld_len()` test accessor added; `large_file_stream_pem_many_chunks_buffer_is_bounded` asserts buffer ≤ `SAFETY_WINDOW_SIZE` at every `next_chunk()` call. **Blocker 2**: Added `path: PathBuf` field and `check_identity()` method to `LargeFileStream`; identity checked at top of every `next_chunk()`; `large_file_modification_between_classify_and_open_detected` and `large_file_modification_during_streaming_returns_error` tests added. `is_known_secrets_file` changed to `pub(crate)` to resolve E0603. |
 | `crates/attic-discovery/src/lib.rs` | Fixed two test call sites: `stream.collect_all()` (method) → `secrets::collect_all(&mut stream)` (free function); destructured `ScanResult` correctly. |
 | `docs/PHASE_1B_COMPLETION_REPORT.md` | Updated status, test counts, and this round-4 section. |
+
+---
+
+## Corrective Review Fixes — Round 5
+
+### Fix 13 — `FileIdentity` upgraded to BLAKE3 content hash (cryptographic identity)
+
+**Finding**: The Round 3/4 `FileIdentity { size: u64, modified: SystemTime }` was
+best-effort: two different files with identical size and the same mtime would be
+considered identical, and mtime granularity varies by filesystem (1 s on FAT32,
+100 ns on NTFS, but often truncated to seconds).  A file modified in the same
+second on a coarse-mtime filesystem would silently pass the identity check with
+incorrect classification metadata.
+
+Tests reflected this weakness via escape-hatch comments ("acceptable if file
+changed") that allowed the identity check to succeed even when it should have
+failed.
+
+**Resolution** (`secrets.rs`, `lib.rs`):
+
+- `FileIdentity` replaced with `pub(crate) struct FileIdentity { pub(crate) content_hash: String }`.
+  - `content_hash` is a 64-character lowercase hex string produced by `blake3::Hasher`.
+  - Uses the same `blake3` crate already declared in `Cargo.toml` for `manifest.rs`.
+- `file_identity(path)` reimplemented: streams the file in `STREAM_CHUNK_SIZE`
+  blocks, feeds each chunk to `blake3::Hasher::update()`, returns hex of
+  `hasher.finalize()`.
+- `stream_scan_large_file_classify(path)` now returns
+  `(SecretScanDecision, Vec<SecretFinding>, String)` — the third element is the
+  BLAKE3 hex hash accumulated during the classify pass (no extra I/O).
+- `preprocess_large_file()` simplified to single-path:
+  ```rust
+  let (decision, all_findings, classify_hash) =
+      stream_scan_large_file_classify(path)?;
+  let identity = FileIdentity { content_hash: classify_hash };
+  let stream = LargeFileStream::open_with_identity(path, identity)?;
+  ```
+  The separate pre/post `file_identity()` bracket is eliminated.
+- `LargeFileStream` gains two fields:
+  - `hasher: blake3::Hasher` — fed raw bytes of each chunk in `next_chunk()`.
+  - `hash_verified: bool` — set to `true` after the first successful EOF
+    verification to prevent double-verification on repeated calls.
+- `verify_hash_at_eof()` (private method on `LargeFileStream`):
+  - Finalises the running hasher.
+  - Compares `hasher.finalize().to_hex()` against `identity.content_hash`.
+  - Returns `Err(io::Error::new(io::ErrorKind::Other, "source identity changed
+    during streaming (unstable capture): {path}"))` on mismatch.
+- `verify_hash_at_eof()` called at all three EOF conditions inside
+  `next_chunk()`:
+  1. `n == 0` — zero-byte read (true EOF from first read).
+  2. `n < STREAM_CHUNK_SIZE` — short read (EOF after partial chunk).
+  3. Drain-complete path — withheld buffer flushed at EOF.
+- All test escape hatches removed; both identity tests now assert:
+  ```rust
+  assert!(got_error, "identity mismatch MUST return an error; no fallback acceptable");
+  ```
+- Five new BLAKE3 property tests added to `secrets.rs`:
+
+| Test | What it verifies |
+|------|-----------------|
+| `file_identity_same_content_same_hash` | Identical bytes → identical hash |
+| `file_identity_different_content_different_hash` | Changed content → changed hash |
+| `file_identity_hash_is_64_hex_chars` | Output is exactly 64 lowercase hex chars |
+| `file_identity_empty_file_has_known_length_hash` | Empty file produces valid 64-char hash |
+| `classify_hash_matches_file_identity` | Hash from classify pass == hash from `file_identity()` |
+
+- `lib.rs` match arms updated to destructure the new 3-tuple:
+  ```rust
+  Ok((SecretScanDecision::Safe, _, _)) => { … }
+  Ok((SecretScanDecision::Redacted, findings, _)) => { … }
+  Ok((SecretScanDecision::Excluded, _, _)) => { … }
+  Ok((SecretScanDecision::PartialScan, findings, _)) => { … }
+  ```
+
+### Round 5 — Files Modified
+
+| File | Change |
+|------|--------|
+| `crates/attic-discovery/src/secrets.rs` | `FileIdentity` → BLAKE3 `content_hash`; `file_identity()` streaming hasher; `stream_scan_large_file_classify` returns 3-tuple; `LargeFileStream` gains `hasher` + `hash_verified` fields; `verify_hash_at_eof()` method; hash check at all 3 EOF points; escape-hatch branches removed; 5 new BLAKE3 property tests; total secrets tests: 38 → 43. |
+| `crates/attic-discovery/src/lib.rs` | Match arms updated from 2-tuple to 3-tuple destructure in `classify_file_for_downstream`. |
+| `docs/PHASE_1B_COMPLETION_REPORT.md` | This document — Round 5 section, updated test counts (140 → 145), invariants table, Fix 5 and Fix 12 annotations. |

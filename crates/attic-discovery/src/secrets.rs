@@ -1,6 +1,5 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub const SMALL_FILE_THRESHOLD: u64 = 4 * 1024 * 1024;
 pub const VERY_LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024;
@@ -36,12 +35,28 @@ pub struct PreprocessResult {
     pub findings: Vec<SecretFinding>,
 }
 
+/// Source identity: BLAKE3 content hash of the file (64 lowercase hex chars).
+///
+/// This aligns with the `SourceRevision` / `ManifestEntry` contract in
+/// `manifest.rs` — the same BLAKE3 primitive is used throughout the codebase.
+/// A size+mtime approach is intentionally avoided because mtime resolution
+/// can be as coarse as 1 second on some filesystems, making silent
+/// modification invisible to the identity check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileIdentity { size: u64, modified: SystemTime }
+pub(crate) struct FileIdentity { pub(crate) content_hash: String }
 
+/// Compute the BLAKE3 content hash of a file.  Streams in `STREAM_CHUNK_SIZE`
+/// blocks to bound memory use.  Mirrors `hash_file_content` in `manifest.rs`.
 fn file_identity(path: &Path) -> io::Result<FileIdentity> {
-    let m = std::fs::metadata(path)?;
-    Ok(FileIdentity { size: m.len(), modified: m.modified()? })
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+    loop {
+        let n = read_exact_up_to(&mut file, &mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(FileIdentity { content_hash: hasher.finalize().to_hex().to_string() })
 }
 
 #[derive(Debug, Clone)]
@@ -103,19 +118,26 @@ pub fn preprocess_large_file(path: &Path, repo_relative: &str) -> io::Result<Pre
     if is_known_secrets_file(repo_relative) {
         return Ok(PreprocessResult { decision: SecretScanDecision::Excluded, content: None, stream: None, findings: Vec::new() });
     }
-    let id_before = file_identity(path)?;
-    let (decision, all_findings) = stream_scan_large_file_classify(path)?;
-    let id_after = file_identity(path)?;
-    if id_before != id_after {
-        return Err(io::Error::new(io::ErrorKind::Other,
-            format!("file changed during classification (unstable capture): {}", path.display())));
-    }
-    let stream = LargeFileStream::open_with_identity(path, id_after)?;
+    // The classify pass computes the BLAKE3 hash alongside the secret scan in
+    // a single streaming read.  The returned hash becomes the FileIdentity
+    // stored in the stream.  The stream's running hasher verifies at EOF that
+    // the bytes it reads match this hash, detecting any modification between
+    // the classify pass and actual streaming.
+    let (decision, all_findings, classify_hash) = stream_scan_large_file_classify(path)?;
+    let identity = FileIdentity { content_hash: classify_hash };
+    let stream = LargeFileStream::open_with_identity(path, identity)?;
     Ok(PreprocessResult { decision, content: None, stream: Some(stream), findings: all_findings })
 }
 
-pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDecision, Vec<SecretFinding>)> {
+/// Scan a large file for secrets and compute its BLAKE3 content hash in a
+/// single streaming pass.
+///
+/// Returns `(decision, findings, content_hash)`.  The `content_hash` is fed
+/// into [`FileIdentity`] so that the subsequent [`LargeFileStream`] can verify
+/// it is reading the same bytes without a third full file read.
+pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDecision, Vec<SecretFinding>, String)> {
     let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
     let mut all_findings: Vec<SecretFinding> = Vec::new();
     let mut overlap_buf: Vec<u8> = Vec::new();
     let mut file_offset_of_new_bytes: usize = 0;
@@ -134,6 +156,9 @@ pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDec
             }
             break;
         }
+        // Feed raw bytes into the content hasher before any text processing.
+        hasher.update(&new_chunk[..n]);
+
         window.extend_from_slice(&new_chunk[..n]);
         let window_str = String::from_utf8_lossy(&window).into_owned();
         let window_file_base = file_offset_of_new_bytes.saturating_sub(overlap_len);
@@ -163,7 +188,8 @@ pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDec
         }
     }
     let decision = if all_findings.is_empty() { SecretScanDecision::Safe } else { SecretScanDecision::Redacted };
-    Ok((decision, all_findings))
+    let content_hash = hasher.finalize().to_hex().to_string();
+    Ok((decision, all_findings, content_hash))
 }
 
 fn pem_classify_window(window_str: &str, window_file_base: usize, pem_state: &mut PemStreamState, all_findings: &mut Vec<SecretFinding>) {
@@ -202,6 +228,12 @@ pub struct LargeFileStream {
     pem_state: PemStreamState,
     done: bool,
     identity: FileIdentity,
+    /// Running BLAKE3 hasher fed with every raw chunk read from `file`.
+    /// Finalised at EOF and compared to `identity.content_hash` to detect
+    /// any modification between the classify pass and actual streaming.
+    hasher: blake3::Hasher,
+    /// Guards against calling `verify_hash_at_eof` more than once.
+    hash_verified: bool,
 }
 
 impl std::fmt::Debug for LargeFileStream {
@@ -218,14 +250,35 @@ impl LargeFileStream {
 
     pub(crate) fn open_with_identity(path: &Path, identity: FileIdentity) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
-        Ok(LargeFileStream { path: path.to_path_buf(), file, withheld: Vec::new(), withheld_file_offset: 0, file_bytes_consumed: 0, pem_state: PemStreamState::Idle, done: false, identity })
+        Ok(LargeFileStream {
+            path: path.to_path_buf(),
+            file,
+            withheld: Vec::new(),
+            withheld_file_offset: 0,
+            file_bytes_consumed: 0,
+            pem_state: PemStreamState::Idle,
+            done: false,
+            identity,
+            hasher: blake3::Hasher::new(),
+            hash_verified: false,
+        })
     }
 
-    fn check_identity(&self) -> io::Result<()> {
-        let current = file_identity(&self.path)?;
-        if current != self.identity {
-            return Err(io::Error::new(io::ErrorKind::Other,
-                format!("source identity changed during streaming (unstable capture): {}", self.path.display())));
+    /// Finalise the running hasher and compare to the stored identity hash.
+    /// An error is returned if the hashes differ, indicating that the file was
+    /// modified between the classify pass and the streaming pass.
+    fn verify_hash_at_eof(&mut self) -> io::Result<()> {
+        if self.hash_verified { return Ok(()); }
+        self.hash_verified = true;
+        let actual = self.hasher.finalize().to_hex().to_string();
+        if actual != self.identity.content_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "source identity changed during streaming (unstable capture): {}",
+                    self.path.display()
+                ),
+            ));
         }
         Ok(())
     }
@@ -234,15 +287,15 @@ impl LargeFileStream {
     pub fn withheld_len(&self) -> usize { self.withheld.len() }
 
     pub fn next_chunk(&mut self) -> Option<io::Result<StreamChunk>> {
-        if !self.done {
-            if let Err(e) = self.check_identity() {
-                self.done = true;
-                return Some(Err(e));
-            }
-        }
         if self.done && self.withheld.is_empty() {
             if matches!(&self.pem_state, PemStreamState::Draining { .. }) {
                 return Some(self.flush_pem_eof());
+            }
+            // Fully drained: perform final hash integrity check.
+            if !self.hash_verified {
+                if let Err(e) = self.verify_hash_at_eof() {
+                    return Some(Err(e));
+                }
             }
             return None;
         }
@@ -255,13 +308,24 @@ impl LargeFileStream {
         };
         if n == 0 {
             self.done = true;
+            if let Err(e) = self.verify_hash_at_eof() {
+                return Some(Err(e));
+            }
             if matches!(&self.pem_state, PemStreamState::Draining { .. }) {
                 return Some(self.flush_pem_eof());
             }
             return if self.withheld.is_empty() { None } else { Some(self.flush_withheld()) };
         }
+        // Feed raw bytes into the running content hasher.
+        self.hasher.update(&new_buf[..n]);
+
         let is_eof = n < STREAM_CHUNK_SIZE;
-        if is_eof { self.done = true; }
+        if is_eof {
+            self.done = true;
+            if let Err(e) = self.verify_hash_at_eof() {
+                return Some(Err(e));
+            }
+        }
         self.file_bytes_consumed += n;
         let new_bytes = new_buf[..n].to_vec();
 
@@ -728,7 +792,6 @@ mod tests {
     fn scan_redacted_text_does_not_contain_raw_token() {
         let text = "token: ghp_abcdefghijklmnopqrstuvwxyz1234567890ab end";
         let r = scan_and_redact(text);
-        // the raw full token should not appear verbatim in redacted output
         assert!(!r.redacted.contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab"));
     }
 
@@ -749,10 +812,8 @@ mod tests {
     fn no_raw_secret_value_in_findings() {
         let text = "ghp_abcdefghijklmnopqrstuvwxyz1234567890ab";
         let r = scan_and_redact(text);
-        // findings carry offset/length into the *original* text — not into redacted
         for f in &r.findings {
             let raw_slice = &text[f.offset..f.offset + f.length];
-            // The redacted output must NOT contain the raw slice verbatim
             assert!(!r.redacted.contains(raw_slice),
                 "raw secret value '{}' found verbatim in redacted output", raw_slice);
         }
@@ -879,9 +940,8 @@ mod tests {
 
     #[test]
     fn large_file_stream_pem_spans_two_chunks() {
-        // Construct a PEM block that spans a chunk boundary
         let header = b"-----BEGIN RSA PRIVATE KEY-----\n";
-        let body = vec![b'A'; STREAM_CHUNK_SIZE]; // body larger than one chunk
+        let body = vec![b'A'; STREAM_CHUNK_SIZE];
         let footer = b"\n-----END RSA PRIVATE KEY-----\n";
         let mut data = Vec::new();
         data.extend_from_slice(header);
@@ -898,7 +958,6 @@ mod tests {
 
     #[test]
     fn large_file_stream_pem_many_chunks_buffer_is_bounded() {
-        // PEM body of 10x STREAM_CHUNK_SIZE — tail/withheld must never exceed SAFETY_WINDOW_SIZE
         let header = b"-----BEGIN RSA PRIVATE KEY-----\n";
         let body_len = STREAM_CHUNK_SIZE * 10;
         let body = vec![b'B'; body_len];
@@ -910,7 +969,6 @@ mod tests {
         let f = tmp_file(&data);
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         loop {
-            // Assert buffer is bounded BEFORE reading next chunk
             assert!(stream.withheld_len() <= SAFETY_WINDOW_SIZE,
                 "withheld buffer exceeded SAFETY_WINDOW_SIZE: {} > {}",
                 stream.withheld_len(), SAFETY_WINDOW_SIZE);
@@ -920,87 +978,45 @@ mod tests {
                 Some(Err(e)) => panic!("unexpected error: {}", e),
             }
         }
-        // Final check after drain
         assert!(stream.withheld_len() <= SAFETY_WINDOW_SIZE);
     }
 
     // -----------------------------------------------------------------------
-    // Source identity enforcement
+    // Source identity enforcement — BLAKE3 hash-based, no escape hatches
     // -----------------------------------------------------------------------
 
+    /// Supplying a stale (pre-modification) FileIdentity to open_with_identity
+    /// and then streaming MUST return an error.  The BLAKE3 hash of the
+    /// original content will not match the hash of the modified content that
+    /// the stream actually reads, so detection is guaranteed regardless of
+    /// filesystem mtime resolution.
     #[test]
     fn large_file_modification_between_classify_and_open_detected() {
-        // Write initial content
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"original content").unwrap();
+        f.write_all(b"original content for blake3 identity test").unwrap();
         f.flush().unwrap();
 
-        // Capture identity before modification
+        // Capture identity of the original file.
         let id_before = file_identity(f.path()).unwrap();
 
-        // Modify the file to change identity
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Overwrite with different content — BLAKE3 hash will differ.
         {
             let mut fh = std::fs::OpenOptions::new().write(true).truncate(true).open(f.path()).unwrap();
-            fh.write_all(b"modified content that is different").unwrap();
+            fh.write_all(b"completely different modified content xyz").unwrap();
             fh.flush().unwrap();
         }
 
-        // Attempt to open with the stale identity — must fail
-        let result = LargeFileStream::open_with_identity(f.path(), id_before);
-        // open_with_identity itself just opens; the identity check fires on next_chunk
-        let mut stream = result.unwrap();
-        let chunk_result = stream.next_chunk();
-        match chunk_result {
-            Some(Err(e)) => {
-                let msg = e.to_string();
-                assert!(msg.contains("source identity changed") || msg.contains("unstable capture"),
-                    "unexpected error message: {}", msg);
-            }
-            Some(Ok(_)) => {
-                // If file content is read but identity matches, that's also acceptable
-                // (race condition: if the modified file has same size+mtime it passes)
-                // The test's intent is satisfied if identity check eventually fires
-            }
-            None => {
-                // Empty file after modification — acceptable if size changed to non-zero previously
-            }
-        }
-    }
-
-    #[test]
-    fn large_file_modification_during_streaming_returns_error() {
-        // Create a file larger than one chunk so we get at least two next_chunk() calls
-        let initial_data = vec![b'X'; STREAM_CHUNK_SIZE + 1024];
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(&initial_data).unwrap();
-        f.flush().unwrap();
-
-        let mut stream = LargeFileStream::open(f.path()).unwrap();
-
-        // Read first chunk successfully
-        match stream.next_chunk() {
-            Some(Ok(_)) => {}
-            Some(Err(e)) => panic!("first chunk should succeed: {}", e),
-            None => panic!("expected at least one chunk"),
-        }
-
-        // Modify the file between chunks
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        {
-            let mut fh = std::fs::OpenOptions::new().write(true).truncate(true).open(f.path()).unwrap();
-            fh.write_all(b"completely different shorter content").unwrap();
-            fh.flush().unwrap();
-        }
-
-        // Next chunk must detect the identity change
+        // Open with the stale identity and drain the stream.
+        let mut stream = LargeFileStream::open_with_identity(f.path(), id_before).unwrap();
         let mut got_error = false;
-        for _ in 0..5 {
+        loop {
             match stream.next_chunk() {
                 Some(Err(e)) => {
                     let msg = e.to_string();
-                    assert!(msg.contains("source identity changed") || msg.contains("unstable capture"),
-                        "unexpected error: {}", msg);
+                    assert!(
+                        msg.contains("source identity changed") || msg.contains("unstable capture"),
+                        "unexpected error message: {}", msg
+                    );
                     got_error = true;
                     break;
                 }
@@ -1008,9 +1024,99 @@ mod tests {
                 None => break,
             }
         }
-        // We strongly expect an error, but on systems where mtime resolution is coarse
-        // the identity check may not fire. Accept either outcome.
-        let _ = got_error;
+        assert!(got_error,
+            "streaming a file with a stale BLAKE3 identity MUST return an error; \
+             no fallback is acceptable — the content hashes are different");
+    }
+
+    /// Modifying a file between the first and second next_chunk calls MUST
+    /// result in an error by EOF.  With BLAKE3 identity the check fires at
+    /// EOF when the accumulated hash diverges from the classify-pass hash.
+    #[test]
+    fn large_file_modification_during_streaming_returns_error() {
+        // File must be larger than one chunk to force multiple next_chunk calls.
+        let initial_data = vec![b'X'; STREAM_CHUNK_SIZE + 1024];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&initial_data).unwrap();
+        f.flush().unwrap();
+
+        let mut stream = LargeFileStream::open(f.path()).unwrap();
+
+        // First chunk — must succeed (file unmodified at this point).
+        match stream.next_chunk() {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => panic!("first chunk should succeed: {}", e),
+            None => panic!("expected at least one chunk"),
+        }
+
+        // Overwrite the file with different content while the stream is open.
+        // The running BLAKE3 hasher will accumulate bytes from the new content,
+        // producing a final hash that differs from the classify-pass hash.
+        {
+            let mut fh = std::fs::OpenOptions::new().write(true).truncate(true).open(f.path()).unwrap();
+            fh.write_all(b"completely different shorter content").unwrap();
+            fh.flush().unwrap();
+        }
+
+        // Drain remaining chunks — the error MUST appear by EOF.
+        let mut got_error = false;
+        for _ in 0..10 {
+            match stream.next_chunk() {
+                Some(Err(e)) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("source identity changed") || msg.contains("unstable capture"),
+                        "unexpected error: {}", msg
+                    );
+                    got_error = true;
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                None => break,
+            }
+        }
+        assert!(got_error,
+            "modifying a file during streaming MUST produce an error by EOF; \
+             BLAKE3 identity is not subject to mtime-resolution races");
+    }
+
+    // -----------------------------------------------------------------------
+    // FileIdentity — BLAKE3 property tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_identity_same_content_same_hash() {
+        let f1 = tmp_file(b"identical content");
+        let f2 = tmp_file(b"identical content");
+        let id1 = file_identity(f1.path()).unwrap();
+        let id2 = file_identity(f2.path()).unwrap();
+        assert_eq!(id1, id2, "same content must produce identical FileIdentity");
+    }
+
+    #[test]
+    fn file_identity_different_content_different_hash() {
+        let f1 = tmp_file(b"content A");
+        let f2 = tmp_file(b"content B");
+        let id1 = file_identity(f1.path()).unwrap();
+        let id2 = file_identity(f2.path()).unwrap();
+        assert_ne!(id1, id2, "different content must produce different FileIdentity");
+    }
+
+    #[test]
+    fn file_identity_hash_is_64_hex_chars() {
+        let f = tmp_file(b"some file content");
+        let id = file_identity(f.path()).unwrap();
+        assert_eq!(id.content_hash.len(), 64,
+            "BLAKE3 hex hash must be 64 characters");
+        assert!(id.content_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "BLAKE3 hash must contain only hex digits");
+    }
+
+    #[test]
+    fn file_identity_empty_file_has_known_length_hash() {
+        let f = tmp_file(b"");
+        let id = file_identity(f.path()).unwrap();
+        assert_eq!(id.content_hash.len(), 64);
     }
 
     // -----------------------------------------------------------------------
@@ -1019,7 +1125,6 @@ mod tests {
 
     #[test]
     fn entropy_uniform_string_high() {
-        // A base64-like string with varied characters should have high entropy
         let s = "aB3dE6gH9jKlMnOpQrStUvWxYz012345";
         assert!(shannon_entropy(s) > 4.0, "entropy should be > 4.0 for varied string");
     }
@@ -1054,27 +1159,41 @@ mod tests {
     #[test]
     fn classify_safe_file() {
         let f = tmp_file(b"no secrets here at all");
-        let (decision, findings) = stream_scan_large_file_classify(f.path()).unwrap();
+        let (decision, findings, hash) = stream_scan_large_file_classify(f.path()).unwrap();
         assert_eq!(decision, SecretScanDecision::Safe);
         assert!(findings.is_empty());
+        assert_eq!(hash.len(), 64, "classify must return a 64-char BLAKE3 hash");
     }
 
     #[test]
     fn classify_file_with_pem() {
         let data = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
         let f = tmp_file(data);
-        let (decision, findings) = stream_scan_large_file_classify(f.path()).unwrap();
+        let (decision, findings, hash) = stream_scan_large_file_classify(f.path()).unwrap();
         assert_eq!(decision, SecretScanDecision::Redacted);
         assert!(findings.iter().any(|f| f.pattern_id == "PK-001"));
+        assert_eq!(hash.len(), 64);
     }
 
     #[test]
     fn classify_file_with_aws_key() {
         let data = b"key: AKIAIOSFODNN7EXAMPLE end";
         let f = tmp_file(data);
-        let (decision, findings) = stream_scan_large_file_classify(f.path()).unwrap();
+        let (decision, findings, _hash) = stream_scan_large_file_classify(f.path()).unwrap();
         assert_eq!(decision, SecretScanDecision::Redacted);
         assert!(findings.iter().any(|f| f.pattern_id == "AWS-001"));
+    }
+
+    #[test]
+    fn classify_hash_matches_file_identity() {
+        // The hash returned by classify must equal the hash from file_identity
+        // (both use the same BLAKE3 algorithm over the same raw bytes).
+        let data = b"some content without secrets";
+        let f = tmp_file(data);
+        let (_, _, classify_hash) = stream_scan_large_file_classify(f.path()).unwrap();
+        let id = file_identity(f.path()).unwrap();
+        assert_eq!(classify_hash, id.content_hash,
+            "classify hash must equal file_identity hash for the same file");
     }
 
     // -----------------------------------------------------------------------
@@ -1170,17 +1289,15 @@ mod tests {
 
     #[test]
     fn aws_key_too_short_not_detected() {
-        let text = "AKIA123456789"; // only 13 chars total, needs 20
+        let text = "AKIA123456789";
         let r = scan_and_redact(text);
         assert!(!r.findings.iter().any(|f| f.pattern_id == "AWS-001"));
     }
 
     #[test]
     fn aws_key_continued_alphanumeric_not_detected() {
-        // 21-char sequence starting with AKIA — not a valid key (too long / continued)
-        let text = "AKIAIOSFODNN7EXAMPLE1"; // 21 chars, continued
+        let text = "AKIAIOSFODNN7EXAMPLE1";
         let r = scan_and_redact(text);
-        // Should not detect because it's continued
         assert!(!r.findings.iter().any(|f| f.pattern_id == "AWS-001"));
     }
 
@@ -1211,7 +1328,6 @@ mod tests {
 
     #[test]
     fn jwt_two_parts_not_detected() {
-        // Only two parts — not a valid JWT
         let text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0";
         let r = scan_and_redact(text);
         assert!(!r.findings.iter().any(|f| f.pattern_id == "JWT-001"),

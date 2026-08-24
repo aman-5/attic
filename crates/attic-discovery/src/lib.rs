@@ -333,17 +333,17 @@ fn classify_file_for_downstream(
                 return DownstreamClassification::Excluded;
             }
             match secrets::stream_scan_large_file_classify(abs_path) {
-                Ok((SecretScanDecision::Safe, _)) => {
+                Ok((SecretScanDecision::Safe, _, _)) => {
                     DownstreamClassification::Safe { size_tier: FileSizeTier::Large }
                 }
-                Ok((SecretScanDecision::Redacted, findings)) => {
+                Ok((SecretScanDecision::Redacted, findings, _)) => {
                     DownstreamClassification::Redacted {
                         size_tier: FileSizeTier::Large,
                         findings,
                     }
                 }
-                Ok((SecretScanDecision::Excluded, _)) => DownstreamClassification::Excluded,
-                Ok((SecretScanDecision::PartialScan, findings)) => {
+                Ok((SecretScanDecision::Excluded, _, _)) => DownstreamClassification::Excluded,
+                Ok((SecretScanDecision::PartialScan, findings, _)) => {
                     DownstreamClassification::PartialScan { findings }
                 }
                 Err(e) => DownstreamClassification::ScanSkipped {
