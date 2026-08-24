@@ -31,6 +31,27 @@ pub enum StorageError {
     /// A JSON (de)serialisation error.
     #[error("JSON error: {0}")]
     Json(String),
+
+    /// A background OS thread could not be spawned.
+    #[error("thread spawn failed: {0}")]
+    ThreadSpawn(String),
+
+    /// The mutation was part of a batch that was rolled back due to another
+    /// mutation in the same batch failing.
+    #[error("mutation rolled back: batch contained a failed mutation")]
+    BatchRolledBack,
+
+    /// All read connections in the pool are currently in use.
+    #[error("read connection pool exhausted (max connections in use)")]
+    PoolExhausted,
+
+    /// A generic worker-level error (e.g., BEGIN/COMMIT failure).
+    #[error("writer worker error: {0}")]
+    Worker(String),
+
+    /// An internal mutex was poisoned.
+    #[error("internal mutex poisoned: {0}")]
+    MutexPoisoned(String),
 }
 
 impl From<serde_json::Error> for StorageError {
