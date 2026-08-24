@@ -28,6 +28,13 @@ serde_json         = "1.0.140"
 uuid               = { version = "1.11.0",  features = ["v4", "serde"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3",     features = ["env-filter"] }
+# Phase 1B: gitignore-aware walking (ripgrep/ignore, MSRV 1.88, Unlicense OR MIT)
+ignore             = "0.4.33"
+# Phase 1B: BLAKE3 hashing required by source_revision contract
+blake3             = "1.8.7"
+# Test utilities
+tempfile           = "3"
 attic-core         = { path = "crates/attic-core" }
 attic-storage      = { path = "crates/attic-storage" }
 attic-test-support = { path = "crates/attic-test-support" }
+attic-discovery    = { path = "crates/attic-discovery" }

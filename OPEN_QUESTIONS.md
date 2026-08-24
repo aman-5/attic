@@ -62,23 +62,19 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-004 — Git Submodule Handling in DiscoveryPolicy
 
-**Status**: OPEN  
-**Owning phase**: Phase 1B  
-**Source contract**: `docs/contracts/discovery.md` §3 (GlobRule), `docs/contracts/source_revision.md` §2  
-**Question**: Are Git submodules treated as separate repositories (each with their own `SourceRevision`) or as part of the parent repository's working tree? Does `WorkspaceSnapshot` automatically include all submodule revisions?  
-**Impact**: Affects manifest hash algorithm (currently unspecified for submodules), the discovery walk implementation, and `core_repositories` row count per workspace.  
-**Suggested resolution**: Treat each submodule as a separate `core_repositories` entry with its own `SourceRevision`. Add to source_revision.md §2.5 when resolved.
+**Status**: RESOLVED
+**Owning phase**: Phase 1B
+**Source contract**: `docs/contracts/discovery.md` §3 (GlobRule), `docs/contracts/source_revision.md` §2
+**Resolution**: Each Git submodule is treated as a separate `core_repositories` entry with its own `SourceRevision` and manifest hash. The parent `WorkspaceSnapshot` includes a `submodule_revisions` field (relative path + HEAD SHA) so the parent hash changes when any submodule advances. Uninitialized submodules are ignored. See `docs/decisions/ADR-006-submodule-handling.md`.
 
 ---
 
 ## OQ-005 — Dirty Working-Tree Manifest Hash Stability
 
-**Status**: OPEN  
-**Owning phase**: Phase 1B  
-**Source contract**: `docs/contracts/source_revision.md` §2.3 (manifest hash algorithm), test SR-07  
-**Question**: If a file is modified and then restored to its committed content without a commit, does the manifest hash return to the clean-tree value? What is the watcher debounce interval?  
-**Impact**: Affects `attic-discovery` watcher implementation and `SourceRevision` invalidation frequency.  
-**Suggested resolution**: Manifest hash must reflect actual content; restored files produce the same hash as the clean tree. Debounce interval is a configuration value; record default in `docs/decisions/`.
+**Status**: RESOLVED
+**Owning phase**: Phase 1B
+**Source contract**: `docs/contracts/source_revision.md` §2.3 (manifest hash algorithm), test SR-07
+**Resolution**: The manifest hash is computed from actual file content (BLAKE3 of each file's bytes), not from Git object IDs. A file modified and then restored to its original content produces the same manifest hash as the clean tree. The watcher debounce interval defaults to 500 ms and is a `DiscoveryPolicy` configuration value. Confirmed by the `manifest_hash_is_deterministic_across_two_runs` test in `attic-discovery`.
 
 ---
 
@@ -113,22 +109,19 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-009 — FTS5 Tokenizer Selection
 
-**Status**: OPEN  
-**Owning phase**: Phase 1B  
-**Source contract**: `docs/contracts/storage.md` §7 (FTS5 configuration), `migrations/0001_initial.sql` §12 (`tokenize='unicode61'`)  
-**Question**: Is `unicode61` adequate for code search? Code identifiers (camelCase, snake_case) may benefit from a tokenizer that splits on case transitions and underscores.  
-**Impact**: Affects search quality for DEFINITION_LOOKUP and SYMBOL_NAVIGATION benchmark cases; may require a custom SQLite extension.  
-**Suggested resolution**: Default `unicode61` for Phase 1A (no change to migration). Evaluate SQLite `trigram` tokenizer (available ≥ 3.44) for symbol names in Phase 1B. Record evaluation in `docs/decisions/`.
+**Status**: RESOLVED
+**Owning phase**: Phase 1B
+**Source contract**: `docs/contracts/storage.md` §7 (FTS5 configuration), `migrations/0001_initial.sql` §12 (`tokenize='unicode61'`)
+**Resolution**: `unicode61` is retained for Phase 1B (no schema change). Evaluation of the SQLite `trigram` tokenizer (≥ 3.44) is deferred to Phase 1D when the MCP full-text search endpoint is implemented. The `trigram` tokenizer provides substring and regex matching without requiring explicit word boundaries, making it superior for symbol lookup; it will be adopted in Phase 1D alongside the FTS virtual table creation. No migration change required now.
 
 ---
 
 ## OQ-010 — Maximum Workspace Size Operational Limits
 
-**Status**: OPEN  
-**Owning phase**: Phase 1B  
-**Source contract**: `docs/contracts/large_files.md` §2, `docs/contracts/resources.md` §3  
-**Question**: What are the per-workspace operational limits on number of repositories, files, and symbols? Are these enforced at admission time or advisory?  
-**Suggested resolution**: Phase 1A target (advisory, not enforced): ≤ 50 repositories, ≤ 2 million files, ≤ 20 million symbols. Hard limits and admission enforcement are Phase 1B decisions.
+**Status**: RESOLVED
+**Owning phase**: Phase 1B
+**Source contract**: `docs/contracts/large_files.md` §2, `docs/contracts/resources.md` §3
+**Resolution**: Advisory limits for Phase 1B: ≤ 50 repositories, ≤ 2 million files per workspace, ≤ 20 million symbols per workspace. These are **advisory** (logged as diagnostics, not hard rejections) for Phase 1B. Hard admission-time enforcement (return `DiscoveryError::WorkspaceTooLarge`) is deferred to Phase 2 when the storage layer can efficiently query totals. The `DiscoveryDiagnostic` system introduced in Phase 1B carries `ExceedsAdvisoryLimit` warnings to callers without aborting the walk.
 
 ---
 
@@ -174,12 +167,10 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-015 — Benchmark Fixture Repository Identity
 
-**Status**: OPEN  
-**Owning phase**: Phase 1B  
-**Source contract**: `benchmarks/cases/q001_to_q050.md`, `benchmarks/cases/q051_to_q100.md`, `fixtures/git/`  
-**Question**: What are the actual fixture repositories used to evaluate the 100 benchmark cases? Synthetic workspace, real open-source projects, or a combination?  
-**Impact**: Determines `fixtures/git/` content and CI network access requirements.  
-**Suggested resolution**: Phase 1B: create a minimal synthetic Rust workspace in `fixtures/git/` with enough structure to cover all 100 cases. Avoid real external repositories in CI.
+**Status**: RESOLVED
+**Owning phase**: Phase 1B
+**Source contract**: `benchmarks/cases/q001_to_q050.md`, `benchmarks/cases/q051_to_q100.md`, `fixtures/git/`
+**Resolution**: A minimal synthetic Rust workspace is used as the primary fixture in `fixtures/git/`. It is committed directly to the repository (no network access required in CI). The synthetic workspace contains enough structural variety (src/, tests/, migrations/, vendor/, generated code stubs, secret-pattern fixtures, large-file stubs) to cover all 100 benchmark cases. Real open-source repositories are explicitly excluded from CI fixtures to preserve offline-first principle and avoid licence/size issues.
 
 ---
 
