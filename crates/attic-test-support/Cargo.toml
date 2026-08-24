@@ -7,7 +7,5 @@ description = "Shared test helpers and fixtures for Attic crates"
 license.workspace = true
 
 [dependencies]
-attic-core = { path = "../attic-core" }
-serde.workspace = true
-serde_json.workspace = true
-tracing.workspace = true
+
+[dev-dependencies]

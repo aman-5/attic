@@ -6,9 +6,8 @@ Recorded: 2026-08-24
 
 | Item | Value | Notes |
 |------|-------|-------|
-| Toolchain | `1.98.0-x86_64-pc-windows-gnu` | GNU variant required; no MSVC linker on host |
+| Toolchain | `1.98.0` | Portable — no platform suffix. Windows GNU setup: see `docs/local-setup/WINDOWS.md` |
 | MSRV | 1.88 | Minimum required by rmcp 3.x |
-| Linker | `gcc` via MinGW 16.2.0 (Scoop) | Installed user-local, no admin required |
 
 ## Workspace Dependencies (pinned 2026-08-24)
 
@@ -27,8 +26,8 @@ Recorded: 2026-08-24
 |-------|-------------|--------|
 | rmcp | Phase 1D | MCP SDK — not needed until stdio transport skeleton |
 | rusqlite / sqlx | Phase 1A | Storage layer not yet implemented |
-| tree-sitter | Phase 1C | Analyzers not yet implemented |
-| notify | Phase 1B | File watching not yet implemented |
+| tree-sitter | Phase 3 | Structural analyzers not yet implemented |
+| notify | Phase 2 | File watching not yet implemented |
 | fastembed / ort | Phase 5 | Semantic embeddings — Phase 5 only |
 
 ## Verification Sources

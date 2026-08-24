@@ -1,6 +1,6 @@
 [toolchain]
-# Pinned to stable GNU variant (no MSVC linker required).
-# Verified: rustc 1.98.0 (2026-08-18) >= MSRV 1.88 required by rmcp 3.x.
+# Pinned to stable. Verified: rustc 1.98.0 (2026-08-18) >= MSRV 1.88 required by rmcp 3.x.
 # Re-verify before upgrading.
-channel = "1.98.0-x86_64-pc-windows-gnu"
+# Windows users without MSVC: see docs/local-setup/WINDOWS.md for GNU toolchain setup.
+channel    = "1.98.0"
 components = ["rustfmt", "clippy"]

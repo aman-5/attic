@@ -1,19 +1,15 @@
 [package]
-name        = "attic-analyzers"
-description = "Attic — Analyzer trait, AnalyzerRegistry, GenericAnalyzer, language/format analyzers"
-version.workspace     = true
-edition.workspace     = true
+name         = "attic-analyzers"
+description  = "Attic — language analyzers (Bootstrap skeleton)"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-authors.workspace     = true
-license.workspace     = true
-repository.workspace  = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
 
+# No dependencies during Bootstrap.
+# Analyzer trait, tree-sitter grammars and domain deps added in Phase 1C / Phase 3.
 [dependencies]
-attic-core = { workspace = true }
-serde      = { workspace = true }
-thiserror  = { workspace = true }
-tracing    = { workspace = true }
-
-# Tree-sitter grammar crates added in Phase 3.
 
 [dev-dependencies]
