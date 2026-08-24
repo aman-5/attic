@@ -15,6 +15,7 @@ E. STATE INVARIANTS
 F. DEFINE TESTS
 G. IMPLEMENT MINIMUM CHANGE
 H. RUN CHECKS
+H.1 Command Execution and Endpoint Security
 I. INSPECT DIFF
 J. RECORD DECISION
 K. STOP AT GATE
@@ -64,6 +65,61 @@ cargo test --workspace
 ```
 
 Run phase-specific tests too.
+
+### H.1 Command Execution and Endpoint Security
+
+Execute required development commands directly.
+
+Do not create ad-hoc PowerShell, CMD, BAT, shell, Python, Node, or other wrapper scripts merely to:
+
+- capture command output;
+- capture exit codes;
+- retry failed commands;
+- change execution targets;
+- work around execution failures;
+- work around endpoint-security controls.
+
+Reviewed project scripts that are explicitly part of Attic are allowed when required by the approved implementation.
+
+#### Endpoint-security rule
+
+If CrowdStrike, Windows Defender, or any other endpoint-security control blocks a command, executable, compiler output, test binary, script, or process:
+
+1. STOP the affected execution.
+2. Report the exact command that was executed.
+3. Report the executable/process that was blocked.
+4. Report the compilation target and exact error.
+5. Do not automatically retry through another shell, wrapper, target, renamed/copied executable, or alternate execution mechanism.
+6. Do not disable, bypass, whitelist, exclude, or modify endpoint-security controls.
+7. Do not add the project, `target/`, Cargo directories, executables, or build artifacts to security exclusions.
+8. Wait for explicit user approval before attempting further execution related to the block.
+
+#### Current Windows development environment
+
+On the current Windows development machine, Rust validation commands use:
+
+`--target x86_64-pc-windows-msvc`
+
+because machine-local Cargo configuration may otherwise select the GNU target.
+
+This is a local execution requirement only.
+
+Never encode this target, a machine-specific linker path, user-specific Cargo configuration, or absolute machine path into Attic's tracked repository configuration.
+
+These rules apply to all development-time execution, including:
+
+- builds;
+- tests;
+- benchmarks;
+- migrations;
+- fixture generators;
+- integration tests;
+- recovery tests;
+- analyzer tests;
+- MCP tests;
+- semantic tests;
+- packaging validation;
+- production validation.
 
 ### I. INSPECT DIFF
 Check for:
