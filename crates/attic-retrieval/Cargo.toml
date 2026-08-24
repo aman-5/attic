@@ -9,12 +9,5 @@ license.workspace     = true
 repository.workspace  = true
 
 [dependencies]
-attic-core    = { workspace = true }
-attic-storage = { workspace = true }
-serde         = { workspace = true }
-thiserror     = { workspace = true }
-tracing       = { workspace = true }
-tokio         = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }

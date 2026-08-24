@@ -1,19 +1,15 @@
 [package]
-name        = "attic-discovery"
-description = "Attic — repository discovery, Git-aware ignore, path canonicalization, security boundaries"
-version.workspace     = true
-edition.workspace     = true
+name         = "attic-discovery"
+description  = "Attic — repository and file discovery (Bootstrap skeleton)"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-authors.workspace     = true
-license.workspace     = true
-repository.workspace  = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
 
+# No dependencies during Bootstrap.
+# Git-aware ignore walking and domain deps added in Phase 1B.
 [dependencies]
-attic-core = { workspace = true }
-serde      = { workspace = true }
-thiserror  = { workspace = true }
-tracing    = { workspace = true }
-
-# Git-aware ignore walking (e.g. `ignore` crate) added in Phase 1B.
 
 [dev-dependencies]

@@ -1,22 +1,15 @@
 [package]
-name        = "attic-indexing"
-description = "Attic — indexing orchestration, SourceRevision capture, invalidation DAG, freshness, checkpoints"
-version.workspace     = true
-edition.workspace     = true
+name         = "attic-indexing"
+description  = "Attic — indexing orchestration (Bootstrap skeleton)"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-authors.workspace     = true
-license.workspace     = true
-repository.workspace  = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
 
+# No dependencies during Bootstrap.
+# Domain deps, tokio, and storage deps added in Phase 1A/1B/1C/2.
 [dependencies]
-attic-core      = { workspace = true }
-attic-storage   = { workspace = true }
-attic-discovery = { workspace = true }
-attic-analyzers = { workspace = true }
-serde           = { workspace = true }
-thiserror       = { workspace = true }
-tracing         = { workspace = true }
-tokio           = { workspace = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }

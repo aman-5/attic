@@ -7,15 +7,12 @@
 #![deny(clippy::all)]
 
 /// Placeholder so the crate compiles during Bootstrap.
-pub mod evidence {
-    /// Marker type — replaced in Phase 4/5.
-    pub struct Evidence;
-}
+pub mod evidence {}
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn placeholder_passes() {
-        // placeholder — replace with real assertions in Phase 1
+    fn crate_is_present() {
+        // placeholder — evidence type tests added in Phase 4
     }
 }

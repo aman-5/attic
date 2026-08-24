@@ -1,21 +1,16 @@
 [package]
-name        = "attic-core"
-description = "Attic — pure domain model: IDs, revisions, snapshots, identities, evidence, retrieval plan"
-version.workspace     = true
-edition.workspace     = true
+name         = "attic-core"
+description  = "Attic — pure domain model (Bootstrap skeleton)"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-authors.workspace     = true
-license.workspace     = true
-repository.workspace  = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
 
+# No dependencies during Bootstrap — domain types are added in Phase 0.
+# attic-core must NEVER depend on: tokio, SQLite, rmcp, tree-sitter, notify,
+# or any I/O or transport crate.
 [dependencies]
-serde      = { workspace = true }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
-tracing    = { workspace = true }
-
-# attic-core must NOT depend on: tokio, SQLite, rmcp, tree-sitter, notify,
-# or any other I/O or transport crate. That constraint is enforced by this
-# Cargo.toml having none of them.
 
 [dev-dependencies]
