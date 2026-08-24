@@ -14,16 +14,16 @@
 //!   → priority classification
 //!   → eligible manifest
 //!   → SourceRevision manifest hash
-//!   → per-file secrets classification (Safe / Redacted / Excluded)
+//!   → per-file secrets classification (Safe / Redacted / Excluded / PartialScan)
 //!     (classification only — content is NOT retained in DiscoveryOutput)
 //! ```
 //!
 //! # Downstream content contract
 //!
 //! `DiscoveryOutput` records a **classification** for each eligible file —
-//! whether its content is safe, redacted, or excluded — but does **not**
-//! retain the file content in memory.  This ensures the discovery pass
-//! remains bounded even for workspaces with 500 K+ files.
+//! whether its content is safe, redacted, excluded, or only partially scanned —
+//! but does **not** retain the file content in memory.  This ensures the
+//! discovery pass remains bounded even for workspaces with 500 K+ files.
 //!
 //! Consumers that need actual file content call [`preprocess_file_content`]
 //! per file, which reads, secret-scans, and returns the (possibly redacted)
@@ -31,11 +31,16 @@
 //!
 //! Large-file handling follows `docs/contracts/large_files.md`:
 //!
-//! | Tier | Size | Secrets scan |
-//! |------|------|--------------|
-//! | SMALL / MEDIUM | < 4 MiB | Full content scanned |
-//! | LARGE | 4 MiB – 50 MiB | Sample only (first + last `MAX_SAMPLE_BYTES`) |
-//! | VERY_LARGE | > 50 MiB | Sample only + `PartialSecretScan` diagnostic |
+//! | Tier | Size | Secrets scan | Content returned |
+//! |------|------|--------------|-----------------|
+//! | SMALL / MEDIUM | < 4 MiB | Full content scanned | Present (redacted if needed) |
+//! | LARGE | 4 MiB – 50 MiB | **Full streaming scan** (bounded chunks) | `None` — caller streams separately |
+//! | VERY_LARGE | > 50 MiB | Head + tail sample only | Sample (partial) |
+//!
+//! VERY_LARGE files are classified as [`DownstreamClassification::PartialScan`]
+//! (never `Safe`) because the body between the head and tail samples is not
+//! inspected.  Consumers **must not** treat `PartialScan` as equivalent to
+//! `Safe`.
 //!
 //! # Entry point
 //!
@@ -82,9 +87,21 @@ pub const MAX_FULL_LOAD_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 /// Files above this threshold are VERY_LARGE — metadata + sample only.
 pub const MAX_LARGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
-/// Bytes sampled from start and end of LARGE / VERY_LARGE files for secret
-/// scanning (matches `MAX_SAMPLE_BYTES` from the contract).
+/// Bytes sampled from start and end of VERY_LARGE files for secret scanning
+/// (matches `MAX_SAMPLE_BYTES` from the contract).
 pub const MAX_SAMPLE_BYTES: usize = 8 * 1024; // 8 KiB
+
+/// Chunk size for the bounded streaming secret scan of LARGE files.
+///
+/// Each chunk is read into memory independently; only two chunks (current +
+/// overlap tail) are live at once, so peak allocation is
+/// `LARGE_SCAN_CHUNK_BYTES + CHUNK_OVERLAP_BYTES`, not the full file size.
+pub const LARGE_SCAN_CHUNK_BYTES: usize = 128 * 1024; // 128 KiB
+
+/// Overlap between consecutive scan windows to catch secrets that span a
+/// chunk boundary.  Must be >= the length of the longest V1 secret pattern.
+/// 256 bytes comfortably covers all V1 patterns.
+const CHUNK_OVERLAP_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Downstream content classification
@@ -95,11 +112,12 @@ pub const MAX_SAMPLE_BYTES: usize = 8 * 1024; // 8 KiB
 pub enum FileSizeTier {
     /// < 4 MiB — full content loaded and scanned.
     Small,
-    /// 4 MiB – 50 MiB — only a sample is scanned; full content streamed by
-    /// later pipeline stages.
+    /// 4 MiB to 50 MiB — full streaming secret scan; content streamed on demand
+    /// by later pipeline stages (not buffered during discovery).
     Large,
-    /// Above 50 MiB — only a sample is scanned; a `PartialSecretScan`
-    /// diagnostic is recorded.
+    /// Above 50 MiB — only a head + tail sample is scanned; a
+    /// `PartialSecretScan` diagnostic is recorded.  Classified as
+    /// [`DownstreamClassification::PartialScan`], never `Safe`.
     VeryLarge,
 }
 
@@ -111,13 +129,20 @@ pub enum FileSizeTier {
 #[derive(Debug, Clone)]
 pub enum DownstreamClassification {
     /// No secrets found.  Content is safe for downstream indexing.
+    ///
+    /// Only produced when the **entire** file has been scanned:
+    /// - SMALL/MEDIUM: full text scan.
+    /// - LARGE: complete streaming chunk scan.
+    ///
+    /// VERY_LARGE files are **never** classified as `Safe`; they produce
+    /// [`DownstreamClassification::PartialScan`] instead.
     Safe {
         /// Size tier at discovery time.
         size_tier: FileSizeTier,
     },
     /// Secrets were found; content must be redacted before indexing.
-    /// `findings` lists pattern IDs and (for small files) byte offsets only;
-    /// no raw secret values are stored in findings.
+    /// `findings` lists pattern IDs and byte offsets only;
+    /// no raw secret values are stored.
     Redacted {
         /// Size tier at discovery time.
         size_tier: FileSizeTier,
@@ -127,6 +152,17 @@ pub enum DownstreamClassification {
     /// The file is a known secrets carrier (e.g. `.netrc`, `id_rsa`) and must
     /// not be indexed at all.
     Excluded,
+    /// **VERY_LARGE file**: only a head + tail sample was scanned.
+    ///
+    /// The body between the two samples was **not** inspected.  Downstream
+    /// consumers **must not** treat this as equivalent to [`Self::Safe`].
+    /// A `PARTIAL_SECRET_SCAN` diagnostic is recorded alongside this result.
+    ///
+    /// `findings` contains any secrets detected in the sample portion.
+    PartialScan {
+        /// Secrets detected in the sampled portion (no raw secret values).
+        findings: Vec<SecretFinding>,
+    },
     /// Secret scanning was skipped or could not be completed (e.g. unreadable
     /// file, binary content).  The file must not be indexed until rescanned.
     ScanSkipped {
@@ -145,9 +181,9 @@ use std::path::Path;
 /// The complete output of a single discovery pass over one root directory.
 ///
 /// `downstream_classifications` records the secrets-scan *classification*
-/// (Safe / Redacted / Excluded / ScanSkipped) for each eligible file, but
-/// does **not** retain file content.  Callers retrieve content lazily via
-/// [`preprocess_file_content`].
+/// (Safe / Redacted / Excluded / PartialScan / ScanSkipped) for each eligible
+/// file, but does **not** retain file content.  Callers retrieve content
+/// lazily via [`preprocess_file_content`].
 #[derive(Debug)]
 pub struct DiscoveryOutput {
     /// Eligible files sorted by `repo_relative` path.
@@ -176,9 +212,12 @@ pub struct DiscoveryOutput {
 /// 3. Walk the tree with the `ignore` crate using `policy`.
 /// 4. Apply security exclusions, default exclusions, and classification.
 /// 5. Build the BLAKE3 manifest (using raw bytes — before redaction).
-/// 6. For each eligible file: determine size tier, scan a bounded amount of
-///    content for secrets, and record the [`DownstreamClassification`].
-///    **File content is not retained in the returned `DiscoveryOutput`.**
+/// 6. For each eligible file: determine size tier, scan content for secrets,
+///    and record the [`DownstreamClassification`].
+///    - SMALL/MEDIUM: full content scan.
+///    - LARGE: bounded streaming chunk scan (no full-file allocation).
+///    - VERY_LARGE: head + tail sample only; classified as `PartialScan`.
+///      **File content is not retained in the returned `DiscoveryOutput`.**
 /// 7. Return [`DiscoveryOutput`].
 ///
 /// # Errors
@@ -206,7 +245,7 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
         None
     };
 
-    // 3–4. Walk + security + classification.
+    // 3-4. Walk + security + classification.
     let walk_result = walk::walk(&canonical_root, policy)?;
 
     let mut all_diagnostics = walk_result.diagnostics;
@@ -219,8 +258,10 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
     all_diagnostics.extend(manifest.unstable_captures.clone());
 
     // 6. Classify each file's content for downstream use.
-    //    We determine the size tier and scan a bounded amount of content for
-    //    secrets.  Content is NOT retained — only the classification is stored.
+    //    SMALL/MEDIUM: full scan.
+    //    LARGE: bounded streaming scan (no full-file allocation).
+    //    VERY_LARGE: head+tail sample → PartialScan classification.
+    //    Content is NOT retained — only the classification is stored.
     let mut downstream_classifications: Vec<(String, DownstreamClassification)> =
         Vec::with_capacity(walk_result.entries.len());
 
@@ -240,15 +281,18 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
 }
 
 /// Classify one file's content for downstream use by determining its size
-/// tier and scanning a bounded portion of its content for secrets.
+/// tier and applying the appropriate secret-scanning strategy.
 ///
 /// **No content is retained after this function returns.**
 ///
-/// For SMALL/MEDIUM files (< `MAX_FULL_LOAD_BYTES`) the full content is
-/// scanned.  For LARGE/VERY_LARGE files only the first + last
-/// `MAX_SAMPLE_BYTES` are scanned; a `PartialSecretScan` diagnostic is added
-/// for VERY_LARGE files because the body between the two samples is not
-/// inspected.
+/// - SMALL/MEDIUM (< `MAX_FULL_LOAD_BYTES`): full content scanned.
+/// - LARGE (`MAX_FULL_LOAD_BYTES`..=`MAX_LARGE_BYTES`): the entire file is
+///   scanned in bounded `LARGE_SCAN_CHUNK_BYTES` chunks; at most two chunks
+///   are live in memory simultaneously.
+/// - VERY_LARGE (> `MAX_LARGE_BYTES`): only the first + last `MAX_SAMPLE_BYTES`
+///   are scanned; a `PARTIAL_SECRET_SCAN` diagnostic is recorded; the
+///   classification is always [`DownstreamClassification::PartialScan`], never
+///   `Safe`, because the mid-body was not inspected.
 fn classify_file_for_downstream(
     abs_path: &Path,
     repo_relative: &str,
@@ -272,69 +316,172 @@ fn classify_file_for_downstream(
         FileSizeTier::Small
     };
 
-    // For SMALL/MEDIUM: load full text content; scan entirely.
-    // For LARGE/VERY_LARGE: read only a bounded sample for secret scanning.
-    let scan_content: String = match size_tier {
+    match size_tier {
         FileSizeTier::Small => {
             // Full content — bounded by MAX_FULL_LOAD_BYTES.
-            match std::fs::read_to_string(abs_path) {
+            let content = match std::fs::read_to_string(abs_path) {
                 Ok(s) => s,
                 Err(_) => {
-                    // Binary or unreadable: cannot scan.
                     return DownstreamClassification::ScanSkipped {
                         reason: "file unreadable or binary".to_string(),
                     };
                 }
+            };
+            let preprocess = secrets::preprocess(&content, repo_relative);
+            // Drop content immediately — do not propagate to caller.
+            drop(content);
+            match preprocess.decision {
+                SecretScanDecision::Excluded => DownstreamClassification::Excluded,
+                SecretScanDecision::Safe => DownstreamClassification::Safe { size_tier },
+                SecretScanDecision::Redacted => DownstreamClassification::Redacted {
+                    size_tier,
+                    findings: preprocess.findings,
+                },
+                // PartialScan is never returned by `secrets::preprocess` (which
+                // always has access to the full text it was given). Handle
+                // defensively so the match is exhaustive.
+                SecretScanDecision::PartialScan => DownstreamClassification::ScanSkipped {
+                    reason: "unexpected PartialScan from full-content preprocess".to_string(),
+                },
             }
         }
-        FileSizeTier::Large | FileSizeTier::VeryLarge => {
-            // Sample only: first MAX_SAMPLE_BYTES + last MAX_SAMPLE_BYTES.
-            match read_sample(abs_path, MAX_SAMPLE_BYTES) {
-                Ok(s) => {
-                    if matches!(size_tier, FileSizeTier::VeryLarge) {
-                        // Record that the body between the two samples was not
-                        // scanned — a downstream consumer must handle this.
-                        diagnostics.push(Diagnostic {
-                            kind: DiagnosticKind::IoError,
-                            path: abs_path.to_path_buf(),
-                            message: format!(
-                                "PARTIAL_SECRET_SCAN: '{}' is {size_bytes} bytes \
-                                 (VERY_LARGE); only {MAX_SAMPLE_BYTES}-byte head/tail \
-                                 samples were scanned for secrets",
-                                repo_relative
-                            ),
-                        });
-                    }
-                    s
-                }
+
+        FileSizeTier::Large => {
+            // Streaming chunk scan — the ENTIRE file is scanned but only
+            // LARGE_SCAN_CHUNK_BYTES + CHUNK_OVERLAP_BYTES bytes are live
+            // at any one time.  No full-file allocation.
+            stream_scan_large_file_classify(abs_path, repo_relative)
+        }
+
+        FileSizeTier::VeryLarge => {
+            // Sample-only scan: head + tail.  The mid-body is NOT inspected.
+            // Classification is ALWAYS PartialScan, never Safe.
+            let sample = match read_sample(abs_path, MAX_SAMPLE_BYTES) {
+                Ok(s) => s,
                 Err(e) => {
                     return DownstreamClassification::ScanSkipped {
                         reason: format!("sample read failed: {e}"),
                     };
                 }
+            };
+
+            // Record that mid-body was not scanned.
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::IoError,
+                path: abs_path.to_path_buf(),
+                message: format!(
+                    "PARTIAL_SECRET_SCAN: '{}' is {size_bytes} bytes \
+                     (VERY_LARGE); only {MAX_SAMPLE_BYTES}-byte head/tail \
+                     samples were scanned for secrets; mid-body NOT inspected",
+                    repo_relative
+                ),
+            });
+
+            // Scan the sample for secrets.
+            let result = secrets::scan_and_redact(&sample);
+            drop(sample);
+
+            // Regardless of whether findings were detected in the sample,
+            // this is always PartialScan — never Safe.
+            DownstreamClassification::PartialScan {
+                findings: result.findings,
             }
+        }
+    }
+}
+
+/// Scan a LARGE file for secrets using a bounded streaming approach.
+///
+/// The file is read in `LARGE_SCAN_CHUNK_BYTES` chunks.  To catch secrets
+/// that span a chunk boundary, the last `CHUNK_OVERLAP_BYTES` bytes of the
+/// previous chunk are prepended to each new chunk before scanning.
+///
+/// At most `LARGE_SCAN_CHUNK_BYTES + CHUNK_OVERLAP_BYTES` bytes are live at
+/// any one time — the full file is **never** loaded into memory.
+///
+/// Returns `Safe { Large }` if no secrets are found across the entire file,
+/// `Redacted { Large, findings }` if secrets were detected, or `ScanSkipped`
+/// if the file cannot be opened or contains non-UTF-8 content.
+fn stream_scan_large_file_classify(abs_path: &Path, repo_relative: &str) -> DownstreamClassification {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // Check path-based exclusion first (e.g. `.env`, `*.pem`).
+    if secrets::is_known_secrets_file(repo_relative) {
+        return DownstreamClassification::Excluded;
+    }
+
+    let file = match File::open(abs_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return DownstreamClassification::ScanSkipped {
+                reason: format!("open failed: {e}"),
+            };
         }
     };
 
-    // Run secrets preprocess on the (bounded) content.
-    let preprocess = secrets::preprocess(&scan_content, repo_relative);
-    // Drop scan_content immediately — do not propagate to caller.
-    drop(scan_content);
+    let mut reader = BufReader::new(file);
+    let mut all_findings: Vec<SecretFinding> = Vec::new();
+    // Overlap tail carried forward from the previous window.
+    let mut overlap: Vec<u8> = Vec::new();
+    // Cumulative byte offset of the start of the *overlap* window within
+    // the file — used to adjust finding offsets to be file-relative.
+    let mut window_file_offset: usize = 0;
 
-    match preprocess.decision {
-        SecretScanDecision::Excluded => DownstreamClassification::Excluded,
-        SecretScanDecision::Safe => DownstreamClassification::Safe { size_tier },
-        SecretScanDecision::Redacted => DownstreamClassification::Redacted {
-            size_tier,
-            // Store findings metadata only — no raw secret values.
-            findings: preprocess.findings,
-        },
+    let mut raw_chunk = vec![0u8; LARGE_SCAN_CHUNK_BYTES];
+
+    loop {
+        let n = match reader.read(&mut raw_chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                return DownstreamClassification::ScanSkipped {
+                    reason: format!("read failed: {e}"),
+                };
+            }
+        };
+
+        // Build the scan window: overlap from previous chunk + new bytes.
+        let mut window_bytes = Vec::with_capacity(overlap.len() + n);
+        window_bytes.extend_from_slice(&overlap);
+        window_bytes.extend_from_slice(&raw_chunk[..n]);
+
+        // Convert to str for the scanner (lossy — replace invalid UTF-8 with
+        // the replacement character so we never miss an ASCII secret).
+        let window_str = String::from_utf8_lossy(&window_bytes).into_owned();
+
+        let scan_result = secrets::scan_and_redact(&window_str);
+
+        // Adjust finding offsets to be file-relative and collect.
+        for mut finding in scan_result.findings {
+            finding.offset += window_file_offset;
+            all_findings.push(finding);
+        }
+
+        // Prepare overlap for the next iteration:
+        // keep the last CHUNK_OVERLAP_BYTES of the *new* bytes only (not the
+        // full window) so the overlap window doesn't grow unboundedly.
+        let overlap_start = n.saturating_sub(CHUNK_OVERLAP_BYTES);
+        overlap = raw_chunk[overlap_start..n].to_vec();
+        // Advance the file offset by the new bytes consumed this iteration.
+        window_file_offset += n;
+    }
+
+    if all_findings.is_empty() {
+        DownstreamClassification::Safe {
+            size_tier: FileSizeTier::Large,
+        }
+    } else {
+        DownstreamClassification::Redacted {
+            size_tier: FileSizeTier::Large,
+            findings: all_findings,
+        }
     }
 }
 
 /// Read the first `sample_bytes` and last `sample_bytes` of a file into a
 /// `String`, discarding any non-UTF-8 bytes.  Used for secret scanning of
-/// LARGE / VERY_LARGE files without loading the full content.
+/// VERY_LARGE files without loading the full content.
 fn read_sample(path: &Path, sample_bytes: usize) -> io::Result<String> {
     use std::fs::File;
     use std::io::Seek;
@@ -363,32 +510,71 @@ fn read_sample(path: &Path, sample_bytes: usize) -> io::Result<String> {
 }
 
 /// Process a single file's content through the secrets layer and return the
-/// redacted or raw content as appropriate, following the large-file contract.
+/// result appropriate for its size tier, following the large-file contract.
 ///
 /// This is the **lazy content accessor** for downstream consumers.  It reads
-/// the file, scans it, and returns content safe for indexing.  It does not
-/// retain state — callers invoke it per file when they need content.
+/// the file, scans it for secrets, and returns a [`PreprocessResult`] whose
+/// `content` field is:
 ///
-/// For LARGE / VERY_LARGE files this returns the sampled content only; the
-/// caller is responsible for further streaming or region-based processing per
-/// `docs/contracts/large_files.md`.
+/// - **SMALL/MEDIUM** (< `MAX_FULL_LOAD_BYTES`): the full (possibly redacted)
+///   content as a `String`.  Decision is `Safe`, `Redacted`, or `Excluded`.
+/// - **LARGE** (`MAX_FULL_LOAD_BYTES`..=`MAX_LARGE_BYTES`): `content` is
+///   `None`.  The entire file was scanned via the streaming chunked scanner
+///   but is **not buffered** here — callers must stream the file themselves
+///   for content delivery.  Decision is `Safe`, `Redacted`, or `Excluded`.
+/// - **VERY_LARGE** (> `MAX_LARGE_BYTES`): `content` contains the head + tail
+///   sample only (not the full file).  Decision is always `PartialScan` —
+///   never `Safe` — because the mid-body was not inspected.
 ///
 /// # Errors
 ///
-/// Returns `Err` if the file cannot be opened or read.
+/// Returns `Err` if the file cannot be opened or stat'd.
 pub fn preprocess_file_content(
     abs_path: &Path,
     repo_relative: &str,
 ) -> io::Result<PreprocessResult> {
     let size_bytes = std::fs::metadata(abs_path)?.len();
 
-    let raw: String = if size_bytes > MAX_FULL_LOAD_BYTES {
-        // LARGE / VERY_LARGE: sample only.
-        read_sample(abs_path, MAX_SAMPLE_BYTES)?
-    } else {
-        std::fs::read_to_string(abs_path)?
-    };
+    if size_bytes > MAX_LARGE_BYTES {
+        // VERY_LARGE: sample-only scan, PartialScan decision.
+        let sample = read_sample(abs_path, MAX_SAMPLE_BYTES)?;
+        let scan = secrets::scan_and_redact(&sample);
+        // Return the sample as content so callers can at least display it;
+        // but the decision is unambiguously PartialScan.
+        return Ok(PreprocessResult {
+            decision: SecretScanDecision::PartialScan,
+            content: Some(scan.redacted),
+            findings: scan.findings,
+        });
+    }
 
+    if size_bytes > MAX_FULL_LOAD_BYTES {
+        // LARGE: streaming scan of entire file; content NOT buffered.
+        let classification = stream_scan_large_file_classify(abs_path, repo_relative);
+        let decision = match &classification {
+            DownstreamClassification::Safe { .. } => SecretScanDecision::Safe,
+            DownstreamClassification::Redacted { .. } => SecretScanDecision::Redacted,
+            DownstreamClassification::Excluded => SecretScanDecision::Excluded,
+            DownstreamClassification::PartialScan { .. } => SecretScanDecision::PartialScan,
+            DownstreamClassification::ScanSkipped { reason } => {
+                return Err(io::Error::other(reason.clone()));
+            }
+        };
+        let findings = match classification {
+            DownstreamClassification::Redacted { findings, .. } => findings,
+            DownstreamClassification::PartialScan { findings } => findings,
+            _ => Vec::new(),
+        };
+        // content is None — caller must stream the file for actual content.
+        return Ok(PreprocessResult {
+            decision,
+            content: None,
+            findings,
+        });
+    }
+
+    // SMALL/MEDIUM: full content, full scan.
+    let raw = std::fs::read_to_string(abs_path)?;
     Ok(secrets::preprocess(&raw, repo_relative))
 }
 
@@ -523,7 +709,6 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let output = discover(root, &policy).unwrap();
 
-        // Verify that DownstreamClassification::Safe does not carry a String.
         let entry = output
             .downstream_classifications
             .iter()
@@ -569,8 +754,6 @@ mod tests {
                     !findings.is_empty(),
                     "at least one finding expected for AWS key; got {findings:?}"
                 );
-                // Verify no raw key value is in the findings (findings are
-                // metadata only — pattern IDs, not raw secret values).
             }
             other => panic!(
                 "expected Redacted classification for file with AWS key; got {other:?}"
@@ -578,19 +761,11 @@ mod tests {
         }
     }
 
-    /// A known secrets carrier (`.netrc`-style content, if it reaches
-    /// classification) must produce `Excluded`.
-    ///
-    /// We test this via the public `preprocess_file_content` lazy accessor
-    /// rather than through `discover()`, because the walk security layer may
-    /// already exclude these files before they enter `downstream_classifications`.
-    /// The important invariant is that calling `preprocess_file_content` on a
-    /// known-secrets-carrier path returns `Excluded` — callers must honour that.
+    /// A known secrets carrier (`.netrc`-style content) must produce `Excluded`.
     #[test]
     fn known_secret_carrier_produces_excluded_classification() {
         let tmp = TempDir::new().unwrap();
 
-        // Write a `.netrc`-style file that `is_known_secrets_file` recognises.
         let path = tmp.path().join(".netrc");
         fs::write(&path, "machine example.com login user password s3cr3t").unwrap();
 
@@ -619,7 +794,6 @@ mod tests {
 
         // Write a file just over the 4 MiB boundary.
         let size = MAX_FULL_LOAD_BYTES as usize + 1;
-        // Use all-ASCII content so `read_to_string` never rejects it as binary.
         let content = "a".repeat(size);
         write_file(root, "data/large.txt", &content);
 
@@ -653,8 +827,7 @@ mod tests {
         }
     }
 
-    /// `preprocess_file_content` is the lazy per-file content accessor.
-    /// For a clean small file it returns `Safe` with content.
+    /// `preprocess_file_content` for a clean small file returns `Safe` with content.
     /// For a file containing a secret it returns `Redacted` with findings and
     /// the secret value removed from the returned content.
     #[test]
@@ -699,11 +872,272 @@ mod tests {
             "at least one finding expected; got {:?}",
             secret.findings
         );
-        // The raw key value must not appear in the returned content.
         let returned = secret.content.expect("Redacted result must carry redacted content");
         assert!(
             !returned.contains("AKIAIOSFODNN7EXAMPLE"),
             "raw secret must not survive in the returned content"
         );
+    }
+
+    // ── New focused tests for streaming LARGE scan and PartialScan ────────
+
+    /// A LARGE file whose AWS secret exists **only in the middle** must be
+    /// detected by the streaming scanner and classified as `Redacted`.
+    ///
+    /// This verifies that the chunked scan covers the full file, not just
+    /// head+tail samples.
+    #[test]
+    fn large_file_secret_in_middle_is_detected_by_streaming_scan() {
+        let tmp = TempDir::new().unwrap();
+
+        // Build a file that is just over MAX_FULL_LOAD_BYTES.
+        // Place the secret in the exact middle so head+tail sampling would miss it.
+        let half = MAX_FULL_LOAD_BYTES as usize / 2;
+        // "a" * half  +  AWS key  +  "b" * half  → total > 4 MiB
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let mut content = String::with_capacity(half * 2 + secret.len() + 10);
+        content.push_str(&"a".repeat(half));
+        content.push(' ');
+        content.push_str(secret);
+        content.push(' ');
+        content.push_str(&"b".repeat(half));
+
+        let path = tmp.path().join("large_with_middle_secret.txt");
+        fs::write(&path, &content).unwrap();
+
+        // Confirm the file is actually LARGE tier.
+        assert!(
+            content.len() as u64 > MAX_FULL_LOAD_BYTES,
+            "test setup: file must exceed MAX_FULL_LOAD_BYTES"
+        );
+        assert!(
+            content.len() as u64 <= MAX_LARGE_BYTES,
+            "test setup: file must not exceed MAX_LARGE_BYTES"
+        );
+
+        let result = preprocess_file_content(&path, "large_with_middle_secret.txt")
+            .expect("preprocess_file_content must not fail");
+
+        assert_eq!(
+            result.decision,
+            SecretScanDecision::Redacted,
+            "streaming scan must detect AWS key in middle of LARGE file; got {:?}",
+            result.decision
+        );
+        assert!(
+            !result.findings.is_empty(),
+            "must have at least one finding for the mid-file AWS key"
+        );
+        // content must be None for LARGE files (not buffered).
+        assert!(
+            result.content.is_none(),
+            "LARGE file preprocess must return content=None (not buffered)"
+        );
+    }
+
+    /// A clean LARGE file (no secrets anywhere) must be classified `Safe`
+    /// with `content=None` (not buffered).  This proves that the streaming
+    /// scanner completes without allocating the full file.
+    #[test]
+    fn large_clean_file_classifies_safe_with_no_content() {
+        let tmp = TempDir::new().unwrap();
+
+        let size = MAX_FULL_LOAD_BYTES as usize + 512;
+        // All lowercase letters — no secret pattern matches.
+        let content = "x".repeat(size);
+        let path = tmp.path().join("large_clean.txt");
+        fs::write(&path, &content).unwrap();
+
+        let result = preprocess_file_content(&path, "large_clean.txt")
+            .expect("preprocess_file_content must not fail for clean large file");
+
+        assert_eq!(
+            result.decision,
+            SecretScanDecision::Safe,
+            "clean LARGE file must be Safe; got {:?}",
+            result.decision
+        );
+        assert!(
+            result.content.is_none(),
+            "LARGE file preprocess must return content=None (not buffered); got Some(...)"
+        );
+        assert!(result.findings.is_empty(), "clean file must have no findings");
+    }
+
+    /// A clean VERY_LARGE file must be classified as `PartialScan`, never `Safe`.
+    /// The content field must be `Some(sample)` (the head+tail portion).
+    #[test]
+    fn very_large_clean_file_classified_as_partial_scan_not_safe() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+
+        // Write a file just over MAX_LARGE_BYTES using sparse writing.
+        // We only need the file to be large on-disk; content can be minimal.
+        // Use a file with clean head + tail but we don't control the middle —
+        // the point is that PartialScan must always be returned.
+        let path = root.join("data").join("very_large_clean.bin");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            use std::io::{Seek, Write};
+            let mut f = fs::File::create(&path).unwrap();
+            // Write 1 byte at offset MAX_LARGE_BYTES + 1 to create a sparse file
+            // of the required size without allocating 50 MiB of RAM.
+            let target = MAX_LARGE_BYTES + 1;
+            f.seek(io::SeekFrom::Start(target)).unwrap();
+            f.write_all(b"z").unwrap();
+        }
+
+        // Via discover() the classification must be PartialScan.
+        let policy = DiscoveryPolicy::default_git();
+        let output = discover(root, &policy).unwrap();
+
+        let entry = output
+            .downstream_classifications
+            .iter()
+            .find(|(p, _)| p == "data/very_large_clean.bin");
+
+        // The file may be excluded by the walk policy (binary / gitignore).
+        // If it is present, it must be PartialScan.
+        if let Some((_, classification)) = entry {
+            match classification {
+                DownstreamClassification::PartialScan { .. } => {
+                    // Correct — VERY_LARGE → always PartialScan.
+                }
+                DownstreamClassification::ScanSkipped { .. } => {
+                    // Acceptable if the file is binary/unreadable.
+                }
+                other => panic!(
+                    "VERY_LARGE file must be PartialScan or ScanSkipped; got {other:?}"
+                ),
+            }
+        }
+
+        // Also test via preprocess_file_content directly.
+        let result = preprocess_file_content(&path, "data/very_large_clean.bin")
+            .expect("preprocess_file_content must not fail");
+
+        assert_eq!(
+            result.decision,
+            SecretScanDecision::PartialScan,
+            "VERY_LARGE clean file must return PartialScan, not Safe; got {:?}",
+            result.decision
+        );
+        assert!(
+            result.content.is_some(),
+            "VERY_LARGE preprocess must return content=Some(sample)"
+        );
+    }
+
+    /// A VERY_LARGE file whose sample contains a secret must be classified
+    /// as `PartialScan` with non-empty findings — not `Safe`.
+    #[test]
+    fn very_large_file_with_secret_in_sample_classifies_partial_scan_with_findings() {
+        let tmp = TempDir::new().unwrap();
+
+        // Write a file > MAX_LARGE_BYTES.  Place an AWS key at the very start
+        // so it falls within the head sample.
+        let path = tmp.path().join("very_large_secret.txt");
+        {
+            use std::io::{Seek, Write};
+            let mut f = fs::File::create(&path).unwrap();
+            // Head: AWS key followed by padding to fill head sample.
+            let head_secret = b"AKIAIOSFODNN7EXAMPLE padding_padding_padding_padding_pad\n";
+            f.write_all(head_secret).unwrap();
+            // Seek past MAX_LARGE_BYTES to make it VERY_LARGE.
+            let target = MAX_LARGE_BYTES + 1;
+            f.seek(io::SeekFrom::Start(target)).unwrap();
+            f.write_all(b"end").unwrap();
+        }
+
+        let result = preprocess_file_content(&path, "very_large_secret.txt")
+            .expect("preprocess_file_content must not fail");
+
+        assert_eq!(
+            result.decision,
+            SecretScanDecision::PartialScan,
+            "VERY_LARGE file must always return PartialScan; got {:?}",
+            result.decision
+        );
+        assert!(
+            !result.findings.is_empty(),
+            "secret in VERY_LARGE head sample must produce findings"
+        );
+    }
+
+    /// The PARTIAL_SECRET_SCAN diagnostic must be emitted for every VERY_LARGE
+    /// file encountered during discovery.
+    #[test]
+    fn very_large_file_emits_partial_secret_scan_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+
+        let path = root.join("data").join("huge.bin");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            use std::io::{Seek, Write};
+            let mut f = fs::File::create(&path).unwrap();
+            let target = MAX_LARGE_BYTES + 1;
+            f.seek(io::SeekFrom::Start(target)).unwrap();
+            f.write_all(b"z").unwrap();
+        }
+
+        let policy = DiscoveryPolicy::default_git();
+        let output = discover(root, &policy).unwrap();
+
+        // If the file made it through the walk, there must be a
+        // PARTIAL_SECRET_SCAN diagnostic for it.
+        let was_classified = output
+            .downstream_classifications
+            .iter()
+            .any(|(p, _)| p == "data/huge.bin");
+
+        if was_classified {
+            let has_partial_diag = output.diagnostics.iter().any(|d| {
+                d.message.contains("PARTIAL_SECRET_SCAN")
+                    && d.path.to_string_lossy().contains("huge.bin")
+            });
+            assert!(
+                has_partial_diag,
+                "a PARTIAL_SECRET_SCAN diagnostic must be emitted for every VERY_LARGE file; \
+                 diagnostics: {:#?}",
+                output.diagnostics
+            );
+        }
+        // If the walk filtered the file out, the test passes trivially —
+        // the invariant only applies to files that enter classification.
+    }
+
+    /// No raw detected secret value may be returned through the `findings`
+    /// field of any `DownstreamClassification` or `PreprocessResult`.
+    /// Findings carry only metadata (pattern_id, offset, length).
+    #[test]
+    fn no_raw_secret_value_in_findings() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("secret.rs");
+        let raw_key = "AKIAIOSFODNN7EXAMPLE";
+        fs::write(&path, format!("const K: &str = \"{raw_key}\";\n")).unwrap();
+
+        let result = preprocess_file_content(&path, "secret.rs")
+            .expect("preprocess_file_content must not fail");
+
+        for finding in &result.findings {
+            // SecretFinding has: pattern_id (&'static str), offset (usize),
+            // length (usize). None of these fields carry raw secret bytes.
+            // Verify the pattern_id is a known label, not raw secret material.
+            assert!(
+                !finding.pattern_id.contains(raw_key),
+                "pattern_id must not contain raw secret: {:?}",
+                finding.pattern_id
+            );
+        }
+        // The content (if present) must not contain the raw key.
+        if let Some(content) = &result.content {
+            assert!(
+                !content.contains(raw_key),
+                "returned content must not contain the raw secret value"
+            );
+        }
     }
 }

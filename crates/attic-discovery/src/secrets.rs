@@ -56,11 +56,23 @@ pub struct SecretFinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretScanDecision {
     /// Content is safe to index (after redaction if needed).
+    ///
+    /// Only produced when the **entire** file content has been scanned.
+    /// LARGE-tier streaming scans and SMALL-tier full scans may produce this.
+    /// VERY_LARGE sample-only scans produce [`SecretScanDecision::PartialScan`]
+    /// instead — never `Safe` — because the mid-body was not inspected.
     Safe,
     /// Content contains secrets; redacted version is available.
     Redacted,
     /// File must not be indexed at all; it is a known secrets carrier.
     Excluded,
+    /// Only a sample of the file was scanned (VERY_LARGE tier).
+    ///
+    /// The sampled portion was clean (no secrets detected in it), but the
+    /// mid-body between the head and tail samples was **not** inspected.
+    /// Downstream consumers MUST NOT treat this as equivalent to `Safe`.
+    /// A `PARTIAL_SECRET_SCAN` diagnostic is recorded alongside this result.
+    PartialScan,
 }
 
 /// Full output of preprocessing one file's content.
@@ -407,9 +419,17 @@ fn find_jwt_tokens(text: &str) -> Vec<RawMatch> {
                         continue;
                     }
                 }
+                // seg2 didn't yield a valid JWT — skip past seg2_end to avoid
+                // rescanning the same base64url run from adjacent positions.
+                i = seg2_end;
+            } else {
+                // No dot after seg1 — no JWT can start anywhere inside this
+                // base64url run; skip to its end to avoid O(n²) rescanning.
+                i = seg1_end;
             }
+        } else {
+            i += 1;
         }
-        i += 1;
     }
     matches
 }
