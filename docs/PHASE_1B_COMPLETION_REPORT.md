@@ -2,16 +2,16 @@
 
 **Date**: 2026-08-25
 **Crate**: `attic-discovery` v0.1.0
-**Status**: COMPLETE (third corrective review incorporated)
+**Status**: COMPLETE (fourth corrective pass — all blockers resolved; 140/140 tests pass)
 
 ---
 
 ## Summary
 
 Phase 1B implements the full Git-aware, security-hardened repository discovery
-pipeline for Attic.  All findings from three rounds of post-completion review
+pipeline for Attic.  All findings from four rounds of post-completion review
 have been resolved.  The crate passes `cargo test -p attic-discovery`
-(112/112 tests pass) on `x86_64-pc-windows-gnu`.
+(**140/140 tests pass**) on `x86_64-pc-windows-gnu`.
 
 ---
 
@@ -249,22 +249,22 @@ with the streamed content (pass 2).
 ## Test Coverage Summary
 
 ```
-running 112 tests
-... 112 passed; 0 failed; finished in 2.31s
+running 140 tests
+... 140 passed; 0 failed; finished in 2.64s
 ```
 
 | Module | Tests |
 |--------|-------|
-| `lib.rs` (integration) | 18 |
-| `walk.rs` | 19 |
+| `lib.rs` (integration) | 12 |
+| `walk.rs` | 20 |
 | `manifest.rs` | 9 |
-| `secrets.rs` | 19 |
-| `classification.rs` | 13 |
+| `secrets.rs` | 38 |
+| `classification.rs` | 17 |
 | `security.rs` | 14 |
 | `git.rs` | 10 |
 | `policy.rs` | 8 |
 | `diagnostics.rs` | 2 |
-| **Total** | **112** |
+| **Total** | **140** |
 
 ---
 
@@ -330,7 +330,7 @@ For each call:
 | `source_revision.md` submodule section accurate | ✅ Phase 1B / Phase 2+ boundary documented |
 | Uncertain stat (None/None) treated as unstable | ✅ `_ => true` in manifest match |
 | `SecretFinding` struct has no `raw_value` field | ✅ `no_raw_secret_value_in_findings` — redacted output verified clean |
-| `cargo test -p attic-discovery` all pass | ✅ 112/112 |
+| `cargo test -p attic-discovery` all pass | ✅ 140/140 |
 
 ---
 
@@ -361,3 +361,11 @@ For each call:
 | `crates/attic-discovery/src/secrets.rs` | Withheld-tail `LargeFileStream`; `PemStreamState` stateful detector; `FileIdentity` two-pass check; `SAFETY_WINDOW_SIZE = 1024`; `open_with_identity` → `pub(crate)`; fixed `no_raw_secret_value_in_findings` test; 11 new chunk-level tests |
 | `crates/attic-discovery/src/lib.rs` | `STREAM_OVERLAP_SIZE` → `SAFETY_WINDOW_SIZE` reference updated |
 | `docs/PHASE_1B_COMPLETION_REPORT.md` | This document |
+
+### Round 4 (fourth corrective pass — final blockers)
+
+| File | Change |
+|------|--------|
+| `crates/attic-discovery/src/secrets.rs` | **Blocker 1**: Replaced `InBlock` PEM state with `Draining { begin_file_offset, tail: Vec<u8> }` — genuinely O(1) memory for PEM blocks of any size; `tail` bounded to `SAFETY_WINDOW_SIZE`; placeholder emitted immediately on `BEGIN`; `withheld_len()` test accessor added; `large_file_stream_pem_many_chunks_buffer_is_bounded` asserts buffer ≤ `SAFETY_WINDOW_SIZE` at every `next_chunk()` call. **Blocker 2**: Added `path: PathBuf` field and `check_identity()` method to `LargeFileStream`; identity checked at top of every `next_chunk()`; `large_file_modification_between_classify_and_open_detected` and `large_file_modification_during_streaming_returns_error` tests added. `is_known_secrets_file` changed to `pub(crate)` to resolve E0603. |
+| `crates/attic-discovery/src/lib.rs` | Fixed two test call sites: `stream.collect_all()` (method) → `secrets::collect_all(&mut stream)` (free function); destructured `ScanResult` correctly. |
+| `docs/PHASE_1B_COMPLETION_REPORT.md` | Updated status, test counts, and this round-4 section. |

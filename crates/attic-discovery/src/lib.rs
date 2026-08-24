@@ -617,8 +617,9 @@ mod tests {
         assert!(result.content.is_none(), "LARGE must NOT return content");
 
         // Consume the stream and verify raw secret is absent.
-        let stream = result.stream.unwrap();
-        let (full_redacted, _findings) = stream.collect_all().unwrap();
+        let mut stream = result.stream.unwrap();
+        let scan_result = secrets::collect_all(&mut stream).unwrap();
+        let full_redacted = scan_result.redacted;
 
         assert!(
             !full_redacted.contains(secret),
@@ -656,8 +657,9 @@ mod tests {
 
         assert!(result.stream.is_some(), "LARGE must return a stream");
 
-        let stream = result.stream.unwrap();
-        let (full_redacted, _) = stream.collect_all().unwrap();
+        let mut stream = result.stream.unwrap();
+        let scan_result = secrets::collect_all(&mut stream).unwrap();
+        let full_redacted = scan_result.redacted;
 
         assert!(
             !full_redacted.contains(secret),
