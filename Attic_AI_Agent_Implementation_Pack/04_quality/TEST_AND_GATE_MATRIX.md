@@ -47,6 +47,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+All command execution performed for tests and gates is subject to the global
+**Command Execution and Endpoint Security** rules in
+`00_master/AGENT_OPERATING_MANUAL.md`.
+
+A test or gate blocked by endpoint security is `NOT VERIFIED`, not `PASS`.
+Security controls must never be bypassed or weakened to make a gate pass.
+
 ## Regression rule
 A higher average score does not excuse material regression in:
 - exact lookup;
