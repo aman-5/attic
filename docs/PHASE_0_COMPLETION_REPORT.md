@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-Phase 0 is complete. All contracts, schemas, fixtures, benchmark definitions, invariants, state machines, compatibility rules, and acceptance gates required before Phase 1A implementation are authored and in place. No runtime code was written beyond the pre-existing scaffold stubs. The project is in a consistent state that fully expresses the system's contracts without anticipating implementation decisions that remain open.
+Phase 0 is complete. All contracts, schemas, benchmark definitions, acceptance gates, open questions, and the initial SQL migration are authored and in place. No runtime code was written beyond the pre-existing scaffold stubs. The project expresses the system's contracts without anticipating implementation decisions that remain open.
 
 ---
 
@@ -15,7 +15,7 @@ Phase 0 is complete. All contracts, schemas, fixtures, benchmark definitions, in
 
 ### 2.1 Contract Documents (docs/contracts/)
 
-All 15 contracts are authored. The table below lists each contract, its document ID, and its test matrix coverage.
+All 15 contracts are authored.
 
 | ID | File | Subject | Test Matrix |
 |---|---|---|---|
@@ -35,19 +35,17 @@ All 15 contracts are authored. The table below lists each contract, its document
 | C14 | `resources.md` | Task, ResourceBudget, admission control | RC-01 to RC-10 |
 | C15 | `recovery.md` | 10-step startup, crash classes, backup | REC-01 to REC-10 |
 
-**Total test matrix entries across all contracts: 151 test cases defined.**
+**Total test matrix entries across all contracts: 151.**
 
 ### 2.2 SQL Migration
 
-| File | Description |
-|---|---|
-| `migrations/0001_initial.sql` | Complete idempotent SQLite DDL. 14 sections covering all `core_*` and `ops_*` tables, FTS5 external content tables, all indexes (including partial indexes for recovery queries), self-registration row. |
+`migrations/0001_initial.sql` — complete idempotent SQLite DDL. 14 sections covering all `core_*` and `ops_*` tables, FTS5 external content tables, partial indexes for recovery queries, and self-registration rows.
 
-Key additions beyond `storage.md` baseline (driven by recovery.md requirements):
-- `core_file_occurrences.secret_scan_state` column (recovery step R-6)
-- `ops_indexing_log` table (recovery step R-4: crash-safe indexing checkpoints)
-- `ops_migration_log` table (recovery step R-3: idempotent migration tracking)
-- `ops_server_state` table (recovery §7: watcher_epoch persistence across restarts)
+Additions beyond the `storage.md` baseline (required by `recovery.md`):
+- `core_file_occurrences.secret_scan_state` — recovery step R-6
+- `ops_indexing_log` — recovery step R-4 (crash-safe indexing checkpoints)
+- `ops_migration_log` — recovery step R-3 (idempotent migration tracking)
+- `ops_server_state` — recovery §7 (watcher_epoch persistence)
 
 ### 2.3 Benchmark Suite
 
@@ -55,138 +53,149 @@ Key additions beyond `storage.md` baseline (driven by recovery.md requirements):
 |---|---|
 | `benchmarks/cases/q001_to_q050.md` | 50 cases: DEFINITION_LOOKUP, SYMBOL_NAVIGATION, CONFIGURATION_LOOKUP, DEBUGGING_ROOT_CAUSE, TEST_BEHAVIOR |
 | `benchmarks/cases/q051_to_q100.md` | 50 cases: ARCHITECTURE_EXPLANATION, IMPACT_ANALYSIS, CROSS_REPO_DEPENDENCY, KNOWLEDGE_QUESTION, GENERIC_SEARCH |
-| `benchmarks/acceptance.md` | 16 acceptance gates (ACC-G01 to ACC-G16), latency SLAs by mode, per-QueryType pass-rate thresholds, secret safety gates (zero-tolerance), resource budget compliance, RetrievalPlan observability gates, reference hardware profile |
+| `benchmarks/acceptance.md` | Four-tier gate structure (T1 static / T2 Phase 4 retrieval / T3 Phase 5 semantic / T4 production). Only T1 gates block Phase 1A. Product benchmark cases contain no Attic internal type names or implementation details. |
 
-All 10 `QueryType` values and all 3 `AnswerModePolicy` modes are covered. Suite composition requirements in `acceptance.md §10` are satisfied.
+All 10 QueryType values and all 3 AnswerModePolicy modes are covered. Suite composition requirements in `acceptance.md §8` are satisfied.
 
 ### 2.4 Open Questions Registry
 
-| File | Contents |
-|---|---|
-| `OPEN_QUESTIONS.md` | 16 open questions (OQ-001 to OQ-016), 1 deferred (OQ-013 — analyzer hot-reload to Phase 2), resolution procedure |
+`OPEN_QUESTIONS.md` — 16 questions. Phase-to-question map assigns each OQ to the phase that owns the decision:
+- Phase 1A blockers: OQ-006 (WAL checkpoint policy), OQ-007 (secret pattern versioning), OQ-014 (ops_server_state constraint), OQ-016 (IndexGeneration per-subsystem versions)
+- Phase 1B: OQ-004, OQ-005, OQ-009, OQ-010, OQ-015
+- Phase 1D: OQ-003 (RESOLVED — stdio transport)
+- Phase 2: OQ-008 (knowledge provenance: `knowledge/*.md` is first-class source; README/docs/ are documentation evidence only; LLM summaries deferred to Phase 5)
+- Phase 4: OQ-011, OQ-012
+- Phase 5 (deferred): OQ-001 (embedding model), OQ-002 (re-ranker), OQ-013 (analyzer hot-reload)
 
-No requirements were invented to fill gaps; all ambiguities are recorded in OPEN_QUESTIONS.md for Phase 1A resolution.
+No requirements were invented. All ambiguities are recorded for their owning phase to resolve.
 
 ---
 
 ## 3. Cargo Validation Results
 
-### 3.1 Environment Note
+All three checks were executed using `C:\Users\amanbansal\.cargo\bin\cargo.exe` (confirmed present). Exit codes are captured directly.
 
-The CI terminal in this development environment does not stream `cargo` output back to the tool session. All three cargo checks (`fmt`, `clippy`, `test`) were invoked; the binary at `C:\Users\amanbansal\.cargo\bin\cargo.exe` exists and resolves correctly (`Test-Path` = `True`). Output could not be captured due to a terminal streaming limitation in the current shell session.
+### T1-G07 — `cargo fmt --check --all`
 
-### 3.2 Manual Code Inspection
-
-All 9 Rust source files were read directly and inspected against the following criteria:
-
-| File | `#![forbid(unsafe_code)]` | `#![deny(clippy::all)]` | Formatting | Compiles |
-|---|---|---|---|---|
-| `attic-analyzers/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-core/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-discovery/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-evidence/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-indexing/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-retrieval/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-server/src/main.rs` | ✓ | ✓ | Clean | ✓ (uses tracing/tracing-subscriber) |
-| `attic-storage/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-| `attic-test-support/src/lib.rs` | ✓ | ✓ | Clean | ✓ (stub) |
-
-**Root `Cargo.toml`**: Workspace resolver v2, edition 2024, MSRV 1.88, all 9 members declared, only `tracing` / `tracing-subscriber` as external deps (used by `attic-server` main.rs). All other deps pinned for Phase 1+ introduction. Profiles (dev/release) configured correctly.
-
-**Assessment**: The scaffold code is clean. No magic literals, no unsafe blocks, no commented-out logic, no sensitive data. All 8 library crates have a single passing placeholder test. The server entry point uses `#[deny(clippy::all)]` and routes tracing to stderr as required by the MCP stdio protocol. The gate ACC-G14/ACC-G15/ACC-G16 note in `acceptance.md §11` correctly scopes these gates to Phase 1A+ when substantive implementation code is introduced.
-
-### 3.3 Recommended Action Before Phase 1A Merge
-
-Run the following in a shell where `cargo` is on PATH (e.g., after `rustup` is initialized):
-
-```powershell
-# From project root
-cargo fmt --check --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+```
+EXIT: 0
+OUTPUT: (empty — zero formatting differences)
 ```
 
-All three are expected to pass cleanly given the current stub state.
+**Result: PASS**
+
+### T1-G08 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+```
+EXIT: 0
+OUTPUT:
+    Checking attic-analyzers v0.1.0
+    Checking attic-test-support v0.1.0
+    Checking attic-discovery v0.1.0
+    Checking attic-retrieval v0.1.0
+    Checking attic-evidence v0.1.0
+    Checking attic-storage v0.1.0
+    Checking attic-indexing v0.1.0
+    Checking attic-core v0.1.0
+    Checking attic-server v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.80s
+```
+
+**Result: PASS** — all 9 crates checked, zero warnings.
+
+### T1-G09 — `cargo test --workspace`
+
+```
+EXIT: 101
+```
+
+Partial output:
+
+```
+test tests::crate_is_present ... ok   [attic-analyzers]
+test tests::crate_is_present ... ok   [attic-core]
+test tests::crate_is_present ... ok   [attic-discovery]
+
+error: test failed, to rerun pass `-p attic-evidence --lib`
+
+Caused by:
+  could not execute process `...\attic_evidence-9228e07fce907d10.exe` (never executed)
+
+Caused by:
+  Access is denied. (os error 5)
+```
+
+**Result: NOT VERIFIED — environment failure**
+
+The `attic-evidence` test binary compiled successfully (compilation is clean per T1-G08). Windows OS-level access control (os error 5 — Access Denied) prevented execution of the compiled test binary in the `target\x86_64-pc-windows-gnu\debug\deps\` directory. This is a Windows Defender / security policy issue blocking execution of unsigned binaries from the build output directory. It is not a test code failure.
+
+**Required action before Phase 1A merge**: Add the project `target\` directory to Windows Defender exclusions (or the equivalent local security policy), then re-run `cargo test --workspace` and confirm all tests pass. Expected result: all 8 placeholder tests pass (trivial assertions; no logic under test).
 
 ---
 
-## 4. Acceptance Gate Status (Phase 0 Scope)
+## 4. T1 Gate Status
 
 | Gate | Description | Status |
 |---|---|---|
-| ACC-G12 | All contracts authored and CONTRACT_CHECKLIST complete | **PASS** — 15 contracts authored |
-| ACC-G13 | `migrations/0001_initial.sql` present and idempotent | **PASS** — file present, uses `CREATE TABLE IF NOT EXISTS` throughout |
-| ACC-G14 | `cargo fmt --check --all` | **MANUAL PASS** — code inspected; terminal streaming issue prevents automated capture |
-| ACC-G15 | `cargo clippy -- -D warnings` | **MANUAL PASS** — all files have `#![deny(clippy::all)]`; stubs contain no lint-triggering patterns |
-| ACC-G16 | `cargo test --workspace` | **MANUAL PASS** — all 8 lib crates have placeholder `#[test]` functions that assert trivially-true statements; server binary has no tests (expected at Bootstrap) |
+| T1-G01 | All 15 contracts present | **PASS** |
+| T1-G02 | `migrations/0001_initial.sql` present | **PASS** |
+| T1-G03 | Migration is idempotent DDL | **PASS** — all `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` |
+| T1-G04 | Benchmark suite: 100 cases, all 10 QueryTypes | **PASS** |
+| T1-G05 | Acceptance gates document present | **PASS** |
+| T1-G06 | Open questions registry present | **PASS** |
+| T1-G07 | `cargo fmt --check --all` | **PASS** — exit 0, zero diff |
+| T1-G08 | `cargo clippy … -D warnings` | **PASS** — exit 0, zero warnings |
+| T1-G09 | `cargo test --workspace` | **NOT VERIFIED** — os error 5 (Access Denied) on test binary execution in Windows security environment; compilation is clean; see §3 |
 
-Gates ACC-G01 through ACC-G11 are runtime gates evaluated by the benchmark harness; they are not applicable until Phase 1A implementation is complete.
+Gates T2–T4 are runtime gates applicable at Phase 4, Phase 5, and production respectively. They do not block Phase 1A.
 
 ---
 
-## 5. Invariant Summary
+## 5. Cross-Cutting Invariants
 
-The following cross-cutting invariants are established across Phase 0 contracts and must be preserved by all Phase 1+ implementation:
+The following invariants are established across Phase 0 contracts and must be preserved by all Phase 1+ implementation:
 
 | Invariant | Source | Rule |
 |---|---|---|
-| Secret non-persistence | C06 secrets.md | Secret bytes NEVER enter FTS, embeddings, summaries, logs, telemetry |
+| Secret non-persistence | C06 secrets.md | Secret bytes never enter FTS, embeddings, summaries, logs, or telemetry |
 | Immutable SourceRevision | C01 source_revision.md | A `SourceRevision` row is write-once; never updated in place |
-| Plan-before-answer | C13 retrieval_plan.md RP-INV-7 | `ops_retrieval_log` row persisted before answer bytes are returned to caller |
+| Plan-before-answer | C13 retrieval_plan.md RP-INV-7 | `ops_retrieval_log` row is persisted before the answer is returned to the caller |
 | Budget hard ceiling | C14 resources.md | Any task exceeding its `ResourceBudget` returns `BUDGET_EXCEEDED`; never silently continues |
-| Invalid evidence exclusion | C09 invalidation.md | Artifacts in `INVALID` state are never used as evidence |
-| Audit in finally | C04 storage.md / C15 recovery.md | `executeAuditAPI` equivalent called regardless of success/failure path |
+| Invalid evidence exclusion | C09 invalidation.md | Artifacts in `INVALID` state never appear in `evidence_used` |
 | Single DB writer | C04 storage.md | All writes funnel through the bounded DB writer queue; no concurrent writers |
-| Recovery idempotency | C15 recovery.md | Every recovery step is safe to re-run; no step assumes it runs exactly once |
+| Recovery idempotency | C15 recovery.md | Every startup recovery step is safe to re-run |
+| Knowledge provenance | C10 evidence.md / OQ-008 | `knowledge/*.md` files are first-class KnowledgeItems; `docs/` Markdown is documentation evidence only and is not automatically promoted to KnowledgeItem |
 
 ---
 
-## 6. Open Questions Requiring Phase 1A Resolution
-
-The following OQ items from `OPEN_QUESTIONS.md` are **blockers** for specific Phase 1A design decisions:
-
-| OQ | Question | Blocks |
-|---|---|---|
-| OQ-001 | Semantic embedding model identity | attic-indexing, storage schema (embedding vector column) |
-| OQ-002 | Re-ranking model identity | attic-retrieval |
-| OQ-003 | MCP transport protocol | attic-server structure |
-| OQ-005 | Dirty working-tree manifest hash stability | attic-discovery watcher |
-| OQ-007 | Secret detector pattern versioning | core_file_occurrences schema, IndexGeneration |
-| OQ-012 | CancellationToken propagation | attic-core task abstraction |
-| OQ-015 | Benchmark fixture repository identity | fixtures/git/, CI setup |
-| OQ-016 | IndexGeneration hash for partial rebuilds | core_index_generations schema |
-
-Non-blocking OQs (OQ-004, OQ-006, OQ-008, OQ-009, OQ-010, OQ-011, OQ-014) may be resolved lazily as the relevant phase begins.
-
----
-
-## 7. What Was NOT Done (Explicitly Deferred)
-
-Per the Phase 0 mandate, the following were explicitly not done:
-
-- No runtime implementation code was written (no SQL query execution, no trait implementations, no async tasks).
-- No external crate dependencies beyond the pre-existing `tracing`/`tracing-subscriber` were added.
-- No CI/CD pipeline was configured (deferred to Phase 1A).
-- No fixture repository content was created in `fixtures/git/` (deferred to Phase 1A per OQ-015).
-- No embedding model, tokenizer, or ML inference code was scaffolded.
-- No `docs/decisions/` entries were created (there are no resolved decisions yet; all are recorded as open questions).
-
----
-
-## 8. Phase 1A Entry Criteria
+## 6. Phase 1A Entry Criteria
 
 Phase 1A may begin when:
 
-1. All blocking OQs in §6 are resolved with decisions recorded in `docs/decisions/`.
-2. `cargo fmt --check --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` all pass in a clean CI environment.
-3. The `CONTRACT_CHECKLIST.md` reflects all 15 contracts as complete.
+1. T1-G09 (`cargo test --workspace`) passes in a clean execution environment (resolve os error 5 by adding `target\` to Defender exclusions).
+2. The four Phase 1A-blocking open questions (OQ-006, OQ-007, OQ-014, OQ-016) are resolved with decisions recorded in `docs/decisions/`.
+3. `CONTRACT_CHECKLIST.md` is updated to reflect all 15 contracts complete.
 4. At least one reviewer has read and acknowledged this report.
 
-**Phase 1A first target**: `attic-core` domain types (SourceRevision, FileIdentity, SymbolIdentity, IndexGeneration value objects) and `attic-storage` connection management + migration runner.
+**Phase 1A first target**: `attic-core` domain value types (SourceRevision, FileIdentity, SymbolIdentity, IndexGeneration) and `attic-storage` connection management + migration runner.
+
+Phase 1A must not introduce vector storage columns, ML model dependencies, async task spawning, MCP transport code, or watcher infrastructure. Those belong to later phases per the open questions registry.
 
 ---
 
-## 9. File Manifest — Phase 0 Outputs
+## 7. What Was Not Done (Explicitly Deferred)
+
+- No runtime implementation code (no SQL execution, no trait implementations, no async tasks).
+- No external crate dependencies added beyond pre-existing `tracing`/`tracing-subscriber`.
+- No CI/CD pipeline (deferred to Phase 1A).
+- No fixture repository content in `fixtures/git/` (deferred to Phase 1B per OQ-015).
+- No embedding model, vector column, tokenizer, or ML inference code (deferred to Phase 5 per OQ-001/OQ-002).
+- No `docs/decisions/` entries (no questions resolved yet; all recorded in OPEN_QUESTIONS.md).
+- No LLM summary generation pipeline (deferred to Phase 5 per OQ-008).
+
+---
+
+## 8. File Manifest — Phase 0 Outputs
 
 ```
 docs/contracts/
@@ -212,12 +221,12 @@ migrations/
 benchmarks/
   cases/q001_to_q050.md    (created Phase 0)
   cases/q051_to_q100.md    (created Phase 0)
-  acceptance.md            (created Phase 0)
+  acceptance.md            (created Phase 0, revised Phase 0 review)
 
-OPEN_QUESTIONS.md          (created Phase 0)
+OPEN_QUESTIONS.md          (created Phase 0, revised Phase 0 review)
 docs/PHASE_0_COMPLETION_REPORT.md  (this file)
 ```
 
 ---
 
-*Phase 0 complete. Do not begin Phase 1A until the entry criteria in §8 are satisfied.*
+*Phase 0 complete pending T1-G09 environment resolution. Do not begin Phase 1A until the entry criteria in §6 are satisfied.*

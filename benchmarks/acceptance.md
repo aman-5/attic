@@ -6,338 +6,224 @@
 
 ## 1. Purpose and Scope
 
-This document defines the **acceptance gates** that must be satisfied by a Phase 1A+ implementation before any benchmark case in `benchmarks/cases/` is considered passing. It specifies:
+This document defines **four tiers of acceptance gates** that apply at different points in the project lifecycle. Gates are separated by what exists at evaluation time:
 
-- Per-`AnswerModePolicy` latency SLAs (P50, P95, P99)  
-- Per-`QueryType` minimum pass-rate thresholds  
-- Confidence level distribution requirements  
-- Resource budget compliance gates  
-- Secret-safety gates (zero-tolerance)  
-- Benchmark suite composition requirements  
-- Overall Phase 0 → Phase 1A readiness criterion  
+| Tier | Name | Evaluated when |
+|---|---|---|
+| **T1** | Phase 0 → Phase 1A static gate | Phase 0 complete; no runtime exists |
+| **T2** | Phase 4 retrieval quality gate | Retrieval layer implemented (Phase 4) |
+| **T3** | Phase 5 semantic-value gate | Semantic intelligence layer implemented (Phase 5) |
+| **T4** | Production gate | Pre-production readiness |
 
-**These gates are binding.** A build that does not meet all gates in §2 through §8 is not eligible for Phase 1A merge.
+**Only T1 gates block Phase 1A.** Runtime latency, accuracy, and semantic quality gates (T2–T4) cannot be evaluated until the corresponding implementation phases are complete. No part of this document requires Phase 1A to implement retrieval, query classification, embedding, or answer assembly.
+
+**Benchmark cases** (`benchmarks/cases/`) are product-level engineering questions posed against benchmark repositories. They do not reference or assume Attic internal function names, DB writer implementation details, `CancellationToken` types, mutation sites, or any other future source layout. Implementation conformance tests (verifying that Attic's internal components satisfy contract invariants) are defined separately in `benchmarks/conformance/` (to be created in Phase 1A).
 
 ---
 
-## 2. Latency Gates by AnswerModePolicy
+## 2. Tier 1 — Phase 0 → Phase 1A Static Gates
 
-Latency is measured from **query receipt at the MCP transport layer** to **first byte of the serialized answer** delivered back to the caller. All measurements are taken on the reference hardware profile defined in §9.
+These are the only gates that must pass before Phase 1A implementation begins. All are verifiable without any running Attic server.
 
-### 2.1 FAST Mode Latency Gates
-
-| Percentile | Gate | Rationale |
+| Gate ID | Description | Pass Criterion |
 |---|---|---|
-| P50 | ≤ 150 ms | Must feel instant in IDE context |
-| P95 | ≤ 280 ms | Within `max_time_ms` = 300 ms budget |
-| P99 | ≤ 300 ms | Hard ceiling; queries exceeding this are TIMEOUT failures |
-| Max (any) | 300 ms | Enforced by `AnswerModePolicy.max_time_ms`; must return `BUDGET_EXCEEDED` result code, not a partial answer |
+| T1-G01 | All Phase 0 contracts authored | All 15 contract files (C01–C15) present in `docs/contracts/` |
+| T1-G02 | `migrations/0001_initial.sql` present | File exists at that path |
+| T1-G03 | Migration is idempotent DDL | Every table uses `CREATE TABLE IF NOT EXISTS`; every index uses `CREATE INDEX IF NOT EXISTS` |
+| T1-G04 | Benchmark suite complete | Exactly 100 cases in `benchmarks/cases/`; all 10 QueryType values covered |
+| T1-G05 | Acceptance gates document present | This file present and structurally valid |
+| T1-G06 | Open questions registry present | `OPEN_QUESTIONS.md` present; no invented requirements |
+| T1-G07 | `cargo fmt --check --all` | Zero diff on existing Rust source files |
+| T1-G08 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Zero warnings on existing Rust source files |
+| T1-G09 | `cargo test --workspace` | All existing tests green |
+
+---
+
+## 3. Tier 2 — Phase 4 Retrieval Quality Gate
+
+Evaluated after Phase 4 (retrieval layer) is implemented. These gates require a running Attic server that can process queries.
+
+### 3.1 Latency SLAs by AnswerModePolicy
+
+Latency is measured from query receipt at the MCP transport layer to first byte of the serialized answer. All measurements use the reference hardware profile in §7.
+
+#### FAST Mode
+
+| Percentile | Gate |
+|---|---|
+| P50 | ≤ 150 ms |
+| P95 | ≤ 280 ms |
+| P99 / Max | 300 ms hard ceiling — must return `BUDGET_EXCEEDED`, not a partial answer |
 
 FAST mode cases: Q001–Q010, Q021–Q030, Q093–Q094.
 
-### 2.2 NORMAL Mode Latency Gates
+#### NORMAL Mode
 
-| Percentile | Gate | Rationale |
-|---|---|---|
-| P50 | ≤ 1 200 ms | Responsive for IDE lookup |
-| P95 | ≤ 2 800 ms | Within `max_time_ms` = 3 000 ms budget |
-| P99 | ≤ 3 000 ms | Hard ceiling |
-| Max (any) | 3 000 ms | Enforced hard ceiling; must return `BUDGET_EXCEEDED` |
+| Percentile | Gate |
+|---|---|
+| P50 | ≤ 1 200 ms |
+| P95 | ≤ 2 800 ms |
+| P99 / Max | 3 000 ms hard ceiling |
 
 NORMAL mode cases: Q011–Q020, Q031–Q035, Q041–Q050, Q066–Q070, Q076–Q080, Q086–Q088, Q095–Q097.
 
-### 2.3 DEEP Mode Latency Gates
+#### DEEP Mode
 
-| Percentile | Gate | Rationale |
-|---|---|---|
-| P50 | ≤ 12 000 ms | Allowed for thorough analysis |
-| P95 | ≤ 28 000 ms | Within `max_time_ms` = 30 000 ms budget |
-| P99 | ≤ 30 000 ms | Hard ceiling |
-| Max (any) | 30 000 ms | Enforced hard ceiling |
+| Percentile | Gate |
+|---|---|
+| P50 | ≤ 12 000 ms |
+| P95 | ≤ 28 000 ms |
+| P99 / Max | 30 000 ms hard ceiling |
 
 DEEP mode cases: Q036–Q040, Q051–Q065, Q071–Q075, Q081–Q085, Q089–Q092, Q098–Q100.
 
-### 2.4 Latency Measurement Protocol
+#### Latency Measurement Protocol
 
-1. Run each benchmark case **5 times** with warm cache (first run is a warm-up and excluded).
+1. Run each case 5 times with warm cache (first run excluded as warm-up).
 2. Record wall-clock latency for each of the 4 measurement runs.
-3. Gate is evaluated against the **P95** across all runs of all cases within a mode bucket.
-4. A single case that exceeds `max_time_ms` in any run is a **hard failure** for that case regardless of the aggregate percentile.
-5. Clock source: `std::time::Instant` on the server side; transport overhead is included.
+3. Gate evaluated against P95 across all runs within a mode bucket.
+4. Any single case exceeding `max_time_ms` in any run is a hard failure regardless of aggregate percentile.
 
----
+### 3.2 Per-QueryType Pass-Rate Thresholds
 
-## 3. Per-QueryType Accuracy Gates
+A benchmark case passes when all of: (a) required evidence types present in the plan, (b) `final_confidence` at or above the case minimum, (c) no secret content in the answer, (d) latency within mode ceiling.
 
-"Passing" a benchmark case requires **all** of the following to be true simultaneously:
-- The required evidence types listed in the case are present in the `RetrievalPlan.evidence_used` list.
-- The `final_confidence` is at or above the minimum level specified in the case.
-- No secret content appears in the returned answer (§7).
-- Latency is within the mode's hard ceiling.
-
-### 3.1 Pass-Rate Thresholds
-
-| QueryType | Cases | Min Pass Rate (v1.0) | Min Pass Rate (v0.5 beta) |
-|---|---|---|---|
-| DEFINITION_LOOKUP | Q001–Q010 | 95% (≥ 10/10 with 1 allowed near-miss) | 80% |
-| SYMBOL_NAVIGATION | Q011–Q020 | 90% (≥ 9/10) | 75% |
-| CONFIGURATION_LOOKUP | Q021–Q030 | 90% (≥ 9/10) | 80% |
-| DEBUGGING_ROOT_CAUSE | Q031–Q040 | 80% (≥ 8/10) | 65% |
-| TEST_BEHAVIOR | Q041–Q050 | 85% (≥ 9/10 rounded) | 70% |
-| ARCHITECTURE_EXPLANATION | Q051–Q065 | 75% (≥ 11/15 rounded) | 60% |
-| IMPACT_ANALYSIS | Q066–Q075 | 75% (≥ 8/10 rounded) | 60% |
-| CROSS_REPO_DEPENDENCY | Q076–Q085 | 70% (≥ 7/10) | 55% |
-| KNOWLEDGE_QUESTION | Q086–Q092 | 70% (≥ 5/7) | 55% |
-| GENERIC_SEARCH | Q093–Q100 | 80% (≥ 6/8) | 65% |
-
-**Overall pass rate gate**: ≥ 82% across all 100 cases (≥ 82 cases passing).
-
-> **Note**: A "near-miss" for DEFINITION_LOOKUP is when the correct symbol is present in `evidence_used` but at lower authority than expected (e.g., `INFERRED` when `DIRECT` was required). Near-misses count as ½ point toward the pass count.
-
-### 3.2 Confidence Level Distribution Requirements
-
-For each QueryType bucket, the distribution of `final_confidence` values across all passing cases must satisfy:
-
-| QueryType | Minimum % at CONFIRMED | Minimum % at CONFIDENT | Maximum % at UNCERTAIN |
-|---|---|---|---|
-| DEFINITION_LOOKUP | 70% | 90% cumulative | 10% |
-| SYMBOL_NAVIGATION | 60% | 85% cumulative | 15% |
-| CONFIGURATION_LOOKUP | 65% | 88% cumulative | 12% |
-| DEBUGGING_ROOT_CAUSE | 30% | 70% cumulative | 30% |
-| TEST_BEHAVIOR | 40% | 75% cumulative | 25% |
-| ARCHITECTURE_EXPLANATION | 20% | 60% cumulative | 40% |
-| IMPACT_ANALYSIS | 25% | 65% cumulative | 35% |
-| CROSS_REPO_DEPENDENCY | 20% | 60% cumulative | 40% |
-| KNOWLEDGE_QUESTION | 15% | 55% cumulative | 45% |
-| GENERIC_SEARCH | 30% | 70% cumulative | 30% |
-
-`ConfidenceLevel` enum values in ascending order: `NO_EVIDENCE < UNCERTAIN < POSSIBLE < CONFIDENT < CONFIRMED`.
-
----
-
-## 4. Resource Budget Compliance Gates
-
-Every benchmark case execution must remain within its declared `ResourceBudget` (from `docs/contracts/resources.md`). Violations are **hard failures** regardless of answer quality.
-
-### 4.1 Memory Ceiling
-
-| Mode | Max RSS increase during query | Rationale |
+| QueryType | Cases | Min Pass Rate |
 |---|---|---|
-| FAST | ≤ 32 MB above idle baseline | Tight—FAST should hit cache only |
-| NORMAL | ≤ 128 MB above idle baseline | File reads + graph traversal |
-| DEEP | ≤ 512 MB above idle baseline | Full graph + semantic allowed |
+| DEFINITION_LOOKUP | Q001–Q010 | 90% |
+| SYMBOL_NAVIGATION | Q011–Q020 | 85% |
+| CONFIGURATION_LOOKUP | Q021–Q030 | 85% |
+| DEBUGGING_ROOT_CAUSE | Q031–Q040 | 75% |
+| TEST_BEHAVIOR | Q041–Q050 | 80% |
+| ARCHITECTURE_EXPLANATION | Q051–Q065 | 70% |
+| IMPACT_ANALYSIS | Q066–Q075 | 70% |
+| CROSS_REPO_DEPENDENCY | Q076–Q085 | 65% |
+| KNOWLEDGE_QUESTION | Q086–Q092 | 65% |
+| GENERIC_SEARCH | Q093–Q100 | 75% |
 
-Measurement: RSS delta reported by the OS between query start and answer delivery.
+**Overall pass rate gate**: ≥ 78% across all 100 cases.
 
-### 4.2 DB Read Row Ceiling
+### 3.3 Resource Budget Compliance
 
-| Mode | max_db_read_rows gate | Must not exceed |
-|---|---|---|
-| FAST | 5 000 | 5 000 |
-| NORMAL | 100 000 | 100 000 |
-| DEEP | 2 000 000 | 2 000 000 |
+Every case execution must remain within its declared `ResourceBudget`. Violations are hard failures regardless of answer quality.
 
-Enforcement: tracked via `ResourceBudget.max_db_read_rows`; `BUDGET_EXCEEDED` returned if crossed.
+| Mode | Max RSS increase | Max DB read rows | Max open files |
+|---|---|---|---|
+| FAST | ≤ 32 MB | 5 000 | 5 |
+| NORMAL | ≤ 128 MB | 100 000 | 50 |
+| DEEP | ≤ 512 MB | 2 000 000 | 500 |
 
-### 4.3 Open File Ceiling
+### 3.4 RetrievalPlan Observability Gates
 
-| Mode | max_open_files gate |
+- All required `RetrievalPlan` fields (per `docs/contracts/retrieval_plan.md §2.1`) present and non-null in every persisted plan.
+- Steps form a valid linear sequence by `step_index`.
+- Plans persisted to `ops_retrieval_log` before answer delivery: 100% compliance.
+- `plan_json` size limits: FAST ≤ 64 KB, NORMAL ≤ 256 KB, DEEP ≤ 1 MB.
+
+### 3.5 Invalidation and Freshness Gates
+
+- Queries against workspaces with known-stale artifacts must disclose staleness (`STALE_EVIDENCE` result or equivalent); they must never return `SUCCESS` using undisclosed stale evidence. Zero tolerance.
+- Artifacts in `INVALID` state must never appear in `evidence_used`. Zero tolerance.
+
+### 3.6 Secret Safety Gates (zero tolerance)
+
+- No secret content (per `docs/contracts/secrets.md` V1 patterns) in any answer text.
+- No raw secret bytes in `ops_retrieval_log.plan_json`.
+- No secret patterns in server logs during benchmark runs.
+- Pre-flight: FTS5 tables (`fts_retrieval_units`, `fts_symbol_names`) must contain no V1 secret pattern matches before the suite runs.
+
+---
+
+## 4. Tier 3 — Phase 5 Semantic-Value Gate
+
+Evaluated after Phase 5 (semantic intelligence) is implemented. Requires semantic search and re-ranking to be operational.
+
+### 4.1 Confidence Distribution Requirements
+
+For DEEP mode cases where `semantic_allowed = true`, the distribution of `final_confidence` values must satisfy:
+
+| QueryType | Min % at CONFIRMED | Min % at CONFIDENT (cumulative) | Max % at UNCERTAIN |
+|---|---|---|---|
+| DEFINITION_LOOKUP | 70% | 90% | 10% |
+| ARCHITECTURE_EXPLANATION | 25% | 65% | 35% |
+| KNOWLEDGE_QUESTION | 20% | 60% | 40% |
+
+### 4.2 Pass-Rate Uplift vs Tier 2 Baseline
+
+Enabling semantic search and re-ranking must improve pass rates vs the Tier 2 baseline:
+
+| QueryType | Required uplift |
 |---|---|
-| FAST | 5 |
-| NORMAL | 50 |
-| DEEP | 500 |
-
-### 4.4 DB Writer Queue Back-Pressure Gate
-
-- During benchmark runs, the DB writer queue depth must not exceed **90%** of its maximum capacity (`RC-A3` from resources.md) for more than 2 consecutive seconds.
-- If this threshold is breached during a run, the run is marked `BACKPRESSURE_VIOLATION` and excluded from latency statistics (but counted as a failure for pass-rate purposes).
-
-### 4.5 Concurrency Limit Gate
-
-- No query of class `RETRIEVAL_FAST` may use more than **1 DB writer slot** concurrently per resources.md `RC-A1`.
-- No more than **4 RETRIEVAL_NORMAL** tasks may be simultaneously active.
-- No more than **2 RETRIEVAL_DEEP** tasks may be simultaneously active.
-- Violations are counted as concurrency policy failures (separate from accuracy failures).
+| ARCHITECTURE_EXPLANATION | ≥ +8 percentage points |
+| KNOWLEDGE_QUESTION | ≥ +10 percentage points |
+| CROSS_REPO_DEPENDENCY | ≥ +5 percentage points |
 
 ---
 
-## 5. RetrievalPlan Observability Gates
+## 5. Tier 4 — Production Gate
 
-Every query response must produce a `RetrievalPlan` that satisfies all of the following:
+All T2 and T3 gates must already pass. Additional production requirements:
 
-### 5.1 Required Fields Gate
-
-All fields listed as required in `docs/contracts/retrieval_plan.md §2.1` must be present and non-null in every persisted plan. Missing fields are **schema violations** and the benchmark case is a hard failure regardless of answer quality.
-
-Required: `plan_id`, `query_id`, `created_at_us`, `raw_query`, `query_type`, `policy`, `steps`, `evidence_used`, `result`, `final_confidence`, `context_tokens`.
-
-### 5.2 Step Sequence Integrity Gate
-
-- `steps` must form a valid linear sequence by `step_index` (no gaps, no duplicates).
-- Every step with `status = COMPLETED` must have `duration_us > 0`.
-- Every step with `status = FAILED` must have a non-empty `error_message`.
-- Every step with `status = SKIPPED` must have a non-empty `skip_reason`.
-
-### 5.3 Plan Persistence Gate
-
-Plans must be persisted to `ops_retrieval_log` before the answer is delivered to the caller (per `RP-INV-7` from retrieval_plan.md). In benchmark runs, validate that a row for the case's `plan_id` exists in the DB **at the time the latency stop-clock is triggered**.
-
-Gate: 100% of plans persisted before answer delivery. Zero tolerance.
-
-### 5.4 Plan JSON Size Gate
-
-The `plan_json` column in `ops_retrieval_log` must not exceed:
-
-| Mode | Max plan_json size |
+| Gate | Criterion |
 |---|---|
-| FAST | 64 KB |
-| NORMAL | 256 KB |
-| DEEP | 1 MB |
-
-Plans exceeding this threshold are flagged as `PLAN_OVERFLOW` failures and must be truncated deterministically (only `evidence_dropped` and non-critical step details may be omitted; core fields are never truncated).
-
----
-
-## 6. Invalidation and Freshness Gates
-
-### 6.1 Stale Artifact Gate
-
-For benchmark cases where the query workspace has been modified after indexing (test scenarios involving `STALE` state):
-- The `RetrievalPlan` must include at least one step with `subsystem = FRESHNESS_CHECKER`.
-- The plan `result` must be `STALE_EVIDENCE` or `REPAIR_CYCLE_LIMIT_REACHED`; it must **not** return `SUCCESS` while using known-stale evidence without disclosing it.
-- Cases: INV-adjacent scenarios, Q031–Q040 (debugging scenarios where staleness is injected).
-
-Gate: 100% compliance. Returning a success answer built on undisclosed stale evidence is a **critical failure**.
-
-### 6.2 INVALID Artifact Gate
-
-For benchmark cases where an artifact has been explicitly invalidated (state = `INVALID`):
-- It must **never** appear in `evidence_used`.
-- It may appear in `evidence_dropped` with `drop_reason = INVALID_ARTIFACT`.
-
-Gate: 100% compliance. Zero tolerance on invalid evidence use.
+| DB writer queue saturation | Queue depth ≤ 90% capacity for no more than 2 consecutive seconds during peak benchmark load |
+| Concurrency limits | ≤ 4 simultaneous RETRIEVAL_NORMAL tasks; ≤ 2 simultaneous RETRIEVAL_DEEP tasks |
+| Snapshot stability | All plans in a single benchmark run share the same `WorkspaceSnapshot` hash |
+| Benchmark harness exit code | Exits 0 only when all applicable tier gates pass |
 
 ---
 
-## 7. Secret Safety Gates
+## 6. Implementation Conformance Tests
 
-All gates in this section are **zero-tolerance**. A single violation is an immediate **suite-wide failure** that blocks Phase 1A regardless of all other metrics.
+Implementation conformance tests verify that Attic's internal components satisfy contract invariants. These are **distinct from product benchmark cases** and live in `benchmarks/conformance/` (created during Phase 1A+).
 
-### 7.1 Secret Content in Answer Gate
+Conformance tests may reference Attic internal types (e.g., the `ResourceBudget` struct, the DB writer queue, the `CancellationToken` abstraction) because they test implementation contracts. Product benchmark cases in `benchmarks/cases/` do not.
 
-No content classified as a secret (via the `SecretState` / `RedactedSpan` contract in `docs/contracts/secrets.md`) may appear in any benchmark answer text.
-
-Validation method: Run the V1 secret detector patterns over every answer text in the benchmark run. Any match is a `SECRET_LEAK` failure.
-
-### 7.2 Secret Content in Plan Gate
-
-`ops_retrieval_log.plan_json` must not contain raw secret bytes. `RedactedSpan` representations (showing span location and pattern ID but not the matched text) are allowed.
-
-### 7.3 Secret Content in Logs Gate
-
-Server logs emitted during benchmark runs must not contain patterns matching V1 secret detector rules. Log scanning is part of the benchmark harness.
-
-### 7.4 Secret Content in FTS Index Gate
-
-A separate index integrity check (run once before the benchmark suite):
-- Query the FTS5 `fts_retrieval_units` and `fts_symbol_names` tables with V1 secret detector patterns.
-- Any match is a `SECRET_IN_INDEX` failure.
-
-This check is run once as a pre-flight gate; if it fails, the benchmark suite does not run.
+Conformance test categories to be defined in Phase 1A:
+- `conformance/storage/` — migration idempotency, WAL mode, writer queue back-pressure
+- `conformance/invalidation/` — state transitions, propagation correctness
+- `conformance/secrets/` — scanner accuracy against V1 patterns, FTS exclusion
+- `conformance/resources/` — budget enforcement, cancellation propagation
+- `conformance/recovery/` — crash simulation, each of the 10 startup steps
 
 ---
 
-## 8. SourceRevision Stability Gate
+## 7. Reference Hardware Profile
 
-All benchmark cases within a single run share a **pinned `WorkspaceSnapshot`**. The snapshot is frozen at the start of the run and must not change during execution.
-
-Gate: The `source_revision` field on every plan produced during a single benchmark run must hash to the same `WorkspaceSnapshot`. Mixed snapshots within a run are a `SNAPSHOT_INSTABILITY` failure.
-
----
-
-## 9. Reference Hardware Profile
-
-Benchmark results are only valid when measured on a configuration meeting or exceeding:
+Benchmark results (T2+) are valid only when measured on a configuration meeting or exceeding:
 
 | Resource | Minimum Specification |
 |---|---|
 | CPU | 4 physical cores, x86-64, ≥ 2.5 GHz base clock |
-| RAM | 16 GB system RAM; ≤ 4 GB consumed by other processes at run time |
+| RAM | 16 GB; ≤ 4 GB consumed by other processes at run time |
 | Storage | NVMe SSD, ≥ 500 MB/s sequential read |
 | OS | Linux (kernel ≥ 5.15) or Windows 11 (≥ 22H2) |
 | Rust toolchain | 1.98.0 (per `rust-toolchain.toml`) |
 | SQLite | 3.45.0 or later (WAL mode available) |
 
-Results on hardware below this profile are informational only and do not constitute acceptance evidence.
+T1 gates have no hardware requirements.
 
 ---
 
-## 10. Benchmark Suite Composition Requirements
-
-Before the suite is considered valid for acceptance evaluation:
+## 8. Benchmark Suite Composition Requirements (validated at T1)
 
 | Requirement | Gate |
 |---|---|
-| Total cases | Exactly 100 (Q001–Q100 as defined in `benchmarks/cases/`) |
+| Total cases | Exactly 100 (Q001–Q100) |
 | QueryType coverage | All 10 QueryType values represented |
 | AnswerMode coverage | All 3 modes (FAST, NORMAL, DEEP) represented |
 | Freshness scenario coverage | At least 5 cases with injected STALE state |
 | Secret injection coverage | At least 3 cases where a secret is planted in source; answer must not contain it |
 | Cross-repo coverage | At least 10 cases spanning ≥ 2 repositories |
 | Empty-result coverage | At least 3 cases with expected `NO_EVIDENCE` result |
-
-All requirements above are satisfied by `q001_to_q050.md` + `q051_to_q100.md`.
-
----
-
-## 11. Phase 0 → Phase 1A Readiness Gate (Summary)
-
-All of the following must be satisfied before Phase 1A implementation begins:
-
-| Gate ID | Description | Threshold |
-|---|---|---|
-| ACC-G01 | Overall benchmark pass rate | ≥ 82 / 100 cases |
-| ACC-G02 | FAST mode P95 latency | ≤ 280 ms |
-| ACC-G03 | NORMAL mode P95 latency | ≤ 2 800 ms |
-| ACC-G04 | DEEP mode P95 latency | ≤ 28 000 ms |
-| ACC-G05 | Secret content in answers | 0 violations |
-| ACC-G06 | Secret content in plan_json | 0 violations |
-| ACC-G07 | Secret content in FTS index | 0 violations (pre-flight) |
-| ACC-G08 | INVALID evidence used in answer | 0 violations |
-| ACC-G09 | Undisclosed stale evidence in SUCCESS answer | 0 violations |
-| ACC-G10 | Plan persistence before answer delivery | 100% |
-| ACC-G11 | ResourceBudget hard ceiling exceeded | 0 violations |
-| ACC-G12 | All contracts authored and CONTRACT_CHECKLIST complete | 100% |
-| ACC-G13 | migrations/0001_initial.sql present and idempotent | Pass |
-| ACC-G14 | `cargo fmt --check --all` | Zero diff |
-| ACC-G15 | `cargo clippy --workspace --all-targets -- -D warnings` | Zero warnings |
-| ACC-G16 | `cargo test --workspace` | All tests green |
-
-> Gates ACC-G14 through ACC-G16 apply to the Phase 0 scaffolding code only (stub `lib.rs` files and the migration SQL do not generate Rust compilation artifacts; these gates apply once Phase 1A skeleton code is introduced). For Phase 0 specifically, the applicable gates are ACC-G12 and ACC-G13 plus any Rust code that does exist compiling cleanly.
+| No Attic internals | Cases describe engineering questions; no Attic type names, internal paths, or implementation details assumed |
 
 ---
 
-## 12. Benchmark Harness Contract
-
-The benchmark harness (to be implemented in Phase 1B or later) must:
-
-1. Accept a `WorkspaceSnapshot` identifier and a path to a cases directory as inputs.
-2. Execute each case in isolation with a fresh per-case `RetrievalPlan` context.
-3. Record per-case: latency (ms), pass/fail, `final_confidence`, `plan_id`, evidence count, resource metrics.
-4. Produce a machine-readable JSON report at `benchmarks/reports/<run_id>.json` and a human-readable summary at `benchmarks/reports/<run_id>.md`.
-5. Run the secret-safety scans (§7) as pre-flight and post-flight steps.
-6. Exit with code 0 only if all gates in §11 are satisfied; exit with code 1 otherwise.
-
-The report schema (to be formalized in Phase 1B) must include per-case results, per-gate pass/fail, and aggregate statistics keyed by QueryType and AnswerMode.
-
----
-
-## 13. Versioning
-
-This acceptance gate document is versioned alongside the contracts it references:
+## 9. Versioning
 
 | Gate Document Version | Associated Contract Versions |
 |---|---|
-| v0.1.0 (this document) | C01–C15, answer_modes v0.1, retrieval_plan v0.1, resources v0.1, recovery v0.1 |
+| v0.2.0 (this document) | C01–C15; reflects four-tier gate structure |
 
 When any referenced contract is updated in a breaking way, this document must be updated in the same PR and its version incremented.
