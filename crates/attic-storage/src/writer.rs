@@ -16,10 +16,33 @@
 //! The worker accumulates up to [`BATCH_SIZE`] mutations into a single
 //! `BEGIN IMMEDIATE … COMMIT` transaction for throughput.  If **any**
 //! mutation in a batch fails:
-//! 1. The transaction is rolled back.
+//! 1. A `ROLLBACK` is issued.
 //! 2. The failing mutation's caller receives its original error.
 //! 3. Every other mutation in the same batch receives
 //!    [`StorageError::BatchRolledBack`].
+//!
+//! ## Transaction finalization failure and writer poisoning
+//! If a `ROLLBACK` or `COMMIT` fails, the connection's transactional state
+//! becomes unknown.  In that case the writer is **poisoned**:
+//!
+//! - All pending callers receive [`StorageError::WriterPoisoned`].
+//! - All future `send` calls return [`StorageError::WriterPoisoned`]
+//!   immediately without enqueuing.
+//! - The worker exits its loop; no further batches are processed.
+//!
+//! Specifically:
+//! - Mutation failure → `ROLLBACK`:
+//!   - `ROLLBACK` succeeds → failing caller gets original error; all others
+//!     get [`StorageError::BatchRolledBack`].
+//!   - `ROLLBACK` fails → writer poisoned; all callers get
+//!     [`StorageError::WriterPoisoned`].
+//! - All mutations succeed → `COMMIT`:
+//!   - `COMMIT` succeeds → all callers get `Ok(())`.
+//!   - `COMMIT` fails → attempt `ROLLBACK` to restore known-clean state:
+//!     - `ROLLBACK` succeeds → all callers get
+//!       [`StorageError::Worker`]`("COMMIT failed: …")`.
+//!     - `ROLLBACK` fails → writer poisoned; all callers get
+//!       [`StorageError::WriterPoisoned`].
 //!
 //! ## Shutdown
 //! Shutdown is signalled via an [`AtomicBool`] flag that the worker checks on
@@ -44,7 +67,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::error::StorageError;
 
@@ -70,6 +93,33 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 type MutationFn = Box<dyn FnOnce(&Connection) -> Result<(), StorageError> + Send + 'static>;
 
 // ---------------------------------------------------------------------------
+// TransactionFinalizer — abstraction over COMMIT / ROLLBACK
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the `COMMIT` and `ROLLBACK` SQL statements.
+///
+/// The default implementation issues `COMMIT` and `ROLLBACK` directly via
+/// `conn.execute_batch`.  Tests may inject a [`FailingFinalizer`] to exercise
+/// the writer-poisoning code paths without requiring real SQLite failures.
+pub(crate) trait TransactionFinalizer: Send + 'static {
+    fn commit(&self, conn: &Connection) -> rusqlite::Result<()>;
+    fn rollback(&self, conn: &Connection) -> rusqlite::Result<()>;
+}
+
+/// Production finalizer: issues real `COMMIT` and `ROLLBACK` statements.
+pub(crate) struct DefaultFinalizer;
+
+impl TransactionFinalizer for DefaultFinalizer {
+    fn commit(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch("COMMIT;")
+    }
+
+    fn rollback(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch("ROLLBACK;")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Work item — mutation + result return channel
 // ---------------------------------------------------------------------------
 
@@ -92,6 +142,9 @@ struct WorkItem {
 #[derive(Clone)]
 pub struct WriterQueueHandle {
     tx: SyncSender<WorkItem>,
+    /// Shared with the worker.  When `true`, the writer connection is in an
+    /// unknown state and no further mutations may be enqueued.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl WriterQueueHandle {
@@ -100,16 +153,25 @@ impl WriterQueueHandle {
     ///
     /// ## Return value
     /// - `Ok(())` — the mutation was committed successfully.
+    /// - `Err(StorageError::WriterPoisoned)` — the writer connection is in an
+    ///   unknown transactional state; the storage layer must be restarted.
     /// - `Err(StorageError::QueueFull)` — the queue is at capacity; try later.
     /// - `Err(StorageError::QueueShutdown)` — the worker has shut down.
     /// - `Err(StorageError::BatchRolledBack)` — this mutation was rolled back
     ///   because a different mutation in the same batch failed.
+    /// - `Err(StorageError::Worker(_))` — a `COMMIT` failed but `ROLLBACK`
+    ///   succeeded; the transaction was cleanly aborted.
     /// - Any other `Err` — the mutation itself returned an error; the batch
     ///   was rolled back.
     pub fn send<F>(&self, f: F) -> Result<(), StorageError>
     where
         F: FnOnce(&Connection) -> Result<(), StorageError> + Send + 'static,
     {
+        // Refuse to enqueue if the writer is poisoned.
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(StorageError::WriterPoisoned);
+        }
+
         // Oneshot result channel: capacity 1 so the worker never blocks on send.
         let (result_tx, result_rx) = mpsc::sync_channel(1);
 
@@ -155,15 +217,30 @@ impl WriterQueue {
     /// # Errors
     /// Returns [`StorageError::ThreadSpawn`] if the OS cannot create a thread.
     pub fn new(conn: Connection) -> Result<Self, StorageError> {
+        Self::new_with_finalizer(conn, DefaultFinalizer)
+    }
+
+    /// Create a new `WriterQueue` with a custom [`TransactionFinalizer`].
+    ///
+    /// Intended for testing; production code should use [`WriterQueue::new`].
+    pub(crate) fn new_with_finalizer<F>(conn: Connection, finalizer: F) -> Result<Self, StorageError>
+    where
+        F: TransactionFinalizer,
+    {
         let (tx, rx) = mpsc::sync_channel::<WorkItem>(QUEUE_CAPACITY);
-        let handle = WriterQueueHandle { tx };
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let handle = WriterQueueHandle {
+            tx,
+            poisoned: Arc::clone(&poisoned),
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let shutdown_flag = Arc::clone(&shutdown);
+        let poisoned_flag = Arc::clone(&poisoned);
         let worker = thread::Builder::new()
             .name("attic-writer".into())
             .spawn(move || {
-                worker_loop(conn, rx, shutdown_flag);
+                worker_loop(conn, rx, shutdown_flag, poisoned_flag, Box::new(finalizer));
             })
             .map_err(|e| StorageError::ThreadSpawn(e.to_string()))?;
 
@@ -202,11 +279,32 @@ fn worker_loop(
     conn: Connection,
     rx: mpsc::Receiver<WorkItem>,
     shutdown: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
+    finalizer: Box<dyn TransactionFinalizer>,
 ) {
     let mut batch: Vec<WorkItem> = Vec::with_capacity(BATCH_SIZE);
     let mut last_flush = Instant::now();
 
     loop {
+        // If the writer is poisoned, drain the channel sending WriterPoisoned
+        // to all waiting callers, then exit.
+        if poisoned.load(Ordering::Acquire) {
+            loop {
+                match rx.try_recv() {
+                    Ok(item) => {
+                        let _ = item.result_tx.send(Err(StorageError::WriterPoisoned));
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Also drain any items that accumulated in `batch` before poisoning.
+            for item in batch.drain(..) {
+                let _ = item.result_tx.send(Err(StorageError::WriterPoisoned));
+            }
+            debug!("attic-writer: exiting due to poisoned writer connection");
+            break;
+        }
+
         let shutting_down = shutdown.load(Ordering::Acquire);
 
         // Drain messages into the batch.
@@ -224,15 +322,19 @@ fn worker_loop(
         }
 
         // Flush if the batch is full, the timer has expired, or we're shutting down.
-        let should_flush =
-            !batch.is_empty() && (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL || shutting_down);
+        let should_flush = !batch.is_empty()
+            && (batch.len() >= BATCH_SIZE
+                || last_flush.elapsed() >= FLUSH_INTERVAL
+                || shutting_down);
 
         if should_flush {
-            flush_batch(&conn, &mut batch);
+            flush_batch(&conn, &mut batch, &poisoned, finalizer.as_ref());
             last_flush = Instant::now();
+            // If flush_batch poisoned the writer, the top-of-loop check
+            // will drain remaining items and exit on the next iteration.
         }
 
-        if shutting_down {
+        if shutting_down && !poisoned.load(Ordering::Acquire) {
             // Drain anything that arrived between the shutdown flag check and now.
             loop {
                 match rx.try_recv() {
@@ -241,14 +343,16 @@ fn worker_loop(
                 }
             }
             if !batch.is_empty() {
-                flush_batch(&conn, &mut batch);
+                flush_batch(&conn, &mut batch, &poisoned, finalizer.as_ref());
             }
             debug!("attic-writer: shut down cleanly");
             break;
         }
 
-        // Brief sleep to avoid busy-spinning.
-        thread::sleep(Duration::from_millis(1));
+        if !shutting_down {
+            // Brief sleep to avoid busy-spinning.
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -256,7 +360,12 @@ fn worker_loop(
 // Batch execution
 // ---------------------------------------------------------------------------
 
-fn flush_batch(conn: &Connection, batch: &mut Vec<WorkItem>) {
+fn flush_batch(
+    conn: &Connection,
+    batch: &mut Vec<WorkItem>,
+    poisoned: &Arc<AtomicBool>,
+    finalizer: &dyn TransactionFinalizer,
+) {
     if batch.is_empty() {
         return;
     }
@@ -269,6 +378,7 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<WorkItem>) {
     let n = fns_and_txs.len();
 
     // Open transaction.  On failure every caller receives the error.
+    // No transaction is open so poisoning is not required here.
     if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") {
         let msg = e.to_string();
         error!("attic-writer: BEGIN IMMEDIATE failed: {msg}");
@@ -280,10 +390,10 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<WorkItem>) {
 
     // Execute each mutation in order; stop executing on first failure.
     let mut results: Vec<Result<(), StorageError>> = Vec::with_capacity(n);
-    let mut failed = false;
+    let mut failed_index: Option<usize> = None;
 
-    for (f, _tx) in fns_and_txs.iter_mut() {
-        if failed {
+    for (i, (f, _tx)) in fns_and_txs.iter_mut().enumerate() {
+        if failed_index.is_some() {
             results.push(Err(StorageError::BatchRolledBack));
             continue;
         }
@@ -293,19 +403,68 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<WorkItem>) {
         let real_f = std::mem::replace(f, noop);
         let res = real_f(conn);
         if res.is_err() {
-            failed = true;
+            failed_index = Some(i);
         }
         results.push(res);
     }
 
-    // Commit or rollback.
-    let commit_sql = if failed { "ROLLBACK;" } else { "COMMIT;" };
-    if let Err(e) = conn.execute_batch(commit_sql) {
-        warn!("attic-writer: {commit_sql} failed: {e}");
-        // If COMMIT failed, all mutations are effectively rolled back.
-        if !failed {
-            for r in results.iter_mut() {
-                *r = Err(StorageError::Worker(format!("COMMIT failed: {e}")));
+    if failed_index.is_some() {
+        // ----------------------------------------------------------------
+        // Mutation failure path — attempt ROLLBACK
+        // ----------------------------------------------------------------
+        match finalizer.rollback(conn) {
+            Ok(()) => {
+                // ROLLBACK succeeded: known-clean state.
+                // Callers already have their correct results (original error
+                // for the failed mutation, BatchRolledBack for the rest).
+                // Nothing to change — deliver as-is.
+            }
+            Err(rb_err) => {
+                // ROLLBACK failed: connection state is unknown.  Poison.
+                error!(
+                    "attic-writer: ROLLBACK failed after mutation error: {rb_err}; \
+                     poisoning writer connection"
+                );
+                poisoned.store(true, Ordering::Release);
+                // Overwrite all results with WriterPoisoned.
+                for r in results.iter_mut() {
+                    *r = Err(StorageError::WriterPoisoned);
+                }
+            }
+        }
+    } else {
+        // ----------------------------------------------------------------
+        // All mutations succeeded — attempt COMMIT
+        // ----------------------------------------------------------------
+        match finalizer.commit(conn) {
+            Ok(()) => {
+                // COMMIT succeeded: all results are already Ok(()).
+            }
+            Err(commit_err) => {
+                // COMMIT failed.  Attempt ROLLBACK to restore known-clean state.
+                let commit_msg = commit_err.to_string();
+                error!("attic-writer: COMMIT failed: {commit_msg}; attempting ROLLBACK");
+
+                match finalizer.rollback(conn) {
+                    Ok(()) => {
+                        // ROLLBACK after COMMIT failure succeeded: known-clean state.
+                        // All mutations are effectively rolled back.
+                        for r in results.iter_mut() {
+                            *r = Err(StorageError::Worker(format!("COMMIT failed: {commit_msg}")));
+                        }
+                    }
+                    Err(rb_err) => {
+                        // Both COMMIT and ROLLBACK failed: unknown state.  Poison.
+                        error!(
+                            "attic-writer: ROLLBACK also failed after COMMIT failure: {rb_err}; \
+                             poisoning writer connection"
+                        );
+                        poisoned.store(true, Ordering::Release);
+                        for r in results.iter_mut() {
+                            *r = Err(StorageError::WriterPoisoned);
+                        }
+                    }
+                }
             }
         }
     }
@@ -326,6 +485,10 @@ mod tests {
     use crate::connection::{configure_connection, open_rw};
     use crate::migration::run_migrations;
 
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
     fn migrated_file_db() -> (std::path::PathBuf, Connection) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("attic_writer_{}.db", uuid::Uuid::new_v4()));
@@ -339,6 +502,75 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Injected finalizers for testing error paths
+    // -----------------------------------------------------------------------
+
+    /// Finalizer whose ROLLBACK always fails with the given message.
+    struct FailRollbackFinalizer {
+        msg: &'static str,
+    }
+
+    impl TransactionFinalizer for FailRollbackFinalizer {
+        fn commit(&self, conn: &Connection) -> rusqlite::Result<()> {
+            DefaultFinalizer.commit(conn)
+        }
+
+        fn rollback(&self, _conn: &Connection) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
+                    extended_code: 1,
+                },
+                Some(self.msg.to_owned()),
+            ))
+        }
+    }
+
+    /// Finalizer whose COMMIT always fails, and whose ROLLBACK always succeeds.
+    struct FailCommitFinalizer;
+
+    impl TransactionFinalizer for FailCommitFinalizer {
+        fn commit(&self, _conn: &Connection) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
+                    extended_code: 1,
+                },
+                Some("injected COMMIT failure".to_owned()),
+            ))
+        }
+
+        fn rollback(&self, conn: &Connection) -> rusqlite::Result<()> {
+            DefaultFinalizer.rollback(conn)
+        }
+    }
+
+    /// Finalizer whose COMMIT fails and whose subsequent ROLLBACK also fails.
+    struct FailBothFinalizer;
+
+    impl TransactionFinalizer for FailBothFinalizer {
+        fn commit(&self, _conn: &Connection) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
+                    extended_code: 1,
+                },
+                Some("injected COMMIT failure".to_owned()),
+            ))
+        }
+
+        fn rollback(&self, _conn: &Connection) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
+                    extended_code: 1,
+                },
+                Some("injected ROLLBACK failure".to_owned()),
+            ))
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -479,7 +711,8 @@ mod tests {
     fn queue_full_returns_error() {
         // Use a tiny channel directly to simulate full queue without a real DB.
         let (tx, _rx) = mpsc::sync_channel::<WorkItem>(2);
-        let handle = WriterQueueHandle { tx };
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let handle = WriterQueueHandle { tx, poisoned };
 
         // Fill the queue.
         let (dummy_tx1, _) = mpsc::sync_channel(1);
@@ -493,6 +726,117 @@ mod tests {
             matches!(result, Err(StorageError::QueueFull)),
             "expected QueueFull, got {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Poisoned handle rejects new sends immediately
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn poisoned_handle_rejects_send() {
+        let (tx, _rx) = mpsc::sync_channel::<WorkItem>(16);
+        let poisoned = Arc::new(AtomicBool::new(true)); // pre-poisoned
+        let handle = WriterQueueHandle { tx, poisoned };
+
+        let result = handle.send(|_| Ok(()));
+        assert!(
+            matches!(result, Err(StorageError::WriterPoisoned)),
+            "expected WriterPoisoned, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ROLLBACK failure after mutation error → writer poisoned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rollback_failure_after_mutation_error_poisons_writer() {
+        let (path, writer_conn) = migrated_file_db();
+
+        let queue =
+            WriterQueue::new_with_finalizer(writer_conn, FailRollbackFinalizer { msg: "disk full" })
+                .unwrap();
+        let handle = queue.handle();
+
+        // This mutation will succeed (no constraint error), but we need the
+        // ROLLBACK path.  We force it by injecting a mutation that explicitly
+        // returns an error.
+        let result = handle.send(|_conn| Err(StorageError::Worker("forced failure".into())));
+
+        // The mutation error triggered ROLLBACK, which failed → WriterPoisoned.
+        assert!(
+            matches!(result, Err(StorageError::WriterPoisoned)),
+            "expected WriterPoisoned after ROLLBACK failure, got {result:?}"
+        );
+
+        // Subsequent sends must also return WriterPoisoned immediately.
+        let result2 = handle.send(|_| Ok(()));
+        assert!(
+            matches!(result2, Err(StorageError::WriterPoisoned)),
+            "expected WriterPoisoned on subsequent send, got {result2:?}"
+        );
+
+        drop(queue);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // COMMIT failure + successful ROLLBACK → Worker error to all callers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commit_failure_with_successful_rollback_returns_worker_error_to_all_callers() {
+        let (path, writer_conn) = migrated_file_db();
+
+        let queue = WriterQueue::new_with_finalizer(writer_conn, FailCommitFinalizer).unwrap();
+        let handle = queue.handle();
+
+        let result = handle.send(|_| Ok(()));
+
+        // COMMIT failed but ROLLBACK succeeded → Worker error, not Poisoned.
+        assert!(
+            matches!(result, Err(StorageError::Worker(ref msg)) if msg.contains("COMMIT failed")),
+            "expected Worker(COMMIT failed ...), got {result:?}"
+        );
+
+        // Writer is NOT poisoned — can still accept mutations (though they
+        // will also fail with this injected finalizer; that's fine for this test).
+        assert!(
+            !handle.poisoned.load(Ordering::Acquire),
+            "writer must not be poisoned when ROLLBACK after COMMIT failure succeeded"
+        );
+
+        drop(queue);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // COMMIT failure + ROLLBACK failure → writer poisoned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commit_and_rollback_failure_poisons_writer() {
+        let (path, writer_conn) = migrated_file_db();
+
+        let queue = WriterQueue::new_with_finalizer(writer_conn, FailBothFinalizer).unwrap();
+        let handle = queue.handle();
+
+        let result = handle.send(|_| Ok(()));
+
+        assert!(
+            matches!(result, Err(StorageError::WriterPoisoned)),
+            "expected WriterPoisoned when both COMMIT and ROLLBACK fail, got {result:?}"
+        );
+
+        // Writer is poisoned — subsequent sends rejected immediately.
+        let result2 = handle.send(|_| Ok(()));
+        assert!(
+            matches!(result2, Err(StorageError::WriterPoisoned)),
+            "expected WriterPoisoned on subsequent send after double failure, got {result2:?}"
+        );
+
+        drop(queue);
+        cleanup(&path);
     }
 
     // -----------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Phase 1A Completion Report — Storage Foundation
 
-**Date:** 2026-08-24
+**Date:** 2026-08-24 (updated 2026-08-24 — follow-up correctness pass)
 **Gate:** Phase 1A storage correctness/lifecycle
 **Outcome:** ✅ PASSED — 0 errors, 0 warnings (`cargo check --target x86_64-pc-windows-msvc`)
 
@@ -8,11 +8,15 @@
 
 ## Summary
 
-All nine Phase 1A storage correctness issues identified in review have been resolved.
-The `attic-storage` crate now satisfies its Phase 1A contract: deterministic lifecycle,
-genuinely bounded concurrency, caller-visible mutation results, atomic batch failure
-semantics, propagated construction errors, and a single canonical write path for
-`subsystem_versions_json`.
+All Phase 1A storage correctness issues have been resolved across two passes.
+
+**Initial pass (9 issues):** deterministic lifecycle, genuinely bounded concurrency,
+caller-visible mutation results, atomic batch failure semantics, propagated construction
+errors, and a single canonical write path for `subsystem_versions_json`.
+
+**Follow-up pass (3 issues):** transaction finalization failure-safety with writer
+poisoning, panic-safe RAII pool guard for read connections, and corrected ADR-001
+wording on WAL autocheckpoint behaviour.
 
 ---
 
@@ -28,7 +32,7 @@ every 30 seconds has been removed entirely.  Phase 1A relies solely on
 a passive checkpoint automatically after every 1 000-page WAL write.  An explicit
 `CheckpointController` background task is deferred to Phase 2.
 
-### 2 — Cleaned ADR-001
+### 2 — Cleaned and Corrected ADR-001
 
 **File:** `docs/decisions/ADR-001-wal-checkpoint-policy.md`
 
@@ -39,6 +43,15 @@ a passive checkpoint automatically after every 1 000-page WAL write.  An explici
   (5-minute time-based), and Phase 2 BACKUP pre-flush in a checkpoint-mode table.
 - Added "Alternatives Rejected" entries: background thread (unowned infinite thread)
   and STALE_EVICTION repurposing (wrong abstraction layer).
+- **Follow-up (correctness):** Corrected the Consequences section.
+  - Replaced the erroneous "WAL file is bounded to approximately 4 MB
+    (1,000 × 4 KB pages)" claim.  `wal_autocheckpoint = 1000` is a checkpoint
+    *threshold*, not a hard upper bound; the WAL can grow beyond 1,000 frames when
+    a long-running reader prevents checkpoint progress.
+  - Replaced "Readers are never blocked by the autocheckpoint mechanism" with an
+    accurate description: PASSIVE checkpointing skips frames still referenced by
+    active readers (so it does not stall the write path), but a long-lived reader
+  may cause the WAL to grow until it releases its snapshot.
 
 ### 3 — Writer Returns Actual Execution Result
 
@@ -49,7 +62,7 @@ returns the actual `Result<(), StorageError>` to the caller.  Each `WorkItem` ca
 a `SyncSender<Result<(), StorageError>>` (capacity 1, used as a oneshot) that the
 worker sends into after executing the closure.
 
-### 4 — Batch Failure Semantics
+### 4 — Batch Failure Semantics and Transaction Finalization Safety
 
 **File:** `crates/attic-storage/src/writer.rs`
 
@@ -58,6 +71,29 @@ the transaction.  If any mutation fails, the transaction is rolled back.  The fa
 caller receives the original `StorageError`; all other callers in the same batch
 receive `StorageError::BatchRolledBack`.  No mutation in a rolled-back batch is
 silently discarded.
+
+**Follow-up (correctness):** Explicit finalization failure handling with writer
+poisoning.  The full decision tree is:
+
+- **Mutation failure → ROLLBACK succeeds:** failing caller gets original error; all
+  others get `BatchRolledBack`.  Known-clean state; writer continues.
+- **Mutation failure → ROLLBACK fails:** connection state unknown.  Writer is
+  **poisoned** (`Arc<AtomicBool>` set to `true`); all callers in the batch — and all
+  future callers — receive `StorageError::WriterPoisoned`.  Worker exits.
+- **All succeed → COMMIT succeeds:** all callers get `Ok(())`.
+- **All succeed → COMMIT fails → ROLLBACK succeeds:** known-clean state; all callers
+  receive `StorageError::Worker("COMMIT failed: …")`.  Writer is **not** poisoned.
+- **All succeed → COMMIT fails → ROLLBACK also fails:** connection state unknown.
+  Writer poisoned; all callers receive `StorageError::WriterPoisoned`.  Worker exits.
+
+A `TransactionFinalizer` trait (`commit` / `rollback`) is injected into the worker
+via `WriterQueue::new_with_finalizer`.  `DefaultFinalizer` calls
+`conn.execute_batch("COMMIT;")` / `conn.execute_batch("ROLLBACK;")`.  Tests inject
+`FailRollbackFinalizer`, `FailCommitFinalizer`, and `FailBothFinalizer` to exercise
+each poisoning code path without requiring real SQLite failures.
+
+`WriterQueueHandle::send` checks the poisoned flag *before* enqueuing and returns
+`StorageError::WriterPoisoned` immediately if set.
 
 ### 5 — Deterministic Writer Shutdown
 
@@ -69,14 +105,42 @@ full queue cannot block `Drop::join()`.  The worker drains and nacks any remaini
 queued items (with `StorageError::Worker("shutdown")`) before exiting, ensuring
 `join()` always completes.
 
-### 6 — Genuinely Bounded Read Connection Pool
+### 6 — Genuinely Bounded Read Connection Pool with Panic-Safe RAII Guard
 
 **File:** `crates/attic-storage/src/connection.rs`
 
 `DbPool` is now backed by `PoolInner { idle: Vec<Connection>, in_use: usize }` behind
 `Arc<Mutex<PoolInner>>`.  `POOL_MAX_READERS = 8` is the hard ceiling.  `with_reader`
 returns `StorageError::PoolExhausted` immediately when all 8 slots are in use.
-Connections are returned to the idle pool after use via `PoolGuard`'s `Drop` impl.
+
+**Follow-up (correctness):** The original implementation incremented `in_use` before
+calling the closure and decremented it afterward.  If the closure panicked, the
+decrement was skipped, permanently leaking the pool slot.
+
+This is now fixed with a `PoolGuard` RAII struct:
+
+```rust
+struct PoolGuard {
+    conn: Option<Connection>,
+    pool_inner: Arc<Mutex<PoolInner>>,
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut guard) = self.pool_inner.lock() {
+                guard.idle.push(conn);
+                guard.in_use = guard.in_use.saturating_sub(1);
+            }
+        }
+    }
+}
+```
+
+`with_reader` creates a `PoolGuard` before calling the closure.  `Drop` always runs —
+on normal return, error return, and thread unwinding — returning the connection to the
+idle pool in all cases.  If the pool mutex is itself poisoned during `Drop`, the
+connection is simply dropped (closed safely) rather than lost silently.
 
 ### 7 — No `expect()`/`panic` on Recoverable Paths
 
@@ -122,8 +186,9 @@ Verified correct; no changes required.
 | `ThreadSpawn(String)` | `thread::Builder::spawn` failure in `WriterQueue::new` |
 | `BatchRolledBack` | Callers in a batch whose transaction was rolled back by a peer failure |
 | `PoolExhausted` | All 8 read connections are currently in use |
-| `Worker(String)` | Worker-internal error (e.g., channel disconnect, nack on shutdown) |
+| `Worker(String)` | Worker-internal error (e.g., `BEGIN IMMEDIATE` failure; `COMMIT` failed but `ROLLBACK` succeeded) |
 | `MutexPoisoned(String)` | `Mutex::lock()` returned `PoisonError` |
+| `WriterPoisoned` | `ROLLBACK` or `COMMIT`+`ROLLBACK` both failed; connection state unknown; restart required |
 
 ---
 
@@ -137,12 +202,17 @@ Verified correct; no changes required.
 - `open_db_returns_writer_and_pool`
 - `wal_autocheckpoint_pragma_is_set`
 - `db_reopen_preserves_data`
+- `panicking_reader_does_not_leak_pool_slot` *(new — `catch_unwind` proves `PoolGuard::Drop` runs on unwinding)*
 
 ### `writer.rs`
 - `writer_executes_mutation_and_returns_ok`
 - `writer_returns_error_on_mutation_failure`
 - `mid_batch_failure_rolls_back_batch`
 - `queue_full_returns_error`
+- `poisoned_handle_rejects_send` *(new)*
+- `rollback_failure_after_mutation_error_poisons_writer` *(new)*
+- `commit_failure_with_successful_rollback_returns_worker_error_to_all_callers` *(new)*
+- `commit_and_rollback_failure_poisons_writer` *(new)*
 - `shutdown_does_not_hang_when_queue_full`
 - `worker_thread_joins_on_drop`
 - `writer_queue_new_returns_ok_on_valid_connection`
@@ -181,10 +251,17 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.77s
 | `cargo check` (0 errors, 0 warnings) | ✅ |
 | No background WAL thread | ✅ |
 | ADR-001 clean (no STALE_EVICTION, no thread refs) | ✅ |
+| ADR-001 WAL bound wording correct (threshold, not hard bound) | ✅ |
+| ADR-001 PASSIVE checkpoint wording correct (may grow under pinned reader) | ✅ |
 | Writer returns actual result | ✅ |
 | Batch rollback nacks all peers | ✅ |
+| ROLLBACK failure poisons writer | ✅ |
+| COMMIT failure + ROLLBACK success → `Worker` error, not poisoned | ✅ |
+| COMMIT + ROLLBACK both fail → writer poisoned | ✅ |
+| Poisoned handle rejects new sends immediately | ✅ |
 | Shutdown never hangs | ✅ |
 | Pool hard-bounded at 8 | ✅ |
+| Pool slot released on panic (`PoolGuard` RAII) | ✅ |
 | No `expect()`/`panic` in non-test paths | ✅ |
 | Secret re-scan scheduling deferred | ✅ |
 | Single canonical `subsystem_versions_json` write path | ✅ |

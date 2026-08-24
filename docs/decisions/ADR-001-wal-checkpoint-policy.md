@@ -80,12 +80,21 @@ The checkpoint policy for Phase 1A is fully implemented by the
 
 ## Consequences
 
-- WAL file is bounded to approximately 4 MB (1,000 × 4 KB pages) under normal
-  write load in Phase 1A.
-- Readers are never blocked by the autocheckpoint mechanism.
+- Setting `wal_autocheckpoint = 1000` causes SQLite to *attempt* a PASSIVE
+  checkpoint after each write transaction that pushes the WAL to ≥ 1,000
+  frames.  This is a checkpoint *threshold*, not a hard upper bound: the WAL
+  can grow beyond 1,000 frames when checkpoint progress is prevented — for
+  example, by a long-running reader that holds an open WAL snapshot pinning
+  older frames.
+- PASSIVE checkpointing does not wait for readers; it skips frames that are
+  still referenced by active readers and therefore will not stall the write
+  path.  However, a long-lived reader that prevents checkpoint progress may
+  cause the WAL to grow beyond the autocheckpoint threshold until that reader
+  releases its snapshot.
 - The 5-minute time-based trigger and the pre-backup FULL checkpoint are
   deferred; REC-B3 is partially satisfied until Phase 2.
 - No background threads are leaked by the Phase 1A storage layer.
+</parameter>
 
 ---
 

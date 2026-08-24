@@ -9,7 +9,7 @@
 //!   read connections in `DbPool`.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -80,6 +80,45 @@ struct PoolInner {
     in_use: usize,
 }
 
+// ---------------------------------------------------------------------------
+// PoolGuard — RAII lease that always releases the pool slot
+// ---------------------------------------------------------------------------
+
+/// An RAII guard that holds a borrowed [`Connection`] from [`DbPool`].
+///
+/// When this guard is dropped — whether by normal return, error return, or
+/// thread unwinding (panic) — the connection is returned to the idle pool
+/// and `in_use` is decremented.  This prevents pool-slot leaks when a
+/// caller panics inside [`DbPool::with_reader`].
+struct PoolGuard {
+    /// The borrowed connection.  `Option` so we can `take()` it in `Drop`
+    /// without requiring `Connection: Copy`.
+    conn: Option<Connection>,
+    /// Shared pool state; used during `Drop` to return the connection.
+    pool_inner: Arc<Mutex<PoolInner>>,
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Best-effort: if the mutex is poisoned (another thread panicked
+            // while holding it), we simply drop the connection rather than
+            // trying to return it.  The connection closes cleanly on drop,
+            // which is safe and does not corrupt the database.
+            if let Ok(mut guard) = self.pool_inner.lock() {
+                guard.idle.push(conn);
+                guard.in_use = guard.in_use.saturating_sub(1);
+            }
+            // If mutex is poisoned, `conn` is dropped here, closing the
+            // SQLite connection safely.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DbPool
+// ---------------------------------------------------------------------------
+
 /// A bounded pool of read-only SQLite connections.
 ///
 /// At most [`POOL_MAX_READERS`] connections are ever open at the same time.
@@ -87,17 +126,22 @@ struct PoolInner {
 /// [`StorageError::PoolExhausted`] immediately (no blocking wait).
 ///
 /// Connections are created lazily on first use and reused across calls.
+///
+/// ## Panic safety
+/// [`DbPool::with_reader`] uses a [`PoolGuard`] RAII struct so that the pool
+/// slot is **always** released even if the closure panics.  This prevents
+/// permanent pool-capacity leaks during unwinding.
 #[derive(Clone)]
 pub struct DbPool {
-    path: std::sync::Arc<std::path::PathBuf>,
-    inner: std::sync::Arc<Mutex<PoolInner>>,
+    path: Arc<std::path::PathBuf>,
+    inner: Arc<Mutex<PoolInner>>,
 }
 
 impl DbPool {
     fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            path: std::sync::Arc::new(path.into()),
-            inner: std::sync::Arc::new(Mutex::new(PoolInner {
+            path: Arc::new(path.into()),
+            inner: Arc::new(Mutex::new(PoolInner {
                 idle: Vec::with_capacity(POOL_MAX_READERS),
                 in_use: 0,
             })),
@@ -118,36 +162,41 @@ impl DbPool {
     /// - If the pool is at capacity and all connections are in use,
     ///   [`StorageError::PoolExhausted`] is returned immediately.
     ///
-    /// The connection is always returned to the idle pool when `f` completes,
-    /// regardless of whether `f` returns `Ok` or `Err`.
+    /// The connection is **always** returned to the idle pool when `f`
+    /// completes, whether `f` returns `Ok`, `Err`, or panics.
     pub fn with_reader<F, T>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce(&Connection) -> Result<T, StorageError>,
     {
-        // Acquire or create a connection.
-        let conn = {
-            let mut guard = self.lock()?;
-            if let Some(c) = guard.idle.pop() {
-                guard.in_use += 1;
-                c
-            } else if guard.in_use < POOL_MAX_READERS {
+        // Acquire or create a connection, then wrap it in a PoolGuard so that
+        // Drop will release it regardless of how `f` exits.
+        let guard = {
+            let mut lock = self.lock()?;
+            if let Some(c) = lock.idle.pop() {
+                lock.in_use += 1;
+                PoolGuard {
+                    conn: Some(c),
+                    pool_inner: Arc::clone(&self.inner),
+                }
+            } else if lock.in_use < POOL_MAX_READERS {
                 let c = open_ro(&self.path)?;
-                guard.in_use += 1;
-                c
+                lock.in_use += 1;
+                PoolGuard {
+                    conn: Some(c),
+                    pool_inner: Arc::clone(&self.inner),
+                }
             } else {
                 return Err(StorageError::PoolExhausted);
             }
         };
 
-        let result = f(&conn);
+        // Call the closure.  If `f` panics, `guard` is dropped via unwinding,
+        // which returns the connection to the pool before the panic propagates.
+        let result = f(guard.conn.as_ref().unwrap());
 
-        // Return the connection to the idle pool.
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.idle.push(conn);
-            guard.in_use = guard.in_use.saturating_sub(1);
-        }
-        // If the mutex is poisoned during return, the connection is dropped
-        // (closed), which is safe — it does not corrupt the database.
+        // `guard` drops here on normal return (both Ok and Err), returning the
+        // connection to the idle pool.
+        drop(guard);
 
         result
     }
@@ -343,6 +392,56 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "data must survive DB close/reopen");
         }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Panic safety — PoolGuard must release the slot even on unwinding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn panicking_reader_does_not_leak_pool_slot() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_pool_panic_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let conn = open_rw(&path).unwrap();
+            configure_connection(&conn).unwrap();
+        }
+
+        let pool = DbPool::new(&path);
+
+        // Wrap the pool in AssertUnwindSafe so we can pass it into catch_unwind.
+        // Safety: DbPool contains Mutex-protected state; we do not rely on any
+        // thread-local or address-sensitive invariants across the unwind boundary.
+        let pool_ref = std::panic::AssertUnwindSafe(&pool);
+
+        // The closure panics inside with_reader.  catch_unwind catches it so
+        // the test thread itself does not abort.
+        let result = std::panic::catch_unwind(move || {
+            pool_ref.with_reader(|_conn| -> Result<(), StorageError> {
+                panic!("deliberate test panic inside reader closure");
+            })
+        });
+
+        // catch_unwind should have caught the panic.
+        assert!(result.is_err(), "catch_unwind must return Err when closure panics");
+
+        // The PoolGuard Drop must have run during unwinding, returning the
+        // connection to the idle pool.
+        assert_eq!(
+            pool.in_use_count(),
+            0,
+            "pool slot must be released after panicking reader (in_use must be 0)"
+        );
+        assert_eq!(
+            pool.idle_count(),
+            1,
+            "connection must be returned to idle pool after panicking reader"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

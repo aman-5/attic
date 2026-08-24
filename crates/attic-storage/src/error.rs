@@ -52,6 +52,15 @@ pub enum StorageError {
     /// An internal mutex was poisoned.
     #[error("internal mutex poisoned: {0}")]
     MutexPoisoned(String),
+
+    /// The writer connection is in an unknown transactional state and has been
+    /// permanently disabled.  All subsequent write attempts will be rejected
+    /// until the storage layer is restarted.
+    ///
+    /// This is set when a `ROLLBACK` or `COMMIT` failure leaves the connection
+    /// in a state that cannot be safely determined or recovered from.
+    #[error("writer connection poisoned (unrecoverable transaction finalization failure; restart required)")]
+    WriterPoisoned,
 }
 
 impl From<serde_json::Error> for StorageError {
