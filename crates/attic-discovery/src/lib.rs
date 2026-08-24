@@ -544,6 +544,7 @@ pub fn preprocess_file_content(
         return Ok(PreprocessResult {
             decision: SecretScanDecision::PartialScan,
             content: Some(scan.redacted),
+            stream: None,
             findings: scan.findings,
         });
     }
@@ -569,6 +570,7 @@ pub fn preprocess_file_content(
         return Ok(PreprocessResult {
             decision,
             content: None,
+            stream: None,
             findings,
         });
     }
