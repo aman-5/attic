@@ -3,5 +3,6 @@
 pub mod file_occurrence;
 pub mod index_generation;
 pub mod publication;
+#[allow(clippy::module_inception)]
 pub mod repository;
 pub mod source_revision;

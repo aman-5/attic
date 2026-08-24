@@ -289,13 +289,8 @@ fn worker_loop(
         // If the writer is poisoned, drain the channel sending WriterPoisoned
         // to all waiting callers, then exit.
         if poisoned.load(Ordering::Acquire) {
-            loop {
-                match rx.try_recv() {
-                    Ok(item) => {
-                        let _ = item.result_tx.send(Err(StorageError::WriterPoisoned));
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(item) = rx.try_recv() {
+                let _ = item.result_tx.send(Err(StorageError::WriterPoisoned));
             }
             // Also drain any items that accumulated in `batch` before poisoning.
             for item in batch.drain(..) {
@@ -336,11 +331,8 @@ fn worker_loop(
 
         if shutting_down && !poisoned.load(Ordering::Acquire) {
             // Drain anything that arrived between the shutdown flag check and now.
-            loop {
-                match rx.try_recv() {
-                    Ok(item) => batch.push(item),
-                    Err(_) => break,
-                }
+            while let Ok(item) = rx.try_recv() {
+                batch.push(item);
             }
             if !batch.is_empty() {
                 flush_batch(&conn, &mut batch, &poisoned, finalizer.as_ref());

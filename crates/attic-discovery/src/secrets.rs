@@ -272,13 +272,10 @@ impl LargeFileStream {
         self.hash_verified = true;
         let actual = self.hasher.finalize().to_hex().to_string();
         if actual != self.identity.content_hash {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "source identity changed during streaming (unstable capture): {}",
-                    self.path.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "source identity changed during streaming (unstable capture): {}",
+                self.path.display()
+            )));
         }
         Ok(())
     }
@@ -292,10 +289,8 @@ impl LargeFileStream {
                 return Some(self.flush_pem_eof());
             }
             // Fully drained: perform final hash integrity check.
-            if !self.hash_verified {
-                if let Err(e) = self.verify_hash_at_eof() {
-                    return Some(Err(e));
-                }
+            if !self.hash_verified && let Err(e) = self.verify_hash_at_eof() {
+                return Some(Err(e));
             }
             return None;
         }
@@ -405,7 +400,7 @@ impl LargeFileStream {
 
         if let Some(end_pos) = find_pem_end(&search_str, 0) {
             let end_line_finish = find_str_line_end_pos(&search_str, end_pos);
-            let remainder_start_in_new = if end_line_finish >= tail_len { end_line_finish - tail_len } else { 0 };
+            let remainder_start_in_new = end_line_finish.saturating_sub(tail_len);
             let after_end_bytes = new_bytes[remainder_start_in_new.min(new_bytes.len())..].to_vec();
             let bytes_before_end_in_new = end_pos.saturating_sub(tail_len);
             let finding_end_file_offset = self.file_bytes_consumed.saturating_sub(new_bytes.len()).saturating_add(bytes_before_end_in_new);
