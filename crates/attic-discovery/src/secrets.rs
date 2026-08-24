@@ -20,28 +20,37 @@
 //!
 //! # File-size tiers and safe streaming
 //!
-//! | Tier       | Threshold        | Content delivery                         |
-//! |------------|------------------|------------------------------------------|
-//! | SMALL      | <= 256 KiB       | Full in-memory redact, `content` field   |
-//! | LARGE      | 256 KiB-16 MiB   | [`LargeFileStream`] bounded streaming    |
-//! | VERY_LARGE | > 16 MiB         | Sample-only classification (PartialScan) |
+//! Thresholds follow `docs/contracts/large_files.md` — these are the single
+//! source of truth; `lib.rs` re-exports them and must not define its own.
+//!
+//! | Tier       | Threshold          | Content delivery                         |
+//! |------------|--------------------|------------------------------------------|
+//! | SMALL      | <= 4 MiB           | Full in-memory redact, `content` field   |
+//! | LARGE      | 4 MiB – 50 MiB     | [`LargeFileStream`] bounded streaming    |
+//! | VERY_LARGE | > 50 MiB           | Sample-only classification (PartialScan) |
 //!
 //! Phase 1C **must** obtain LARGE-file content exclusively through
 //! [`LargeFileStream`].  It must never reopen the raw file and consume raw
-//! bytes directly -- that would bypass the redaction boundary and allow
+//! bytes directly — that would bypass the redaction boundary and allow
 //! classified-Redacted content to reach indexers.
 
 use std::io::{self, Read};
 
 // ---------------------------------------------------------------------------
-// Size-tier constants
+// Size-tier constants  (authoritative — from docs/contracts/large_files.md)
 // ---------------------------------------------------------------------------
 
 /// Files <= this size are processed entirely in memory (SMALL tier).
-pub const SMALL_FILE_THRESHOLD: u64 = 256 * 1024; // 256 KiB
+///
+/// Matches `MAX_FULL_LOAD_BYTES` in the large-file contract (4 MiB).
+/// `lib.rs` re-exports this constant and must not define a conflicting value.
+pub const SMALL_FILE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
 
 /// Files > this size are treated as VERY_LARGE (sample-only scan).
-pub const VERY_LARGE_FILE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16 MiB
+///
+/// Matches `MAX_LARGE_BYTES` in the large-file contract (50 MiB).
+/// `lib.rs` re-exports this constant and must not define a conflicting value.
+pub const VERY_LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024; // 50 MiB
 
 /// Chunk size used when streaming LARGE files.
 pub const STREAM_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
@@ -58,14 +67,18 @@ pub const STREAM_OVERLAP_SIZE: usize = 4 * 1024; // 4 KiB
 // ---------------------------------------------------------------------------
 
 /// File-size classification tier.
+///
+/// This is the **single authoritative** size-tier type for the entire
+/// `attic-discovery` crate.  `lib.rs` re-exports it; there must be no
+/// second definition.  Threshold values follow `docs/contracts/large_files.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSizeTier {
-    /// <= SMALL_FILE_THRESHOLD.  Full in-memory processing.
+    /// <= `SMALL_FILE_THRESHOLD` (4 MiB).  Full in-memory processing.
     Small,
-    /// > SMALL_FILE_THRESHOLD and <= VERY_LARGE_FILE_THRESHOLD.
-    /// Content is delivered through LargeFileStream.
+    /// > `SMALL_FILE_THRESHOLD` (4 MiB) and <= `VERY_LARGE_FILE_THRESHOLD` (50 MiB).
+    /// Content is delivered through [`LargeFileStream`].
     Large,
-    /// > VERY_LARGE_FILE_THRESHOLD.
+    /// > `VERY_LARGE_FILE_THRESHOLD` (50 MiB).
     /// Only a head+tail sample is scanned; mid-body is not inspected.
     VeryLarge,
 }
