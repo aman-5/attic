@@ -13,3 +13,6 @@ Cargo.lock.bak
 
 # editor
 *.rs.bk
+
+#base-Files
+/Attic_AI_Agent_Implementation_Pack/*
