@@ -76,22 +76,18 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
     let mut result = WalkResult::default();
 
     // ── Step 1: obtain tracked-file set if include_untracked = false ───────
+    // FAIL CLOSED: if the caller explicitly requested include_untracked=false
+    // and we cannot obtain the Git tracked-file set, we must NOT silently
+    // fall back to include_untracked=true semantics.  Broadening the discovery
+    // scope without authorisation violates the policy contract.
     let tracked_files: Option<HashSet<String>> =
         if policy.git_aware && !policy.include_untracked {
-            match git_tracked_files(root) {
-                Ok(set) => Some(set),
-                Err(e) => {
-                    // If git ls-files fails (e.g. shallow clone, no commits),
-                    // emit a diagnostic and fall back to include_untracked=true
-                    // semantics for this walk.
-                    result.diagnostics.push(Diagnostic {
-                        kind: DiagnosticKind::IoError,
-                        path: root.to_path_buf(),
-                        message: format!("git ls-files failed, falling back to include_untracked=true: {e}"),
-                    });
-                    None
+            let set = git_tracked_files(root).map_err(|e| {
+                DiscoveryError::TrackedFileSetUnavailable {
+                    reason: e.to_string(),
                 }
-            }
+            })?;
+            Some(set)
         } else {
             None
         };
@@ -577,6 +573,35 @@ mod tests {
     }
 
     // ── New tests required by review ──────────────────────────────────────
+
+    /// When `include_untracked = false` and `git ls-files` fails (no git repo,
+    /// no commits), the walk must return an error — not silently fall back to
+    /// `include_untracked = true` semantics.
+    #[test]
+    fn include_untracked_false_fails_closed_when_git_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Deliberately NOT a valid git repo (no `git init`), so `git ls-files`
+        // will fail.  A bare `.git/` stub is also insufficient for ls-files.
+        // We create just normal files — no git machinery.
+        write(root, "src/main.rs", "fn main() {}");
+
+        let mut policy = DiscoveryPolicy::default_git();
+        policy.include_untracked = false;
+
+        let result = walk(root, &policy);
+        assert!(
+            result.is_err(),
+            "walk must fail when include_untracked=false and git tracked-file set is unavailable"
+        );
+        match result.unwrap_err() {
+            crate::error::DiscoveryError::TrackedFileSetUnavailable { .. } => {}
+            other => panic!(
+                "expected TrackedFileSetUnavailable, got {other:?}"
+            ),
+        }
+    }
 
     /// `include_untracked = false` with a real `git init` + `git add`:
     /// tracked files appear, untracked files are suppressed.

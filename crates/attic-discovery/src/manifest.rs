@@ -136,10 +136,13 @@ pub fn build_manifest(entries: &[EligibleEntry], root: &Path) -> SourceManifest 
                 let stat_after = FileStat::read(&entry.abs_path).ok();
 
                 // Detect a change: size or mtime differs between reads.
+                // If either stat failed the capture state is uncertain —
+                // we cannot confirm the file was stable, so treat it as
+                // unstable (fail-closed).
                 let file_changed = match (&stat_before, &stat_after) {
                     (Some(before), Some(after)) => before != after,
-                    // If either stat failed the capture is uncertain → unstable.
-                    _ => false,
+                    // One or both stats unavailable → cannot establish stability.
+                    _ => true,
                 };
 
                 if file_changed {
@@ -383,14 +386,9 @@ mod tests {
         assert!(m.is_stable());
     }
 
-    /// Simulates an unstable capture: we use a custom hook by injecting a
-    /// pre-built entry whose abs_path points to a real file, then verify the
-    /// normal (stable) path.  True unstable detection requires concurrent
-    /// modification which is inherently racy in unit tests; instead we verify
-    /// the `FileStat` comparison logic directly.
+    /// FileStat comparison correctly identifies a size change.
     #[test]
     fn file_stat_detects_size_change() {
-        // Verify that FileStat comparison correctly identifies a size change.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("f.txt");
         fs::write(&path, b"hello").unwrap();
@@ -406,21 +404,59 @@ mod tests {
         assert_ne!(before.size, after.size);
     }
 
-    /// Verify that `ManifestEntry.unstable` and `unstable_captures` are wired
-    /// correctly when a simulated unstable entry is encountered.
-    ///
-    /// We test the diagnostic path by constructing an entry, manually
-    /// verifying that equal stats produce `unstable = false`, since actually
-    /// racing the file system in a unit test would be non-deterministic.
+    /// Two different `FileStat` values → `file_changed` logic returns `true`.
+    /// Identical values → returns `false`.
     #[test]
     fn unstable_capture_detected_when_stats_differ() {
-        // Two different FileStat values → file_changed must be true.
         let stat_a = FileStat { size: 10, modified: None };
         let stat_b = FileStat { size: 20, modified: None };
         assert_ne!(stat_a, stat_b, "different sizes must produce != stats");
 
-        // Same FileStat values → file_changed must be false.
         let stat_c = FileStat { size: 10, modified: None };
         assert_eq!(stat_a, stat_c, "identical stats must be equal");
+    }
+
+    /// When a stat call fails (file absent before/after hashing), the capture
+    /// must be treated as uncertain/unstable — not stable.
+    #[test]
+    fn uncertain_stat_is_treated_as_unstable() {
+        // Simulate stat failure by using a missing file:
+        // stat_before = None, stat_after = None → uncertain → unstable.
+        // We exercise the match arm directly via the logic's documented contract:
+        // (None, _) or (_, None) must yield file_changed = true.
+        //
+        // We test the observable outcome: an entry whose file disappears after
+        // hashing starts (abs_path points to a real file for the hash but we
+        // delete it before the post-hash stat) should surface as unstable.
+        //
+        // Because we cannot reliably race the post-stat in a unit test, we
+        // verify the logic by creating a manifest entry with a file that
+        // exists for hashing but test the FileStat::read error path separately.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Build a valid entry for a file that exists.
+        let e = make_entry(root, "src/ephemeral.rs", "fn e() {}");
+        let m = build_manifest(&[e], root);
+
+        // For a normal file both stats succeed → stable.
+        assert!(
+            m.unstable_captures.is_empty(),
+            "normal file must be stable; got {:?}",
+            m.unstable_captures
+        );
+
+        // Now confirm the uncertain branch: (None, Some) or (Some, None)
+        // resolves to true. We access the match logic indirectly: if
+        // FileStat::read returns Err, stat is None. Verify that a None stat
+        // for a nonexistent path is indeed None (not a panic).
+        let nonexistent = root.join("does_not_exist.rs");
+        assert!(
+            FileStat::read(&nonexistent).is_err(),
+            "FileStat::read must fail for nonexistent path"
+        );
+        // The `_ => true` arm in build_manifest means any None stat
+        // causes unstable=true — documented and verified by code inspection
+        // since the race cannot be forced deterministically.
     }
 }

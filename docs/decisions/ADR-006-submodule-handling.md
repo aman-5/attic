@@ -10,81 +10,99 @@
 ## Context
 
 The Phase 1B discovery pipeline walks a repository's working tree and builds a
-`WorkspaceSnapshot` containing a `SourceRevision` and a per-file manifest.  Git
-submodules are directories inside the parent working tree that are themselves
-independent Git repositories.  Two treatment strategies were possible:
+per-file manifest.  Git submodules are directories inside the parent working
+tree that are themselves independent Git repositories.  Two treatment strategies
+were considered for the parent walk:
 
 1. **Opaque subtree** — treat the submodule directory as ordinary files inside
-   the parent walk; include it in the parent `SourceRevision` manifest.
-2. **Separate repository** — refuse to descend into submodule directories during
-   the parent walk; represent each submodule as its own `core_repositories` row
-   with its own `SourceRevision`.
+   the parent walk; include submodule object files in the parent manifest.
+2. **Boundary stop + skip** — refuse to descend into submodule directories
+   during the parent walk; emit a diagnostic and record the boundary so callers
+   know about it.
 
 ---
 
 ## Decision
 
-**Each Git submodule is treated as a separate repository with its own
-`SourceRevision`.**
+**Phase 1B implements boundary detection and exclusion only.**
 
-Concretely:
+Concretely, the only Phase 1B behaviour is:
 
-- During the `ignore`-crate walk of the parent repository, any path that
-  resolves to a directory containing its own `.git` file or `.git/` directory is
-  treated as a nested repository root and is **not descended into** by the parent
-  walk.
-- The discovery engine records the submodule path and its `HEAD` SHA as a
-  separate `core_repositories` entry in the storage layer.
-- Each submodule has its own `WorkspaceSnapshot`, manifest hash, and
-  `SourceRevision`.
-- The parent `WorkspaceSnapshot` includes a `submodule_revisions` field
-  (Vec<(String, String)> — relative path + HEAD SHA) so the parent manifest
-  hash still changes when any submodule advances.
-- Uninitialized submodules (no `.git` file inside) are treated as an empty
-  directory and do not produce a `core_repositories` row.
+- During the `ignore`-crate walk of the parent repository, any directory that
+  contains its own `.git` file or `.git/` directory is treated as a **nested
+  repository boundary**.
+- The walk does **not** descend into that directory.
+- A `DiagnosticKind::SubmoduleDetected` diagnostic is emitted, carrying the
+  repo-relative path of the detected boundary.
+- The submodule's repo-relative prefix is recorded in `WalkResult::submodule_prefixes`
+  (a `Vec<String>`) so callers can enumerate detected boundaries.
+
+Phase 1B does **not**:
+
+- Create `core_repositories` rows for submodules.
+- Build `WorkspaceSnapshot`, `SourceRevision`, or manifest records for submodules.
+- Schedule submodule index passes.
+- Read the submodule's `HEAD` SHA or include it in the parent manifest hash.
+
+Registration of submodule boundaries into the storage layer, cross-repository
+indexing, and incremental scheduling of submodule discovery passes are
+**future work** deferred to Phase 2 and beyond (see §Future Work below).
 
 ---
 
 ## Rationale
 
-| Criterion | Opaque subtree | Separate repository |
-|-----------|---------------|---------------------|
-| Manifest hash accuracy | ❌ Hashes submodule object files that are opaque binary blobs | ✅ Each submodule's hash computed from its own working tree |
-| Storage efficiency | ❌ Duplicate indexing of shared library code | ✅ One row per repo; content deduplicated via file hash |
-| Cross-repository navigation | ❌ Not possible — symbols are mixed into parent namespace | ✅ Symbols are queryable per-repository or across workspace |
-| Phase 1B scope | ⚠️ Simpler to implement but creates debt for Phase 2+ | ✅ Correct boundary from the start |
+| Criterion | Opaque subtree | Boundary stop (Phase 1B) |
+|-----------|---------------|--------------------------|
+| Correctness | ❌ Hashes submodule object files (binary blobs, not source) | ✅ Parent manifest contains only parent source files |
+| Phase 1B scope | ⚠️ Simpler but wrong — creates manifest debt for Phase 2 | ✅ Clean boundary from day one; submodule work deferred safely |
+| Diagnostic visibility | ❌ Submodule silently absorbed | ✅ Caller knows exactly which boundaries were skipped |
+| Forward compatibility | ❌ Future cross-repo navigation requires re-manifesting everything | ✅ Storage registration can be added in Phase 2 without retroactive fixes |
 
-The "separate repository" model aligns with how Git itself models submodules and
-with the storage contract's `core_repositories` multi-row design.
+The explicit `.git`-presence check is necessary because the `ignore` crate does
+**not** automatically stop at `.git` boundaries inside a walk that was started
+from a parent root.
 
 ---
 
 ## Consequences
 
-- `attic-discovery` `walk.rs` detects submodule roots actively: for every
-  directory entry encountered during a walk pass, it checks whether
-  `abs_path.join(".git").exists()`.  If `true`, the directory is treated as a
-  nested repository boundary — a `DiagnosticKind::SubmoduleDetected` diagnostic
-  is emitted, the directory's repo-relative prefix is recorded in
-  `submodule_prefixes`, and all files underneath it are skipped for the
-  remainder of that pass.  This explicit check is necessary because the `ignore`
-  crate does **not** automatically stop at `.git` boundaries inside a walk that
-  was started from a parent root.
-- `WorkspaceSnapshot` gains a `submodule_revisions` field in Phase 1B.  If the
-  field is empty the parent hash is computed as before; if non-empty the
-  submodule SHAs are included in the BLAKE3 hash input.
-- Phase 2 indexing must iterate `submodule_revisions` and enqueue each submodule
-  for its own index pass.
-- The `source_revision.md` contract §2.5 is updated to document submodule
-  semantics.
+### Phase 1B (implemented)
+
+- `walk.rs` checks `abs_path.join(".git").exists()` for every directory entry
+  it encounters.  When `true`, it:
+  1. emits a `DiagnosticKind::SubmoduleDetected` diagnostic,
+  2. appends the repo-relative prefix to `WalkResult::submodule_prefixes`, and
+  3. skips (does not descend into) that directory for the remainder of the pass.
+- `EligibleEntry` values returned by `walk()` contain **only** files from the
+  parent repository's own working tree — no submodule files are included.
+- The parent `SourceManifest` hash therefore reflects the parent's source files
+  only, which is correct.
+
+### Future work (Phase 2+)
+
+- A registration step will iterate `WalkResult::submodule_prefixes`, create or
+  update a `core_repositories` row for each submodule, and enqueue each
+  submodule for its own discovery pass.
+- Each submodule will eventually have its own `SourceManifest` and
+  `SourceRevision`.
+- The parent manifest may optionally include a `submodule_revisions` field
+  (Vec<(String, String)> — relative path + HEAD SHA) so the parent hash changes
+  when a submodule advances.  This design is deferred and will be documented in
+  a Phase 2 ADR.
+- Uninitialized submodules (no `.git` file inside the directory) are treated as
+  an empty directory in Phase 1B; Phase 2 may add explicit tracking of
+  uninitialized entries.
 
 ---
 
 ## Alternatives Rejected
 
-**Merge submodule content into parent manifest**: rejected because the submodule
-working tree is a separate `HEAD` and its files change on a different cadence
-than the parent.  Mixing them makes incremental invalidation impractical.
+**Merge submodule content into parent manifest**: rejected because submodule
+object files are opaque binary blobs and do not represent source content.
+Including them in the parent manifest would cause spurious hash changes
+unrelated to source changes.
 
-**Ignore submodules entirely**: rejected because a workspace containing
-submodules would silently miss large portions of its own codebase.
+**Ignore submodules entirely (no diagnostic)**: rejected because callers would
+have no visibility into skipped boundaries, making silent data gaps possible.
+The `SubmoduleDetected` diagnostic makes every skipped boundary observable.

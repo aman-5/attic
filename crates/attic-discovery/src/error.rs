@@ -41,6 +41,14 @@ pub enum DiscoveryError {
     /// Configuration is invalid for another reason.
     #[error("invalid discovery configuration: {0}")]
     InvalidConfig(String),
+
+    /// `include_untracked = false` was requested but the Git tracked-file set
+    /// could not be obtained.  The walk did not proceed — refusing to silently
+    /// broaden discovery scope.
+    #[error(
+        "include_untracked=false requested but git tracked-file set unavailable: {reason}"
+    )]
+    TrackedFileSetUnavailable { reason: String },
 }
 
 impl From<std::io::Error> for DiscoveryError {
