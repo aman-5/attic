@@ -25,19 +25,15 @@ repository    = "https://github.com/your-org/attic"
 # Update only after re-verifying on crates.io/official repositories.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
-# async runtime — required by server and indexing workers
-tokio = { version = "1.53.1", default-features = false }
-
-# serialization
-serde      = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151" }
-
-# error types
-thiserror = "2.0.20"
-
-# structured logging (to stderr — never stdout, which is reserved for MCP stdio)
+# structured logging — used by attic-server (Bootstrap only external deps)
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+# Deferred to later phases (add back when the implementing crate actually uses them):
+# tokio     — Phase 1+ (async I/O crates)
+# serde     — Phase 0+ (domain types)
+# serde_json — Phase 0+ (domain types)
+# thiserror  — Phase 0+ (domain error types)
 
 # intra-workspace
 attic-core         = { path = "crates/attic-core" }
