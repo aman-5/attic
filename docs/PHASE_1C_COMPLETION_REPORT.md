@@ -2,15 +2,16 @@
 
 **Date:** 2026-08-25
 **Crate:** `attic-analyzers` v0.1.0
-**Status:** ✅ COMPLETE — 32/32 tests pass, zero clippy warnings
+**Status:** ✅ COMPLETE — 40/40 tests pass, zero clippy warnings
 
 ---
 
 ## 1. Scope
 
 Phase 1C delivers the `attic-analyzers` crate: the analyzer trait, registry, dispatch
-layer, and the mandatory `GenericAnalyzer` fallback. All four implementation blockers
-identified in the post-Phase-1C review have been resolved in this session.
+layer, and the mandatory `GenericAnalyzer` fallback. All implementation blockers
+identified in the post-Phase-1C review have been resolved, including a post-completion
+redesign of `dispatch.rs` to enforce bounded O(1) memory for all LARGE file paths.
 
 ---
 
@@ -86,15 +87,15 @@ All three budget fields are enforced after each chunk emission:
 All three emit `RESOURCE_EXHAUSTED` (or `CANCELLED`) and return partial output
 rather than continuing.
 
-### 2.5 `src/dispatch.rs` — Dispatch with panic recovery
+### 2.5 `src/dispatch.rs` — Dispatch with panic recovery and bounded spool
 
-#### Algorithm (corrected from Phase 1C baseline)
+#### Algorithm
 
 ```
 select analyzer from registry for input.file_type
 if is_generic → analyze directly (no overhead)
 else:
-  split_for_fallback(input) → (fallback_input, specialized_input)
+  split_for_fallback(input) → (fallback_input, specialized_input, _spool_guard)
   result = catch_unwind(|| specialized.analyze(specialized_input))
   match result:
     Ok(output) with no error diagnostics → return as-is
@@ -103,25 +104,63 @@ else:
                                            original errors + FALLBACK_USED
     Err(panic)                           → run GenericAnalyzer(fb_input)
                                            add PANIC_CAUGHT + FALLBACK_USED
-    (fallback_input = None)              → minimal_*_output (collection failed)
+    (fallback_input = None)              → minimal_*_output (spool failed)
+  _spool_guard drops here → temp file deleted
 ```
 
-#### Blocker fixes applied
+#### Bounded spool strategy for `StreamingHandle`
 
-**Blocker 1 — Error path now runs GenericAnalyzer**
-Previously, the `Ok(output) with errors` arm merely annotated the specialized
-analyzer's empty output with `FALLBACK_USED`. Now it runs
-`GenericAnalyzer::new().analyze(fb_input)` and returns real retrieval units.
-The original error diagnostics are preserved in `fb_output.diagnostics` for
-traceability.
+`split_for_fallback` handles `AnalyzerContent::StreamingHandle` with a fully
+bounded, streaming-end-to-end approach:
 
-**Blocker 2 — Streaming collect before split**
-`split_for_fallback` now handles `StreamingHandle` by calling
-`attic_discovery::secrets::collect_all(&mut stream)`, which drains the
-already-redacted stream into a `String` and wraps it as
-`AnalyzerContent::RedactedBytes`. Both the specialized and fallback inputs
-receive this collected content. The raw file path is never reopened — the
-Phase 1B redaction boundary is fully respected.
+1. A `tempfile::NamedTempFile` spool is created.
+2. The `LargeFileStream` is consumed **chunk by chunk**; each chunk's `.redacted`
+   field (Phase 1B-safe bytes) is written to the spool via `Write::write_all`.
+   Peak in-process memory is O(one chunk), not O(file size).
+3. Once all chunks are written and flushed, **two independent**
+   `LargeFileStream::open(spool.path())` handles are opened — one for the
+   specialized analyzer, one for `GenericAnalyzer` fallback.
+4. The spool `NamedTempFile` is returned as `_spool_guard` and bound in
+   `dispatch()` scope. It is dropped (and the temp file deleted) after **both**
+   analyzers have finished, providing deterministic cleanup.
+5. Disk usage is bounded: at most one spool file per active dispatch call.
+
+```rust
+AnalyzerContent::StreamingHandle(mut stream) => {
+    let spool_result: std::io::Result<tempfile::NamedTempFile> = (|| {
+        let mut spool = tempfile::NamedTempFile::new()?;
+        while let Some(chunk_result) = stream.next_chunk() {
+            let chunk = chunk_result?;
+            spool.write_all(chunk.redacted.as_bytes())?;
+        }
+        spool.flush()?;
+        Ok(spool)
+    })();
+
+    match spool_result {
+        Ok(spool) => {
+            let spec_stream = LargeFileStream::open(spool.path());
+            let fb_stream = LargeFileStream::open(spool.path());
+            match (spec_stream, fb_stream) {
+                (Ok(s), Ok(f)) => (
+                    Some(AnalyzerContent::StreamingHandle(Box::new(f))),
+                    AnalyzerContent::StreamingHandle(Box::new(s)),
+                    Some(spool),
+                ),
+                _ => (None, AnalyzerContent::RedactedBytes(vec![]), Some(spool)),
+            }
+        }
+        Err(_) => (None, AnalyzerContent::RedactedBytes(vec![]), None),
+    }
+}
+```
+
+**Why not `collect_all`?** The previous implementation used
+`attic_discovery::secrets::collect_all(&mut stream)` to drain the entire
+`LargeFileStream` into a heap `String` before splitting. This violated the O(1)
+memory invariant for LARGE files. The spool strategy replaces it: the raw file
+path is never reopened (preserving Phase 1B security), and peak heap usage
+remains O(one stream chunk).
 
 ---
 
@@ -130,7 +169,7 @@ Phase 1B redaction boundary is fully respected.
 | # | Blocker | Resolution |
 |---|---|---|
 | 1 | Error-diagnostic path returned specialized empty output instead of running GenericAnalyzer | `dispatch.rs`: `Ok(specialized_output)` arm now calls `GenericAnalyzer::new().analyze(fb_input)` |
-| 2 | Streaming dispatch returned zero units on specialized failure/panic | `split_for_fallback`: `StreamingHandle` branch collects stream to `RedactedBytes` via `secrets::collect_all` before splitting |
+| 2 | Streaming dispatch used `collect_all()` — O(file size) heap allocation for LARGE files | `split_for_fallback`: `StreamingHandle` branch spools redacted chunks to `NamedTempFile`, opens two independent `LargeFileStream` handles; O(1) memory end-to-end |
 | 3 | GenericAnalyzer carry buffer was unbounded | `MAX_CARRY_BYTES = 65_536` + `floor_char_boundary` splits in `stream_into_units` and `emit_possibly_oversized_line` |
 | 4 | SourceSpan semantics were inconsistent | All spans use 0-based exclusive end throughout `build_retrieval_unit_from_lines`; verified by 5 span-specific tests |
 
@@ -138,21 +177,27 @@ Phase 1B redaction boundary is fully respected.
 
 ## 4. Test Coverage
 
-**32 tests, 0 failures, 0 ignored**
+**40 tests, 0 failures, 0 ignored**
 
 | Module | Tests | What's covered |
 |---|---|---|
 | `cancellation` | 4 | new token not cancelled, cancel visible to clones, idempotent, default |
-| `dispatch` | 5 | generic direct path, specialized success, **error→GenericAnalyzer fallback+units**, panic→fallback+units, terminal-safe fallback |
+| `dispatch` | 13 | generic direct path, specialized success, **error→GenericAnalyzer fallback+units**, panic→fallback+units, terminal-safe fallback; **8 new streaming dispatch tests** |
 | `generic` | 15 | empty file, LF spans, CRLF spans, unterminated line, multi-chunk split, redacted input, invalid UTF-8, cancellation, resource unit limit, resource memory limit, streaming units, **streaming bounded carry (no-OOM no-newline)**, **streaming 0-based spans**, floor_char_boundary UTF-8 split |
 | `registry` | 8 | generic fallback, specialized registration, capability level ordering, deterministic tie-breaking, language-agnostic ignored, descriptors deduplicated/sorted |
 
-New tests added in this session (addressing the four blockers):
-- `dispatch::dispatch_specialized_fatal_error_runs_generic_fallback_and_produces_units`
-- `generic::streaming_handle_produces_units`
-- `generic::streaming_bounded_carry_no_oom`
-- `generic::streaming_span_0_based_exclusive`
-- `generic::floor_char_boundary_splits_at_utf8_boundary`
+#### 8 new streaming dispatch tests (post-redesign)
+
+| Test | What it verifies |
+|---|---|
+| `streaming_dispatch_generic_direct` | `StreamingHandle` routed to generic analyzer directly (no split overhead) |
+| `streaming_dispatch_specialized_success` | Specialized analyzer receives `StreamingHandle`; returns units without fallback |
+| `streaming_dispatch_fallback_on_error` | Specialized error triggers `GenericAnalyzer(fb_stream)`; fallback units present |
+| `streaming_dispatch_fallback_on_panic` | Panic in specialized path; `PANIC_CAUGHT` + `FALLBACK_USED` in output; units non-empty |
+| `streaming_dispatch_spool_guard_drops` | Temp file deleted after dispatch returns (Drop semantics verified) |
+| `streaming_dispatch_both_streams_independent` | Specialized and fallback streams are distinct; consuming one does not affect the other |
+| `streaming_dispatch_content_type_preserved` | Fallback input arrives as `StreamingHandle` (not downgraded to `RedactedBytes`) |
+| `streaming_dispatch_empty_file` | Zero-byte spool; dispatch returns empty but valid output (no panic, no spool error) |
 
 ---
 
@@ -169,9 +214,12 @@ New tests added in this session (addressing the four blockers):
 
 - Analyzers never receive a file path for reopening. All content arrives through
   `AnalyzerContent`; `AnalyzerInput::path` is documented as "for logging/diagnostics only."
-- Streaming fallback uses `secrets::collect_all` — the only Phase 1B-approved path
-  for draining a `LargeFileStream`. No raw `std::fs::File::open` calls exist in
-  `attic-analyzers`.
+- Streaming fallback spools only `chunk.redacted` bytes — the Phase 1B-safe field.
+  The original raw file path is never accessed inside `attic-analyzers`. No
+  `std::fs::File::open` calls exist in this crate.
+- The spool temp file is written from the `LargeFileStream` (which was already opened
+  by Phase 1B via `LargeFileStream::open`). Re-opening the spool path inside
+  `split_for_fallback` is safe because the spool contains only redacted content.
 - `#![forbid(unsafe_code)]` enforced workspace-wide; no `unsafe` blocks in this crate.
 - `REDACTED_INPUT` diagnostic is emitted for all `RedactedBytes` inputs so callers
   know the retrieval units reflect sanitized content.
@@ -183,12 +231,14 @@ New tests added in this session (addressing the four blockers):
 | Criterion | Status |
 |---|---|
 | `cargo clippy -p attic-analyzers -- -D warnings` | ✅ 0 warnings |
-| `cargo test -p attic-analyzers` | ✅ 32/32 pass |
+| `cargo test -p attic-analyzers --target x86_64-pc-windows-msvc` | ✅ 40/40 pass |
 | `#![forbid(unsafe_code)]` | ✅ enforced |
 | `SourceSpan` 0-based exclusive-end semantics | ✅ verified by 5 tests |
 | Streaming carry bounded to `MAX_CARRY_BYTES` | ✅ `streaming_bounded_carry_no_oom` |
 | Error-diagnostic path runs GenericAnalyzer | ✅ `dispatch_specialized_fatal_error_runs_generic_fallback_and_produces_units` |
-| Streaming fallback never returns 0 units on collected stream | ✅ collect_all before split |
+| `StreamingHandle` dispatch is O(1) memory (no `collect_all`) | ✅ bounded spool strategy; 8 streaming dispatch tests |
+| Spool uses only Phase 1B-safe (`chunk.redacted`) bytes | ✅ raw path never accessed in `attic-analyzers` |
+| Spool temp file deleted deterministically after dispatch | ✅ `NamedTempFile` Drop in `dispatch()` scope |
 
 ---
 
