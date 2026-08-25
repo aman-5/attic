@@ -1,81 +1,91 @@
 //! S2 — Idempotent schema migration runner.
 //!
-//! The single migration `0001_initial.sql` is embedded at compile time.
-//! `run_migrations` is safe to call on every startup; it checks whether
-//! the migration has already been applied before executing it.
+//! Migrations are embedded at compile time and applied in order.  Each
+//! migration SQL file is responsible for recording its own entry in
+//! `core_schema_migrations`; this runner only guards against re-applying an
+//! already-applied migration.
 
 use rusqlite::Connection;
 use tracing::info;
 
 use crate::error::StorageError;
 
-/// The initial schema, embedded from `migrations/0001_initial.sql`.
-const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
+// ---------------------------------------------------------------------------
+// Embedded migrations
+// ---------------------------------------------------------------------------
 
-/// The version tag recorded in `core_schema_migrations` after applying the initial migration.
-const VERSION_0001: &str = "0001";
+const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
+const VERSION_0001: &str = "0001_initial";
+
+const MIGRATION_0002: &str = include_str!("../../../migrations/0002_phase1d.sql");
+const VERSION_0002: &str = "0002_phase1d";
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /// Apply all pending migrations to `conn`.
 ///
-/// This function is **idempotent** — calling it multiple times on the same
-/// database is safe and produces no side-effects after the first run.
+/// Safe to call on every startup — already-applied migrations are skipped.
 pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
-    // Ensure the tracking table exists (bootstraps a brand-new database).
+    // Bootstrap the tracking table.  Uses `id` as the primary key column to
+    // match the schema established by 0001_initial.sql.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS core_schema_migrations (
-            version     TEXT PRIMARY KEY NOT NULL,
-            applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            id          TEXT    PRIMARY KEY NOT NULL,
+            applied_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000000)
         );",
     )?;
 
-    // Check whether migration 0001 has already been applied.
+    apply_migration(conn, VERSION_0001, MIGRATION_0001)?;
+    apply_migration(conn, VERSION_0002, MIGRATION_0002)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Apply a single migration if it has not already been recorded.
+///
+/// The migration SQL is executed inside `BEGIN IMMEDIATE … COMMIT`.  On
+/// failure the transaction is rolled back and a [`StorageError::Migration`]
+/// is returned.  Each migration SQL file contains its own
+/// `INSERT OR IGNORE INTO core_schema_migrations` so there is no need to
+/// insert here.
+fn apply_migration(conn: &Connection, version: &str, sql: &str) -> Result<(), StorageError> {
     let already_applied: bool = conn.query_row(
-        "SELECT COUNT(*) FROM core_schema_migrations WHERE version = ?1",
-        rusqlite::params![VERSION_0001],
+        "SELECT COUNT(*) FROM core_schema_migrations WHERE id = ?1",
+        rusqlite::params![version],
         |row| row.get::<_, i64>(0),
     )? > 0;
 
     if already_applied {
-        info!("migration {VERSION_0001} already applied — skipping");
+        info!("migration {version} already applied — skipping");
         return Ok(());
     }
 
-    // Run the migration inside an explicit transaction so we can roll back on failure.
     conn.execute_batch("BEGIN IMMEDIATE;")?;
 
-    let result = (|| -> Result<(), StorageError> {
-        conn.execute_batch(MIGRATION_0001)?;
-
-        // Record the migration in the tracking table.
-        conn.execute(
-            "INSERT INTO core_schema_migrations (version) VALUES (?1)",
-            rusqlite::params![VERSION_0001],
-        )?;
-
-        // Record an entry in the ops migration log (created by the migration itself).
-        conn.execute(
-            "INSERT INTO ops_migration_log (migration_version, status, notes)
-             VALUES (?1, 'applied', 'initial schema')",
-            rusqlite::params![VERSION_0001],
-        )?;
-
-        Ok(())
-    })();
-
-    match result {
+    match conn.execute_batch(sql) {
         Ok(()) => {
             conn.execute_batch("COMMIT;")?;
-            info!("migration {VERSION_0001} applied successfully");
+            info!("migration {version} applied");
             Ok(())
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK;");
             Err(StorageError::Migration {
-                message: format!("migration {VERSION_0001} failed and was rolled back: {e}"),
+                message: format!("migration {version} failed and was rolled back: {e}"),
             })
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -101,7 +111,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "exactly one migration row expected");
+        assert_eq!(count, 2, "both migration rows expected after first run");
     }
 
     #[test]
@@ -117,7 +127,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "still exactly one migration row after second run");
+        assert_eq!(count, 2, "still exactly two migration rows after second run");
     }
 
     #[test]
@@ -131,6 +141,7 @@ mod tests {
             "core_index_generations",
             "core_file_identities",
             "core_file_occurrences",
+            "core_retrieval_units",
             "ops_server_state",
             "ops_migration_log",
         ] {
@@ -142,6 +153,30 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(exists, 1, "table '{table}' should exist after migration");
+        }
+    }
+
+    #[test]
+    fn phase1d_columns_exist_after_migration() {
+        let conn = in_memory_conn();
+        run_migrations(&conn).unwrap();
+
+        // Use PRAGMA table_info to check that the Phase 1D columns were added.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(core_retrieval_units)")
+            .unwrap();
+
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for col in &["analyzer_id", "analyzer_version", "start_line", "end_line", "is_redacted"] {
+            assert!(
+                columns.contains(&col.to_string()),
+                "column '{col}' should exist in core_retrieval_units after phase1d migration"
+            );
         }
     }
 }

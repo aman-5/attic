@@ -19,5 +19,10 @@ pub mod writer;
 
 pub use connection::{open_db, DbPool};
 pub use error::StorageError;
+pub use fts::{
+    FtsSearchParams, FtsSearchResult, NewRetrievalUnit, MAX_SEARCH_RESULTS,
+    delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup,
+    fts_search, insert_retrieval_unit_with_fts,
+};
 pub use migration::run_migrations;
 pub use writer::{WriterQueue, WriterQueueHandle};

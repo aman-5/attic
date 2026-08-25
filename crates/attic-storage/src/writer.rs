@@ -577,7 +577,9 @@ mod tests {
 
         let result = handle.send(|conn| {
             conn.execute(
-                "INSERT INTO core_repositories (id, root_path, name) VALUES ('r1', '/tmp/r1', 'r1')",
+                "INSERT INTO core_repositories \
+                     (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                     VALUES ('r1', '/tmp/r1', 'r1', 1, 1, 0, 0)",
                 [],
             )?;
             Ok(())
@@ -612,7 +614,9 @@ mod tests {
         handle
             .send(|conn| {
                 conn.execute(
-                    "INSERT INTO core_repositories (id, root_path, name) VALUES ('dup', '/tmp', 'dup')",
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES ('dup', '/tmp', 'dup', 1, 1, 0, 0)",
                     [],
                 )?;
                 Ok(())
@@ -621,7 +625,9 @@ mod tests {
 
         let result = handle.send(|conn| {
             conn.execute(
-                "INSERT INTO core_repositories (id, root_path, name) VALUES ('dup', '/tmp', 'dup')",
+                "INSERT INTO core_repositories \
+                     (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                     VALUES ('dup', '/tmp', 'dup', 1, 1, 0, 0)",
                 [],
             )?;
             Ok(())
@@ -652,7 +658,9 @@ mod tests {
         let t1 = thread::spawn(move || {
             h1.send(|conn| {
                 conn.execute(
-                    "INSERT INTO core_repositories (id, root_path, name) VALUES ('batch-ok', '/tmp', 'ok')",
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES ('batch-ok', '/tmp/ok', 'ok', 1, 1, 0, 0)",
                     [],
                 )?;
                 Ok(())
@@ -663,7 +671,9 @@ mod tests {
         let t2 = thread::spawn(move || {
             h2.send(|conn| {
                 conn.execute(
-                    "INSERT INTO core_repositories (id, root_path, name) VALUES ('batch-ok', '/tmp', 'dup')",
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES ('batch-ok', '/tmp/dup', 'dup', 1, 1, 0, 0)",
                     [],
                 )?;
                 Ok(())

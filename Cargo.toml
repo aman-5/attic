@@ -32,9 +32,17 @@ tracing-subscriber = { version = "0.3",     features = ["env-filter"] }
 ignore             = "0.4.33"
 # Phase 1B: BLAKE3 hashing required by source_revision contract
 blake3             = "1.8.7"
+# Phase 1D: Async runtime (rmcp requires tokio)
+tokio              = { version = "1",        features = ["rt-multi-thread", "macros", "sync", "io-std", "fs", "time"] }
+# Phase 1D: Official Rust MCP SDK (ADR-008)
+# Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
+rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
 # Test utilities
 tempfile           = "3"
 attic-core         = { path = "crates/attic-core" }
 attic-storage      = { path = "crates/attic-storage" }
 attic-test-support = { path = "crates/attic-test-support" }
 attic-discovery    = { path = "crates/attic-discovery" }
+attic-analyzers    = { path = "crates/attic-analyzers" }
+attic-indexing     = { path = "crates/attic-indexing" }
+attic-retrieval    = { path = "crates/attic-retrieval" }

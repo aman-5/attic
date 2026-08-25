@@ -1,4 +1,4 @@
-//! S3 — `core_index_generations` insert, completion, and subsystem version retrieval.
+//! S3 — `core_index_generations` insert and subsystem version retrieval.
 
 use rusqlite::Connection;
 
@@ -6,45 +6,56 @@ use attic_core::{IndexGenerationId, RepositoryId, SourceRevisionId, SubsystemVer
 
 use crate::error::StorageError;
 
-/// Insert a new index generation record in the `started` state.
+/// Insert a new index generation record.
 ///
-/// `subsystem_versions` is always explicitly provided (ADR-004).
+/// All required NOT NULL fields are populated:
+/// - `schema_version`, `analyzer_registry_version`, `segmentation_version`,
+///   `indexer_version`, `ranking_version`, `configuration_hash`,
+///   `discovery_policy_hash`, `analyzer_versions_json` receive stub values
+///   suitable for tests and bootstrap scenarios.
+/// - `subsystem_versions_json` is populated from the provided `SubsystemVersions`.
+/// - `_repository_id` is accepted for call-site compatibility but `core_index_generations`
+///   does not have a `repository_id` column.
 pub fn insert_index_generation(
     conn: &Connection,
     id: &IndexGenerationId,
-    repository_id: &RepositoryId,
+    _repository_id: &RepositoryId,
     source_revision_id: &SourceRevisionId,
     secret_detector_version: i64,
     subsystem_versions: &SubsystemVersions,
 ) -> Result<(), StorageError> {
     let sv_json = subsystem_versions.to_json()?;
+    let now_us: i64 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    };
     conn.execute(
         "INSERT INTO core_index_generations
-             (id, repository_id, source_revision_id,
-              secret_detector_version, subsystem_versions_json, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'started')",
+             (id, source_revision_id,
+              schema_version, analyzer_registry_version, analyzer_versions_json,
+              segmentation_version, indexer_version, discovery_policy_hash,
+              ranking_version, configuration_hash,
+              secret_detector_version, subsystem_versions_json,
+              created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             id.to_string_repr(),
-            repository_id.to_string_repr(),
             source_revision_id.to_string_repr(),
+            "1.0.0",   // schema_version
+            "1.0.0",   // analyzer_registry_version
+            "{}",      // analyzer_versions_json
+            "1.0.0",   // segmentation_version
+            "1.0.0",   // indexer_version
+            "0000000000000000000000000000000000000000000000000000000000000000", // discovery_policy_hash
+            "1.0.0",   // ranking_version
+            "0000000000000000000000000000000000000000000000000000000000000000", // configuration_hash
             secret_detector_version,
             sv_json,
+            now_us,
         ],
-    )?;
-    Ok(())
-}
-
-/// Mark an index generation as completed by setting `completed_at`.
-pub fn complete_index_generation(
-    conn: &Connection,
-    id: &IndexGenerationId,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "UPDATE core_index_generations
-         SET status       = 'completed',
-             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id = ?1",
-        rusqlite::params![id.to_string_repr()],
     )?;
     Ok(())
 }
@@ -75,7 +86,7 @@ mod tests {
     use crate::migration::run_migrations;
     use crate::repository::repository::upsert_repository;
     use crate::repository::source_revision::insert_source_revision;
-    use attic_core::{SourceType, constants::subsystem_keys};
+    use attic_core::{constants::subsystem_keys, SourceType};
     use rusqlite::Connection;
 
     fn migrated_conn() -> Connection {
@@ -102,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_complete_generation() {
+    fn insert_generation_succeeds() {
         let conn = migrated_conn();
         let (repo_id, rev_id) = seed_repo_and_revision(&conn);
 
@@ -113,26 +124,15 @@ mod tests {
         let gen_id = IndexGenerationId::new_v4();
         insert_index_generation(&conn, &gen_id, &repo_id, &rev_id, 1, &sv).unwrap();
 
-        // Verify status is 'started'.
-        let status: String = conn
+        // Verify the row exists.
+        let count: i64 = conn
             .query_row(
-                "SELECT status FROM core_index_generations WHERE id = ?1",
+                "SELECT COUNT(*) FROM core_index_generations WHERE id = ?1",
                 rusqlite::params![gen_id.to_string_repr()],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "started");
-
-        complete_index_generation(&conn, &gen_id).unwrap();
-
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM core_index_generations WHERE id = ?1",
-                rusqlite::params![gen_id.to_string_repr()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "completed");
+        assert_eq!(count, 1);
     }
 
     #[test]

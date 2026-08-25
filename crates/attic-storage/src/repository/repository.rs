@@ -14,16 +14,24 @@ pub fn upsert_repository(
     conn: &Connection,
     id: &RepositoryId,
     root_path: &str,
-    name: &str,
+    display_name: &str,
 ) -> Result<(), StorageError> {
+    let now_us: i64 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    };
     conn.execute(
-        "INSERT INTO core_repositories (id, root_path, name)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO core_repositories
+             (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 1, 1, ?4, ?4)
          ON CONFLICT(id) DO UPDATE SET
-             root_path = excluded.root_path,
-             name      = excluded.name,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-        rusqlite::params![id.to_string_repr(), root_path, name],
+             root_path    = excluded.root_path,
+             display_name = excluded.display_name,
+             updated_at   = excluded.updated_at",
+        rusqlite::params![id.to_string_repr(), root_path, display_name, now_us],
     )?;
     Ok(())
 }

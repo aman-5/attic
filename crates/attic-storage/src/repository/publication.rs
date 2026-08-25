@@ -95,7 +95,7 @@ mod tests {
     use crate::repository::source_revision::insert_source_revision;
     use attic_core::{
         DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
-        RepositoryId, SecretScanState, SecurityState, SourceRevisionId, SourceType,
+        RepositoryId, SecurityState, SourceRevisionId, SourceType,
     };
     use rusqlite::Connection;
 

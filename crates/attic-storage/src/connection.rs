@@ -374,7 +374,9 @@ mod tests {
             crate::migration::run_migrations(&writer).unwrap();
             writer
                 .execute(
-                    "INSERT INTO core_repositories (id, root_path, name) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, 1, 1, 0, 0)",
                     rusqlite::params!["reopen-repo-1", "/tmp/reopen", "reopen-test"],
                 )
                 .unwrap();
