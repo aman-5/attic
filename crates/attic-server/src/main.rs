@@ -888,14 +888,23 @@ async fn main() -> anyhow::Result<()> {
         let root = PathBuf::from(&ws);
 
         // 1. Bootstrap / index the workspace synchronously on first run.
+        //
+        // FAIL-CLOSED: a failed initial indexing must never leave stale or
+        // partial state presented as CURRENT.  The publication itself is
+        // atomic, but any failure here means we cannot vouch for the
+        // workspace — refuse to serve rather than guess.
         let srv = server.clone();
         let root_for_bootstrap = root.clone();
-        if let Err(e) =
+        let boot =
             tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        {
-            warn!("workspace indexing failed: {e}");
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match evaluate_bootstrap(&boot) {
+            BootstrapAction::Proceed(_) => {}
+            BootstrapAction::FailClosed(why) => {
+                error!("workspace bootstrap FAILED — refusing to serve (fail-closed): {why}");
+                return Err(anyhow::anyhow!("bootstrap failed: {why}"));
+            }
         }
 
         // 2. Schedule offline refresh for anything not CURRENT.
@@ -979,6 +988,26 @@ async fn main() -> anyhow::Result<()> {
     serve_until_closed(server).await
 }
 
+/// Outcome of the initial workspace indexing decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapAction {
+    /// Indexing succeeded; repository id available.
+    Proceed(String),
+    /// Indexing failed — refuse to serve anything as CURRENT (fail-closed).
+    FailClosed(String),
+}
+
+/// Map a bootstrap outcome to the serve/fail-closed decision.
+///
+/// Unit-tested: an `Err` MUST map to [`BootstrapAction::FailClosed`] so the
+/// caller exits instead of serving stale state as CURRENT.
+fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
+    match r {
+        Ok(id) => BootstrapAction::Proceed(id.clone()),
+        Err(e) => BootstrapAction::FailClosed(e.to_string()),
+    }
+}
+
 /// Serve MCP until the stdio transport closes, then record a clean shutdown.
 async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
     // Keep a writer handle for the clean-shutdown marker; `serve` consumes
@@ -1044,6 +1073,28 @@ mod tests {
     }
 
     // compile-time gate: IndexError has no Sqlite variant
+    #[test]
+    fn bootstrap_failure_is_fail_closed() {
+        // Err ⇒ FailClosed (never serve stale state as CURRENT).
+        let err: Result<String, ServerError> = Err(ServerError::Indexing(
+            IndexError::RepositoryNotBootstrapped("/ws".into()),
+        ));
+        assert_eq!(
+            evaluate_bootstrap(&err),
+            BootstrapAction::FailClosed(
+                "indexing error: repository at /ws has not been bootstrapped; run a full index first"
+                    .into()
+            )
+        );
+
+        // Ok ⇒ Proceed with the repository id.
+        let ok: Result<String, ServerError> = Ok("repo-1".into());
+        assert_eq!(
+            evaluate_bootstrap(&ok),
+            BootstrapAction::Proceed("repo-1".into())
+        );
+    }
+
     #[test]
     fn indexing_uses_writer_abstraction() {
         fn _check(e: IndexError) {

@@ -84,7 +84,7 @@ pub enum PathRead {
     Uncertain(#[allow(dead_code)] String),
 }
 
-fn classify_read(result: std::io::Result<String>, path: &Path) -> PathRead {
+pub(crate) fn classify_read(result: std::io::Result<String>, path: &Path) -> PathRead {
     match result {
         Ok(h) => PathRead::Present(h),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathRead::NotFound,

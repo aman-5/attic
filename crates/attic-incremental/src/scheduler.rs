@@ -28,7 +28,32 @@ use attic_storage::{
 use crate::changeset::VerifiedChangeSet;
 use crate::{IncrementalError, run_on_writer};
 
-/// Priority for user-visible edits (highest).
+/// Origin of a recomputation request — decides queue priority and the
+/// `from_reconciliation` flag so reconciliation-generated work is never
+/// mistaken for ordinary user-edit work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOrigin {
+    /// Direct watcher/user-driven change.
+    UserEdit,
+    /// Produced by an authoritative reconciliation pass.
+    Reconciliation,
+}
+
+impl TaskOrigin {
+    /// Queue priority for this origin.
+    pub fn priority(self) -> i64 {
+        match self {
+            TaskOrigin::UserEdit => PRIORITY_USER_EDIT,
+            TaskOrigin::Reconciliation => PRIORITY_RECONCILE,
+        }
+    }
+
+    /// Payload flag value for this origin.
+    pub fn from_reconciliation(self) -> bool {
+        matches!(self, TaskOrigin::Reconciliation)
+    }
+}
+
 pub const PRIORITY_USER_EDIT: i64 = 80;
 /// Priority for reconciliation refreshes.
 pub const PRIORITY_RECONCILE: i64 = 40;
@@ -365,7 +390,15 @@ fn execute_task(
                         uncertain = report.change_set.uncertain.len(),
                         "authoritative reconciliation diff complete"
                     );
-                    let cs = report.change_set;
+                    let mut cs = report.change_set;
+                    if let Ok(typed) = report.repository_id.parse::<attic_core::RepositoryId>()
+                        && let Err(e) =
+                            crate::service::pair_content_renames(root, pool, &typed, &mut cs)
+                    {
+                        return TaskOutcome::Failed {
+                            error: format!("rename pairing failed: {e}"),
+                        };
+                    }
                     if !cs.uncertain.is_empty() {
                         let repo = report.repository_id.clone();
                         let paths = cs.uncertain.clone();
@@ -409,6 +442,7 @@ fn execute_task(
                             &report.repository_id,
                             &cs,
                             config.max_pending,
+                            TaskOrigin::Reconciliation,
                         ) {
                             Ok(outcome) => {
                                 debug!(?outcome, "reconciliation scheduled recomputation");

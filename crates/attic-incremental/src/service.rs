@@ -155,7 +155,13 @@ pub struct IncrementalService {
     coalescer: Arc<Mutex<EventCoalescer>>,
     pub(crate) metrics: Arc<ServiceMetrics>,
     quiet_ms: u64,
+    /// Test-only injectable pump lifetime.  `None` (production default) =
+    /// run until explicit shutdown.
+    #[doc(hidden)]
+    pub pump_lifetime_for_tests: Option<Duration>,
 }
+
+// doc-hidden test hook
 
 impl IncrementalService {
     /// Create a service for one repository root under the given policy.
@@ -172,7 +178,13 @@ impl IncrementalService {
             ))),
             metrics: Arc::new(ServiceMetrics::default()),
             quiet_ms: DEFAULT_QUIET_MS,
+            pump_lifetime_for_tests: None,
         }
+    }
+
+    /// Production pumps have NO artificial lifetime — `None` proves it.
+    pub fn pump_lifetime(&self) -> Option<Duration> {
+        self.pump_lifetime_for_tests
     }
 
     /// Override the debounce quiet period in milliseconds (tests use tiny
@@ -290,11 +302,14 @@ impl IncrementalService {
         Ok(changeset::verify(&self.root, ops, &source))
     }
 
-    /// Full synchronous step: drain → verify → invalidate → schedule.
+    /// Full synchronous step: drain → authoritative discovery diff →
+    /// invalidate → schedule.
     ///
-    /// Deterministic tests drive this with explicit timestamps; the watch
-    /// pump calls it every tick so a single event flushes once the quiet
-    /// period elapses even if no further batch ever arrives.
+    /// Eligibility is decided by the AUTHORITATIVE Phase 1B walker (gitignore,
+    /// nested gitignore, `.git/info/exclude`, negation, attic overrides) — a
+    /// watcher event alone can never index a file that real discovery would
+    /// exclude.  A cheap content pre-check skips the walk entirely when every
+    /// hinted path provably matches its CURRENT persisted hash.
     pub fn apply_pending(
         &self,
         pool: &DbPool,
@@ -308,18 +323,107 @@ impl IncrementalService {
         self.apply_operations(pool, writer, ops)
     }
 
-    /// Apply an explicit operation list (deterministic entry point).
+    /// Apply an explicit operation list through the authoritative pipeline.
     pub fn apply_operations(
         &self,
         pool: &DbPool,
         writer: &WriterQueueHandle,
         ops: Vec<CoalescedChange>,
     ) -> Result<StepReport, IncrementalError> {
+        use crate::changeset::{PathRead, classify_read};
+
         if ops.is_empty() {
             return Ok(StepReport::default());
         }
-        let cs = self.verify(pool, ops)?;
-        self.apply_verified_change_set(pool, writer, &cs)
+
+        // ── Cheap pre-check: dedupe hints, detect no-op touches, catch
+        //    unreadable paths and policy inputs without walking. ───────────
+        let mut hinted: std::collections::BTreeSet<String> = Default::default();
+        for op in &ops {
+            match op {
+                CoalescedChange::Upsert(p) => {
+                    hinted.insert(p.clone());
+                }
+                CoalescedChange::Remove(p) => {
+                    hinted.insert(p.clone());
+                }
+                CoalescedChange::Rename(f, t) => {
+                    hinted.insert(f.clone());
+                    hinted.insert(t.clone());
+                }
+            }
+        }
+
+        let repo_id = self.resolve_repo(pool)?;
+        let typed: attic_core::RepositoryId = repo_id
+            .parse()
+            .map_err(|_| IncrementalError::NotBootstrapped(repo_id.clone()))?;
+
+        let mut needs_walk = false;
+        let mut policy_flag = false;
+        let mut pre_uncertain: Vec<String> = Vec::new();
+        for p in &hinted {
+            if changeset::is_policy_input(p) {
+                policy_flag = true;
+                needs_walk = true;
+            }
+            let abs = self.root.join(p);
+            if abs.is_dir() {
+                pre_uncertain.push(p.clone());
+                needs_walk = true;
+                continue;
+            }
+            match classify_read(changeset::hash_file(&abs), &abs) {
+                PathRead::Present(h) => {
+                    let snap = pool
+                        .with_reader(|c| attic_storage::lookup_occurrence_snapshot(c, &typed, p))?;
+                    let unchanged = matches!(&snap, Some(s)
+                        if s.content_hash == h
+                            && s.freshness_state == "CURRENT"
+                            && s.existence_state != "deleted");
+                    if !unchanged {
+                        needs_walk = true;
+                    }
+                }
+                PathRead::NotFound => {
+                    let has_snap = pool
+                        .with_reader(|c| attic_storage::lookup_occurrence_snapshot(c, &typed, p))?
+                        .is_some();
+                    if has_snap {
+                        needs_walk = true;
+                    }
+                }
+                PathRead::Uncertain(why) => {
+                    pre_uncertain.push(p.clone());
+                    needs_walk = true;
+                    debug!(path = %p, why, "hinted path unreadable → uncertain");
+                }
+            }
+        }
+
+        if !needs_walk && !policy_flag {
+            debug!("all hints verified as CURRENT no-ops; skipping walk");
+            return Ok(StepReport::default());
+        }
+
+        // ── Authoritative Phase 1B walker decides eligibility/content ──────
+        let mut step =
+            recovery::reconcile_repository(pool, writer, &self.root, self.filter.policy())?;
+        pair_content_renames(&self.root, pool, &typed, &mut step.change_set)?;
+        if policy_flag {
+            step.change_set.policy_changed = true;
+        }
+        for p in pre_uncertain {
+            if !step.change_set.uncertain.contains(&p) {
+                step.change_set.uncertain.push(p);
+            }
+        }
+        // Merged uncertainty vetoes any deletion the walk may have inferred
+        // while the path was unreadable.
+        step.change_set
+            .deletes
+            .retain(|p| !step.change_set.uncertain.contains(p));
+        self.apply_verified_change_set(pool, writer, &step.change_set)
     }
 
     /// Apply an ALREADY-VERIFIED change set directly.
@@ -373,7 +477,13 @@ impl IncrementalService {
         }
 
         let repo_id = self.resolve_repo(pool)?;
-        let outcome = invalidate_and_schedule(writer, &repo_id, cs, DEFAULT_TASK_MAX_PENDING)?;
+        let outcome = invalidate_and_schedule(
+            writer,
+            &repo_id,
+            cs,
+            DEFAULT_TASK_MAX_PENDING,
+            scheduler::TaskOrigin::UserEdit,
+        )?;
         match outcome {
             ScheduleOutcome::Queued => report.task_queued = true,
             ScheduleOutcome::Deduplicated => report.task_deduplicated = true,
@@ -407,7 +517,7 @@ impl IncrementalService {
     }
 
     /// Observe raw-pipe drops recorded by the notify callback thread.
-    pub fn note_raw_drops(&self, dropped: &Arc<AtomicU64>) {
+    pub fn note_raw_drops(&self, dropped: &Arc<AtomicU64>) -> u64 {
         let n = dropped.swap(0, Ordering::SeqCst);
         if n > 0 {
             self.metrics
@@ -415,6 +525,7 @@ impl IncrementalService {
                 .fetch_add(n, Ordering::Relaxed);
             self.on_watcher_error("raw watcher queue saturated; batches dropped");
         }
+        n
     }
 
     /// Whether event loss / saturation demands an authoritative rescan.
@@ -486,7 +597,6 @@ impl IncrementalService {
         writer: WriterQueueHandle,
     ) -> Result<WatcherGuard<notify_debouncer_full::RecommendedCache>, IncrementalError> {
         use std::sync::mpsc::Receiver;
-        use std::time::Instant;
 
         enum PumpMsg {
             Batch(notify_debouncer_full::DebounceEventResult),
@@ -517,15 +627,23 @@ impl IncrementalService {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_pump = Arc::clone(&stop);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_pump = Arc::clone(&finished);
         let svc_pump = Arc::clone(&svc);
         let handle = std::thread::Builder::new()
             .name("attic-watch-pump".into())
             .spawn(move || {
-                // Deadline-bounded loop; ticks even without batch arrival so
-                // the quiet-period flush ALWAYS happens.
-                let deadline = Instant::now() + Duration::from_secs(300);
+                // Runs until EXPLICIT shutdown — no artificial production
+                // lifetime.  A test-only injectable lifetime (never set in
+                // production) exercises auto-stop deterministically.
+                let started = std::time::Instant::now();
                 loop {
-                    if stop_pump.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    if stop_pump.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Some(lt) = svc_pump.pump_lifetime_for_tests
+                        && started.elapsed() >= lt
+                    {
                         break;
                     }
                     match rx.recv_timeout(PUMP_TICK) {
@@ -534,7 +652,18 @@ impl IncrementalService {
                             for ev in &debounced {
                                 normalized.extend(events::normalize_debounced(ev, &svc_pump.root));
                             }
-                            svc_pump.note_raw_drops(&dropped);
+                            if std::env::var("ATTIC_PUMP_TRACE").is_ok() {
+                                eprintln!(
+                                    "PUMP batch n={} drops={}",
+                                    normalized.len(),
+                                    dropped.load(Ordering::SeqCst)
+                                );
+                            }
+                            let drops = svc_pump.note_raw_drops(&dropped);
+                            if drops > 0 {
+                                // Saturation ⇒ authoritative rescan, deduped.
+                                let _ = recovery::schedule_reconciliation(&writer);
+                            }
                             if !normalized.is_empty() {
                                 svc_pump.ingest(&normalized);
                             }
@@ -544,17 +673,26 @@ impl IncrementalService {
                             }
                         }
                         Ok(PumpMsg::Batch(Err(errors))) => {
-                            svc_pump.note_raw_drops(&dropped);
+                            let drops = svc_pump.note_raw_drops(&dropped);
+                            if drops > 0 {
+                                let _ = recovery::schedule_reconciliation(&writer);
+                            }
                             for e in errors {
                                 svc_pump.on_watcher_error(&e.to_string());
                             }
                             let _ = recovery::schedule_reconciliation(&writer);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if std::env::var("ATTIC_PUMP_TRACE").is_ok() {
+                                eprintln!("PUMP tick");
+                            }
                             // TICK: pending coalesced events whose quiet
                             // period elapsed are flushed here even when the
                             // watcher produced nothing further.
-                            svc_pump.note_raw_drops(&dropped);
+                            let drops = svc_pump.note_raw_drops(&dropped);
+                            if drops > 0 {
+                                let _ = recovery::schedule_reconciliation(&writer);
+                            }
                             if let Err(e) = svc_pump.apply_pending(&pool, &writer, None) {
                                 warn!(error = %e, "watch pump tick apply failed");
                             }
@@ -562,15 +700,64 @@ impl IncrementalService {
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                finished_pump.store(true, Ordering::SeqCst);
             })
             .map_err(|e| IncrementalError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(WatcherGuard {
             _debouncer: Mutex::new(Some(debouncer)),
             stop,
+            finished,
             pump: Some(handle),
         })
     }
+}
+
+/// Promote identical-content delete+add pairs to explicit rename records so
+/// identity continuity (HEURISTIC `CONTENT_MATCH` links) survives the switch
+/// to authoritative-diff change sets.
+pub(crate) fn pair_content_renames(
+    root: &Path,
+    pool: &DbPool,
+    repo_id: &attic_core::RepositoryId,
+    cs: &mut VerifiedChangeSet,
+) -> Result<(), IncrementalError> {
+    if cs.deletes.is_empty() || cs.upserts.is_empty() {
+        return Ok(());
+    }
+    let mut promoted_from: Vec<String> = Vec::new();
+    for a in cs.deletes.clone() {
+        let Some(from_snap) =
+            pool.with_reader(|c| attic_storage::lookup_occurrence_snapshot(c, repo_id, &a))?
+        else {
+            continue;
+        };
+        let Some(b) = cs
+            .upserts
+            .iter()
+            .find(|b| {
+                *b != &a
+                    && std::fs::read(root.join(*b))
+                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                        .map(|h| h == from_snap.content_hash)
+                        .unwrap_or(false)
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        cs.deletes.retain(|p| p != &a);
+        cs.upserts.retain(|p| p != &b);
+        promoted_from.push(a.clone());
+        cs.renames.push((a, b));
+    }
+    // A renamed file still needs re-indexing under its new path.
+    for (_, b) in &cs.renames {
+        if !cs.upserts.contains(b) && !promoted_from.iter().any(|_| false) {
+            cs.upserts.push(b.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Shared invalidation → scheduling step used by BOTH the service and the
@@ -582,6 +769,7 @@ pub(crate) fn invalidate_and_schedule(
     repo_id: &str,
     cs: &VerifiedChangeSet,
     max_pending: usize,
+    origin: scheduler::TaskOrigin,
 ) -> Result<ScheduleOutcome, IncrementalError> {
     let counts = invalidation::apply_invalidation(
         writer,
@@ -601,14 +789,9 @@ pub(crate) fn invalidate_and_schedule(
         upserts: cs.upserts.clone(),
         deletes: cs.deletes.clone(),
         renames: cs.renames.clone(),
-        from_reconciliation: false,
+        from_reconciliation: origin.from_reconciliation(),
     };
-    let priority = if payload.from_reconciliation {
-        scheduler::PRIORITY_RECONCILE
-    } else {
-        scheduler::PRIORITY_USER_EDIT
-    };
-    scheduler::schedule_incremental(writer, repo_id, &payload, priority, max_pending)
+    scheduler::schedule_incremental(writer, repo_id, &payload, origin.priority(), max_pending)
 }
 
 /// Verified restoration: disk hash matched the stored hash, so trust is
@@ -686,6 +869,14 @@ impl IncrementalWatch {
         }
     }
 
+    /// Whether the background change-detection loop is still alive.
+    pub fn running(&self) -> bool {
+        match self {
+            IncrementalWatch::Native(g) => g.running(),
+            IncrementalWatch::Periodic(g) => g.running(),
+        }
+    }
+
     /// Stop the background loop(s).  Idempotent per variant Drop.
     pub fn stop(&mut self) {
         match self {
@@ -699,6 +890,7 @@ impl IncrementalWatch {
 /// reconcile → verified change set → invalidation → scheduled recomputation).
 pub struct FallbackGuard {
     stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -710,6 +902,8 @@ impl FallbackGuard {
         interval: Duration,
     ) -> Result<Self, IncrementalError> {
         let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&finished);
         let stop_flag = Arc::clone(&stop);
         let root = svc.root.clone();
         let policy = svc.policy().clone();
@@ -761,10 +955,12 @@ impl FallbackGuard {
                         std::thread::sleep(Duration::from_millis(50).min(remaining));
                     }
                 }
+                finished_flag.store(true, Ordering::SeqCst);
             })
             .map_err(|e| IncrementalError::Scheduler(format!("fallback reconcile spawn: {e}")))?;
         Ok(Self {
             stop,
+            finished,
             worker: Some(worker),
         })
     }
@@ -775,6 +971,13 @@ impl FallbackGuard {
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+    }
+}
+
+impl FallbackGuard {
+    /// Whether the fallback loop is still alive.
+    pub fn running(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst) && !self.finished.load(Ordering::SeqCst)
     }
 }
 
@@ -792,10 +995,16 @@ pub struct WatcherGuard<C: notify_debouncer_full::FileIdCache> {
         >,
     >,
     stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<C: notify_debouncer_full::FileIdCache> WatcherGuard<C> {
+    /// Whether the pump thread is still running (liveness probe).
+    pub fn running(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst) && !self.finished.load(Ordering::SeqCst)
+    }
+
     /// Stop pump + watcher and join threads.
     pub fn signal_stop_and_join(&mut self) {
         self.stop.store(true, Ordering::SeqCst);

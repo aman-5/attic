@@ -41,7 +41,7 @@ pub use recovery::{
     record_clean_shutdown_marker, run_startup_recovery,
 };
 pub use scheduler::{
-    SchedulerConfig, SchedulerHandle, run_next_task_synchronously, spawn_scheduler,
+    SchedulerConfig, SchedulerHandle, TaskOrigin, run_next_task_synchronously, spawn_scheduler,
 };
 pub use service::{
     DEFAULT_QUIET_MS, FallbackGuard, IncrementalService, IncrementalWatch, ServiceStatus,
