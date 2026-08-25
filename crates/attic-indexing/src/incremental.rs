@@ -35,10 +35,9 @@ use attic_core::{
 use attic_discovery::{DiscoveryPolicy, manifest_hash_from_pairs};
 use attic_storage::{
     IndexPublication, OccurrenceSnapshot, PublicationFile, PublicationOccurrence,
-    PublicationRetrievalUnit, close_pending_records_for_occurrence,
-    current_path_hashes_for_repository, insert_identity_link, lookup_file_identity_by_basis,
-    lookup_latest_file_occurrence_for_path, lookup_occurrence_snapshot,
-    lookup_repository_by_root_path, submit_index_publication,
+    PublicationRetrievalUnit, current_path_hashes_for_repository, insert_identity_link,
+    lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    lookup_occurrence_snapshot, lookup_repository_by_root_path, submit_index_publication,
 };
 
 use crate::{
@@ -142,18 +141,38 @@ pub fn index_changes(
         .collect();
 
     // ── 2. Hash every changed file NOW (canonical detection: content only) ──
+    //
+    // Three-state rule: ONLY a verified NotFound may become a deletion
+    // tombstone.  Permission errors, transient I/O failures, unstable reads
+    // and hash failures are propagated as errors so the task retries — never
+    // silently converted into "file missing".
     let mut upsert_hashes: BTreeMap<String, String> = BTreeMap::new();
     let mut vanished: Vec<String> = Vec::new();
     for rel in &changes.upserts {
-        match hash_file_content(&root.join(rel)) {
+        let abs = root.join(rel);
+        if abs.is_dir() {
+            // A directory where an indexed file used to be is uncertain, not
+            // a clean deletion.
+            return Err(IndexError::Io {
+                path: rel.clone(),
+                source: std::io::Error::other("indexed file path became a directory"),
+            });
+        }
+        match hash_file_content(&abs) {
             Ok(h) => {
                 upsert_hashes.insert(rel.clone(), h);
             }
-            Err(_) => {
-                // Existed at verification time, gone now → tombstone; the
-                // next reconciliation confirms whether it reappears.
-                debug!(path = %rel, "upsert target vanished before publication");
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %rel, "upsert target verifiably gone before publication");
                 vanished.push(rel.clone());
+            }
+            Err(source) => {
+                // No silent fallback: previous state stays STALE/INVALID and
+                // the scheduler retries the task.
+                return Err(IndexError::Io {
+                    path: rel.clone(),
+                    source,
+                });
             }
         }
     }
@@ -353,6 +372,7 @@ pub fn index_changes(
             },
             files,
             delete_units_for_occurrences: old_occurrence_ids.clone(),
+            close_audit_for_occurrences: old_occurrence_ids.clone(),
             retrieval_units,
         },
     )
@@ -403,16 +423,14 @@ pub fn index_changes(
             .map_err(IndexError::Storage)?;
     }
 
-    // ── 9. Close invalidation audit records for replaced artifacts ──────────
-    if !old_occurrence_ids.is_empty() || !tombstone_occ_ids.is_empty() {
+    // ── 9. Tombstone occurrences must never advertise CURRENT freshness ────
+    // (audit-record closure for replaced artifacts already happened inside
+    // the publication transaction, while the old rows still existed.)
+    if !tombstone_occ_ids.is_empty() {
         let tomb = tombstone_occ_ids.clone();
         store
             .writer
             .send(move |conn| {
-                for occ in &old_occurrence_ids {
-                    close_pending_records_for_occurrence(conn, occ, now_micros())
-                        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
-                }
                 for t in &tomb {
                     conn.execute(
                         "UPDATE core_file_occurrences

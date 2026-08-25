@@ -54,6 +54,23 @@ impl Default for SchedulerConfig {
     }
 }
 
+impl SchedulerConfig {
+    /// Validate configuration before any thread is created.
+    pub fn validate(&self) -> Result<(), IncrementalError> {
+        if self.workers == 0 {
+            return Err(IncrementalError::Scheduler(
+                "workers must be >= 1 (a zero-worker scheduler would never execute tasks)".into(),
+            ));
+        }
+        if self.max_pending == 0 {
+            return Err(IncrementalError::Scheduler(
+                "max_pending must be >= 1 (zero would shed every enqueue)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Result of an idempotent enqueue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleOutcome {
@@ -160,45 +177,61 @@ impl std::fmt::Debug for SchedulerHandle {
 
 /// Spawn `config.workers` worker threads.
 ///
-/// The store pair is cloned into every worker; all writes still serialize
-/// through the single coordinated writer queue.
+/// Fallible by contract: configuration is validated first, and if ANY worker
+/// thread fails to spawn the already-started workers are shut down and an
+/// error is returned — a handle that would never execute tasks is never
+/// handed out.
 pub fn spawn_scheduler(
     config: SchedulerConfig,
     pool: DbPool,
     writer: WriterQueueHandle,
     root: std::path::PathBuf,
     policy: attic_discovery::DiscoveryPolicy,
-) -> SchedulerHandle {
+) -> Result<SchedulerHandle, IncrementalError> {
+    config.validate()?;
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let state = Arc::new(ShutdownState::default());
-    let mut workers = Vec::with_capacity(config.workers.max(1));
+    let mut workers = Vec::with_capacity(config.workers);
 
-    for worker_idx in 0..config.workers.max(1) {
+    for worker_idx in 0..config.workers {
         let cfg = config.clone();
         let pool = pool.clone();
         let writer = writer.clone();
         let root = root.clone();
         let policy = policy.clone();
-        let shutdown = Arc::clone(&shutdown);
+        let worker_shutdown = Arc::clone(&shutdown);
         let st = Arc::clone(&state);
         match std::thread::Builder::new()
             .name(format!("attic-sched-{worker_idx}"))
             .spawn(move || {
-                worker_loop(cfg, pool, writer, root, policy, shutdown, st);
+                worker_loop(cfg, pool, writer, root, policy, worker_shutdown, st);
             }) {
             Ok(h) => workers.push(h),
             Err(e) => {
-                warn!(error = %e, "scheduler worker spawn failed");
-                break;
+                // Partial startup: stop what did start, then fail loudly.
+                shutdown.store(true, Ordering::SeqCst);
+                if let Ok(mut g) = state.stop_accepting.lock() {
+                    *g = true;
+                }
+                state.cv.notify_all();
+                for h in workers.drain(..) {
+                    let _ = h.join();
+                }
+                return Err(IncrementalError::Scheduler(format!(
+                    "worker thread {} failed to spawn: {e}",
+                    workers.len()
+                )));
             }
         }
     }
 
-    SchedulerHandle {
+    debug!(workers = workers.len(), "scheduler started");
+    Ok(SchedulerHandle {
         shutdown,
         state,
         workers,
-    }
+    })
 }
 
 fn wait_for_wake_or_timeout(state: &ShutdownState, timeout: Duration) {
@@ -231,7 +264,7 @@ fn worker_loop(
         match claimed {
             Ok(Some(task)) => {
                 debug!(task = %task.id, kind = %task.task_type, "executing task");
-                let outcome = execute_task(&pool, &writer, &root, &policy, &task);
+                let outcome = execute_task(&pool, &writer, &root, &policy, &config, &task);
                 let task_id = task.id.clone();
                 let finished: Result<(), IncrementalError> = run_on_writer(&writer, move |conn| {
                     finish_task(conn, &task_id, &outcome, crate::now_micros())
@@ -259,6 +292,7 @@ fn execute_task(
     writer: &WriterQueueHandle,
     root: &std::path::Path,
     policy: &attic_discovery::DiscoveryPolicy,
+    config: &SchedulerConfig,
     task: &ClaimedTask,
 ) -> TaskOutcome {
     match task.task_type.as_str() {
@@ -288,6 +322,8 @@ fn execute_task(
                 upserts: payload.upserts.clone(),
                 deletes: payload.deletes.clone(),
                 renames: payload.renames.clone(),
+                uncertain: vec![],
+                restored: vec![],
                 policy_changed: false,
             };
             // The scoped indexer takes its own verified-input shape.
@@ -317,13 +353,75 @@ fn execute_task(
             }
         }
         TASK_RECONCILIATION => {
+            // Authoritative diff — then take it through the SAME pipeline as
+            // every other change: invalidation (cheap, sync) → schedule
+            // INCREMENTAL_INDEX recomputation (separate task).  A converged
+            // tree yields an empty change set and no follow-up work, so the
+            // loop terminates.
             match crate::recovery::reconcile_repository(pool, writer, root, policy) {
                 Ok(report) => {
                     debug!(
-                        changed = report.changed_paths,
-                        excluded = report.newly_excluded,
-                        "reconciliation done"
+                        changed = report.change_set.upserts.len() + report.change_set.deletes.len(),
+                        uncertain = report.change_set.uncertain.len(),
+                        "authoritative reconciliation diff complete"
                     );
+                    let cs = report.change_set;
+                    if !cs.uncertain.is_empty() {
+                        let repo = report.repository_id.clone();
+                        let paths = cs.uncertain.clone();
+                        let _: Result<(), IncrementalError> =
+                            crate::run_on_writer(writer, move |conn| {
+                                if let Ok(typed) = repo.parse::<attic_core::RepositoryId>() {
+                                    for p in &paths {
+                                        if let Some(snap) =
+                                            attic_storage::lookup_occurrence_snapshot(
+                                                conn, &typed, p,
+                                            )?
+                                        {
+                                            conn.execute(
+                                                "UPDATE core_file_occurrences
+                                                    SET freshness_state = 'UNKNOWN'
+                                                  WHERE id = ?1
+                                                    AND freshness_state IN ('CURRENT','STALE')",
+                                                [&snap.id],
+                                            )?;
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            });
+                    }
+                    if !cs.restored.is_empty()
+                        && !report.repository_id.is_empty()
+                        && let Err(e) = crate::service::apply_restored(
+                            writer,
+                            &report.repository_id,
+                            &cs.restored,
+                        )
+                    {
+                        return TaskOutcome::Failed {
+                            error: format!("verified restore failed: {e}"),
+                        };
+                    }
+                    if cs.has_verified_work() && !report.repository_id.is_empty() {
+                        match crate::service::invalidate_and_schedule(
+                            writer,
+                            &report.repository_id,
+                            &cs,
+                            config.max_pending,
+                        ) {
+                            Ok(outcome) => {
+                                debug!(?outcome, "reconciliation scheduled recomputation");
+                            }
+                            Err(e) => {
+                                return TaskOutcome::Failed {
+                                    error: format!(
+                                        "reconciliation invalidation/scheduling failed: {e}"
+                                    ),
+                                };
+                            }
+                        }
+                    }
                     TaskOutcome::Done
                 }
                 Err(e) => TaskOutcome::Failed {
@@ -355,7 +453,14 @@ pub fn run_next_task_synchronously(
         return Ok(false);
     };
     debug!(task = %task.id, kind = %task.task_type, "sync-executing task");
-    let outcome = execute_task(pool, writer, root, policy, &task);
+    let outcome = execute_task(
+        pool,
+        writer,
+        root,
+        policy,
+        &SchedulerConfig::default(),
+        &task,
+    );
     run_on_writer(writer, move |conn| {
         finish_task(conn, &task.id, &outcome, crate::now_micros())
     })?;

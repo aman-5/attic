@@ -89,12 +89,12 @@ impl EventCoalescer {
 
     /// Feed one normalized event at virtual time `now_ms`.
     ///
+    /// The caller MUST have applied security/eligibility filtering already
+    /// ([`crate::events::EventFilter`]); this state machine is policy-agnostic.
+    ///
     /// Returns `false` when the event had to be shed (overflow) — the caller
     /// MUST treat this as possible event loss.
     pub fn push(&mut self, ev: &NormalizedEvent, now_ms: u64) -> bool {
-        if crate::events::is_early_filtered(&ev.rel_path) {
-            return true;
-        }
         self.total_events_in += 1;
 
         match ev.kind {

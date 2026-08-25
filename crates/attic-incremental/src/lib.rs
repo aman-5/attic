@@ -36,12 +36,16 @@ pub use changeset::{FileChange, VerifiedChangeSet};
 pub use coalesce::{CoalescedChange, EventCoalescer};
 pub use events::{FsEventKind, NormalizedEvent};
 pub use freshness::assert_transition;
-pub use recovery::{ReconcileReport, RecoveryReport, reconcile_repository, run_startup_recovery};
+pub use recovery::{
+    ReconcileReport, RecoveryReport, plan_offline_refresh, reconcile_repository,
+    record_clean_shutdown_marker, run_startup_recovery,
+};
 pub use scheduler::{
     SchedulerConfig, SchedulerHandle, run_next_task_synchronously, spawn_scheduler,
 };
 pub use service::{
-    DEFAULT_QUIET_MS, DefaultWatcherGuard, IncrementalService, ServiceStatus, StepReport,
+    DEFAULT_QUIET_MS, FallbackGuard, IncrementalService, IncrementalWatch, ServiceStatus,
+    StepReport, WatchMode,
 };
 
 use thiserror::Error;
@@ -67,6 +71,9 @@ pub enum IncrementalError {
     /// Repository must be bootstrapped with a full index first.
     #[error("repository not bootstrapped: {0}")]
     NotBootstrapped(String),
+    /// Scheduler could not start (zero or failed worker threads).
+    #[error("scheduler startup failed: {0}")]
+    Scheduler(String),
 }
 
 /// Monotonic-ish wall clock in microseconds (failure-tolerant).

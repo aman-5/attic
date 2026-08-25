@@ -198,28 +198,45 @@ pub fn reconcile_repository(
         }
         Ok(out)
     })?;
-    for (path, hash, _fresh, exist) in rows {
+    for (path, hash, fresh, exist) in rows {
         db_paths.insert(
             path,
             OccurrenceRow {
                 content_hash: hash,
+                freshness: fresh,
                 existence: exist,
             },
         );
     }
 
-    // Disk truth from the walk.
+    // Disk truth from the walk — three-state reads.  Only verified
+    // `NotFound`-class absence may later become a deletion; unreadable or
+    // hash-failing paths are recorded as UNCERTAIN and degrade to UNKNOWN.
     let mut disk: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut uncertain: Vec<String> = Vec::new();
     for entry in &discovery.entries {
+        if entry.abs_path.is_dir() {
+            uncertain.push(entry.repo_relative.clone());
+            warn!(path = %entry.repo_relative, "reconcile: path became a directory");
+            continue;
+        }
         match changeset::hash_file(&entry.abs_path) {
             Ok(h) => {
                 disk.insert(entry.repo_relative.clone(), h);
             }
-            Err(e) => warn!(path = %entry.repo_relative, error = %e, "reconcile hash failed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Verified absence: omit from disk map → delete candidate in
+                // the DB→disk diff below.
+            }
+            Err(e) => {
+                uncertain.push(entry.repo_relative.clone());
+                warn!(path = %entry.repo_relative, error = %e, "reconcile: read failed → uncertain");
+            }
         }
     }
 
     let mut report = ReconcileReport {
+        repository_id: repo_id.to_string_repr(),
         ..Default::default()
     };
     let mut cs = VerifiedChangeSet::default();
@@ -240,18 +257,29 @@ pub fn reconcile_repository(
                 cs.upserts.push(path.clone());
                 report.changed_paths += 1;
             }
+            Some(row)
+                if row.freshness != "CURRENT"
+                    && row.existence != "deleted"
+                    && row.content_hash == *hash =>
+            {
+                // Disk verifies the stored hash: trust re-established
+                // WITHOUT recomputation (UNKNOWN → CURRENT is a legal
+                // verified transition).
+                cs.restored.push(path.clone());
+            }
             Some(_) => {}
         }
     }
 
     // DB → disk diff: deleted or newly excluded by policy.
     for (path, row) in &db_paths {
-        if !disk.contains_key(path) && row.existence != "deleted" {
+        if !disk.contains_key(path) && !uncertain.contains(path) && row.existence != "deleted" {
             cs.deletes.push(path.clone());
             report.newly_excluded += 1;
         }
     }
 
+    cs.uncertain = uncertain;
     report.change_set = cs;
     Ok(report)
 }
@@ -259,18 +287,30 @@ pub fn reconcile_repository(
 #[derive(Debug, Default, Clone)]
 struct OccurrenceRow {
     content_hash: String,
+    freshness: String,
     existence: String,
 }
 
 /// Result of one reconciliation pass.
 #[derive(Debug, Default)]
 pub struct ReconcileReport {
+    /// Repository the change set belongs to (empty when not bootstrapped).
+    pub repository_id: String,
     /// Verified change set (applied by caller).
     pub change_set: VerifiedChangeSet,
     /// Added/modified count.
     pub changed_paths: usize,
     /// Deleted-or-excluded count.
     pub newly_excluded: usize,
+}
+
+/// Record a clean-shutdown marker through the coordinated writer queue.
+///
+/// The next startup uses this to distinguish a clean stop from a crash.
+pub fn record_clean_shutdown_marker(writer: &WriterQueueHandle) -> Result<(), IncrementalError> {
+    run_on_writer(writer, |conn| {
+        attic_storage::record_clean_shutdown(conn, crate::now_micros())
+    })
 }
 
 /// Enqueue a RECONCILIATION task (deduped; workspace scope).

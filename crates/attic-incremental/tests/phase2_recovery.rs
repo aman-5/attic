@@ -328,7 +328,8 @@ fn graceful_shutdown_with_pending_work_preserves_queue() {
         fx.writer.clone(),
         fx.root().to_path_buf(),
         fx.policy(),
-    );
+    )
+    .expect("scheduler must start");
 
     // Queue several tasks, then shut down gracefully with a deadline.
     for dedup in ["d1", "d2", "d3"] {

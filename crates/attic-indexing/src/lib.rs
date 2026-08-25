@@ -402,7 +402,8 @@ pub fn index_repository(
             secret_detector_version: SECRET_PATTERN_VERSION,
             subsystem_versions: sv,
             files: publication_files,
-            delete_units_for_occurrences: stale_occurrences,
+            delete_units_for_occurrences: stale_occurrences.clone(),
+            close_audit_for_occurrences: stale_occurrences,
             retrieval_units,
         },
     )

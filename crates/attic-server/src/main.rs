@@ -79,6 +79,9 @@ struct AtticServer {
     _queue: Arc<WriterQueue>,
     /// Phase 2 incremental service; present only in watch mode.
     incremental: Option<Arc<attic_incremental::IncrementalService>>,
+    /// Which change-detection mechanism is running (`None` = incremental
+    /// disabled explicitly).
+    watch_mode: Option<attic_incremental::WatchMode>,
 }
 
 impl AtticServer {
@@ -93,6 +96,7 @@ impl AtticServer {
             writer,
             _queue,
             incremental: None,
+            watch_mode: None,
         })
     }
 
@@ -650,14 +654,27 @@ fn handle_repo_map(
 fn handle_status(
     pool: &DbPool,
     incremental: Option<&Arc<attic_incremental::IncrementalService>>,
+    watch_mode: Option<attic_incremental::WatchMode>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
 
+    // Incremental subsystem state — including EXPLICIT degraded modes.  The
+    // server never claims a mode it is not actually running.
+    payload["watcher"] = json!({
+        "mode": match (watch_mode, incremental.is_some()) {
+            (Some(m), _) => m.as_str(),
+            (None, true) => "starting",
+            (None, false) => "disabled",
+        },
+        "active": matches!(watch_mode, Some(attic_incremental::WatchMode::NativeWatcher)),
+        "periodic_reconciliation": matches!(
+            watch_mode,
+            Some(attic_incremental::WatchMode::PeriodicReconciliation)
+        ),
+    });
+
     if let Some(svc) = incremental {
-        // Freshness must never be reported CURRENT when it is not: the
-        // snapshot includes per-state totals, queue depth, watcher health,
-        // and the reconciliation flag (Phase 2 §14).
         match svc.status_snapshot(pool) {
             Ok(snap) => {
                 let recovery_state = if snap.reconciliation_required {
@@ -672,6 +689,7 @@ fn handle_status(
                     "events_ingested": snap.events_ingested,
                     "hints_dropped": snap.hints_dropped,
                     "watcher_errors": snap.watcher_errors,
+                    "raw_batches_dropped": snap.raw_batches_dropped,
                     "reconciliation_required": snap.reconciliation_required,
                     "freshness": snap.freshness,
                     "tasks": snap.tasks,
@@ -786,6 +804,7 @@ impl ServerHandler for AtticServer {
     ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send {
         let pool = self.pool.clone();
         let incremental = self.incremental.clone();
+        let watch_mode = self.watch_mode;
         let name = request.name.clone();
         let args: HashMap<String, Value> =
             request.arguments.unwrap_or_default().into_iter().collect();
@@ -795,7 +814,7 @@ impl ServerHandler for AtticServer {
                 "file" => handle_file(&pool, &args),
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(&pool, incremental.as_ref()),
+                "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {
@@ -841,34 +860,34 @@ async fn main() -> anyhow::Result<()> {
 
     let mut server = AtticServer::new(&db_path)?;
 
-    // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
+    // ─── Startup recovery — ALWAYS before serving (recovery contract §3) ────
     //
-    // Startup order per the recovery contract:
-    //   1. recovery runs BEFORE serving (idempotent);
-    //   2. full workspace bootstrap/index if needed;
-    //   3. offline-refresh tasks scheduled for non-CURRENT occurrences;
-    //   4. scheduler workers + filesystem watcher start in the background
-    //      (REC-W2: queries are served while the startup refresh completes).
-    let mut _watch_guard: Option<attic_incremental::DefaultWatcherGuard> = None;
+    // Fail-closed: if recovery cannot establish a safe state, the process
+    // refuses to serve rather than risk presenting affected data as CURRENT
+    // (REC-INV-1).  There is no silent "keep going" path.
+    match attic_incremental::run_startup_recovery(&server.pool, &server.writer) {
+        Ok(report) => info!(
+            tasks_reset = report.tasks_reset,
+            abandoned_runs = report.indexing_runs_abandoned,
+            rescheduled = report.refreshes_rescheduled,
+            epoch = report.watcher_epoch,
+            previous_clean_shutdown = report.previous_shutdown_clean,
+            "startup recovery complete"
+        ),
+        Err(e) => {
+            error!("startup recovery FAILED — refusing to serve (fail-closed): {e}");
+            return Err(anyhow::anyhow!("startup recovery failed: {e}"));
+        }
+    }
+
+    let mut _watch: Option<attic_incremental::IncrementalWatch> = None;
     let mut _sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
+    // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
     if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
         let root = PathBuf::from(&ws);
 
-        // 1. Crash recovery (before accepting queries).
-        match attic_incremental::run_startup_recovery(&server.pool, &server.writer) {
-            Ok(report) => info!(
-                tasks_reset = report.tasks_reset,
-                abandoned_runs = report.indexing_runs_abandoned,
-                rescheduled = report.refreshes_rescheduled,
-                epoch = report.watcher_epoch,
-                previous_clean_shutdown = report.previous_shutdown_clean,
-                "startup recovery complete"
-            ),
-            Err(e) => warn!("startup recovery failed (continuing): {e}"),
-        }
-
-        // 2. Bootstrap / index the workspace synchronously on first run.
+        // 1. Bootstrap / index the workspace synchronously on first run.
         let srv = server.clone();
         let root_for_bootstrap = root.clone();
         if let Err(e) =
@@ -879,8 +898,8 @@ async fn main() -> anyhow::Result<()> {
             warn!("workspace indexing failed: {e}");
         }
 
-        // 3. Schedule offline refresh for anything not CURRENT.
-        match attic_incremental::recovery::plan_offline_refresh(&server.pool) {
+        // 2. Schedule offline refresh for anything not CURRENT.
+        match attic_incremental::plan_offline_refresh(&server.pool) {
             Ok(batch) => {
                 for refresh in batch {
                     let payload = attic_storage::IncrementalTaskPayload {
@@ -896,48 +915,75 @@ async fn main() -> anyhow::Result<()> {
                         renames: vec![],
                         from_reconciliation: true,
                     };
-                    match attic_incremental::scheduler::schedule_incremental(
+                    if let Err(e) = attic_incremental::scheduler::schedule_incremental(
                         &server.writer,
                         &refresh.repository_id,
                         &payload,
                         attic_incremental::scheduler::PRIORITY_RECONCILE,
                         4096,
                     ) {
-                        Ok(_) => {}
-                        Err(e) => warn!("offline refresh scheduling failed: {e}"),
+                        warn!("offline refresh scheduling failed: {e}");
                     }
                 }
             }
             Err(e) => warn!("offline refresh planning failed: {e}"),
         }
 
-        // 4. Scheduler + watcher.
+        // 3. Scheduler — fallible: a scheduler that cannot start its workers
+        //    is never silently accepted.
         let policy = DiscoveryPolicy::default_git();
-        let sched = attic_incremental::spawn_scheduler(
+        match attic_incremental::spawn_scheduler(
             attic_incremental::SchedulerConfig::default(),
             server.pool.clone(),
             server.writer.clone(),
             root.clone(),
             policy.clone(),
-        );
-        _sched_handle = Some(sched);
+        ) {
+            Ok(sched) => _sched_handle = Some(sched),
+            Err(e) => {
+                error!("scheduler startup failed — incremental mode DISABLED: {e}");
+                server.watch_mode = None;
+                server.incremental = None;
+                // Continue serving WITHOUT incremental claims; status reports
+                // watcher.mode = "disabled".
+                return serve_until_closed(server).await;
+            }
+        }
 
+        // 4. Change detection: native watcher, or a REAL bounded periodic
+        //    reconciliation loop as fallback — both perform actual work and
+        //    the active mode is exposed via `status`.
         let service = Arc::new(
             attic_incremental::IncrementalService::new(&root, policy)
                 .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
         );
-        match service.spawn_watcher(server.pool.clone(), server.writer.clone()) {
-            Ok(guard) => _watch_guard = Some(guard),
-            Err(e) => warn!(
-                "filesystem watcher unavailable ({e}); continuing with reconciliation-only mode"
-            ),
+        match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
+            Ok(watch) => {
+                info!(
+                    mode = watch.mode().as_str(),
+                    "incremental change detection started"
+                );
+                server.watch_mode = Some(watch.mode());
+                _watch = Some(watch);
+            }
+            Err(e) => {
+                error!("change detection failed to start ({e}) — incremental DISABLED");
+                server.watch_mode = None;
+                server.incremental = None;
+                return serve_until_closed(server).await;
+            }
         }
-
-        let svc_status = Arc::clone(&service);
         server.incremental = Some(service);
-        let _ = svc_status; // kept alive through `server.incremental`
     }
 
+    serve_until_closed(server).await
+}
+
+/// Serve MCP until the stdio transport closes, then record a clean shutdown.
+async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
+    // Keep a writer handle for the clean-shutdown marker; `serve` consumes
+    // the server value.
+    let writer_for_shutdown = server.writer.clone();
     // Serve returns once the MCP lifecycle handshake has completed.  The
     // returned RunningService MUST be kept alive for the lifetime of the
     // server — dropping it cancels the whole service.  `waiting()` consumes
@@ -951,6 +997,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     info!("attic server stopped: {reason:?}");
+
+    // Clean-shutdown marker for crash detection on next start.
+    let _ = attic_incremental::record_clean_shutdown_marker(&writer_for_shutdown);
     Ok(())
 }
 
@@ -1618,7 +1667,7 @@ mod tests {
     #[test]
     fn status_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        let r = handle_status(&make_server(&tmp).pool, None).unwrap();
+        let r = handle_status(&make_server(&tmp).pool, None, None).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
@@ -1646,7 +1695,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, None).unwrap();
+        let r = handle_status(&srv.pool, None, None).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 

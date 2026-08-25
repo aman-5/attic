@@ -1,12 +1,23 @@
-//! Event normalization + early ignore/security filtering.
+//! Event normalization + Phase 1B-derived filtering.
 //!
 //! Native watcher events are **hints**.  Normalization maps backend-specific
-//! `notify` events into repo-relative [`NormalizedEvent`] values; the early
-//! filter drops everything Attic must never touch (`.git` internals, build
-//! output, dependency trees) BEFORE any queueing work happens.
+//! `notify` events into repo-relative [`NormalizedEvent`] values.
+//!
+//! Filtering has two strictly separated layers:
+//!
+//! 1. **Security (absolute, never policy-dependent)** — `.git` internals,
+//!    parent escapes, NUL bytes, empty paths.  These mirror the mandatory
+//!    Phase 1B security boundary and can never be overridden.
+//! 2. **Eligibility (policy-derived)** — delegated entirely to the approved
+//!    Phase 1B classifier ([`attic_discovery::classification::classify`]) so
+//!    default exclusions, attic exclude rules, and attic INCLUDE rules behave
+//!    identically to the walker.  A configured include rule (e.g. re-including
+//!    vendored or generated content) keeps those paths visible to incremental
+//!    updates.
 
 use std::path::Path;
 
+use attic_discovery::{DiscoveryPolicy, DiscoveryPriority, classification::classify};
 use notify_debouncer_full::notify::EventKind;
 use notify_debouncer_full::{DebouncedEvent, notify::event::RenameMode};
 
@@ -35,6 +46,49 @@ pub struct NormalizedEvent {
     pub rel_path: String,
     /// What the watcher claims happened.
     pub kind: FsEventKind,
+}
+
+/// Policy-aware event gate derived from the approved Phase 1B
+/// [`DiscoveryPolicy`] — no independent ignore policy lives here.
+#[derive(Debug, Clone)]
+pub struct EventFilter {
+    policy: DiscoveryPolicy,
+}
+
+impl EventFilter {
+    /// Build the gate from the active discovery policy.
+    pub fn new(policy: DiscoveryPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// The underlying policy.
+    pub fn policy(&self) -> &DiscoveryPolicy {
+        &self.policy
+    }
+
+    /// Absolute security rejection (never policy-dependent, never overridable).
+    pub fn is_security_blocked(rel_path: &str) -> bool {
+        let p = rel_path.trim_start_matches("./");
+        if p.is_empty() {
+            return true;
+        }
+        // Git internals are forbidden territory (Phase 1B mandatory rule).
+        if p == ".git" || p.starts_with(".git/") {
+            return true;
+        }
+        // Never follow parent escapes / absolute / NUL-bearing paths.
+        if p.contains("..") || p.starts_with('/') || p.contains(':') || p.contains('\0') {
+            return true;
+        }
+        false
+    }
+
+    /// Phase 1B eligibility: `false` ⇒ the path would not be indexed by the
+    /// approved walker either (default exclusions, attic excludes), unless an
+    /// attic INCLUDE rule rescues it — in which case it stays visible here.
+    pub fn is_eligible(&self, rel_path: &str) -> bool {
+        classify(rel_path, &self.policy) != DiscoveryPriority::Ignored
+    }
 }
 
 /// Map one debounced batch entry to normalized events (0..n paths).
@@ -86,64 +140,60 @@ fn to_rel_path(path: &Path, root: &Path) -> Option<String> {
         return None;
     }
     let s = rel.to_string_lossy();
-    if !s.is_ascii() && s.contains('\0') {
+    if s.contains('\0') {
         return None;
     }
     Some(s.replace('\\', "/"))
-}
-
-/// Early ignore/security filter applied before any queueing.
-///
-/// Mirrors Phase 1B's hard security boundary plus the default exclusions that
-/// can never be interesting to Attic.  Returns `true` when the event must be
-/// DROPPED.
-pub fn is_early_filtered(rel_path: &str) -> bool {
-    let p = rel_path.trim_start_matches("./");
-    if p.is_empty() {
-        return true;
-    }
-    // Git internals are forbidden territory.
-    if p == ".git" || p.starts_with(".git/") {
-        return true;
-    }
-    // Never follow parent escapes.
-    if p.contains("..") || p.starts_with('/') || p.contains(':') {
-        return true;
-    }
-    // Default exclusions: build output and vendored dependencies generate
-    // enormous event storms that would waste the bounded queues.
-    const NOISE_PREFIXES: [&str; 8] = [
-        "target/",
-        "node_modules/",
-        "vendor/",
-        "dist/",
-        "build/",
-        "out/",
-        ".idea/",
-        "__pycache__/",
-    ];
-    for prefix in NOISE_PREFIXES {
-        if p.starts_with(prefix) {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn filter(policy: DiscoveryPolicy) -> EventFilter {
+        EventFilter::new(policy)
+    }
+
     #[test]
-    fn git_and_noise_are_filtered_early() {
-        assert!(is_early_filtered(".git/HEAD"));
-        assert!(is_early_filtered(".git"));
-        assert!(is_early_filtered("target/debug/foo.rs"));
-        assert!(is_early_filtered("node_modules/pkg/index.js"));
-        assert!(is_early_filtered("../escape.rs"));
-        assert!(is_early_filtered(""));
-        assert!(!is_early_filtered("src/lib.rs"));
-        assert!(!is_early_filtered(".gitignore"));
+    fn git_and_escapes_are_absolutely_blocked() {
+        assert!(EventFilter::is_security_blocked(".git/HEAD"));
+        assert!(EventFilter::is_security_blocked(".git"));
+        assert!(EventFilter::is_security_blocked("../escape.rs"));
+        assert!(EventFilter::is_security_blocked("/abs.rs"));
+        assert!(EventFilter::is_security_blocked(""));
+        // Security blocking is independent of any policy:
+        let p = DiscoveryPolicy::default_non_git();
+        assert!(EventFilter::is_security_blocked(".git/config"));
+        let _ = p;
+    }
+
+    #[test]
+    fn eligibility_is_policy_derived_not_hardcoded() {
+        // With defaults, node_modules content is ignored...
+        let f = filter(DiscoveryPolicy::default_git());
+        assert!(!f.is_eligible("node_modules/pkg/index.js"));
+        assert!(
+            f.is_eligible("vendor/lib/x.js"),
+            "vendor is NOT in Phase 1B defaults"
+        );
+        assert!(f.is_eligible("src/lib.rs"));
+        assert!(f.is_eligible(".gitignore"));
+
+        // ...but an explicit include rule MUST rescue even ignored paths
+        // (Phase 1B parity with the walker):
+        let mut p = DiscoveryPolicy::default_git();
+        p.attic_include_rules
+            .push(attic_discovery::GlobRule::include("node_modules/**"));
+        let f2 = filter(p);
+        assert!(
+            f2.is_eligible("node_modules/pkg/index.js"),
+            "configured includes must survive watcher filtering"
+        );
+
+        // And disabling default exclusions makes them eligible wholesale:
+        let mut p3 = DiscoveryPolicy::default_git();
+        p3.default_exclusions = false;
+        assert!(filter(p3).is_eligible("node_modules/x/index.js"));
     }
 
     #[test]

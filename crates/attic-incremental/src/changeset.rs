@@ -33,6 +33,16 @@ pub struct VerifiedChangeSet {
     pub deletes: Vec<String>,
     /// Verified rename pairs (identical content observed on both ends).
     pub renames: Vec<(String, String)>,
+    /// Paths whose true state could NOT be established (permission errors,
+    /// transient I/O failures, unstable reads, hash failures, file→directory
+    /// substitutions).  These MUST degrade to UNKNOWN/reconciliation — never
+    /// to deletion.
+    pub uncertain: Vec<String>,
+    /// Non-CURRENT paths whose on-disk hash VERIFIES against the persisted
+    /// content hash (e.g. UNKNOWN rows after a transient failure resolved).
+    /// They may be restored to CURRENT without recomputation — content is
+    /// unchanged, trust is re-established by verification.
+    pub restored: Vec<String>,
     /// `true` when a discovery-policy input changed (`.gitignore`, policy
     /// config); caller must run targeted rediscovery instead of scoped work.
     pub policy_changed: bool,
@@ -50,6 +60,42 @@ impl VerifiedChangeSet {
                 .flat_map(|(f, t)| [f.clone(), t.clone()]),
         );
         s
+    }
+
+    /// Whether there is any actionable verified work at all.
+    pub fn has_verified_work(&self) -> bool {
+        !(self.upserts.is_empty() && self.deletes.is_empty() && self.renames.is_empty())
+    }
+}
+
+/// Outcome of reading a hinted path's actual bytes.
+///
+/// Only `NotFound` (verified absence via `io::ErrorKind::NotFound`) may ever
+/// produce a deletion.  Everything else that is not a clean hash is
+/// [`PathRead::Uncertain`] and must degrade to UNKNOWN semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathRead {
+    /// File exists; BLAKE3 hex of raw bytes.
+    Present(String),
+    /// Verified absence (`ErrorKind::NotFound`).
+    NotFound,
+    /// Exists-but-unreadable, transient I/O error, unstable read, hash
+    /// failure, or the path having turned into a directory.
+    Uncertain(#[allow(dead_code)] String),
+}
+
+fn classify_read(result: std::io::Result<String>, path: &Path) -> PathRead {
+    match result {
+        Ok(h) => PathRead::Present(h),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathRead::NotFound,
+        Err(e) => {
+            // A directory where a file used to be is not "absence" either.
+            if path.is_dir() {
+                PathRead::Uncertain("path became a directory".to_owned())
+            } else {
+                PathRead::Uncertain(e.to_string())
+            }
+        }
     }
 }
 
@@ -99,10 +145,13 @@ pub fn hash_file(path: &Path) -> std::io::Result<String> {
 /// Verify coalesced hints against actual filesystem + persisted state.
 ///
 /// `root` is the repository root on disk; every hint path is joined under it.
-pub fn verify(
+/// `hasher` is the content reader (injectable so tests can simulate
+/// permission errors / unstable reads deterministically).
+pub fn verify_with_hasher(
     root: &Path,
     ops: Vec<CoalescedChange>,
     snapshots: &dyn SnapshotSource,
+    hasher: &dyn Fn(&Path) -> std::io::Result<String>,
 ) -> VerifiedChangeSet {
     let mut cs = VerifiedChangeSet::default();
 
@@ -130,46 +179,65 @@ pub fn verify(
         }
     }
 
-    // Per-path verification pass.  Deterministic: BTreeMap order.
-    // disk_state: path → Option<(exists, hash)>
-    let mut disk_state: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Per-path read pass.  Deterministic: BTreeMap order.
+    //
+    // Three-state model: only verified NotFound may ever become a deletion;
+    // any other read failure lands in `uncertain` and is excluded from
+    // classification entirely.
+    enum Read {
+        Present(String),
+        Missing,
+        Uncertain(#[allow(dead_code)] String),
+    }
+    let mut reads: BTreeMap<String, Read> = BTreeMap::new();
 
-    for (path, hint) in &hints {
+    for path in hints.keys() {
         if is_policy_input(path) {
             cs.policy_changed = true;
         }
         let abs = root.join(path);
-        let hash = hash_file(&abs).ok();
-        disk_state.insert(path.clone(), hash);
-        match hint {
-            Hint::Touch => {}
-            Hint::Gone | Hint::RenameFrom | Hint::RenameTo => {}
+        // Guard the file→directory substitution explicitly: a directory can
+        // never satisfy a file hash.
+        if abs.is_dir() {
+            cs.uncertain.push(path.clone());
+            reads.insert(
+                path.clone(),
+                Read::Uncertain("path became a directory".to_owned()),
+            );
+            continue;
+        }
+        match classify_read(hasher(&abs), &abs) {
+            PathRead::Present(h) => {
+                reads.insert(path.clone(), Read::Present(h));
+            }
+            PathRead::NotFound => {
+                reads.insert(path.clone(), Read::Missing);
+            }
+            PathRead::Uncertain(why) => {
+                cs.uncertain.push(path.clone());
+                reads.insert(path.clone(), Read::Uncertain(why));
+            }
         }
     }
 
-    // Classify each unique path once.
+    // Classify each unique readable path once.  Uncertain paths are skipped
+    // here; the caller degrades them to UNKNOWN/reconciliation.
     let mut added_or_modified: BTreeSet<String> = BTreeSet::new();
     let mut deleted: BTreeSet<String> = BTreeSet::new();
     let mut content_by_path: BTreeMap<String, String> = BTreeMap::new();
 
     for (path, hint) in &hints {
-        let disk_hash = disk_state.get(path).cloned().flatten();
         let snap = snapshots.snapshot(path);
-
-        match (&hint, disk_hash) {
-            (_, Some(hash)) => {
+        match reads.get(path) {
+            Some(Read::Uncertain(_)) | None => { /* already recorded as uncertain */ }
+            Some(Read::Present(hash)) => {
                 content_by_path.insert(path.clone(), hash.clone());
                 let unchanged = matches!(&snap, Some(s)
-                    if s.content_hash == hash && s.existence_state != "deleted");
+                    if s.content_hash == *hash && s.existence_state != "deleted");
                 match &hint {
-                    Hint::RenameTo | Hint::Touch => {
-                        if !unchanged {
-                            added_or_modified.insert(path.clone());
-                        }
-                    }
-                    Hint::Gone => {
-                        // Remove hint but file exists again (delete+recreate
-                        // collapsed): classify by content comparison.
+                    Hint::RenameTo | Hint::Touch | Hint::Gone => {
+                        // "Gone" hint + present file = recreate collapsed in
+                        // the window; classify by content comparison.
                         if !unchanged {
                             added_or_modified.insert(path.clone());
                         }
@@ -179,18 +247,14 @@ pub fn verify(
                     }
                 }
             }
-            (_, None) => match &hint {
-                Hint::RenameFrom | Hint::Gone => {
+            Some(Read::Missing) => match &hint {
+                Hint::RenameFrom | Hint::Gone | Hint::Touch | Hint::RenameTo => {
+                    // Verified absence with any hint kind ⇒ deletion — but
+                    // ONLY when we previously indexed something there.
                     if snap.is_some() {
                         deleted.insert(path.clone());
                     }
                     // No snapshot and no file: transient noise; drop.
-                }
-                Hint::Touch | Hint::RenameTo => {
-                    // Existed at hint time, gone at verify time → deletion.
-                    if snap.is_some() {
-                        deleted.insert(path.clone());
-                    }
                 }
             },
         }
@@ -231,6 +295,15 @@ pub fn verify(
     cs.upserts.sort();
     cs.deletes.sort();
     cs
+}
+
+/// Production verification entry point using the real BLAKE3 file hasher.
+pub fn verify(
+    root: &Path,
+    ops: Vec<CoalescedChange>,
+    snapshots: &dyn SnapshotSource,
+) -> VerifiedChangeSet {
+    verify_with_hasher(root, ops, snapshots, &hash_file)
 }
 
 /// Paths whose modification changes discovery policy semantics.
