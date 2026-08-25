@@ -181,6 +181,31 @@ pub fn build_manifest(entries: &[EligibleEntry], root: &Path) -> SourceManifest 
     }
 }
 
+/// Compute the working-tree manifest hash from already-known
+/// `(repo_relative, content_hash)` pairs **without re-reading file content**.
+///
+/// This is the Phase 2 incremental path: unchanged files contribute their
+/// previously verified BLAKE3 hashes, and only files touched by a verified
+/// ChangeSet are re-hashed.  The canonical text format and hashing are exactly
+/// the same as [`build_manifest`], so a full-walk manifest and an incremental
+/// manifest over identical file states produce identical hashes.
+///
+/// The pairs are sorted by path defensively; duplicates are not deduplicated
+/// (callers must pass one entry per path).
+pub fn manifest_hash_from_pairs(pairs: &[(String, String)]) -> String {
+    let mut entries: Vec<ManifestEntry> = pairs
+        .iter()
+        .map(|(path, hash)| ManifestEntry {
+            repo_relative: path.clone(),
+            content_hash: hash.clone(),
+            unstable: false,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
+    let text = serialize_manifest(&entries);
+    hash_manifest_text(&text)
+}
+
 /// Returns `true` when the manifest contains no read errors and no unstable
 /// captures (fully stable).
 impl SourceManifest {

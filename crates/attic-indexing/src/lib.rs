@@ -68,7 +68,13 @@ pub enum IndexError {
     },
     #[error("policy hash failed: {0}")]
     PolicyHash(String),
+    #[error("repository at {0} has not been bootstrapped; run a full index first")]
+    RepositoryNotBootstrapped(String),
 }
+
+pub mod incremental;
+
+pub use incremental::{ScopedChanges, ScopedIndexResult, index_changes};
 
 // ---------------------------------------------------------------------------
 // Store handle — the ONLY way callers provide database access
@@ -396,7 +402,8 @@ pub fn index_repository(
             secret_detector_version: SECRET_PATTERN_VERSION,
             subsystem_versions: sv,
             files: publication_files,
-            delete_units_for_occurrences: stale_occurrences,
+            delete_units_for_occurrences: stale_occurrences.clone(),
+            close_audit_for_occurrences: stale_occurrences,
             retrieval_units,
         },
     )

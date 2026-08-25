@@ -139,6 +139,10 @@ pub struct IndexPublication {
     /// Previous-run occurrence IDs whose retrieval units must be deleted
     /// before the new units are inserted (refresh path).
     pub delete_units_for_occurrences: Vec<String>,
+    /// Occurrence IDs whose pending `core_invalidation_records` must be
+    /// closed atomically BEFORE their derived rows are removed — otherwise
+    /// the audit rows could never be resolved afterwards.
+    pub close_audit_for_occurrences: Vec<String>,
     /// Retrieval units to insert with FTS synchronisation.
     pub retrieval_units: Vec<PublicationRetrievalUnit>,
 }
@@ -188,6 +192,18 @@ fn execute_index_publication(
         p.secret_detector_version,
         &p.subsystem_versions,
     )?;
+
+    // Close pending invalidation-audit rows while the old derived rows are
+    // still present (they are referenced by the audit records).
+    for occ in &p.close_audit_for_occurrences {
+        crate::invalidation_ops::close_pending_records_for_occurrence(conn, occ, {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0)
+        })?;
+    }
 
     for f in &p.files {
         upsert_file_identity(
@@ -369,6 +385,7 @@ mod tests {
             subsystem_versions: SubsystemVersions::default(),
             files,
             delete_units_for_occurrences: vec![],
+            close_audit_for_occurrences: vec![],
             retrieval_units: units,
         }
     }

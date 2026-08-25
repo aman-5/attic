@@ -14,8 +14,11 @@ pub mod connection;
 pub mod error;
 pub mod fts;
 pub mod indexing_publication;
+pub mod invalidation_ops;
 pub mod migration;
+pub mod ops_tasks;
 pub mod repository;
+pub mod server_state;
 pub mod writer;
 
 pub use connection::{DbPool, open_db};
@@ -29,13 +32,28 @@ pub use indexing_publication::{
     IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
     PublicationRetrievalUnit, submit_index_publication,
 };
+pub use invalidation_ops::{
+    FreshnessTotals, InvalidationCounts, close_pending_records_for_occurrence,
+    get_freshness_totals, invalidate_for_occurrences, record_invalidation, record_recomputed,
+};
 pub use migration::run_migrations;
+pub use ops_tasks::{
+    ClaimedTask, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
+    TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
+    enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
+};
+pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
 pub use writer::{WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{
-    NewFileOccurrence, insert_file_occurrence, lookup_file_identity_by_basis,
-    lookup_latest_file_occurrence_for_path, upsert_file_identity,
+    NewFileOccurrence, OccurrenceSnapshot, current_path_hashes_for_repository,
+    insert_file_occurrence, lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    lookup_occurrence_snapshot, upsert_file_identity,
+};
+pub use repository::identity_links::{
+    NewIdentityLink, basis as identity_basis, confidence as identity_confidence,
+    insert_identity_link, latest_link_for_identity,
 };
 pub use repository::index_generation::insert_index_generation;
 pub use repository::publication::{PublicationItem, publish_file_batch};

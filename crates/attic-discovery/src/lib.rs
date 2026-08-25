@@ -73,7 +73,7 @@ pub mod walk;
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use error::DiscoveryError;
 pub use git::GitRepoMeta;
-pub use manifest::{ManifestEntry, SourceManifest};
+pub use manifest::{ManifestEntry, SourceManifest, manifest_hash_from_pairs};
 pub use policy::DiscoveryPriority;
 pub use policy::{DiscoveryPolicy, GlobRule, PriorityRule};
 pub use secrets::{

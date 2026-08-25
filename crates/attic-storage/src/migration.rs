@@ -20,6 +20,9 @@ const VERSION_0001: &str = "0001_initial";
 const MIGRATION_0002: &str = include_str!("../../../migrations/0002_phase1d.sql");
 const VERSION_0002: &str = "0002_phase1d";
 
+const MIGRATION_0003: &str = include_str!("../../../migrations/0003_phase2.sql");
+const VERSION_0003: &str = "0003_phase2";
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -39,6 +42,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 
     apply_migration(conn, VERSION_0001, MIGRATION_0001)?;
     apply_migration(conn, VERSION_0002, MIGRATION_0002)?;
+    apply_migration(conn, VERSION_0003, MIGRATION_0003)?;
 
     Ok(())
 }
@@ -109,7 +113,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(count, 2, "both migration rows expected after first run");
+        assert_eq!(count, 3, "all migration rows expected after first run");
     }
 
     #[test]
@@ -124,8 +128,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            count, 2,
-            "still exactly two migration rows after second run"
+            count, 3,
+            "still exactly three migration rows after second run"
         );
     }
 

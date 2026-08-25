@@ -66,6 +66,13 @@ pub struct FtsSearchResult {
     pub start_line: Option<u32>,
     /// End line (0-based, inclusive) of the retrieval unit span, if recorded.
     pub end_line: Option<u32>,
+    /// Freshness of the source file occurrence backing this unit
+    /// (`CURRENT | STALE | UNKNOWN | INVALID | PENDING_REFRESH`).
+    ///
+    /// Rows whose occurrence OR unit is `INVALID` are never returned at all;
+    /// `STALE` rows are returned with this field set so callers can surface
+    /// the staleness caveat (invalidation contract INV-Q1 resolution).
+    pub freshness_state: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +322,8 @@ pub fn fts_search(
             r.retrieval_text         AS body,
             bm25(fts_retrieval_units) AS score,
             r.start_line             AS start_line,
-            r.end_line               AS end_line
+            r.end_line               AS end_line,
+            fo.freshness_state       AS freshness_state
         FROM fts_retrieval_units fts
         INNER JOIN core_retrieval_units  r    ON r.rowid = fts.rowid
         INNER JOIN core_file_occurrences fo   ON fo.id   = r.file_occurrence_id
@@ -326,6 +334,9 @@ pub fn fts_search(
           AND (?2 IS NULL OR COALESCE(r.repository_id, sr.repository_id) = ?2)
           AND (?3 IS NULL OR fo.file_type = ?3)
           AND (?4 IS NULL OR fo.language  = ?4)
+          AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+          AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+          AND fo.existence_state != 'DELETED'
         ORDER BY bm25(fts_retrieval_units) ASC, fts.rowid ASC
         LIMIT ?5
     ";
@@ -348,6 +359,7 @@ pub fn fts_search(
                 score: -raw_score,
                 start_line: row.get("start_line")?,
                 end_line: row.get("end_line")?,
+                freshness_state: row.get("freshness_state")?,
             })
         },
     )?;
@@ -384,7 +396,8 @@ pub fn fts_path_lookup(
             r.retrieval_text         AS body,
             0.0                      AS score,
             r.start_line             AS start_line,
-            r.end_line               AS end_line
+            r.end_line               AS end_line,
+            fo.freshness_state       AS freshness_state
         FROM core_retrieval_units  r
         INNER JOIN core_file_occurrences fo   ON fo.id   = r.file_occurrence_id
         INNER JOIN core_source_revisions sr   ON sr.id   = fo.source_revision_id
@@ -392,6 +405,9 @@ pub fn fts_path_lookup(
         LEFT  JOIN core_repositories     repo2 ON repo2.id = r.repository_id
         WHERE fo.path = ?1
           AND (?2 IS NULL OR COALESCE(r.repository_id, sr.repository_id) = ?2)
+          AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+          AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+          AND fo.existence_state != 'DELETED'
         ORDER BY r.start_line ASC, r.rowid ASC
         LIMIT ?3
     ";
@@ -411,6 +427,7 @@ pub fn fts_path_lookup(
             score: 0.0,
             start_line: row.get("start_line")?,
             end_line: row.get("end_line")?,
+            freshness_state: row.get("freshness_state")?,
         })
     })?;
 

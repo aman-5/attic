@@ -142,14 +142,25 @@ str_enum! {
 }
 
 str_enum! {
-    /// Whether the index data for this file is up-to-date.
+    /// Whether the index data for this file/artifact is up-to-date.
+    ///
+    /// Values are fixed by `migrations/0001_initial.sql` and the invalidation
+    /// contract (`docs/contracts/invalidation.md`): CURRENT | STALE | UNKNOWN |
+    /// INVALID | PENDING_REFRESH.  Phase 2 enforces the legal transitions via
+    /// the freshness state machine in the incremental service; storage only
+    /// persists the value.
     FreshnessState {
-        /// Index data is current.
-        Fresh      => "fresh",
-        /// File exists but has not yet been indexed.
-        Unindexed  => "unindexed",
-        /// Content changed; re-indexing required.
-        Stale      => "stale",
+        /// Artifact is valid and up-to-date.
+        Current         => "CURRENT",
+        /// Artifact may be outdated; usable only with a staleness caveat.
+        Stale           => "STALE",
+        /// Trustworthiness cannot be established (e.g. watcher event loss);
+        /// reconciliation required before the artifact may serve as CURRENT.
+        Unknown         => "UNKNOWN",
+        /// Artifact must not be used; recomputation required.
+        Invalid         => "INVALID",
+        /// Recomputation scheduled but not yet complete.
+        PendingRefresh  => "PENDING_REFRESH",
     }
 }
 
@@ -191,6 +202,10 @@ str_enum! {
 
 str_enum! {
     /// Reason a symbol occurrence was invalidated.
+    ///
+    /// Legacy Phase 0 vocabulary; retained for compatibility.  New code should
+    /// prefer [`InvalidationCause`] which matches the
+    /// `core_invalidation_records.reason` column values.
     InvalidationReason {
         /// Source file was modified.
         FileModified    => "file_modified",
@@ -200,6 +215,57 @@ str_enum! {
         GenerationExpired => "generation_expired",
         /// Manually invalidated.
         Manual          => "manual",
+    }
+}
+
+str_enum! {
+    /// Artifact type recorded in `core_invalidation_records.artifact_type`.
+    ///
+    /// Values fixed by `migrations/0001_initial.sql` and the invalidation
+    /// contract (`docs/contracts/invalidation.md` §Definitions).
+    InvalidationArtifactType {
+        /// A file's observed state at a source revision.
+        FileOccurrence   => "FILE_OCCURRENCE",
+        /// Parsed structural element (class, function, section, ...).
+        StructuralNode   => "STRUCTURAL_NODE",
+        /// A symbol's definition/occurrence at a source revision.
+        SymbolOccurrence => "SYMBOL_OCCURRENCE",
+        /// A text chunk indexed for search.
+        RetrievalUnit    => "RETRIEVAL_UNIT",
+        /// An embedding or semantic vector (future — Phase 5).
+        SemanticRepr     => "SEMANTIC_REPR",
+        /// A dependency/call/import edge.
+        Relationship     => "RELATIONSHIP",
+        /// A canonical evidence record.
+        Evidence         => "EVIDENCE",
+        /// A knowledge document record.
+        KnowledgeItem    => "KNOWLEDGE_ITEM",
+    }
+}
+
+str_enum! {
+    /// Cause recorded in `core_invalidation_records.reason`.
+    ///
+    /// Values are the union of the migration comment and the invalidation
+    /// contract's `InvalidationReason` definition.
+    InvalidationCause {
+        /// Underlying file content changed.
+        SourceChanged      => "SOURCE_CHANGED",
+        /// Analyzer version changed for this artifact type.
+        AnalyzerUpgraded   => "ANALYZER_UPGRADED",
+        /// Schema version changed; artifacts must be rebuilt.
+        SchemaMigrated     => "SCHEMA_MIGRATED",
+        /// Discovery policy changed; file set may differ.
+        PolicyChanged      => "POLICY_CHANGED",
+        /// A dependency in the DAG was invalidated.
+        DependencyInvalid  => "DEPENDENCY_INVALID",
+        /// Operator-requested rebuild.
+        Explicit           => "EXPLICIT",
+        /// Source file deleted.
+        Deletion           => "DELETION",
+        /// Trustworthiness could not be established (e.g. watcher event loss);
+        /// reconciliation required.
+        ReconciliationRequired => "RECONCILIATION_REQUIRED",
     }
 }
 
