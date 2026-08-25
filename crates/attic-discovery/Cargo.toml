@@ -1,6 +1,6 @@
 [package]
 name         = "attic-discovery"
-description  = "Attic — repository and file discovery (Bootstrap skeleton)"
+description  = "Attic — repository and file discovery (Phase 1B)"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -8,8 +8,16 @@ authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 
-# No dependencies during Bootstrap.
-# Git-aware ignore walking and domain deps added in Phase 1B.
 [dependencies]
+attic-core  = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+ignore      = { workspace = true }
+blake3      = { workspace = true }
+tracing     = { workspace = true }
 
 [dev-dependencies]
+attic-test-support = { workspace = true }
+serde_json         = { workspace = true }
+tempfile           = { workspace = true }

@@ -1,15 +1,30 @@
 [package]
-name = "attic-server"
-version.workspace = true
-edition.workspace = true
+name         = "attic-server"
+description  = "Attic MCP server binary (Phase 1D)"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-description = "Attic MCP server binary"
-license.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
 
 [[bin]]
 name = "attic"
 path = "src/main.rs"
 
 [dependencies]
-tracing.workspace = true
+attic-core.workspace      = true
+attic-storage.workspace   = true
+attic-indexing.workspace  = true
+attic-discovery.workspace = true
+rmcp  = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["process", "io-util"] }
+serde.workspace           = true
+serde_json.workspace      = true
+tracing.workspace         = true
 tracing-subscriber.workspace = true
+thiserror.workspace       = true
+anyhow.workspace          = true
+
+[dev-dependencies]
+tempfile.workspace = true

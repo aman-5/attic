@@ -1,0 +1,11 @@
+    Checking attic-server v0.1.0 (C:\Adobe-Projects\EDS\Local\test\attic\crates\attic-server)
+error: this file contains an unclosed delimiter
+   --> crates\attic-server\src\main.rs:629:29
+    |
+400 | mod tests {
+    |           - unclosed delimiter
+...
+629 |     fn binary_path() -> std
+    |                            ^
+
+error: could not compile `attic-server` (bin "attic") due to 1 previous error

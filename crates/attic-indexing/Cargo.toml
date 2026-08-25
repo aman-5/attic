@@ -1,6 +1,6 @@
 [package]
 name         = "attic-indexing"
-description  = "Attic — indexing orchestration (Bootstrap skeleton)"
+description  = "Attic — end-to-end indexing pipeline (Phase 1D)"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -8,8 +8,18 @@ authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 
-# No dependencies during Bootstrap.
-# Domain deps, tokio, and storage deps added in Phase 1A/1B/1C/2.
 [dependencies]
+attic-core.workspace      = true
+attic-storage.workspace   = true
+attic-analyzers.workspace = true
+attic-discovery.workspace = true
+serde.workspace           = true
+serde_json.workspace      = true
+uuid.workspace            = true
+tracing.workspace         = true
+thiserror.workspace       = true
 
 [dev-dependencies]
+attic-test-support.workspace = true
+tempfile.workspace           = true
+rusqlite.workspace           = true

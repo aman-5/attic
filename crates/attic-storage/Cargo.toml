@@ -1,15 +1,22 @@
 [package]
 name         = "attic-storage"
-description  = "Attic — SQLite persistence layer (Bootstrap skeleton)"
-version.workspace      = true
-edition.workspace      = true
+version      = "0.1.0"
+edition.workspace    = true
 rust-version.workspace = true
-authors.workspace      = true
-license.workspace      = true
-repository.workspace   = true
+authors.workspace    = true
+license.workspace    = true
+description  = "SQLite-backed persistence layer for the Attic MCP server (Phase 1A)."
 
-# No dependencies during Bootstrap.
-# SQLite binding and domain deps added in Phase 1A.
 [dependencies]
+attic-core.workspace  = true
+rusqlite.workspace    = true
+thiserror.workspace   = true
+serde.workspace       = true
+serde_json.workspace  = true
+uuid.workspace        = true
+tracing.workspace     = true
 
 [dev-dependencies]
+attic-test-support.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace           = true

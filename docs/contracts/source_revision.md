@@ -159,12 +159,45 @@ In a Git repository, eligible files fall into categories:
 | Untracked       | Included if discovery policy includes untracked   |
 | Deleted (working tree) | Recorded as `DELETED`; excluded from hash  |
 | Ignored by Git  | Excluded unless explicitly included by Attic policy |
-| Submodule root  | Treated as a separate repository; not recursed    |
+| Submodule root  | Detected as boundary; not recursed into. `SubmoduleDetected` diagnostic emitted. See §Submodule Boundary Handling below. |
 
 `commit_sha` reflects HEAD. If the working tree has modifications,
 `working_tree_manifest_hash` will differ from what a clean checkout of HEAD
 would produce. Both facts are recorded; callers can detect dirty state by
 comparing the two.
+
+---
+
+## Submodule Boundary Handling
+
+When the discovery walk encounters a nested directory that contains its own
+`.git` directory or `.git` file (a submodule or Git worktree root), it treats
+that nested root as a **repository boundary** and does not recurse into it.
+
+### Phase 1B behaviour (implemented)
+
+| Action | Detail |
+|--------|--------|
+| Boundary detection | Any directory with `.git/` or a `.git` file is recognised as a submodule root |
+| Walk behaviour | The directory is **not** descended into; its contents do not appear in the parent `SourceRevision` |
+| Diagnostic | `SubmoduleDetected` diagnostic is recorded in `DiscoveryOutput.diagnostics` |
+| `WalkResult.submodule_prefixes` | The repo-relative path prefix of the submodule is added to this set |
+| Parent manifest | The submodule root directory is **not** included in the parent `working_tree_manifest_hash` |
+
+### Phase 1B explicitly does NOT
+
+- Create `core_repositories` rows for the submodule.
+- Create a `SourceRevision` or `WorkspaceSnapshot` for the submodule.
+- Schedule incremental re-indexing for the submodule.
+- Emit the submodule's HEAD SHA in the parent manifest.
+
+### Future work (Phase 2+)
+
+Phase 2 workspace orchestration may read `WalkResult.submodule_prefixes` and
+register each submodule as an independent `Repository` entry, then schedule
+its own `SourceRevision` capture.  Cross-repository relationship indexing
+follows in Phase 6+.  Whether registration is automatic or requires explicit
+configuration is tracked in SR-Q1 (see §Unresolved Questions).
 
 ---
 
