@@ -211,6 +211,88 @@ pub fn lookup_latest_file_occurrence_for_path(
     .map_err(StorageError::from)
 }
 
+/// Verified state snapshot of the latest occurrence for one repo+path.
+///
+/// Phase 2 change detection compares this against actual filesystem state;
+/// `content_hash` must never be inferred from timestamps alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OccurrenceSnapshot {
+    /// `core_file_occurrences.id` (UUID string) of the latest row.
+    pub id: String,
+    /// Owning identity (UUID string).
+    pub file_identity_id: String,
+    /// BLAKE3 hex of raw bytes at capture time.
+    pub content_hash: String,
+    /// Freshness value (`CURRENT | STALE | UNKNOWN | INVALID | PENDING_REFRESH`).
+    pub freshness_state: String,
+    /// Existence value (`PRESENT | DELETED`).
+    pub existence_state: String,
+}
+
+/// Read the [`OccurrenceSnapshot`] for the latest occurrence at repo+path.
+pub fn lookup_occurrence_snapshot(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+    path: &str,
+) -> Result<Option<OccurrenceSnapshot>, StorageError> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT fo.id, fo.file_identity_id, fo.content_hash,
+                fo.freshness_state, fo.existence_state
+           FROM core_file_occurrences fo
+           JOIN core_file_identities  fi ON fo.file_identity_id = fi.id
+          WHERE fi.repository_id = ?1 AND fo.path = ?2
+          ORDER BY fo.rowid DESC
+          LIMIT 1",
+        rusqlite::params![repository_id.to_string_repr(), path],
+        |r| {
+            Ok(OccurrenceSnapshot {
+                id: r.get(0)?,
+                file_identity_id: r.get(1)?,
+                content_hash: r.get(2)?,
+                freshness_state: r.get(3)?,
+                existence_state: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
+/// Read `(path, content_hash)` for every non-deleted occurrence whose
+/// freshness is trusted (`CURRENT`) in the given repository, deduplicated to
+/// the latest row per path.
+///
+/// This is the incremental-manifest basis: verified hashes are reused without
+/// re-reading unchanged files; anything not CURRENT is re-verified separately.
+pub fn current_path_hashes_for_repository(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+) -> Result<Vec<(String, String)>, StorageError> {
+    let mut stmt = conn.prepare(
+        "WITH latest AS (
+             SELECT fo.path AS p, MAX(fo.rowid) AS m
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+              WHERE fi.repository_id = ?1
+              GROUP BY fo.path
+         )
+         SELECT fo.path, fo.content_hash
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+          WHERE fo.freshness_state = 'CURRENT'
+            AND fo.existence_state != 'DELETED'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Update the `secret_scan_state` and `secret_pattern_version` for a file occurrence.
 pub fn set_secret_scan_state(
     conn: &Connection,

@@ -68,7 +68,13 @@ pub enum IndexError {
     },
     #[error("policy hash failed: {0}")]
     PolicyHash(String),
+    #[error("repository at {0} has not been bootstrapped; run a full index first")]
+    RepositoryNotBootstrapped(String),
 }
+
+pub mod incremental;
+
+pub use incremental::{ScopedChanges, ScopedIndexResult, index_changes};
 
 // ---------------------------------------------------------------------------
 // Store handle — the ONLY way callers provide database access

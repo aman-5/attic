@@ -77,6 +77,8 @@ struct AtticServer {
     pool: DbPool,
     writer: WriterQueueHandle,
     _queue: Arc<WriterQueue>,
+    /// Phase 2 incremental service; present only in watch mode.
+    incremental: Option<Arc<attic_incremental::IncrementalService>>,
 }
 
 impl AtticServer {
@@ -90,6 +92,7 @@ impl AtticServer {
             pool,
             writer,
             _queue,
+            incremental: None,
         })
     }
 
@@ -570,8 +573,21 @@ fn handle_file(
         SecretScanDecision::PartialScan => format!("# {repo_relative}\n# [Partial scan]\n\n"),
         _ => format!("# {repo_relative}\n\n"),
     };
+
+    // Phase 2: never present stale indexed state as CURRENT.  The body is
+    // read live from disk, but if the latest occurrence for this path is not
+    // CURRENT the response says so explicitly.
+    let freshness_note = pool
+        .with_reader(|c| {
+            attic_storage::lookup_occurrence_snapshot(c, &parsed_repo_id, &repo_relative)
+        })?
+        .map(|s| s.freshness_state)
+        .filter(|f| f != "CURRENT")
+        .map(|f| format!("# [index freshness: {f}]\n"))
+        .unwrap_or_default();
+
     Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-        "{header}{body}"
+        "{header}{freshness_note}\n{body}"
     ))]))
 }
 
@@ -631,10 +647,47 @@ fn handle_repo_map(
     )]))
 }
 
-fn handle_status(pool: &DbPool) -> Result<CallToolResult, ServerError> {
+fn handle_status(
+    pool: &DbPool,
+    incremental: Option<&Arc<attic_incremental::IncrementalService>>,
+) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
+    let mut payload = json!({ "status": "ok", "db": stats });
+
+    if let Some(svc) = incremental {
+        // Freshness must never be reported CURRENT when it is not: the
+        // snapshot includes per-state totals, queue depth, watcher health,
+        // and the reconciliation flag (Phase 2 §14).
+        match svc.status_snapshot(pool) {
+            Ok(snap) => {
+                let recovery_state = if snap.reconciliation_required {
+                    "RECONCILIATION_REQUIRED"
+                } else if snap.tasks.pending > 0 || snap.tasks.running > 0 {
+                    "INDEXING"
+                } else {
+                    "CURRENT"
+                };
+                payload["incremental"] = json!({
+                    "state": recovery_state,
+                    "events_ingested": snap.events_ingested,
+                    "hints_dropped": snap.hints_dropped,
+                    "watcher_errors": snap.watcher_errors,
+                    "reconciliation_required": snap.reconciliation_required,
+                    "freshness": snap.freshness,
+                    "tasks": snap.tasks,
+                });
+            }
+            Err(e) => {
+                payload["incremental"] = json!({
+                    "state": "UNKNOWN",
+                    "error": e.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&json!({ "status": "ok", "db": stats }))?,
+        serde_json::to_string_pretty(&payload)?,
     )]))
 }
 
@@ -732,6 +785,7 @@ impl ServerHandler for AtticServer {
         _cx: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send {
         let pool = self.pool.clone();
+        let incremental = self.incremental.clone();
         let name = request.name.clone();
         let args: HashMap<String, Value> =
             request.arguments.unwrap_or_default().into_iter().collect();
@@ -741,7 +795,7 @@ impl ServerHandler for AtticServer {
                 "file" => handle_file(&pool, &args),
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(&pool),
+                "status" => handle_status(&pool, incremental.as_ref()),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {
@@ -785,15 +839,103 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("attic starting, db={}", db_path.display());
 
-    let server = AtticServer::new(&db_path)?;
+    let mut server = AtticServer::new(&db_path)?;
+
+    // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
+    //
+    // Startup order per the recovery contract:
+    //   1. recovery runs BEFORE serving (idempotent);
+    //   2. full workspace bootstrap/index if needed;
+    //   3. offline-refresh tasks scheduled for non-CURRENT occurrences;
+    //   4. scheduler workers + filesystem watcher start in the background
+    //      (REC-W2: queries are served while the startup refresh completes).
+    let mut _watch_guard: Option<attic_incremental::DefaultWatcherGuard> = None;
+    let mut _sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
     if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
         let root = PathBuf::from(&ws);
+
+        // 1. Crash recovery (before accepting queries).
+        match attic_incremental::run_startup_recovery(&server.pool, &server.writer) {
+            Ok(report) => info!(
+                tasks_reset = report.tasks_reset,
+                abandoned_runs = report.indexing_runs_abandoned,
+                rescheduled = report.refreshes_rescheduled,
+                epoch = report.watcher_epoch,
+                previous_clean_shutdown = report.previous_shutdown_clean,
+                "startup recovery complete"
+            ),
+            Err(e) => warn!("startup recovery failed (continuing): {e}"),
+        }
+
+        // 2. Bootstrap / index the workspace synchronously on first run.
         let srv = server.clone();
-        tokio::task::spawn_blocking(move || match srv.bootstrap_workspace(&root) {
-            Ok(id) => info!("workspace indexed, repository_id={id}"),
-            Err(e) => warn!("workspace indexing failed: {e}"),
-        });
+        let root_for_bootstrap = root.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            warn!("workspace indexing failed: {e}");
+        }
+
+        // 3. Schedule offline refresh for anything not CURRENT.
+        match attic_incremental::recovery::plan_offline_refresh(&server.pool) {
+            Ok(batch) => {
+                for refresh in batch {
+                    let payload = attic_storage::IncrementalTaskPayload {
+                        dedup_key: format!(
+                            "offline-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_micros())
+                                .unwrap_or_default()
+                        ),
+                        upserts: refresh.upsert_paths,
+                        deletes: vec![],
+                        renames: vec![],
+                        from_reconciliation: true,
+                    };
+                    match attic_incremental::scheduler::schedule_incremental(
+                        &server.writer,
+                        &refresh.repository_id,
+                        &payload,
+                        attic_incremental::scheduler::PRIORITY_RECONCILE,
+                        4096,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => warn!("offline refresh scheduling failed: {e}"),
+                    }
+                }
+            }
+            Err(e) => warn!("offline refresh planning failed: {e}"),
+        }
+
+        // 4. Scheduler + watcher.
+        let policy = DiscoveryPolicy::default_git();
+        let sched = attic_incremental::spawn_scheduler(
+            attic_incremental::SchedulerConfig::default(),
+            server.pool.clone(),
+            server.writer.clone(),
+            root.clone(),
+            policy.clone(),
+        );
+        _sched_handle = Some(sched);
+
+        let service = Arc::new(
+            attic_incremental::IncrementalService::new(&root, policy)
+                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
+        );
+        match service.spawn_watcher(server.pool.clone(), server.writer.clone()) {
+            Ok(guard) => _watch_guard = Some(guard),
+            Err(e) => warn!(
+                "filesystem watcher unavailable ({e}); continuing with reconciliation-only mode"
+            ),
+        }
+
+        let svc_status = Arc::clone(&service);
+        server.incremental = Some(service);
+        let _ = svc_status; // kept alive through `server.incremental`
     }
 
     // Serve returns once the MCP lifecycle handshake has completed.  The
@@ -861,6 +1003,7 @@ mod tests {
                 IndexError::Storage(_) => {}
                 IndexError::Io { .. } => {}
                 IndexError::PolicyHash(_) => {}
+                IndexError::RepositoryNotBootstrapped(_) => {}
             }
         }
     }
@@ -1475,7 +1618,7 @@ mod tests {
     #[test]
     fn status_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        let r = handle_status(&make_server(&tmp).pool).unwrap();
+        let r = handle_status(&make_server(&tmp).pool, None).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
@@ -1503,7 +1646,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool).unwrap();
+        let r = handle_status(&srv.pool, None).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 

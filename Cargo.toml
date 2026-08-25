@@ -7,6 +7,7 @@ members = [
     "crates/attic-discovery",
     "crates/attic-evidence",
     "crates/attic-indexing",
+    "crates/attic-incremental",
     "crates/attic-retrieval",
     "crates/attic-server",
     "crates/attic-test-support",
@@ -34,6 +35,9 @@ ignore             = "0.4.33"
 blake3             = "1.8.7"
 # Phase 1D: Async runtime (rmcp requires tokio)
 tokio              = { version = "1",        features = ["rt-multi-thread", "macros", "sync", "io-std", "fs", "time"] }
+# Phase 2: filesystem watching (ADR-008). Stable debouncer 0.7 pulls notify 8.2.x;
+# MSRV 1.88 matches the workspace toolchain.
+notify-debouncer-full = "0.7"
 # Phase 1D: Official Rust MCP SDK (ADR-008)
 # Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
@@ -46,4 +50,5 @@ attic-test-support = { path = "crates/attic-test-support" }
 attic-discovery    = { path = "crates/attic-discovery" }
 attic-analyzers    = { path = "crates/attic-analyzers" }
 attic-indexing     = { path = "crates/attic-indexing" }
+attic-incremental  = { path = "crates/attic-incremental" }
 attic-retrieval    = { path = "crates/attic-retrieval" }

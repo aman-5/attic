@@ -12,9 +12,9 @@ pub use constants::{CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_ke
 pub use domain::{
     enums::{
         ArtifactType, Authority, CompatibilityClass, DependencyBasis, DiscoveryClass,
-        ExistenceState, FileType, FreshnessState, InvalidationReason, LexicalState, RelType,
-        Resolution, SecretScanState, SecurityState, SemanticState, SourceType, SymbolKind,
-        TaskState, TaskType, VerificationState,
+        ExistenceState, FileType, FreshnessState, InvalidationArtifactType, InvalidationCause,
+        InvalidationReason, LexicalState, RelType, Resolution, SecretScanState, SecurityState,
+        SemanticState, SourceType, SymbolKind, TaskState, TaskType, VerificationState,
     },
     ids::{
         EvidenceId, FileIdentityId, FileOccurrenceId, IndexGenerationId, OpsAuditId, RepositoryId,

@@ -98,12 +98,12 @@ Per the operating manual: all requirements that could not be determined from the
 
 ## OQ-008 — `core_knowledge_items` Population Source
 
-**Status**: OPEN  
-**Owning phase**: Phase 2  
-**Source contract**: `docs/contracts/storage.md` §6 (core_knowledge_items table), `docs/contracts/evidence.md` §2 (SourceType::KNOWLEDGE_BASE)  
-**Question**: What is the authoritative source for `core_knowledge_items`? Specifically: (a) `knowledge/*.md` files are the first-class `KnowledgeItem` source; (b) README and `docs/` Markdown are documentation evidence (`SourceType::DOCUMENTATION`) and must not be automatically promoted to `KnowledgeItem`; (c) LLM-generated summaries are deferred to Phase 5.  
-**Impact**: Affects the Phase 2 indexing pipeline. The distinction between knowledge (explicit, first-class) and documentation (contextual evidence) must be enforced from Phase 2 onward.  
-**Phase 2 entry action**: Define the `knowledge/` directory convention, the `knowledge_type` taxonomy, and the ingest pipeline. Confirm that `docs/` Markdown is indexed as documentation evidence only, not as KnowledgeItems. LLM summarization is not introduced until Phase 5.
+**Status**: OPEN (Phase 2 note added 2026-08-25)
+**Owning phase**: Phase 2
+**Source contract**: `docs/contracts/storage.md` §6 (core_knowledge_items table), `docs/contracts/evidence.md` §2 (SourceType::KNOWLEDGE_BASE)
+**Question**: What is the authoritative source for `core_knowledge_items`? Specifically: (a) `knowledge/*.md` files are the first-class `KnowledgeItem` source; (b) README and `docs/` Markdown are documentation evidence (`SourceType::DOCUMENTATION`) and must not be automatically promoted to `KnowledgeItem`; (c) LLM-generated summaries are deferred to Phase 5.
+**Impact**: Affects the Phase 2 indexing pipeline. The distinction between knowledge (explicit, first-class) and documentation (contextual evidence) must be enforced from Phase 2 onward.
+**Phase 2 status (2026-08-25)**: Phase 2 implemented *incremental freshness for knowledge files* — `knowledge/*.md` modifications invalidate their derived artifacts and FTS entries through the standard pipeline (see `phase2_policy_freshness.rs::knowledge_file_modification_invalidates_only_that_file`). The `core_knowledge_items` table itself is still unpopulated (Phase 1D/2 analyzers produce retrieval units only), so the ingest-pipeline decision (taxonomy, `knowledge/` convention enforcement, docs-vs-knowledge separation) remains OPEN and does not block later phases that read the table.
 
 ---
 
@@ -205,3 +205,19 @@ When an open question is resolved:
 2. Update the relevant contract document(s) to reflect the decision.
 3. If the resolution changes a schema or invariant, update `migrations/0001_initial.sql` and note the migration version change.
 4. Record the decision in `docs/decisions/` with full rationale.
+
+---
+
+## OQ-017 — Git-Tracked Rename Detection (EXACT Identity Basis)
+
+**Status**: OPEN
+**Owning phase**: Phase 2+ (discovered during Phase 2)
+**Source contract**: `docs/contracts/identity.md` §File Identity Basis (primary basis: `git:<blob-sha>`), ADR-009 §3
+**Question**: When is Git plumbing (`git diff --name-status` rename scores or blob-SHA basis) introduced so renames can carry EXACT confidence? Phase 2 deliberately added no Git dependency; content-identical moves are recorded as HEURISTIC `CONTENT_MATCH` links in `core_identity_links`.
+**Impact**: Evidence claims about "the same file" across moves remain heuristic until resolved. Schema already accommodates `GIT_RENAME`/`EXACT`.
+
+## OQ-018 — Tombstone Occurrence Freshness Semantics
+
+**Status**: RESOLVED (Phase 2)
+**Owning phase**: Phase 2
+**Resolution**: Occurrences published with `existence_state='deleted'` are set to `freshness_state='INVALID'` immediately after publication (`attic-indexing::incremental`, step 9). Deleted state is therefore never exposed as CURRENT anywhere (fts read boundary additionally filters `existence_state != 'deleted'`). Recorded in the Phase 2 completion report and test `file_deletion_removes_fts_entries_no_ghosts`.
