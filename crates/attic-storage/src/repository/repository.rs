@@ -1,10 +1,39 @@
 //! S3 — `core_repositories` CRUD operations.
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use attic_core::RepositoryId;
 
 use crate::error::StorageError;
+
+// ---------------------------------------------------------------------------
+// Stats types
+// ---------------------------------------------------------------------------
+
+/// Per-repository statistics returned by [`get_repository_stats`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryStats {
+    /// Repository UUID string.
+    pub id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Number of distinct file occurrences.
+    pub file_count: i64,
+    /// Number of retrieval units indexed.
+    pub unit_count: i64,
+}
+
+/// Database-level statistics returned by [`get_db_stats`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbStats {
+    /// Number of applied schema migrations.
+    pub migration_count: i64,
+    /// Number of indexed repositories.
+    pub repository_count: i64,
+    /// Total number of retrieval units across all repositories.
+    pub unit_count: i64,
+}
 
 /// Insert or update a repository record.
 ///
@@ -34,6 +63,64 @@ pub fn upsert_repository(
         rusqlite::params![id.to_string_repr(), root_path, display_name, now_us],
     )?;
     Ok(())
+}
+
+/// Return per-repository file and unit counts for all indexed repositories.
+///
+/// Results are ordered by `display_name` ascending.
+/// The query never returns `root_path` — absolute paths are kept server-side.
+pub fn get_repository_stats(
+    conn: &Connection,
+) -> Result<Vec<RepositoryStats>, StorageError> {
+    let sql = "
+        SELECT r.id, r.display_name,
+               COUNT(DISTINCT fo.id) AS files,
+               COUNT(ru.id)          AS units
+          FROM core_repositories r
+          LEFT JOIN core_file_identities  fi ON fi.repository_id = r.id
+          LEFT JOIN core_file_occurrences fo ON fo.file_identity_id = fi.id
+          LEFT JOIN core_retrieval_units  ru ON ru.file_occurrence_id = fo.id
+         GROUP BY r.id
+         ORDER BY r.display_name
+    ";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(RepositoryStats {
+            id: row.get(0)?,
+            display_name: row.get(1)?,
+            file_count: row.get(2)?,
+            unit_count: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Return database-level statistics (migration count, repository count, unit count).
+pub fn get_db_stats(conn: &Connection) -> Result<DbStats, StorageError> {
+    let migration_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM core_schema_migrations",
+        [],
+        |r| r.get(0),
+    )?;
+    let repository_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM core_repositories",
+        [],
+        |r| r.get(0),
+    )?;
+    let unit_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM core_retrieval_units",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(DbStats {
+        migration_count,
+        repository_count,
+        unit_count,
+    })
 }
 
 /// Return the `root_path` of a repository by ID, or `None` if not found.

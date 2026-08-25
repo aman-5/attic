@@ -33,7 +33,10 @@ pub use repository::file_occurrence::{
 };
 pub use repository::index_generation::insert_index_generation;
 pub use repository::publication::{PublicationItem, publish_file_batch};
-pub use repository::repository::{get_repository_path, upsert_repository};
+pub use repository::repository::{
+    get_db_stats, get_repository_path, get_repository_stats, upsert_repository, DbStats,
+    RepositoryStats,
+};
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
 };

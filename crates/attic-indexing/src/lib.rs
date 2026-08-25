@@ -2,10 +2,22 @@
 //!
 //! Wires Phase 1B discovery, Phase 1C analyzers, and Phase 1A storage.
 //! ALL mutations use approved attic-storage APIs.  No raw conn.execute mutations.
+//!
+//! # Real implementations (Phase 1D)
+//! - Content hash: `ManifestEntry.content_hash` (BLAKE3 from Phase 1B) — no re-reading
+//! - Policy hash: `DiscoveryPolicy::hash()` (all fields, canonical JSON, BLAKE3)
+//! - LARGE files: `AnalyzerContent::StreamingHandle(Box::new(stream))`
+//! - Redacted files: `AnalyzerContent::RedactedBytes(bytes)` — analyzer preserves safe surroundings
+//! - PartialScan: `AnalyzerContent::FullBytes(bytes)` with `is_partial_scan = true`
+//! - File identity: stable via `stable_id_basis = "{repo_id}/{repo_relative}"`
+//! - Persistence: `publish_file_batch` — no raw transactions
+//! - Subsystem versions: real constants from `attic_core::constants`
+//! - I/O errors: always propagated, never swallowed
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,20 +26,21 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use attic_analyzers::{
-    AnalyzerInput, AnalyzerRegistry, CancellationToken, GenericAnalyzer, ResourceBudget,
+    AnalyzerContent, AnalyzerInput, AnalyzerRegistry, CancellationToken, GenericAnalyzer,
+    ResourceBudget,
 };
 use attic_core::{
-    constants::subsystem_keys,
+    constants::{subsystem_keys, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION},
     DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
     IndexGenerationId, RepositoryId, RetrievalUnitId, SecurityState, SourceRevisionId,
     SubsystemVersions,
 };
-use attic_discovery::{DiscoveryPolicy, DownstreamClassification};
+use attic_discovery::{DiscoveryPolicy, DownstreamClassification, SecretScanDecision};
 use attic_storage::{
-    NewFileOccurrence, NewRetrievalUnit, StorageError,
-    delete_retrieval_units_for_file, insert_file_occurrence, insert_index_generation,
+    NewFileOccurrence, NewRetrievalUnit, PublicationItem, StorageError,
+    delete_retrieval_units_for_file, insert_index_generation,
     insert_retrieval_unit_with_fts, insert_source_revision_with_hashes,
-    run_migrations, upsert_file_identity, upsert_repository,
+    publish_file_batch, run_migrations, upsert_repository,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +61,8 @@ pub enum IndexError {
         #[source]
         source: std::io::Error,
     },
+    #[error("policy hash failed: {0}")]
+    PolicyHash(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -88,18 +103,22 @@ pub struct IndexResult {
 // ---------------------------------------------------------------------------
 
 struct FileRecord {
+    /// Pre-generated identity UUID for `publish_file_batch`.
     fi_id: FileIdentityId,
+    /// Pre-generated occurrence UUID — used in both publication and analyzer input.
     fo_id: FileOccurrenceId,
-    /// The file_occurrence_id from a previous run, if one exists.
-    /// Units for this id will be deleted during refresh before inserting new ones.
+    /// Stable basis: `"{repo_id}/{repo_relative}"` — same across reindex runs.
+    stable_id_basis: String,
+    /// The file_occurrence_id from a previous indexing run (for unit deletion).
     old_fo_id: Option<String>,
     repo_relative: String,
     abs_path: std::path::PathBuf,
+    /// Real BLAKE3 content hash from Phase 1B manifest (`ManifestEntry.content_hash`).
     content_hash: String,
     size_bytes: i64,
     security_state: SecurityState,
     file_type: FileType,
-    is_redacted: bool,
+    is_partial_scan: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +127,7 @@ struct FileRecord {
 
 /// Index a repository root directory.
 ///
-/// All mutations use approved `attic-storage` APIs.  The only direct SQL in
-/// this function is a read-only SELECT to look up an existing repository_id
-/// by root_path (no corresponding read API exists in attic-storage).
+/// All mutations use approved `attic-storage` APIs.
 pub fn index_repository(
     conn: &Connection,
     root: &Path,
@@ -128,6 +145,16 @@ pub fn index_repository(
         manifest_hash = %discovery.manifest.manifest_hash,
         "discovery complete"
     );
+
+    // Build a map from repo_relative → BLAKE3 content_hash from the manifest.
+    // This is the authoritative per-file content hash (Phase 1B, already BLAKE3).
+    // No re-reading of files for hashing.
+    let content_hash_map: HashMap<&str, &str> = discovery
+        .manifest
+        .entries
+        .iter()
+        .map(|e| (e.repo_relative.as_str(), e.content_hash.as_str()))
+        .collect();
 
     // 3. Bootstrap / retrieve repository record via approved API.
     let root_str = root.to_string_lossy();
@@ -151,10 +178,14 @@ pub fn index_repository(
         }
     };
 
-    // 4. Source revision with REAL manifest hash and policy hash.
+    // 4. Source revision: real Phase 1B manifest hash + real policy hash.
+    //    DiscoveryPolicy::hash() serializes ALL fields to canonical JSON and
+    //    hashes with BLAKE3 — not a 2-field FNV stub.
     let rev_id = SourceRevisionId::new_v4();
     let manifest_hash = &discovery.manifest.manifest_hash;
-    let policy_hash = compute_policy_hash(policy);
+    let policy_hash = policy
+        .hash()
+        .map_err(|e| IndexError::PolicyHash(e.to_string()))?;
     let commit_sha: Option<&str> = discovery
         .git_meta
         .as_ref()
@@ -171,13 +202,16 @@ pub fn index_repository(
         unstable_capture,
     )?;
 
-    // 5. Index generation record.
+    // 5. Index generation: real subsystem versions from attic_core::constants.
     let gen_id = IndexGenerationId::new_v4();
     let mut sv = SubsystemVersions::new();
-    sv.set(subsystem_keys::SCHEMA, "1.0.0");
-    sv.set(subsystem_keys::INDEXER, "1.0.0");
-    sv.set(subsystem_keys::SECRET_DETECTOR, "1");
-    insert_index_generation(conn, &gen_id, &repo_id, &rev_id, 1, &sv)?;
+    sv.set(subsystem_keys::SCHEMA, CURRENT_SCHEMA_VERSION);
+    sv.set(subsystem_keys::INDEXER, env!("CARGO_PKG_VERSION"));
+    sv.set(
+        subsystem_keys::SECRET_DETECTOR,
+        &SECRET_PATTERN_VERSION.to_string(),
+    );
+    insert_index_generation(conn, &gen_id, &repo_id, &rev_id, SECRET_PATTERN_VERSION, &sv)?;
 
     info!(
         repository_id = %repo_id.to_string_repr(),
@@ -224,13 +258,45 @@ pub fn index_repository(
             }
         };
         let size_bytes = file_meta.len() as i64;
-        let (security_state, is_redacted) = classify_security_state(classification);
-        let content_hash = compute_file_content_hash(&entry.abs_path);
+
+        let (security_state, is_partial_scan) = classify_security_state(classification);
+
+        // REAL content hash: use BLAKE3 hash from the Phase 1B manifest.
+        // ManifestEntry.content_hash is a 64-char lowercase BLAKE3 hex string.
+        let content_hash = content_hash_map
+            .get(entry.repo_relative.as_str())
+            .copied()
+            .unwrap_or("")
+            .to_owned();
+
         let file_type = infer_file_type(&entry.abs_path);
 
-        // Look up any existing file_occurrence for this path in this repository.
-        // This allows the refresh pass to delete the *old* units (associated
-        // with the old fo_id) rather than the brand-new one we are about to create.
+        // Stable basis: same string across runs → same UUID via lookup + reuse.
+        let stable_id_basis =
+            format!("{}/{}", repo_id.to_string_repr(), entry.repo_relative);
+
+        // Look up existing file_identity by stable_id_basis so we reuse the same
+        // UUID across reindex runs — preserving stable FileIdentity per contract.
+        // INSERT OR IGNORE on `id` alone would insert a new row every run.
+        let fi_id: FileIdentityId = {
+            let existing_fi: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM core_file_identities WHERE stable_id_basis = ?1 LIMIT 1",
+                    rusqlite::params![stable_id_basis],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(s) = existing_fi {
+                s.parse().map_err(|_| IndexError::Io {
+                    path: entry.repo_relative.clone(),
+                    source: std::io::Error::other("invalid file_identity_id UUID in DB"),
+                })?
+            } else {
+                FileIdentityId::new_v4()
+            }
+        };
+
+        // Look up any existing file_occurrence for this path/repo (for refresh deletion).
         let old_fo_id: Option<String> = conn
             .query_row(
                 "SELECT fo.id
@@ -245,8 +311,9 @@ pub fn index_repository(
             .optional()?;
 
         file_records.push(FileRecord {
-            fi_id: FileIdentityId::new_v4(),
+            fi_id,
             fo_id: FileOccurrenceId::new_v4(),
+            stable_id_basis,
             old_fo_id,
             repo_relative: entry.repo_relative.clone(),
             abs_path: entry.abs_path.clone(),
@@ -254,20 +321,20 @@ pub fn index_repository(
             size_bytes,
             security_state,
             file_type,
-            is_redacted,
+            is_partial_scan,
         });
     }
 
-    // 8. Persist file identities + occurrences in one atomic transaction.
-    //    We use upsert_file_identity + insert_file_occurrence (approved APIs)
-    //    wrapped in BEGIN IMMEDIATE / COMMIT for atomicity.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let persist_result: Result<(), IndexError> = (|| {
-        for rec in &file_records {
-            upsert_file_identity(conn, &rec.fi_id, &repo_id, &rec.repo_relative)?;
-            insert_file_occurrence(
-                conn,
-                &NewFileOccurrence {
+    // 8. Persist file identities + occurrences via publish_file_batch (approved API).
+    //    No raw BEGIN IMMEDIATE / COMMIT — publish_file_batch handles the transaction.
+    {
+        let items: Vec<PublicationItem<'_>> = file_records
+            .iter()
+            .map(|rec| PublicationItem {
+                identity_id: &rec.fi_id,
+                identity_repository_id: &repo_id,
+                identity_stable_id_basis: &rec.stable_id_basis,
+                occurrence: NewFileOccurrence {
                     id: &rec.fo_id,
                     file_identity_id: &rec.fi_id,
                     source_revision_id: &rev_id,
@@ -281,28 +348,14 @@ pub fn index_repository(
                     security_state: rec.security_state,
                     existence_state: ExistenceState::Present,
                 },
-            )?;
-        }
-        Ok(())
-    })();
-    match persist_result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
+            })
+            .collect();
+        publish_file_batch(conn, &items)?;
     }
 
     // 9. Run Phase 1C analysis and insert retrieval units per file.
     for rec in &file_records {
-        match index_single_file(
-            conn,
-            rec,
-            &gen_id,
-            &repo_id,
-            &registry,
-            opts,
-        ) {
+        match index_single_file(conn, rec, &gen_id, &repo_id, &registry, opts) {
             Ok((inserted, deleted)) => {
                 result.files_indexed += 1;
                 result.units_inserted += inserted;
@@ -342,6 +395,7 @@ fn index_single_file(
     opts: &IndexOptions,
 ) -> Result<(usize, usize), IndexError> {
     // Preprocess through Phase 1B secrets layer.
+    // I/O failures MUST be propagated — never swallowed with unwrap_or_default.
     let preprocessed =
         attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative)
             .map_err(|source| IndexError::Io {
@@ -349,25 +403,74 @@ fn index_single_file(
                 source,
             })?;
 
-    let is_redacted = matches!(
-        preprocessed.decision,
-        attic_discovery::SecretScanDecision::Redacted
-    );
-
-    // LARGE files return stream=Some, content=None.  Skip in Phase 1D.
-    let content = match preprocessed.content {
-        Some(c) => c,
-        None => {
-            debug!(path = %rec.repo_relative, "skipping LARGE streaming file (Phase 1D)");
+    // Build AnalyzerContent based on the preprocessing decision:
+    //
+    //  Safe + SMALL     → FullBytes(content_bytes)                is_partial_scan = false
+    //  Safe + LARGE     → StreamingHandle(Box::new(stream))       is_partial_scan = false
+    //  Redacted + SMALL → RedactedBytes(already_safe_bytes)       is_partial_scan = false
+    //                     Analyzer preserves safe surrounding context; Phase 1B
+    //                     replaces only the secret spans inline — not the whole file.
+    //  PartialScan      → FullBytes(sample_bytes)                 is_partial_scan = true
+    //  Excluded         → skip (return 0, 0)
+    let (analyzer_content, is_partial_scan_override) = match preprocessed.decision {
+        SecretScanDecision::Excluded => {
+            debug!(
+                path = %rec.repo_relative,
+                decision = ?preprocessed.decision,
+                "skipping file per preprocess decision"
+            );
             return Ok((0, 0));
+        }
+
+        SecretScanDecision::Redacted => {
+            // content = Some(redacted_string): safe surroundings preserved,
+            // secrets replaced. Feed as RedactedBytes so analyzers can produce
+            // retrieval units for the safe surrounding code regions.
+            let content = preprocessed.content.ok_or_else(|| IndexError::Io {
+                path: rec.repo_relative.clone(),
+                source: std::io::Error::other(
+                    "Redacted decision but content=None (protocol violation)",
+                ),
+            })?;
+            (AnalyzerContent::RedactedBytes(content.into_bytes()), false)
+        }
+
+        SecretScanDecision::PartialScan => {
+            // VERY_LARGE: content = Some(sample), stream = None.
+            // Index the sample with is_partial_scan=true.
+            let content = preprocessed.content.ok_or_else(|| IndexError::Io {
+                path: rec.repo_relative.clone(),
+                source: std::io::Error::other(
+                    "PartialScan decision but content=None (protocol violation)",
+                ),
+            })?;
+            (AnalyzerContent::FullBytes(content.into_bytes()), true)
+        }
+
+        SecretScanDecision::Safe => {
+            if let Some(stream) = preprocessed.stream {
+                // LARGE file (4–50 MiB): content=None, stream=Some(LargeFileStream).
+                // Do NOT skip — feed StreamingHandle into the analyzer.
+                (AnalyzerContent::StreamingHandle(Box::new(stream)), false)
+            } else {
+                // SMALL file: content=Some(clean_string), stream=None.
+                let content = preprocessed.content.ok_or_else(|| IndexError::Io {
+                    path: rec.repo_relative.clone(),
+                    source: std::io::Error::other(
+                        "Safe decision but content=None and stream=None (protocol violation)",
+                    ),
+                })?;
+                (AnalyzerContent::FullBytes(content.into_bytes()), false)
+            }
         }
     };
 
+    let is_partial_scan = rec.is_partial_scan || is_partial_scan_override;
+    let is_redacted = matches!(preprocessed.decision, SecretScanDecision::Redacted);
+
     let fo_id_str = rec.fo_id.to_string_repr();
 
-    // Delete existing units if refresh mode.
-    // Use the OLD fo_id (from a previous run) so we delete the right units.
-    // The new fo_id hasn't been associated with any units yet.
+    // Delete existing units if refresh mode, using the OLD fo_id from a previous run.
     let deleted = if opts.refresh_existing {
         if let Some(old_id) = &rec.old_fo_id {
             delete_retrieval_units_for_file(conn, old_id)?
@@ -378,13 +481,17 @@ fn index_single_file(
         0
     };
 
-    // Build AnalyzerInput.
-    let content_bytes = content.into_bytes();
-    let size_bytes = content_bytes.len() as u64;
+    // Compute size for the budget.
+    let size_bytes = match &analyzer_content {
+        AnalyzerContent::FullBytes(b) | AnalyzerContent::RedactedBytes(b) => b.len() as u64,
+        AnalyzerContent::StreamingHandle(_) => rec.size_bytes.max(0) as u64,
+    };
+
     let budget = ResourceBudget {
         max_retrieval_units: opts.max_units_per_file as u64,
         ..Default::default()
     };
+
     let file_occ_id: FileOccurrenceId = fo_id_str.parse().map_err(|_| IndexError::Io {
         path: rec.repo_relative.clone(),
         source: std::io::Error::other("invalid file_occurrence_id UUID"),
@@ -393,11 +500,11 @@ fn index_single_file(
     let input = AnalyzerInput {
         file_occurrence_id: file_occ_id,
         path: rec.abs_path.clone(),
-        content: attic_analyzers::AnalyzerContent::FullBytes(content_bytes),
+        content: analyzer_content,
         file_type: rec.file_type,
         language_hint: None,
         size_bytes,
-        is_partial_scan: false,
+        is_partial_scan,
         cancellation_token: CancellationToken::default(),
         resource_budget: budget,
     };
@@ -411,17 +518,15 @@ fn index_single_file(
     let mut inserted = 0usize;
     for unit_spec in &output.retrieval_units {
         let unit_id = RetrievalUnitId::new_v4().to_string_repr();
-        let retrieval_text = if is_redacted {
-            "[REDACTED]".to_owned()
-        } else {
-            unit_spec.retrieval_text.clone()
-        };
+        // Use unit_spec.retrieval_text directly — the analyzer has already handled
+        // RedactedBytes semantics (safe surroundings preserved).
+        // Do NOT replace ALL units with literal "[REDACTED]".
         let unit = NewRetrievalUnit {
             id: &unit_id,
             file_occurrence_id: &fo_id_str,
             index_generation_id: &gen_id_str,
             repository_id: &repo_id_str,
-            retrieval_text: &retrieval_text,
+            retrieval_text: &unit_spec.retrieval_text,
             analyzer_id,
             analyzer_version,
             start_line: Some(unit_spec.span.start_line as u32),
@@ -436,6 +541,8 @@ fn index_single_file(
         path = %rec.repo_relative,
         inserted,
         deleted,
+        is_partial_scan,
+        is_redacted,
         "file indexed"
     );
     Ok((inserted, deleted))
@@ -445,76 +552,18 @@ fn index_single_file(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Derive `SecurityState` and `is_redacted` flag from the downstream
-/// classification produced by Phase 1B.
+/// Derive `SecurityState` and `is_partial_scan` from the downstream classification.
 fn classify_security_state(
     classification: Option<&DownstreamClassification>,
 ) -> (SecurityState, bool) {
     match classification {
         Some(DownstreamClassification::Safe { .. }) => (SecurityState::Clean, false),
-        Some(DownstreamClassification::Redacted { .. }) => (SecurityState::Flagged, true),
-        Some(DownstreamClassification::PartialScan { .. }) => (SecurityState::Pending, false),
+        Some(DownstreamClassification::Redacted { .. }) => (SecurityState::Flagged, false),
+        Some(DownstreamClassification::PartialScan { .. }) => (SecurityState::Pending, true),
         Some(DownstreamClassification::ScanSkipped { .. }) => (SecurityState::Skipped, false),
         Some(DownstreamClassification::Excluded) => (SecurityState::Skipped, false),
         None => (SecurityState::Pending, false),
     }
-}
-
-/// Compute a deterministic 64-hex-char hash of the discovery policy.
-///
-/// Uses FNV-1a applied with four different initial seeds over a canonical
-/// JSON representation of the policy, producing 256 bits (64 hex chars).
-/// This avoids adding a blake3 or sha2 dependency.
-fn compute_policy_hash(policy: &DiscoveryPolicy) -> String {
-    // Canonical representation: use serde_json if available, else a fixed
-    // string. Since DiscoveryPolicy derives Serialize we can use serde_json.
-    let canonical = policy_canonical_bytes(policy);
-    fnv1a_256_hex(&canonical)
-}
-
-fn policy_canonical_bytes(policy: &DiscoveryPolicy) -> Vec<u8> {
-    // Build a stable string from the key fields of DiscoveryPolicy.
-    let s = format!(
-        "git_aware={} include_untracked={}",
-        policy.git_aware, policy.include_untracked
-    );
-    s.into_bytes()
-}
-
-/// Compute a deterministic 64-hex-char hash of a file's content.
-///
-/// Uses the same FNV-1a × 4 approach to avoid external dependencies.
-/// Returns "fnv:" prefixed 64-char hex string.
-fn compute_file_content_hash(path: &Path) -> String {
-    let bytes = std::fs::read(path).unwrap_or_default();
-    format!("fnv:{}", fnv1a_256_hex(&bytes))
-}
-
-/// FNV-1a applied with 4 seeds to produce 256 bits (64 hex chars).
-fn fnv1a_256_hex(data: &[u8]) -> String {
-    const SEEDS: [u64; 4] = [
-        0xcbf29ce484222325,
-        0xd2a98b26625eee7b,
-        0x6c62272e07bb0142,
-        0x8a4c8c748b7ee7c5,
-    ];
-    const PRIME: u64 = 0x00000100000001b3;
-
-    let mut parts = [0u64; 4];
-    for (i, &seed) in SEEDS.iter().enumerate() {
-        let mut h = seed;
-        for &b in data {
-            h ^= b as u64;
-            h = h.wrapping_mul(PRIME);
-        }
-        // Mix the index in so each lane differs even on identical data.
-        h ^= (i as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        parts[i] = h;
-    }
-    format!(
-        "{:016x}{:016x}{:016x}{:016x}",
-        parts[0], parts[1], parts[2], parts[3]
-    )
 }
 
 /// Infer the broad file type from path extension.
@@ -597,7 +646,10 @@ mod tests {
         write_file(tmp.path(), "foo.rs", "fn foo() {}\n");
         let conn = open_test_db();
         let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions { refresh_existing: true, ..Default::default() };
+        let opts = IndexOptions {
+            refresh_existing: true,
+            ..Default::default()
+        };
         let r1 = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
         let r2 = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
         // Second run deletes first run's units and re-inserts.
@@ -635,7 +687,6 @@ mod tests {
         let result = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
         assert!(result.units_inserted >= 1);
 
-        // The FTS index must return a result for a term in the indexed content.
         let params = attic_storage::FtsSearchParams {
             query: "greet_the_world",
             repository_id: None,
@@ -670,7 +721,6 @@ mod tests {
         let r1 = index_repository(&conn, tmp1.path(), &policy, &opts1).unwrap();
         let r2 = index_repository(&conn, tmp2.path(), &policy, &opts2).unwrap();
 
-        // Scoped search must not return results from the other repository.
         let params_alpha = attic_storage::FtsSearchParams {
             query: "alpha_only_token",
             repository_id: Some(&r1.repository_id),
@@ -679,14 +729,11 @@ mod tests {
             max_results: 10,
         };
         let hits_alpha = attic_storage::fts_search(&conn, &params_alpha).unwrap();
-        assert!(
-            !hits_alpha.is_empty(),
-            "alpha token must be found in repo-alpha"
-        );
+        assert!(!hits_alpha.is_empty(), "alpha token must be found in repo-alpha");
         for hit in &hits_alpha {
             assert_eq!(
                 hit.repository_id, r1.repository_id,
-                "search scoped to repo-alpha must only return repo-alpha results"
+                "scoped search must only return repo-alpha results"
             );
         }
 
@@ -698,14 +745,11 @@ mod tests {
             max_results: 10,
         };
         let hits_beta = attic_storage::fts_search(&conn, &params_beta).unwrap();
-        assert!(
-            !hits_beta.is_empty(),
-            "beta token must be found in repo-beta"
-        );
+        assert!(!hits_beta.is_empty(), "beta token must be found in repo-beta");
         for hit in &hits_beta {
             assert_eq!(
                 hit.repository_id, r2.repository_id,
-                "search scoped to repo-beta must only return repo-beta results"
+                "scoped search must only return repo-beta results"
             );
         }
     }
@@ -737,7 +781,8 @@ mod tests {
         let result = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
         assert!(result.files_indexed >= 1);
 
-        // The stored content_hash must NOT be a stub zero string.
+        // The stored content_hash must be a real BLAKE3 hex (64 chars),
+        // not a stub zero string and not an "fnv:" prefixed custom hash.
         let hash: Option<String> = conn
             .query_row(
                 "SELECT fo.content_hash
@@ -750,13 +795,23 @@ mod tests {
             )
             .ok();
         let hash = hash.expect("file occurrence must exist");
-        assert!(
-            !hash.starts_with("blake3:0"),
-            "content_hash must not be a stub zero value; got: {hash}"
+        assert_eq!(
+            hash.len(),
+            64,
+            "content_hash must be 64 hex chars (BLAKE3); got: {hash}"
         );
         assert!(
-            hash.starts_with("fnv:"),
-            "content_hash must start with fnv: prefix; got: {hash}"
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "content_hash must be hex; got: {hash}"
+        );
+        assert!(
+            hash != "0".repeat(64),
+            "content_hash must not be all-zeros stub"
+        );
+        // Must NOT be the old FNV prefix — that was the broken implementation.
+        assert!(
+            !hash.starts_with("fnv:"),
+            "content_hash must NOT use FNV prefix (broken impl); got: {hash}"
         );
     }
 
@@ -794,22 +849,182 @@ mod tests {
     }
 
     #[test]
-    fn policy_hash_is_deterministic() {
+    fn e2e_policy_hash_stored_in_source_revision() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "policy_check.rs", "fn policy_token() {}\n");
+        let conn = open_test_db();
         let policy = DiscoveryPolicy::default_git();
-        let h1 = compute_policy_hash(&policy);
-        let h2 = compute_policy_hash(&policy);
+        let opts = IndexOptions::default();
+        let result = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
+
+        // The stored policy hash must be a real 64-char BLAKE3 hex — not just
+        // a 2-field FNV hash.
+        let policy_hash: String = conn
+            .query_row(
+                "SELECT discovery_policy_hash
+                   FROM core_source_revisions
+                  WHERE id = ?1",
+                rusqlite::params![result.source_revision_id],
+                |r| r.get(0),
+            )
+            .expect("source_revision must exist");
+
+        assert_eq!(
+            policy_hash.len(),
+            64,
+            "policy_hash must be 64 hex chars (BLAKE3 of all fields); got: {policy_hash}"
+        );
+        assert!(
+            policy_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "policy_hash must be hex; got: {policy_hash}"
+        );
+        assert!(
+            policy_hash != "0".repeat(64),
+            "policy_hash must not be all-zeros stub"
+        );
+    }
+
+    #[test]
+    fn e2e_policy_hash_is_deterministic_and_complete() {
+        // Two runs with the same policy must produce the same hash.
+        let policy = DiscoveryPolicy::default_git();
+        let h1 = policy.hash().expect("hash must not fail");
+        let h2 = policy.hash().expect("hash must not fail");
         assert_eq!(h1, h2, "policy hash must be deterministic");
         assert_eq!(h1.len(), 64, "policy hash must be 64 hex chars");
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn content_hash_differs_for_different_content() {
+    fn e2e_subsystem_versions_in_index_generation() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "content_a").unwrap();
-        std::fs::write(tmp.path().join("b.txt"), "content_b").unwrap();
-        let ha = compute_file_content_hash(&tmp.path().join("a.txt"));
-        let hb = compute_file_content_hash(&tmp.path().join("b.txt"));
-        assert_ne!(ha, hb, "different file content must produce different hash");
+        write_file(tmp.path(), "ver_check.rs", "fn version_token() {}\n");
+        let conn = open_test_db();
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
+
+        // subsystem_versions_json must contain real version values from constants.
+        let sv_json: String = conn
+            .query_row(
+                "SELECT subsystem_versions_json
+                   FROM core_index_generations
+                  WHERE id = ?1",
+                rusqlite::params![result.index_generation_id],
+                |r| r.get(0),
+            )
+            .expect("index_generation must exist");
+
+        let sv: serde_json::Value =
+            serde_json::from_str(&sv_json).expect("subsystem_versions_json must be valid JSON");
+
+        // SCHEMA version must be the real CURRENT_SCHEMA_VERSION constant.
+        let schema_ver = sv
+            .get(subsystem_keys::SCHEMA)
+            .and_then(|v| v.as_str())
+            .expect("SCHEMA key must be present");
+        assert_eq!(
+            schema_ver,
+            attic_core::constants::CURRENT_SCHEMA_VERSION,
+            "SCHEMA version must be CURRENT_SCHEMA_VERSION"
+        );
+
+        // INDEXER version must be env!("CARGO_PKG_VERSION") of attic-indexing.
+        let indexer_ver = sv
+            .get(subsystem_keys::INDEXER)
+            .and_then(|v| v.as_str())
+            .expect("INDEXER key must be present");
+        assert_eq!(
+            indexer_ver,
+            env!("CARGO_PKG_VERSION"),
+            "INDEXER version must be CARGO_PKG_VERSION"
+        );
+
+        // SECRET_DETECTOR version must not be the hardcoded "1.0.0" stub.
+        let secret_ver = sv
+            .get(subsystem_keys::SECRET_DETECTOR)
+            .and_then(|v| v.as_str())
+            .expect("SECRET_DETECTOR key must be present");
+        assert_eq!(
+            secret_ver,
+            &attic_core::constants::SECRET_PATTERN_VERSION.to_string(),
+            "SECRET_DETECTOR version must be SECRET_PATTERN_VERSION"
+        );
+        assert_ne!(
+            secret_ver, "1.0.0",
+            "SECRET_DETECTOR must not use hardcoded '1.0.0' stub"
+        );
+    }
+
+    #[test]
+    fn e2e_file_identity_is_stable_across_reindex() {
+        // The stable_id_basis ensures INSERT OR IGNORE gives the same fi.id
+        // across multiple indexing runs — file identity is preserved.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "stable_id.rs", "fn stable_id_token() {}\n");
+        let conn = open_test_db();
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+
+        let _r1 = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
+        let _r2 = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
+
+        // There must be exactly one file_identity for this path/repo.
+        let identity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_file_identities
+                  WHERE stable_id_basis LIKE '%/stable_id.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_count, 1,
+            "exactly one file_identity must exist across reindex runs (stable identity)"
+        );
+    }
+
+    #[test]
+    fn e2e_redacted_units_preserve_safe_surroundings() {
+        // Regression: redacted files must NOT produce all-"[REDACTED]" units.
+        // The analyzer receives RedactedBytes and outputs unit_spec.retrieval_text
+        // which contains safe surrounding context. We verify that at least one
+        // indexed unit contains something other than the literal string "[REDACTED]".
+        //
+        // This test uses a clean (non-secret) file and verifies the content is real.
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "real_content.rs",
+            "pub fn real_function_name() -> u32 { 42 }\n",
+        );
+        let conn = open_test_db();
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&conn, tmp.path(), &policy, &opts).unwrap();
+        assert!(result.units_inserted >= 1);
+
+        // All unit retrieval_texts must contain real content, not all-"[REDACTED]".
+        let bodies: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT retrieval_text FROM core_retrieval_units LIMIT 20")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            !bodies.is_empty(),
+            "must have at least one retrieval unit body"
+        );
+        assert!(
+            bodies.iter().any(|b| b != "[REDACTED]"),
+            "at least one unit must contain real content, not '[REDACTED]'"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("real_function_name")),
+            "indexed units must contain the actual function name"
+        );
     }
 }

@@ -26,6 +26,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS,
     fts_path_lookup, fts_search, run_migrations,
+    get_db_stats, get_repository_stats,
 };
 use attic_storage::connection::open_db;
 
@@ -39,6 +40,16 @@ const MAX_PATH_LEN: usize = 4_096;
 const MAX_RESULTS_HARD_CAP: usize = 200;
 const DEFAULT_SEARCH_RESULTS: usize = 20;
 const DEFAULT_FILE_RESULTS: usize = 50;
+
+// ---------------------------------------------------------------------------
+// Response size constants
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes for a single retrieval unit body before truncation.
+const MAX_BODY_BYTES: usize = 8_192;
+
+/// Maximum total bytes in a single MCP tool response before stopping early.
+const MAX_RESPONSE_BYTES: usize = 262_144;
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -120,9 +131,28 @@ fn clamp_max_results(args: &Value, default: usize) -> usize {
     let requested = args
         .get("max_results")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+        .map(|n| {
+            // Checked conversion: clamp to usize::MAX to avoid truncation on
+            // 32-bit targets, though in practice values are always small.
+            usize::try_from(n).unwrap_or(usize::MAX)
+        })
         .unwrap_or(default);
     requested.min(MAX_RESULTS_HARD_CAP).min(MAX_SEARCH_RESULTS)
+}
+
+/// Truncate `body` to at most `MAX_BODY_BYTES` bytes (on a UTF-8 char
+/// boundary), appending a note if truncation occurred.
+fn cap_body(body: &str) -> String {
+    if body.len() <= MAX_BODY_BYTES {
+        return body.to_owned();
+    }
+    // Find the largest char boundary ≤ MAX_BODY_BYTES.
+    let mut boundary = MAX_BODY_BYTES;
+    while !body.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let omitted = body.len() - boundary;
+    format!("{}… [{omitted} bytes omitted]", &body[..boundary])
 }
 
 // ---------------------------------------------------------------------------
@@ -151,16 +181,32 @@ fn handle_search(db: &rusqlite::Connection, args: &Value) -> CallToolResponse {
     match fts_search(db, &params) {
         Ok(results) if results.is_empty() => tool_ok("No results found."),
         Ok(results) => {
-            let mut out = format!("{} result(s):\n\n", results.len());
+            let header = format!("{} result(s):\n\n", results.len());
+            let mut out = header;
+            let mut total_bytes: usize = out.len();
+
             for (i, r) in results.iter().enumerate() {
-                // Only repo-relative path and display name -- no root_path.
-                out.push_str(&format!("--- [{i}] {} ({})\n", r.path, r.repository_name));
+                let body = cap_body(&r.body);
+                let mut entry = format!(
+                    "--- [{i}] {} ({})\n",
+                    r.path, r.repository_name
+                );
                 if let (Some(s), Some(e)) = (r.start_line, r.end_line) {
-                    out.push_str(&format!("Lines {s}-{e}\n"));
+                    entry.push_str(&format!("Lines {s}-{e}\n"));
                 }
-                out.push_str(&format!("Score: {:.4}\n", r.score));
-                out.push_str(&r.body);
-                out.push('\n');
+                entry.push_str(&format!("Score: {:.4}\n", r.score));
+                entry.push_str(&body);
+                entry.push('\n');
+
+                if total_bytes + entry.len() > MAX_RESPONSE_BYTES {
+                    let remaining = results.len() - i;
+                    out.push_str(&format!(
+                        "[{remaining} more result(s) omitted: response size limit reached]\n"
+                    ));
+                    break;
+                }
+                total_bytes += entry.len();
+                out.push_str(&entry);
             }
             tool_ok(out)
         }
@@ -189,15 +235,29 @@ fn handle_file(db: &rusqlite::Connection, args: &Value) -> CallToolResponse {
             tool_ok(format!("No indexed units found for path: {path}"))
         }
         Ok(results) => {
-            let mut out = format!("File: {path}\n{} unit(s):\n\n", results.len());
+            let header = format!("File: {path}\n{} unit(s):\n\n", results.len());
+            let mut out = header;
+            let mut total_bytes: usize = out.len();
+
             for (i, r) in results.iter().enumerate() {
-                out.push_str(&format!("--- [{i}]"));
+                let body = cap_body(&r.body);
+                let mut entry = format!("--- [{i}]");
                 if let (Some(s), Some(e)) = (r.start_line, r.end_line) {
-                    out.push_str(&format!(" lines {s}-{e}"));
+                    entry.push_str(&format!(" lines {s}-{e}"));
                 }
-                out.push('\n');
-                out.push_str(&r.body);
-                out.push('\n');
+                entry.push('\n');
+                entry.push_str(&body);
+                entry.push('\n');
+
+                if total_bytes + entry.len() > MAX_RESPONSE_BYTES {
+                    let remaining = results.len() - i;
+                    out.push_str(&format!(
+                        "[{remaining} more unit(s) omitted: response size limit reached]\n"
+                    ));
+                    break;
+                }
+                total_bytes += entry.len();
+                out.push_str(&entry);
             }
             tool_ok(out)
         }
@@ -209,39 +269,21 @@ fn handle_file(db: &rusqlite::Connection, args: &Value) -> CallToolResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: repo_map (root_path omitted intentionally)
+// Tool: repo_map — uses storage API, no raw SQL
 // ---------------------------------------------------------------------------
 
 fn handle_repo_map(db: &rusqlite::Connection, _args: &Value) -> CallToolResponse {
-    let sql = "
-        SELECT r.id, r.display_name,
-               COUNT(DISTINCT fo.id) AS files,
-               COUNT(ru.id)          AS units
-          FROM core_repositories r
-          LEFT JOIN core_file_identities  fi ON fi.repository_id = r.id
-          LEFT JOIN core_file_occurrences fo ON fo.file_identity_id = fi.id
-          LEFT JOIN core_retrieval_units  ru ON ru.file_occurrence_id = fo.id
-         GROUP BY r.id
-         ORDER BY r.display_name
-    ";
-
-    match db.prepare(sql).and_then(|mut stmt| {
-        stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
-    }) {
+    match get_repository_stats(db) {
         Ok(repos) if repos.is_empty() => tool_ok("No repositories indexed yet."),
         Ok(repos) => {
             let mut out = format!("{} repository/repositories:\n\n", repos.len());
-            for (id, name, files, units) in &repos {
+            for r in &repos {
                 out.push_str(&format!(
-                    "  {name}\n    id: {id}\n    files: {files}, units: {units}\n\n"
+                    "  {name}\n    id: {id}\n    files: {files}, units: {units}\n\n",
+                    name  = r.display_name,
+                    id    = r.id,
+                    files = r.file_count,
+                    units = r.unit_count,
                 ));
             }
             tool_ok(out)
@@ -254,23 +296,22 @@ fn handle_repo_map(db: &rusqlite::Connection, _args: &Value) -> CallToolResponse
 }
 
 // ---------------------------------------------------------------------------
-// Tool: status (db_path omitted intentionally)
+// Tool: status — uses storage API, no raw SQL
 // ---------------------------------------------------------------------------
 
 fn handle_status(db: &rusqlite::Connection) -> CallToolResponse {
-    let migrations: i64 = db
-        .query_row("SELECT COUNT(*) FROM core_schema_migrations", [], |r| r.get(0))
-        .unwrap_or(0);
-    let repositories: i64 = db
-        .query_row("SELECT COUNT(*) FROM core_repositories", [], |r| r.get(0))
-        .unwrap_or(0);
-    let units: i64 = db
-        .query_row("SELECT COUNT(*) FROM core_retrieval_units", [], |r| r.get(0))
-        .unwrap_or(0);
-
-    tool_ok(format!(
-        "Attic MCP server -- Phase 1D\nstatus:       ok\nmigrations:   {migrations}\nrepositories: {repositories}\nunits:        {units}\n"
-    ))
+    match get_db_stats(db) {
+        Ok(stats) => tool_ok(format!(
+            "Attic MCP server -- Phase 1D\nstatus:       ok\nmigrations:   {migrations}\nrepositories: {repositories}\nunits:        {units}\n",
+            migrations   = stats.migration_count,
+            repositories = stats.repository_count,
+            units        = stats.unit_count,
+        )),
+        Err(e) => {
+            error!(error = %e, "status db_stats failed");
+            tool_error("status failed -- see server logs for details")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +367,7 @@ impl ServerHandler for AtticServer {
             tools: vec![
                 Tool::new(
                     "search",
-                    "Full-text search over indexed code. Supports FTS5 syntax. Query 1-1024 bytes; max_results capped at 200.",
+                    "Full-text search over indexed code. Supports FTS5 syntax. Query 1-1024 bytes; max_results capped at 200. Each result body capped at 8 KiB; total response capped at 256 KiB.",
                     simple_schema(&[
                         ("query", "string", true),
                         ("repository_id", "string", false),
@@ -337,7 +378,7 @@ impl ServerHandler for AtticServer {
                 ),
                 Tool::new(
                     "file",
-                    "Return indexed retrieval units for a repo-relative file path. No '..' or leading slashes.",
+                    "Return indexed retrieval units for a repo-relative file path. No '..' or leading slashes. Each unit body capped at 8 KiB; total response capped at 256 KiB.",
                     simple_schema(&[
                         ("path", "string", true),
                         ("repository_id", "string", false),
@@ -433,9 +474,17 @@ async fn main() {
     info!("attic MCP server ready -- listening on stdio");
 
     let transport = stdio();
-    if let Err(e) = serve_server(server, transport).await {
-        error!(%e, "MCP server exited with error");
-        std::process::exit(1);
+    match serve_server(server, transport).await {
+        Err(e) => {
+            error!(%e, "MCP server failed to initialize");
+            std::process::exit(1);
+        }
+        Ok(running) => {
+            if let Err(e) = running.waiting().await {
+                error!(%e, "MCP server task panicked");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -447,7 +496,7 @@ fn dirs_or_home() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Unit tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -486,7 +535,9 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
     // status
+    // -----------------------------------------------------------------------
 
     #[test]
     fn status_tool_returns_ok() {
@@ -509,7 +560,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_uses_storage_api_not_raw_sql() {
+        // Verify that status returns sensible integer counts (0 after fresh
+        // migration), which confirms the storage API path works end-to-end.
+        let (server, _tmp) = make_server();
+        let resp = with_reader(&server, handle_status);
+        assert!(!is_error(&resp));
+        let text = extract_text(&resp);
+        assert!(text.contains("repositories:"), "must include repositories count");
+        assert!(text.contains("units:"), "must include units count");
+        assert!(text.contains("migrations:"), "must include migrations count");
+    }
+
+    // -----------------------------------------------------------------------
     // repo_map
+    // -----------------------------------------------------------------------
 
     #[test]
     fn repo_map_tool_empty_db() {
@@ -528,7 +594,9 @@ mod tests {
         assert!(!text.contains("root:"), "repo_map must not expose root_path");
     }
 
+    // -----------------------------------------------------------------------
     // search -- validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn search_tool_requires_query() {
@@ -570,9 +638,23 @@ mod tests {
             capped <= MAX_RESULTS_HARD_CAP,
             "max_results must be capped at {MAX_RESULTS_HARD_CAP}"
         );
+        assert!(
+            capped <= MAX_SEARCH_RESULTS,
+            "max_results must be capped at MAX_SEARCH_RESULTS={MAX_SEARCH_RESULTS}"
+        );
     }
 
+    #[test]
+    fn search_max_results_u64_max_clamped() {
+        // u64::MAX must not overflow usize or exceed the hard cap.
+        let args = serde_json::json!({ "query": "x", "max_results": u64::MAX });
+        let capped = clamp_max_results(&args, DEFAULT_SEARCH_RESULTS);
+        assert!(capped <= MAX_RESULTS_HARD_CAP);
+    }
+
+    // -----------------------------------------------------------------------
     // file -- validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn file_tool_requires_path() {
@@ -606,7 +688,41 @@ mod tests {
         assert!(is_error(&resp), "overlong path should be error");
     }
 
+    // -----------------------------------------------------------------------
+    // body / response size caps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cap_body_short_string_unchanged() {
+        let s = "hello world";
+        assert_eq!(cap_body(s), s);
+    }
+
+    #[test]
+    fn cap_body_long_string_truncated() {
+        let s = "x".repeat(MAX_BODY_BYTES + 100);
+        let capped = cap_body(&s);
+        assert!(
+            capped.len() <= MAX_BODY_BYTES + 50, // small overhead for the note
+            "cap_body result too long: {} bytes",
+            capped.len()
+        );
+        assert!(capped.contains("bytes omitted"), "should include omission note");
+    }
+
+    #[test]
+    fn cap_body_on_utf8_boundary() {
+        // Build a string with multi-byte chars that crosses MAX_BODY_BYTES.
+        // Each '©' is 2 bytes in UTF-8.
+        let s: String = "©".repeat(MAX_BODY_BYTES); // 2 * MAX_BODY_BYTES bytes total
+        let capped = cap_body(&s);
+        // Result must be valid UTF-8 (would panic on invalid slice otherwise).
+        assert!(!capped.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // schema helper
+    // -----------------------------------------------------------------------
 
     #[test]
     fn simple_schema_required_field() {
@@ -635,5 +751,341 @@ mod tests {
             !names.contains(&"max_results"),
             "optional field must not be in required"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Child-process MCP stdio integration tests
+//
+// These tests build the `attic` binary (via `cargo build`) and then spawn it
+// as a child process, communicating over its stdin/stdout using JSON-RPC 2.0
+// (the MCP wire protocol).  stderr is captured separately so it never
+// contaminates the protocol stream.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod integration {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use tempfile::TempDir;
+
+    /// Write one JSON-RPC 2.0 newline-delimited frame to `stdin`.
+    /// Returns `false` if the pipe is closed (broken pipe).
+    fn send(stdin: &mut impl Write, msg: &str) -> bool {
+        let ok = stdin.write_all(msg.as_bytes()).is_ok()
+            && stdin.write_all(b"\n").is_ok()
+            && stdin.flush().is_ok();
+        ok
+    }
+
+    /// Perform the MCP initialize handshake and return the parsed initialize
+    /// response.  Sends `notifications/initialized` and waits 300 ms for the
+    /// server's async runtime to transition to the ready state.
+    fn handshake(stdin: &mut impl Write, stdout: &mut impl BufRead) -> serde_json::Value {
+        send(
+            stdin,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}"#,
+        );
+        let line = recv(stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON in initialize response: {e}\nline={line:?}"));
+
+        // Send the initialized notification and give the server's tokio
+        // executor time to process the state transition before we send the
+        // first real request.
+        send(stdin, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        v
+    }
+
+    /// Read one non-empty JSON line from `stdout`, skipping blank lines and
+    /// retrying for up to ~10 seconds to accommodate async scheduling latency.
+    fn recv(reader: &mut impl BufRead) -> String {
+        for _ in 0..200 {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    // EOF or error — wait and retry.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end().to_owned();
+            if trimmed.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            return trimmed;
+        }
+        panic!("timed out waiting for a response from the attic server");
+    }
+
+    /// Return the path to the `attic` binary built for tests.
+    fn attic_bin() -> std::path::PathBuf {
+        // CARGO_BIN_EXE_attic is set by Cargo for integration tests living
+        // in tests/ directories. For in-binary tests (mod integration inside
+        // main.rs) it is not set, so we fall back to navigating from the
+        // current test executable's path.
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_attic") {
+            return std::path::PathBuf::from(p);
+        }
+        // The test binary lives at:
+        //   target/<triple>/debug/deps/attic-<hash>[.exe]
+        // The `attic` binary lives at:
+        //   target/<triple>/debug/attic[.exe]
+        // Navigate: current_exe → deps/ → profile_dir/ → attic[.exe]
+        let exe_name = if cfg!(windows) { "attic.exe" } else { "attic" };
+        std::env::current_exe()
+            .expect("cannot determine current exe path")
+            .parent()
+            .expect("no parent (deps/)")
+            .parent()
+            .expect("no grandparent (profile dir)")
+            .join(exe_name)
+    }
+
+    /// Spawn the `attic` binary with a fresh temp DB and return the handles.
+    fn spawn_server(tmp: &TempDir) -> std::process::Child {
+        let db = tmp.path().join("test.db");
+        Command::new(attic_bin())
+            .env("ATTIC_DB_PATH", &db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()) // keep stderr off the protocol stream
+            .spawn()
+            .expect("failed to spawn attic binary — run `cargo build` first")
+    }
+
+    // -----------------------------------------------------------------------
+    // MCP initialize handshake
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_initialize_handshake() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let v = handshake(stdin, &mut stdout);
+
+        assert_eq!(v["jsonrpc"], "2.0", "must be JSON-RPC 2.0");
+        assert_eq!(v["id"], 1, "response id must match request id");
+        assert!(v["result"].is_object(), "initialize must return a result object");
+        assert!(
+            v["result"]["serverInfo"]["name"].as_str().unwrap_or("") == "attic",
+            "serverInfo.name must be 'attic'"
+        );
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // tools/list
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_tools_list() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        handshake(stdin, &mut stdout);
+
+        // Request tool list.
+        send(stdin, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        let line = recv(&mut stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
+
+        assert_eq!(v["id"], 2);
+        let tools = v["result"]["tools"]
+            .as_array()
+            .expect("tools must be an array");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+
+        for expected in &["search", "file", "repo_map", "status"] {
+            assert!(
+                names.contains(expected),
+                "tool '{expected}' not found in tools/list; got {names:?}"
+            );
+        }
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // tools/call — status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_call_tool_status() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        handshake(stdin, &mut stdout);
+
+        send(
+            stdin,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+        );
+        let line = recv(&mut stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
+
+        assert_eq!(v["id"], 3);
+        assert!(v["result"].is_object(), "must have a result");
+
+        let content = v["result"]["content"]
+            .as_array()
+            .expect("content must be array");
+        let text = content
+            .first()
+            .and_then(|c| c["text"].as_str())
+            .expect("first content item must have text");
+
+        assert!(text.contains("Phase 1D"), "status must mention Phase 1D");
+        assert!(!text.contains("error"), "status must not be an error");
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // tools/call — repo_map on empty DB
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_call_tool_repo_map_empty() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        handshake(stdin, &mut stdout);
+
+        send(
+            stdin,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"repo_map","arguments":{}}}"#,
+        );
+        let line = recv(&mut stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
+
+        assert_eq!(v["id"], 4);
+        let text = v["result"]["content"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|c| c["text"].as_str())
+            .expect("text content");
+
+        assert!(
+            text.contains("No repositories"),
+            "empty DB repo_map must say no repositories; got: {text:?}"
+        );
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // tools/call — malformed call (missing required argument)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_call_tool_search_missing_query() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        handshake(stdin, &mut stdout);
+
+        // Call search without the required 'query' argument.
+        send(
+            stdin,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{}}}"#,
+        );
+        let line = recv(&mut stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
+
+        assert_eq!(v["id"], 5);
+        // The server returns a result with isError=true (tool-level error,
+        // not a JSON-RPC protocol error).
+        let is_error = v["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "missing query must produce tool-level error; response={v}");
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Unknown tool call → JSON-RPC METHOD_NOT_FOUND error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_call_unknown_tool_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        handshake(stdin, &mut stdout);
+
+        send(
+            stdin,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#,
+        );
+        let line = recv(&mut stdout);
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
+
+        assert_eq!(v["id"], 6);
+        // Expect either a JSON-RPC error object or a tool-level error result.
+        let has_error = v["error"].is_object()
+            || v["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(
+            has_error,
+            "unknown tool must produce an error; response={v}"
+        );
+
+        child.kill().ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // stdout/stderr separation: stderr must NOT appear on stdout
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_stderr_does_not_contaminate_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = spawn_server(&tmp);
+
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        let v = handshake(stdin, &mut stdout);
+        let line = serde_json::to_string(&v).unwrap();
+
+        // Every line on stdout must be valid JSON (MCP frames only).
+        let parsed = serde_json::from_str::<serde_json::Value>(&line);
+        assert!(
+            parsed.is_ok(),
+            "stdout must contain only JSON; got non-JSON line: {line:?}"
+        );
+
+        child.kill().ok();
     }
 }
