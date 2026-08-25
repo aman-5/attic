@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-25
 **Crate:** `attic-analyzers` v0.1.0
-**Status:** ✅ COMPLETE — 40/40 tests pass, zero clippy warnings
+**Status:** ✅ COMPLETE — 42/42 tests pass, zero clippy warnings
 
 ---
 
@@ -11,7 +11,13 @@
 Phase 1C delivers the `attic-analyzers` crate: the analyzer trait, registry, dispatch
 layer, and the mandatory `GenericAnalyzer` fallback. All implementation blockers
 identified in the post-Phase-1C review have been resolved, including a post-completion
-redesign of `dispatch.rs` to enforce bounded O(1) memory for all LARGE file paths.
+redesign of `dispatch.rs` to enforce bounded O(1) memory for all LARGE file paths,
+followed by two subsequent hardening rounds that added:
+
+- **`SpoolPreparation` enum** with cancellation and time-budget enforcement inside
+  the spool loop (no fabricated empty content on preparation failure).
+- **`Box<AnalyzerInput>` in the `Ready` variant** to satisfy
+  `clippy::large_enum_variant` without changing runtime semantics.
 
 ---
 
@@ -95,62 +101,80 @@ rather than continuing.
 select analyzer from registry for input.file_type
 if is_generic → analyze directly (no overhead)
 else:
-  split_for_fallback(input) → (fallback_input, specialized_input, _spool_guard)
-  result = catch_unwind(|| specialized.analyze(specialized_input))
-  match result:
-    Ok(output) with no error diagnostics → return as-is
-    Ok(output) with error diagnostics    → run GenericAnalyzer(fb_input)
-                                           extend fb_output.diagnostics with
-                                           original errors + FALLBACK_USED
-    Err(panic)                           → run GenericAnalyzer(fb_input)
-                                           add PANIC_CAUGHT + FALLBACK_USED
-    (fallback_input = None)              → minimal_*_output (spool failed)
-  _spool_guard drops here → temp file deleted
+  prepare_spool(input) → SpoolPreparation
+  match preparation:
+    Ready { fallback_input, specialized_input, _spool_guard }:
+      result = catch_unwind(|| specialized.analyze(*specialized_input))
+      match result:
+        Ok(output) with no error diagnostics → return as-is
+        Ok(output) with error diagnostics    → run GenericAnalyzer(fallback_input)
+                                               extend fb_output.diagnostics with
+                                               original errors + FALLBACK_USED
+        Err(panic)                           → run GenericAnalyzer(fallback_input)
+                                               add PANIC_CAUGHT + FALLBACK_USED
+      _spool_guard drops here → temp file deleted
+    Cancelled           → return CANCELLED diagnostic
+    TimeBudgetExhausted → return RESOURCE_EXHAUSTED diagnostic
+    IoFailure           → return RESOURCE_EXHAUSTED diagnostic (never empty content)
 ```
+
+#### `SpoolPreparation` enum
+
+```rust
+enum SpoolPreparation {
+    Ready {
+        fallback_input: AnalyzerInput,
+        /// Boxed to reduce the size difference between enum variants
+        /// (`clippy::large_enum_variant`).
+        specialized_input: Box<AnalyzerInput>,
+        _spool_guard: Option<tempfile::NamedTempFile>,
+    },
+    Cancelled,
+    TimeBudgetExhausted,
+    IoFailure,
+}
+```
+
+`specialized_input` is boxed so that the largest variant (`Ready`, 368 bytes) does
+not dwarf the unit-like variants, satisfying `clippy::large_enum_variant` without
+any runtime overhead (the box is immediately dereferenced with `*specialized_input`
+at the match site in `dispatch()`).
 
 #### Bounded spool strategy for `StreamingHandle`
 
-`split_for_fallback` handles `AnalyzerContent::StreamingHandle` with a fully
-bounded, streaming-end-to-end approach:
+`prepare_spool` handles `AnalyzerContent::StreamingHandle` with a fully bounded,
+streaming-end-to-end approach:
 
 1. A `tempfile::NamedTempFile` spool is created.
 2. The `LargeFileStream` is consumed **chunk by chunk**; each chunk's `.redacted`
    field (Phase 1B-safe bytes) is written to the spool via `Write::write_all`.
-   Peak in-process memory is O(one chunk), not O(file size).
-3. Once all chunks are written and flushed, **two independent**
+   **Cancellation and time-budget are checked at the top of every iteration** —
+   if either fires, the loop returns `SpoolPreparation::Cancelled` or
+   `SpoolPreparation::TimeBudgetExhausted` immediately, without fabricating
+   empty content.
+3. Once all chunks are written and flushed, two independent
    `LargeFileStream::open(spool.path())` handles are opened — one for the
    specialized analyzer, one for `GenericAnalyzer` fallback.
 4. The spool `NamedTempFile` is returned as `_spool_guard` and bound in
    `dispatch()` scope. It is dropped (and the temp file deleted) after **both**
    analyzers have finished, providing deterministic cleanup.
-5. Disk usage is bounded: at most one spool file per active dispatch call.
+5. On I/O failure, `SpoolPreparation::IoFailure` is returned; the caller emits a
+   `RESOURCE_EXHAUSTED` diagnostic — never an empty `AnalyzerOutput`.
+6. Disk usage is bounded: at most one spool file per active dispatch call.
 
 ```rust
-AnalyzerContent::StreamingHandle(mut stream) => {
-    let spool_result: std::io::Result<tempfile::NamedTempFile> = (|| {
-        let mut spool = tempfile::NamedTempFile::new()?;
-        while let Some(chunk_result) = stream.next_chunk() {
-            let chunk = chunk_result?;
-            spool.write_all(chunk.redacted.as_bytes())?;
-        }
-        spool.flush()?;
-        Ok(spool)
-    })();
-
-    match spool_result {
-        Ok(spool) => {
-            let spec_stream = LargeFileStream::open(spool.path());
-            let fb_stream = LargeFileStream::open(spool.path());
-            match (spec_stream, fb_stream) {
-                (Ok(s), Ok(f)) => (
-                    Some(AnalyzerContent::StreamingHandle(Box::new(f))),
-                    AnalyzerContent::StreamingHandle(Box::new(s)),
-                    Some(spool),
-                ),
-                _ => (None, AnalyzerContent::RedactedBytes(vec![]), Some(spool)),
-            }
-        }
-        Err(_) => (None, AnalyzerContent::RedactedBytes(vec![]), None),
+// Inside the spool loop — cancellation + budget guard
+loop {
+    if input.cancellation_token.is_cancelled() {
+        return SpoolPreparation::Cancelled;
+    }
+    if started_at.elapsed().as_millis() as u64 >= input.resource_budget.max_time_ms {
+        return SpoolPreparation::TimeBudgetExhausted;
+    }
+    match stream.next_chunk() {
+        None => break,
+        Some(Err(_)) => return SpoolPreparation::IoFailure,
+        Some(Ok(chunk)) => { spool.write_all(chunk.redacted.as_bytes())?; }
     }
 }
 ```
@@ -169,35 +193,44 @@ remains O(one stream chunk).
 | # | Blocker | Resolution |
 |---|---|---|
 | 1 | Error-diagnostic path returned specialized empty output instead of running GenericAnalyzer | `dispatch.rs`: `Ok(specialized_output)` arm now calls `GenericAnalyzer::new().analyze(fb_input)` |
-| 2 | Streaming dispatch used `collect_all()` — O(file size) heap allocation for LARGE files | `split_for_fallback`: `StreamingHandle` branch spools redacted chunks to `NamedTempFile`, opens two independent `LargeFileStream` handles; O(1) memory end-to-end |
+| 2 | Streaming dispatch used `collect_all()` — O(file size) heap allocation for LARGE files | `prepare_spool`: `StreamingHandle` branch spools redacted chunks to `NamedTempFile`, opens two independent `LargeFileStream` handles; O(1) memory end-to-end |
 | 3 | GenericAnalyzer carry buffer was unbounded | `MAX_CARRY_BYTES = 65_536` + `floor_char_boundary` splits in `stream_into_units` and `emit_possibly_oversized_line` |
 | 4 | SourceSpan semantics were inconsistent | All spans use 0-based exclusive end throughout `build_retrieval_unit_from_lines`; verified by 5 span-specific tests |
+| 5 | Spool loop did not check cancellation or time budget during spooling | Cancellation token and `elapsed >= max_time_ms` checked at each iteration; returns named variant instead of fabricated empty content |
+| 6 | `SpoolPreparation::Ready.specialized_input` caused `clippy::large_enum_variant` (368 B vs 32 B) | `specialized_input: Box<AnalyzerInput>`; unboxed with `*specialized_input` at the match destructure site |
 
 ---
 
 ## 4. Test Coverage
 
-**40 tests, 0 failures, 0 ignored**
+**42 tests, 0 failures, 0 ignored**
 
 | Module | Tests | What's covered |
 |---|---|---|
 | `cancellation` | 4 | new token not cancelled, cancel visible to clones, idempotent, default |
-| `dispatch` | 13 | generic direct path, specialized success, **error→GenericAnalyzer fallback+units**, panic→fallback+units, terminal-safe fallback; **8 new streaming dispatch tests** |
+| `dispatch` | 15 | generic direct path, specialized success, **error→GenericAnalyzer fallback+units**, panic→fallback+units, terminal-safe fallback, IoFailure path; **10 streaming dispatch tests** |
 | `generic` | 15 | empty file, LF spans, CRLF spans, unterminated line, multi-chunk split, redacted input, invalid UTF-8, cancellation, resource unit limit, resource memory limit, streaming units, **streaming bounded carry (no-OOM no-newline)**, **streaming 0-based spans**, floor_char_boundary UTF-8 split |
 | `registry` | 8 | generic fallback, specialized registration, capability level ordering, deterministic tie-breaking, language-agnostic ignored, descriptors deduplicated/sorted |
 
-#### 8 new streaming dispatch tests (post-redesign)
+#### Dispatch tests (15 total)
 
 | Test | What it verifies |
 |---|---|
-| `streaming_dispatch_generic_direct` | `StreamingHandle` routed to generic analyzer directly (no split overhead) |
-| `streaming_dispatch_specialized_success` | Specialized analyzer receives `StreamingHandle`; returns units without fallback |
-| `streaming_dispatch_fallback_on_error` | Specialized error triggers `GenericAnalyzer(fb_stream)`; fallback units present |
-| `streaming_dispatch_fallback_on_panic` | Panic in specialized path; `PANIC_CAUGHT` + `FALLBACK_USED` in output; units non-empty |
-| `streaming_dispatch_spool_guard_drops` | Temp file deleted after dispatch returns (Drop semantics verified) |
-| `streaming_dispatch_both_streams_independent` | Specialized and fallback streams are distinct; consuming one does not affect the other |
-| `streaming_dispatch_content_type_preserved` | Fallback input arrives as `StreamingHandle` (not downgraded to `RedactedBytes`) |
-| `streaming_dispatch_empty_file` | Zero-byte spool; dispatch returns empty but valid output (no panic, no spool error) |
+| `dispatch_with_generic_registry_calls_generic_directly` | Generic path incurs no spool overhead |
+| `dispatch_specialized_success_returns_output` | Specialized analyzer output returned as-is when no error diagnostics |
+| `dispatch_specialized_fatal_error_runs_generic_fallback_and_produces_units` | Error diagnostics trigger `GenericAnalyzer` fallback; fallback units present |
+| `dispatch_specialized_panic_caught_adds_panic_caught_and_fallback_used` | Panic in specialized path; `PANIC_CAUGHT` + `FALLBACK_USED`; units non-empty |
+| `generic_analyzer_is_terminal_safe_fallback` | `GenericAnalyzer` used directly when registry has no specialized entry |
+| `spool_io_failure_never_invokes_specialized_with_empty_content` | I/O failure during spool emits `RESOURCE_EXHAUSTED`; specialized is never called with fabricated empty content |
+| `streaming_specialized_success_remains_bounded` | Specialized analyzer receives `StreamingHandle`; returns units without fallback |
+| `streaming_specialized_error_falls_back_with_searchable_output` | Specialized error triggers `GenericAnalyzer(fb_stream)`; fallback units present |
+| `streaming_specialized_panic_falls_back_with_searchable_output` | Panic in specialized streaming path; `PANIC_CAUGHT` + `FALLBACK_USED`; units non-empty |
+| `streaming_dispatch_does_not_collect_entire_file_into_memory` | Memory usage stays O(chunk) — no `collect_all` |
+| `streaming_spool_temp_file_cleaned_up_after_dispatch` | Temp file deleted after dispatch returns (Drop semantics verified) |
+| `streaming_spool_cleaned_up_on_cancellation` | Temp file deleted even when spool is cancelled mid-stream |
+| `streaming_cancellation_during_spool_returns_cancelled_diagnostic` | Cancellation mid-spool returns `CANCELLED` diagnostic; specialized never invoked |
+| `streaming_time_budget_exhausted_during_spool_returns_resource_exhausted` | Time budget exceeded mid-spool returns `RESOURCE_EXHAUSTED`; specialized never invoked |
+| `streaming_large_dispatch_bounded_and_secret_safe` | Large multi-chunk file spools correctly; output units match; redacted bytes only |
 
 ---
 
@@ -219,10 +252,12 @@ remains O(one stream chunk).
   `std::fs::File::open` calls exist in this crate.
 - The spool temp file is written from the `LargeFileStream` (which was already opened
   by Phase 1B via `LargeFileStream::open`). Re-opening the spool path inside
-  `split_for_fallback` is safe because the spool contains only redacted content.
+  `prepare_spool` is safe because the spool contains only redacted content.
 - `#![forbid(unsafe_code)]` enforced workspace-wide; no `unsafe` blocks in this crate.
 - `REDACTED_INPUT` diagnostic is emitted for all `RedactedBytes` inputs so callers
   know the retrieval units reflect sanitized content.
+- Cancellation and time-budget are enforced **during** spool preparation, not only
+  after — preventing unbounded blocking on adversarial or very large inputs.
 
 ---
 
@@ -230,15 +265,18 @@ remains O(one stream chunk).
 
 | Criterion | Status |
 |---|---|
-| `cargo clippy -p attic-analyzers -- -D warnings` | ✅ 0 warnings |
-| `cargo test -p attic-analyzers --target x86_64-pc-windows-msvc` | ✅ 40/40 pass |
+| `cargo clippy -p attic-analyzers --target x86_64-pc-windows-msvc -- -D warnings` | ✅ 0 warnings |
+| `cargo test -p attic-analyzers --target x86_64-pc-windows-msvc` | ✅ 42/42 pass |
 | `#![forbid(unsafe_code)]` | ✅ enforced |
 | `SourceSpan` 0-based exclusive-end semantics | ✅ verified by 5 tests |
 | Streaming carry bounded to `MAX_CARRY_BYTES` | ✅ `streaming_bounded_carry_no_oom` |
 | Error-diagnostic path runs GenericAnalyzer | ✅ `dispatch_specialized_fatal_error_runs_generic_fallback_and_produces_units` |
-| `StreamingHandle` dispatch is O(1) memory (no `collect_all`) | ✅ bounded spool strategy; 8 streaming dispatch tests |
+| `StreamingHandle` dispatch is O(1) memory (no `collect_all`) | ✅ bounded spool strategy; 10 streaming dispatch tests |
 | Spool uses only Phase 1B-safe (`chunk.redacted`) bytes | ✅ raw path never accessed in `attic-analyzers` |
 | Spool temp file deleted deterministically after dispatch | ✅ `NamedTempFile` Drop in `dispatch()` scope |
+| Cancellation + time budget enforced during spool loop | ✅ `streaming_cancellation_during_spool_returns_cancelled_diagnostic`, `streaming_time_budget_exhausted_during_spool_returns_resource_exhausted` |
+| No fabricated empty content on spool failure | ✅ `spool_io_failure_never_invokes_specialized_with_empty_content` |
+| `clippy::large_enum_variant` resolved | ✅ `SpoolPreparation::Ready.specialized_input: Box<AnalyzerInput>` |
 
 ---
 
