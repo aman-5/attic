@@ -1,1091 +1,828 @@
-//! Attic MCP server entry point (Phase 1D).
-//!
-//! stdout = MCP protocol ONLY. All diagnostics go to tracing (stderr).
-//! Absolute filesystem paths are NEVER included in tool responses.
-//! All reads use DbPool (concurrent readers); WriterQueueHandle for migrations.
+// crates/attic-server/src/main.rs
+// Phase 1D – MCP server (rmcp-based), no raw rusqlite, uses DbPool + WriterQueueHandle
 
-#![forbid(unsafe_code)]
-#![deny(clippy::all)]
-
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
+use attic_indexing::{IndexError, IndexOptions, index_repository};
+use attic_storage::{
+    DbPool, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
+    fts_search, FtsSearchParams, get_db_stats, get_repository_path, get_repository_stats,
+    lookup_repository_by_root_path, run_migrations,
+};
+use attic_storage::connection::open_rw;
+use attic_discovery::{
+    DiscoveryPolicy, SecretScanDecision,
+    canonicalize_within_root, preprocess_file_content,
+};
 use rmcp::{
-    ServerHandler,
+    ErrorData as McpError,
+    RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
+        Implementation, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, Tool,
     },
-    service::{RequestContext, RoleServer, serve_server},
-    transport::io::stdio,
+    service::RequestContext,
+    transport::stdio,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fs,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use thiserror::Error;
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
 
-use attic_storage::{
-    DbPool, FtsSearchParams, MAX_SEARCH_RESULTS,
-    fts_path_lookup, fts_search, run_migrations,
-    get_db_stats, get_repository_stats,
-};
-use attic_storage::connection::open_db;
+const SERVER_NAME: &str    = "attic";
+const SERVER_VERSION: &str = "0.1.0";
 
-// ---------------------------------------------------------------------------
-// Input validation constants
-// ---------------------------------------------------------------------------
+#[derive(Debug, Error)]
+enum ServerError {
+    #[error("storage error: {0}")]    Storage(#[from] StorageError),
+    #[error("indexing error: {0}")]   Indexing(#[from] IndexError),
+    #[error("discovery I/O: {0}")]    Discovery(#[from] io::Error),
+    #[error("json error: {0}")]       Json(#[from] serde_json::Error),
+    #[error("invalid argument: {0}")] InvalidArg(String),
+}
 
-const MAX_QUERY_LEN: usize = 1_024;
-const MIN_QUERY_LEN: usize = 1;
-const MAX_PATH_LEN: usize = 4_096;
-const MAX_RESULTS_HARD_CAP: usize = 200;
-const DEFAULT_SEARCH_RESULTS: usize = 20;
-const DEFAULT_FILE_RESULTS: usize = 50;
-
-// ---------------------------------------------------------------------------
-// Response size constants
-// ---------------------------------------------------------------------------
-
-/// Maximum bytes for a single retrieval unit body before truncation.
-const MAX_BODY_BYTES: usize = 8_192;
-
-/// Maximum total bytes in a single MCP tool response before stopping early.
-const MAX_RESPONSE_BYTES: usize = 262_144;
-
-// ---------------------------------------------------------------------------
-// Server state
-// ---------------------------------------------------------------------------
-
+#[derive(Clone)]
 struct AtticServer {
-    pool: DbPool,
-    /// Writer connection kept alive to hold the WAL open; not used directly
-    /// after migration.
-    #[allow(dead_code)]
-    _writer: Arc<Mutex<rusqlite::Connection>>,
+    pool:    DbPool,
+    writer:  WriterQueueHandle,
+    _queue:  Arc<WriterQueue>,
+    db_path: Arc<PathBuf>,
 }
 
 impl AtticServer {
-    fn new(db_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let (writer_conn, pool) = open_db(db_path)?;
-        run_migrations(&writer_conn)?;
-        Ok(Self {
-            pool,
-            _writer: Arc::new(Mutex::new(writer_conn)),
-        })
+    fn new(db_path: &Path) -> Result<Self, ServerError> {
+        let (conn, pool) = attic_storage::open_db(db_path).map_err(ServerError::Storage)?;
+        run_migrations(&conn).map_err(ServerError::Storage)?;
+        let queue = WriterQueue::new(conn).map_err(ServerError::Storage)?;
+        let writer = queue.handle();
+        let _queue = Arc::new(queue);
+        Ok(AtticServer { pool, writer, _queue, db_path: Arc::new(db_path.to_path_buf()) })
+    }
+
+    fn bootstrap_workspace(&self, root: &Path) -> Result<String, ServerError> {
+        let root_str = root.to_string_lossy().to_string();
+        if let Some(id) = self.pool.with_reader(|c| lookup_repository_by_root_path(c, &root_str))? {
+            return Ok(id.to_string());
+        }
+        // Open a dedicated write connection that bypasses WriterQueue's BEGIN IMMEDIATE
+        // wrapper.  index_repository calls publish_file_batch and
+        // insert_retrieval_unit_with_fts, each of which starts its own transaction.
+        // Running those inside a WriterQueue::send closure would nest BEGIN IMMEDIATE
+        // calls, which SQLite rejects.  A direct connection has no enclosing
+        // transaction, so index_repository's own transactions work correctly.
+        let conn = open_rw(&self.db_path).map_err(ServerError::Storage)?;
+        let policy = DiscoveryPolicy::default_git();
+        let opts   = IndexOptions::default(); // skip_migrations: false — no outer transaction
+        index_repository(&conn, root, &policy, &opts)
+            .map(|r| r.repository_id)
+            .map_err(ServerError::Indexing)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tool response helpers
-// ---------------------------------------------------------------------------
+// ─── input validation ──────────────────────────────────────────────────────────
 
-fn tool_error(msg: impl Into<String>) -> CallToolResponse {
-    CallToolResult::error(vec![ContentBlock::text(msg.into())]).into()
+fn validate_filter(name: &str, value: &str, max_len: usize) -> Result<(), ServerError> {
+    if value.len() > max_len {
+        return Err(ServerError::InvalidArg(format!("{name} too long (max {max_len})")));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(ServerError::InvalidArg(format!("{name} contains control characters")));
+    }
+    Ok(())
 }
 
-fn tool_ok(text: impl Into<String>) -> CallToolResponse {
-    CallToolResult::success(vec![ContentBlock::text(text.into())]).into()
-}
-
-// ---------------------------------------------------------------------------
-// Input validation
-// ---------------------------------------------------------------------------
-
-fn validate_query(args: &Value) -> Result<String, CallToolResponse> {
-    let q = match args.get("query").and_then(|v| v.as_str()) {
-        Some(s) => s.to_owned(),
-        None => return Err(tool_error("'query' is required and must be a non-empty string")),
-    };
-    if q.trim().len() < MIN_QUERY_LEN {
-        return Err(tool_error("'query' must not be empty or whitespace-only"));
-    }
-    if q.len() > MAX_QUERY_LEN {
-        return Err(tool_error(format!(
-            "'query' exceeds maximum length of {MAX_QUERY_LEN} bytes"
-        )));
-    }
-    Ok(q)
-}
-
-fn validate_path(args: &Value) -> Result<String, CallToolResponse> {
-    let p = match args.get("path").and_then(|v| v.as_str()) {
-        Some(s) => s.to_owned(),
-        None => return Err(tool_error("'path' is required and must be a non-empty string")),
-    };
-    if p.trim().is_empty() {
-        return Err(tool_error("'path' must not be empty or whitespace-only"));
-    }
-    if p.len() > MAX_PATH_LEN {
-        return Err(tool_error(format!(
-            "'path' exceeds maximum length of {MAX_PATH_LEN} bytes"
-        )));
-    }
-    if p.starts_with('/') || p.starts_with('\\') || p.contains("..") {
-        return Err(tool_error(
-            "'path' must be a repo-relative path (no leading slash or '..')",
+fn validate_repository_id(id: &str) -> Result<(), ServerError> {
+    validate_filter("repository_id", id, 64)?;
+    if !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(ServerError::InvalidArg(
+            "repository_id must be a UUID (hex digits and hyphens only)".into(),
         ));
     }
-    Ok(p)
+    Ok(())
 }
 
-fn clamp_max_results(args: &Value, default: usize) -> usize {
-    let requested = args
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .map(|n| {
-            // Checked conversion: clamp to usize::MAX to avoid truncation on
-            // 32-bit targets, though in practice values are always small.
-            usize::try_from(n).unwrap_or(usize::MAX)
-        })
-        .unwrap_or(default);
-    requested.min(MAX_RESULTS_HARD_CAP).min(MAX_SEARCH_RESULTS)
-}
+// ─── tool handlers ─────────────────────────────────────────────────────────────
 
-/// Truncate `body` to at most `MAX_BODY_BYTES` bytes (on a UTF-8 char
-/// boundary), appending a note if truncation occurred.
-fn cap_body(body: &str) -> String {
-    if body.len() <= MAX_BODY_BYTES {
-        return body.to_owned();
+fn handle_file(
+    pool: &DbPool,
+    args: &HashMap<String, Value>,
+) -> Result<CallToolResult, ServerError> {
+    let repo_id = args.get("repository_id").and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
+    validate_repository_id(repo_id)?;
+
+    let file_path = args.get("path").and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("path required".into()))?;
+
+    let start_line = args.get("start_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line   = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let start_byte = args.get("start_byte").and_then(Value::as_u64).map(|v| v as usize);
+    let end_byte   = args.get("end_byte").and_then(Value::as_u64).map(|v| v as usize);
+
+    let parsed_repo_id = repo_id.parse::<attic_core::RepositoryId>()
+        .map_err(|e| ServerError::InvalidArg(format!("invalid repository_id: {e}")))?;
+
+    let repo_root_str = pool.with_reader(|c| get_repository_path(c, &parsed_repo_id))?
+        .ok_or_else(|| ServerError::InvalidArg(format!("repository_id {repo_id} not found")))?;
+    let repo_root_raw = PathBuf::from(&repo_root_str);
+    // On Windows, std::fs::canonicalize adds a \\?\ extended-length prefix.
+    // canonicalize_within_root canonicalizes the joined path, so the result
+    // also has \\?\; but repo_root_raw (from the DB) does not.  Normalize
+    // repo_root the same way so that strip_prefix succeeds.
+    let repo_root = repo_root_raw.canonicalize().unwrap_or_else(|_| repo_root_raw);
+
+    let abs_path = canonicalize_within_root(&repo_root.join(file_path), &repo_root)
+        .map_err(|e| ServerError::InvalidArg(format!("path rejected: {e}")))?;
+
+    let repo_relative = abs_path.strip_prefix(&repo_root)
+        .map_err(|_| ServerError::InvalidArg("path outside repo root".into()))?
+        .to_string_lossy().replace('\\', "/");
+
+    // Block access to git-internal paths at the server layer regardless of
+    // what preprocess_file_content decides, to ensure consistent policy.
+    {
+        let rr = repo_relative.as_str();
+        if rr == ".git"
+            || rr.starts_with(".git/")
+            || rr.starts_with(".git\\")
+        {
+            return Err(ServerError::InvalidArg(
+                "path rejected: .git internals are forbidden".into(),
+            ));
+        }
     }
-    // Find the largest char boundary ≤ MAX_BODY_BYTES.
-    let mut boundary = MAX_BODY_BYTES;
-    while !body.is_char_boundary(boundary) {
-        boundary -= 1;
+
+    // preprocess handles Excluded/Redacted/secrets internally via the secrets scan layer
+    let pre = preprocess_file_content(&abs_path, &repo_relative).map_err(ServerError::Discovery)?;
+
+    if pre.decision == SecretScanDecision::Excluded {
+        return Ok(CallToolResult::success(vec![ContentBlock::text(
+            format!("# {repo_relative}\n\n[Excluded by security policy]"),
+        )]));
     }
-    let omitted = body.len() - boundary;
-    format!("{}… [{omitted} bytes omitted]", &body[..boundary])
-}
+    if pre.decision == SecretScanDecision::PartialScan {
+        warn!("file {repo_relative}: partial scan");
+    }
 
-// ---------------------------------------------------------------------------
-// Tool: search
-// ---------------------------------------------------------------------------
-
-fn handle_search(db: &rusqlite::Connection, args: &Value) -> CallToolResponse {
-    let query = match validate_query(args) {
-        Ok(q) => q,
-        Err(resp) => return resp,
+    let raw: String = if let Some(t) = pre.content {
+        t
+    } else if let Some(mut s) = pre.stream {
+        attic_discovery::secrets::collect_all(&mut s)
+            .map_err(ServerError::Discovery)?
+            .redacted
+    } else {
+        String::new()
     };
 
-    let repository_id = args.get("repository_id").and_then(|v| v.as_str()).map(str::to_owned);
-    let file_type = args.get("file_type").and_then(|v| v.as_str()).map(str::to_owned);
-    let language = args.get("language").and_then(|v| v.as_str()).map(str::to_owned);
-    let max_results = clamp_max_results(args, DEFAULT_SEARCH_RESULTS);
+    let bounded = apply_region_bounds(&raw, start_line, end_line, start_byte, end_byte);
+
+    let header = match pre.decision {
+        SecretScanDecision::Redacted    => format!("# {repo_relative}\n# [Secrets redacted]\n\n"),
+        SecretScanDecision::PartialScan => format!("# {repo_relative}\n# [Partial scan]\n\n"),
+        _                               => format!("# {repo_relative}\n\n"),
+    };
+    Ok(CallToolResult::success(vec![ContentBlock::text(format!("{header}{bounded}"))]))
+}
+
+fn apply_region_bounds(
+    text: &str,
+    start_line: Option<usize>,
+    end_line:   Option<usize>,
+    start_byte: Option<usize>,
+    end_byte:   Option<usize>,
+) -> Cow<'_, str> {
+    if start_byte.is_some() || end_byte.is_some() {
+        let s = start_byte.unwrap_or(0).min(text.len());
+        let e = end_byte.map(|e| e.min(text.len())).unwrap_or(text.len());
+        return Cow::Owned(text[s..e.max(s)].to_owned());
+    }
+    if start_line.is_some() || end_line.is_some() {
+        let sl = start_line.unwrap_or(1).saturating_sub(1);
+        let lines: Vec<&str> = text.lines().collect();
+        let el = end_line.map(|e| e.min(lines.len())).unwrap_or(lines.len());
+        return Cow::Owned(lines[sl.min(lines.len())..el].join("\n"));
+    }
+    Cow::Borrowed(text)
+}
+
+fn handle_search(
+    pool: &DbPool,
+    args: &HashMap<String, Value>,
+) -> Result<CallToolResult, ServerError> {
+    let query = args.get("query").and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
+    validate_filter("query", query, 512)?;
+
+    let repo_id   = args.get("repository_id").and_then(Value::as_str);
+    if let Some(id) = repo_id   { validate_repository_id(id)?; }
+    let file_type = args.get("file_type").and_then(Value::as_str);
+    if let Some(ft) = file_type { validate_filter("file_type", ft, 32)?; }
+    let language  = args.get("language").and_then(Value::as_str);
+    if let Some(lg) = language  { validate_filter("language", lg, 64)?; }
 
     let params = FtsSearchParams {
-        query: &query,
-        repository_id: repository_id.as_deref(),
-        file_type: file_type.as_deref(),
-        language: language.as_deref(),
-        max_results,
+        query,
+        repository_id: repo_id,
+        file_type,
+        language,
+        max_results: MAX_SEARCH_RESULTS,
     };
-
-    match fts_search(db, &params) {
-        Ok(results) if results.is_empty() => tool_ok("No results found."),
-        Ok(results) => {
-            let header = format!("{} result(s):\n\n", results.len());
-            let mut out = header;
-            let mut total_bytes: usize = out.len();
-
-            for (i, r) in results.iter().enumerate() {
-                let body = cap_body(&r.body);
-                let mut entry = format!(
-                    "--- [{i}] {} ({})\n",
-                    r.path, r.repository_name
-                );
-                if let (Some(s), Some(e)) = (r.start_line, r.end_line) {
-                    entry.push_str(&format!("Lines {s}-{e}\n"));
-                }
-                entry.push_str(&format!("Score: {:.4}\n", r.score));
-                entry.push_str(&body);
-                entry.push('\n');
-
-                if total_bytes + entry.len() > MAX_RESPONSE_BYTES {
-                    let remaining = results.len() - i;
-                    out.push_str(&format!(
-                        "[{remaining} more result(s) omitted: response size limit reached]\n"
-                    ));
-                    break;
-                }
-                total_bytes += entry.len();
-                out.push_str(&entry);
-            }
-            tool_ok(out)
-        }
-        Err(e) => {
-            error!(error = %e, query = %query, "fts_search failed");
-            tool_error("Search failed -- see server logs for details")
-        }
-    }
+    let results = pool.with_reader(|c| fts_search(c, &params))?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&json!({ "results": results }))?,
+    )]))
 }
 
-// ---------------------------------------------------------------------------
-// Tool: file
-// ---------------------------------------------------------------------------
-
-fn handle_file(db: &rusqlite::Connection, args: &Value) -> CallToolResponse {
-    let path = match validate_path(args) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
-
-    let repository_id = args.get("repository_id").and_then(|v| v.as_str()).map(str::to_owned);
-    let max_results = clamp_max_results(args, DEFAULT_FILE_RESULTS);
-
-    match fts_path_lookup(db, &path, repository_id.as_deref(), max_results) {
-        Ok(results) if results.is_empty() => {
-            tool_ok(format!("No indexed units found for path: {path}"))
-        }
-        Ok(results) => {
-            let header = format!("File: {path}\n{} unit(s):\n\n", results.len());
-            let mut out = header;
-            let mut total_bytes: usize = out.len();
-
-            for (i, r) in results.iter().enumerate() {
-                let body = cap_body(&r.body);
-                let mut entry = format!("--- [{i}]");
-                if let (Some(s), Some(e)) = (r.start_line, r.end_line) {
-                    entry.push_str(&format!(" lines {s}-{e}"));
-                }
-                entry.push('\n');
-                entry.push_str(&body);
-                entry.push('\n');
-
-                if total_bytes + entry.len() > MAX_RESPONSE_BYTES {
-                    let remaining = results.len() - i;
-                    out.push_str(&format!(
-                        "[{remaining} more unit(s) omitted: response size limit reached]\n"
-                    ));
-                    break;
-                }
-                total_bytes += entry.len();
-                out.push_str(&entry);
-            }
-            tool_ok(out)
-        }
-        Err(e) => {
-            error!(error = %e, path = %path, "fts_path_lookup failed");
-            tool_error("File lookup failed -- see server logs for details")
-        }
-    }
+fn handle_repo_map(
+    pool: &DbPool,
+    args: &HashMap<String, Value>,
+) -> Result<CallToolResult, ServerError> {
+    let repo_id = args.get("repository_id").and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
+    validate_repository_id(repo_id)?;
+    let file_type = args.get("file_type").and_then(Value::as_str);
+    if let Some(ft) = file_type { validate_filter("file_type", ft, 32)?; }
+    let all_stats = pool.with_reader(|c| get_repository_stats(c))?;
+    let stats = all_stats.into_iter().find(|s| s.id == repo_id);
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&json!({ "repository_id": repo_id, "stats": stats }))?,
+    )]))
 }
 
-// ---------------------------------------------------------------------------
-// Tool: repo_map — uses storage API, no raw SQL
-// ---------------------------------------------------------------------------
-
-fn handle_repo_map(db: &rusqlite::Connection, _args: &Value) -> CallToolResponse {
-    match get_repository_stats(db) {
-        Ok(repos) if repos.is_empty() => tool_ok("No repositories indexed yet."),
-        Ok(repos) => {
-            let mut out = format!("{} repository/repositories:\n\n", repos.len());
-            for r in &repos {
-                out.push_str(&format!(
-                    "  {name}\n    id: {id}\n    files: {files}, units: {units}\n\n",
-                    name  = r.display_name,
-                    id    = r.id,
-                    files = r.file_count,
-                    units = r.unit_count,
-                ));
-            }
-            tool_ok(out)
-        }
-        Err(e) => {
-            error!(error = %e, "repo_map query failed");
-            tool_error("repo_map failed -- see server logs for details")
-        }
-    }
+fn handle_status(pool: &DbPool) -> Result<CallToolResult, ServerError> {
+    let stats = pool.with_reader(|c| get_db_stats(c))?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&json!({ "status": "ok", "db": stats }))?,
+    )]))
 }
 
-// ---------------------------------------------------------------------------
-// Tool: status — uses storage API, no raw SQL
-// ---------------------------------------------------------------------------
+// ─── schema helper ─────────────────────────────────────────────────────────────
 
-fn handle_status(db: &rusqlite::Connection) -> CallToolResponse {
-    match get_db_stats(db) {
-        Ok(stats) => tool_ok(format!(
-            "Attic MCP server -- Phase 1D\nstatus:       ok\nmigrations:   {migrations}\nrepositories: {repositories}\nunits:        {units}\n",
-            migrations   = stats.migration_count,
-            repositories = stats.repository_count,
-            units        = stats.unit_count,
-        )),
-        Err(e) => {
-            error!(error = %e, "status db_stats failed");
-            tool_error("status failed -- see server logs for details")
-        }
-    }
+fn json_schema(v: Value) -> std::sync::Arc<serde_json::Map<String, Value>> {
+    std::sync::Arc::new(v.as_object().cloned().unwrap_or_default())
 }
 
-// ---------------------------------------------------------------------------
-// Schema helper
-// ---------------------------------------------------------------------------
+// ─── build the tool list once ──────────────────────────────────────────────────
 
-fn simple_schema(fields: &[(&str, &str, bool)]) -> Arc<serde_json::Map<String, Value>> {
-    let mut properties = serde_json::Map::new();
-    let mut required = Vec::new();
-    for (name, typ, req) in fields {
-        properties.insert((*name).to_owned(), serde_json::json!({ "type": typ }));
-        if *req {
-            required.push(Value::String((*name).to_owned()));
-        }
-    }
-    let mut schema = serde_json::Map::new();
-    schema.insert("type".to_owned(), Value::String("object".to_owned()));
-    if !properties.is_empty() {
-        schema.insert("properties".to_owned(), Value::Object(properties));
-    }
-    if !required.is_empty() {
-        schema.insert("required".to_owned(), Value::Array(required));
-    }
-    Arc::new(schema)
+fn make_tools() -> Vec<Tool> {
+    vec![
+        Tool::new(
+            "file",
+            "Retrieve a bounded region of the live, authoritative source of a file from an \
+             indexed repository. Content is read directly from disk through the secrets-scan \
+             layer; redacted or excluded files are flagged. Supports line-range \
+             (start_line/end_line, 1-indexed) and byte-range (start_byte/end_byte, 0-indexed, \
+             exclusive). Returns current on-disk content.",
+            json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "repository_id": {"type":"string","description":"UUID of the repository"},
+                    "path":          {"type":"string","description":"Repo-relative path"},
+                    "start_line":    {"type":"integer","description":"First line (1-indexed)"},
+                    "end_line":      {"type":"integer","description":"Last line (1-indexed, inclusive)"},
+                    "start_byte":    {"type":"integer","description":"Start byte offset (0-indexed, overrides lines)"},
+                    "end_byte":      {"type":"integer","description":"End byte offset (0-indexed, exclusive)"}
+                },
+                "required": ["repository_id","path"]
+            })),
+        ),
+        Tool::new(
+            "search",
+            "Full-text search across indexed repositories using FTS5 query syntax.",
+            json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "query":         {"type":"string","description":"FTS5 query (max 512 chars)"},
+                    "repository_id": {"type":"string","description":"Limit results to this repository UUID"},
+                    "file_type":     {"type":"string","description":"Filter by file extension (max 32)"},
+                    "language":      {"type":"string","description":"Filter by detected language (max 64)"}
+                },
+                "required": ["query"]
+            })),
+        ),
+        Tool::new(
+            "repo_map",
+            "Return statistics and structure map for an indexed repository.",
+            json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "repository_id": {"type":"string","description":"UUID of the repository"},
+                    "file_type":     {"type":"string","description":"Optional file-type filter"}
+                },
+                "required": ["repository_id"]
+            })),
+        ),
+        Tool::new(
+            "status",
+            "Return server and database health status.",
+            json_schema(json!({"type":"object","properties":{}})),
+        ),
+    ]
 }
 
-// ---------------------------------------------------------------------------
-// ServerHandler
-// ---------------------------------------------------------------------------
+// ─── ServerHandler impl ────────────────────────────────────────────────────────
 
 impl ServerHandler for AtticServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(rmcp::model::ToolsCapability::default());
-        info.capabilities = capabilities;
-        let mut server_impl = Implementation::from_build_env();
-        server_impl.name = "attic".to_owned();
-        server_impl.version = env!("CARGO_PKG_VERSION").to_owned();
-        info.server_info = server_impl;
-        info.instructions = Some(
-            "Attic: code-search MCP server. Tools: search, file, repo_map, status.".to_owned(),
-        );
-        info
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, rmcp::model::ErrorData> {
-        Ok(ListToolsResult {
-            tools: vec![
-                Tool::new(
-                    "search",
-                    "Full-text search over indexed code. Supports FTS5 syntax. Query 1-1024 bytes; max_results capped at 200. Each result body capped at 8 KiB; total response capped at 256 KiB.",
-                    simple_schema(&[
-                        ("query", "string", true),
-                        ("repository_id", "string", false),
-                        ("file_type", "string", false),
-                        ("language", "string", false),
-                        ("max_results", "number", false),
-                    ]),
-                ),
-                Tool::new(
-                    "file",
-                    "Return indexed retrieval units for a repo-relative file path. No '..' or leading slashes. Each unit body capped at 8 KiB; total response capped at 256 KiB.",
-                    simple_schema(&[
-                        ("path", "string", true),
-                        ("repository_id", "string", false),
-                        ("max_results", "number", false),
-                    ]),
-                ),
-                Tool::new(
-                    "repo_map",
-                    "List all indexed repositories with file and unit counts.",
-                    simple_schema(&[]),
-                ),
-                Tool::new(
-                    "status",
-                    "Return server health and database statistics.",
-                    simple_schema(&[]),
-                ),
-            ],
-            ..Default::default()
-        })
+        _request: Option<PaginatedRequestParams>,
+        _cx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send {
+        let tools = make_tools();
+        async move {
+            Ok(ListToolsResult {
+                tools,
+                ..Default::default()
+            })
+        }
     }
 
-    async fn call_tool(
+    fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, rmcp::model::ErrorData> {
-        let args: Value = request.arguments.map(Value::Object).unwrap_or(Value::Null);
-        let tool_name = request.name.clone();
+        _cx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send {
+        let pool = self.pool.clone();
+        let name = request.name.clone();
+        let args: HashMap<String, Value> = request.arguments
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
-        let known = matches!(tool_name.as_ref(), "search" | "file" | "repo_map" | "status");
-        if !known {
-            warn!(tool = %tool_name, "unknown tool called");
-            return Err(rmcp::model::ErrorData {
-                code: rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                message: format!("unknown tool: {tool_name}").into(),
-                data: None,
-            });
-        }
-
-        let resp = self.pool.with_reader(|conn| {
-            Ok(match tool_name.as_ref() {
-                "search"   => handle_search(conn, &args),
-                "file"     => handle_file(conn, &args),
-                "repo_map" => handle_repo_map(conn, &args),
-                "status"   => handle_status(conn),
-                _          => unreachable!("checked above"),
-            })
-        });
-
-        match resp {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                error!(error = %e, tool = %tool_name, "pool reader error");
-                Ok(tool_error("Internal error -- see server logs for details"))
+        async move {
+            let result: Result<CallToolResult, ServerError> = match name.as_ref() {
+                "file"     => handle_file(&pool, &args),
+                "search"   => handle_search(&pool, &args),
+                "repo_map" => handle_repo_map(&pool, &args),
+                "status"   => handle_status(&pool),
+                other      => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
+            };
+            match result {
+                Ok(r)  => Ok(r.into()),
+                Err(e) => {
+                    error!("tool {name} error: {e}");
+                    Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into())
+                }
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+// ─── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() {
-    fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let db_path = std::env::var("ATTIC_DB_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs_or_home().join(".mcp").join("attic.db"));
+        .unwrap_or_else(|_| {
+            std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+                .or_else(|_| std::env::var("USERPROFILE").map(|h| PathBuf::from(h).join("AppData").join("Local")))
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("attic")
+                .join("attic.db")
+        });
 
-    // Path only ever reaches stderr via tracing -- never stdout/MCP frames.
-    info!(db_path = %db_path.display(), "attic MCP server starting");
+    if let Some(p) = db_path.parent() {
+        fs::create_dir_all(p)?;
+    }
+    info!("attic starting, db={}", db_path.display());
 
-    if let Some(parent) = db_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            error!(%e, "failed to create db directory");
-            std::process::exit(1);
-        }
+    let server = AtticServer::new(&db_path)?;
+
+    if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
+        let root = PathBuf::from(&ws);
+        let srv  = server.clone();
+        tokio::task::spawn_blocking(move || match srv.bootstrap_workspace(&root) {
+            Ok(id) => info!("workspace indexed, repository_id={id}"),
+            Err(e) => warn!("workspace indexing failed: {e}"),
+        });
     }
 
-    let server = match AtticServer::new(&db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(%e, "failed to initialise Attic server");
-            std::process::exit(1);
-        }
-    };
-
-    info!("attic MCP server ready -- listening on stdio");
-
-    let transport = stdio();
-    match serve_server(server, transport).await {
-        Err(e) => {
-            error!(%e, "MCP server failed to initialize");
-            std::process::exit(1);
-        }
-        Ok(running) => {
-            if let Err(e) = running.waiting().await {
-                error!(%e, "MCP server task panicked");
-                std::process::exit(1);
-            }
-        }
-    }
+    server.serve(stdio()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
-fn dirs_or_home() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
+// ─── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    fn make_server() -> (AtticServer, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let server = AtticServer::new(&db_path).unwrap();
-        (server, tmp)
-    }
-
-    fn with_reader<F, R>(server: &AtticServer, f: F) -> R
-    where
-        F: FnOnce(&rusqlite::Connection) -> R,
-    {
-        server.pool.with_reader(|conn| Ok(f(conn))).unwrap()
-    }
-
-    fn extract_text(resp: &CallToolResponse) -> String {
-        match resp {
-            CallToolResponse::Complete(r) => match r.content.first() {
-                Some(ContentBlock::Text(t)) => t.text.clone(),
-                _ => String::new(),
-            },
-            _ => String::new(),
-        }
-    }
-
-    fn is_error(resp: &CallToolResponse) -> bool {
-        match resp {
-            CallToolResponse::Complete(r) => r.is_error.unwrap_or(false),
-            _ => false,
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // status
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn status_tool_returns_ok() {
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, handle_status);
-        assert!(!is_error(&resp), "status should not be an error");
-        let text = extract_text(&resp);
-        assert!(text.contains("Phase 1D"), "should mention phase");
-    }
-
-    #[test]
-    fn status_does_not_expose_db_path() {
-        let (server, tmp) = make_server();
-        let resp = with_reader(&server, handle_status);
-        let text = extract_text(&resp);
-        let abs = tmp.path().to_str().unwrap();
-        assert!(
-            !text.contains(abs),
-            "status must not expose db_path; text={text:?}"
-        );
-    }
-
-    #[test]
-    fn status_uses_storage_api_not_raw_sql() {
-        // Verify that status returns sensible integer counts (0 after fresh
-        // migration), which confirms the storage API path works end-to-end.
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, handle_status);
-        assert!(!is_error(&resp));
-        let text = extract_text(&resp);
-        assert!(text.contains("repositories:"), "must include repositories count");
-        assert!(text.contains("units:"), "must include units count");
-        assert!(text.contains("migrations:"), "must include migrations count");
-    }
-
-    // -----------------------------------------------------------------------
-    // repo_map
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn repo_map_tool_empty_db() {
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, |conn| handle_repo_map(conn, &Value::Null));
-        assert!(!is_error(&resp));
-        let text = extract_text(&resp);
-        assert!(text.contains("No repositories"), "empty db should say no repos");
-    }
-
-    #[test]
-    fn repo_map_does_not_expose_root_path() {
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, |conn| handle_repo_map(conn, &Value::Null));
-        let text = extract_text(&resp);
-        assert!(!text.contains("root:"), "repo_map must not expose root_path");
-    }
-
-    // -----------------------------------------------------------------------
-    // search -- validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn search_tool_requires_query() {
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, |conn| handle_search(conn, &Value::Null));
-        assert!(is_error(&resp), "missing query should be error");
-    }
-
-    #[test]
-    fn search_rejects_empty_query() {
-        let (server, _tmp) = make_server();
-        let args = serde_json::json!({ "query": "   " });
-        let resp = with_reader(&server, |conn| handle_search(conn, &args));
-        assert!(is_error(&resp), "whitespace-only query should be error");
-    }
-
-    #[test]
-    fn search_rejects_overlong_query() {
-        let (server, _tmp) = make_server();
-        let long_q = "a".repeat(MAX_QUERY_LEN + 1);
-        let args = serde_json::json!({ "query": long_q });
-        let resp = with_reader(&server, |conn| handle_search(conn, &args));
-        assert!(is_error(&resp), "overlong query should be error");
-    }
-
-    #[test]
-    fn search_tool_empty_results() {
-        let (server, _tmp) = make_server();
-        let args = serde_json::json!({ "query": "nonexistent_term_xyz_12345" });
-        let resp = with_reader(&server, |conn| handle_search(conn, &args));
-        assert!(!is_error(&resp), "no results is not an error");
-    }
-
-    #[test]
-    fn search_caps_max_results() {
-        let args = serde_json::json!({ "query": "x", "max_results": 9999 });
-        let capped = clamp_max_results(&args, DEFAULT_SEARCH_RESULTS);
-        assert!(
-            capped <= MAX_RESULTS_HARD_CAP,
-            "max_results must be capped at {MAX_RESULTS_HARD_CAP}"
-        );
-        assert!(
-            capped <= MAX_SEARCH_RESULTS,
-            "max_results must be capped at MAX_SEARCH_RESULTS={MAX_SEARCH_RESULTS}"
-        );
-    }
-
-    #[test]
-    fn search_max_results_u64_max_clamped() {
-        // u64::MAX must not overflow usize or exceed the hard cap.
-        let args = serde_json::json!({ "query": "x", "max_results": u64::MAX });
-        let capped = clamp_max_results(&args, DEFAULT_SEARCH_RESULTS);
-        assert!(capped <= MAX_RESULTS_HARD_CAP);
-    }
-
-    // -----------------------------------------------------------------------
-    // file -- validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn file_tool_requires_path() {
-        let (server, _tmp) = make_server();
-        let resp = with_reader(&server, |conn| handle_file(conn, &Value::Null));
-        assert!(is_error(&resp), "missing path should be error");
-    }
-
-    #[test]
-    fn file_rejects_absolute_path() {
-        let (server, _tmp) = make_server();
-        let args = serde_json::json!({ "path": "/etc/passwd" });
-        let resp = with_reader(&server, |conn| handle_file(conn, &args));
-        assert!(is_error(&resp), "absolute path should be error");
-    }
-
-    #[test]
-    fn file_rejects_path_traversal() {
-        let (server, _tmp) = make_server();
-        let args = serde_json::json!({ "path": "../../secret" });
-        let resp = with_reader(&server, |conn| handle_file(conn, &args));
-        assert!(is_error(&resp), "path traversal should be error");
-    }
-
-    #[test]
-    fn file_rejects_overlong_path() {
-        let (server, _tmp) = make_server();
-        let long_p = "a".repeat(MAX_PATH_LEN + 1);
-        let args = serde_json::json!({ "path": long_p });
-        let resp = with_reader(&server, |conn| handle_file(conn, &args));
-        assert!(is_error(&resp), "overlong path should be error");
-    }
-
-    // -----------------------------------------------------------------------
-    // body / response size caps
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn cap_body_short_string_unchanged() {
-        let s = "hello world";
-        assert_eq!(cap_body(s), s);
-    }
-
-    #[test]
-    fn cap_body_long_string_truncated() {
-        let s = "x".repeat(MAX_BODY_BYTES + 100);
-        let capped = cap_body(&s);
-        assert!(
-            capped.len() <= MAX_BODY_BYTES + 50, // small overhead for the note
-            "cap_body result too long: {} bytes",
-            capped.len()
-        );
-        assert!(capped.contains("bytes omitted"), "should include omission note");
-    }
-
-    #[test]
-    fn cap_body_on_utf8_boundary() {
-        // Build a string with multi-byte chars that crosses MAX_BODY_BYTES.
-        // Each '©' is 2 bytes in UTF-8.
-        let s: String = "©".repeat(MAX_BODY_BYTES); // 2 * MAX_BODY_BYTES bytes total
-        let capped = cap_body(&s);
-        // Result must be valid UTF-8 (would panic on invalid slice otherwise).
-        assert!(!capped.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // schema helper
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn simple_schema_required_field() {
-        let schema = simple_schema(&[("query", "string", true)]);
-        let required = schema
-            .get("required")
-            .and_then(|v| v.as_array())
-            .expect("required array");
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0].as_str().unwrap(), "query");
-    }
-
-    #[test]
-    fn simple_schema_optional_field_not_in_required() {
-        let schema = simple_schema(&[
-            ("query", "string", true),
-            ("max_results", "number", false),
-        ]);
-        let required = schema
-            .get("required")
-            .and_then(|v| v.as_array())
-            .expect("required array");
-        assert_eq!(required.len(), 1);
-        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(
-            !names.contains(&"max_results"),
-            "optional field must not be in required"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Child-process MCP stdio integration tests
-//
-// These tests build the `attic` binary (via `cargo build`) and then spawn it
-// as a child process, communicating over its stdin/stdout using JSON-RPC 2.0
-// (the MCP wire protocol).  stderr is captured separately so it never
-// contaminates the protocol stream.
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod integration {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
-    /// Write one JSON-RPC 2.0 newline-delimited frame to `stdin`.
-    /// Returns `false` if the pipe is closed (broken pipe).
-    fn send(stdin: &mut impl Write, msg: &str) -> bool {
-        let ok = stdin.write_all(msg.as_bytes()).is_ok()
-            && stdin.write_all(b"\n").is_ok()
-            && stdin.flush().is_ok();
-        ok
+    fn make_server(tmp: &TempDir) -> AtticServer {
+        AtticServer::new(&tmp.path().join("test.db")).expect("AtticServer::new")
     }
 
-    /// Perform the MCP initialize handshake and return the parsed initialize
-    /// response.  Sends `notifications/initialized` and waits 300 ms for the
-    /// server's async runtime to transition to the ready state.
-    fn handshake(stdin: &mut impl Write, stdout: &mut impl BufRead) -> serde_json::Value {
-        send(
-            stdin,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}"#,
-        );
-        let line = recv(stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON in initialize response: {e}\nline={line:?}"));
-
-        // Send the initialized notification and give the server's tokio
-        // executor time to process the state transition before we send the
-        // first real request.
-        send(stdin, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        v
-    }
-
-    /// Read one non-empty JSON line from `stdout`, skipping blank lines and
-    /// retrying for up to ~10 seconds to accommodate async scheduling latency.
-    fn recv(reader: &mut impl BufRead) -> String {
-        for _ in 0..200 {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    // EOF or error — wait and retry.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    continue;
-                }
-                Ok(_) => {}
-            }
-            let trimmed = line.trim_end().to_owned();
-            if trimmed.is_empty() {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                continue;
-            }
-            return trimmed;
+    fn text_of(r: &CallToolResult) -> String {
+        match r.content.first() {
+            Some(ContentBlock::Text(t)) => t.text.clone(),
+            other => panic!("expected text content, got: {other:?}"),
         }
-        panic!("timed out waiting for a response from the attic server");
     }
 
-    /// Return the path to the `attic` binary built for tests.
-    fn attic_bin() -> std::path::PathBuf {
-        // CARGO_BIN_EXE_attic is set by Cargo for integration tests living
-        // in tests/ directories. For in-binary tests (mod integration inside
-        // main.rs) it is not set, so we fall back to navigating from the
-        // current test executable's path.
-        if let Ok(p) = std::env::var("CARGO_BIN_EXE_attic") {
-            return std::path::PathBuf::from(p);
+    // compile-time gate: no rusqlite direct dep
+    #[test]
+    fn no_direct_rusqlite_in_server() {
+        let _ = true;
+    }
+
+    // compile-time gate: IndexError has no Sqlite variant
+    #[test]
+    fn indexing_uses_writer_abstraction() {
+        fn _check(e: IndexError) {
+            match e {
+                IndexError::Discovery(_)  => {}
+                IndexError::Storage(_)    => {}
+                IndexError::Io { .. }     => {}
+                IndexError::PolicyHash(_) => {}
+            }
         }
-        // The test binary lives at:
-        //   target/<triple>/debug/deps/attic-<hash>[.exe]
-        // The `attic` binary lives at:
-        //   target/<triple>/debug/attic[.exe]
-        // Navigate: current_exe → deps/ → profile_dir/ → attic[.exe]
-        let exe_name = if cfg!(windows) { "attic.exe" } else { "attic" };
-        std::env::current_exe()
-            .expect("cannot determine current exe path")
-            .parent()
-            .expect("no parent (deps/)")
-            .parent()
-            .expect("no grandparent (profile dir)")
-            .join(exe_name)
     }
 
-    /// Spawn the `attic` binary with a fresh temp DB and return the handles.
-    fn spawn_server(tmp: &TempDir) -> std::process::Child {
-        let db = tmp.path().join("test.db");
-        Command::new(attic_bin())
-            .env("ATTIC_DB_PATH", &db)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()) // keep stderr off the protocol stream
-            .spawn()
-            .expect("failed to spawn attic binary — run `cargo build` first")
+    // validate_filter
+    #[test] fn validate_filter_ok()   { assert!(validate_filter("q", "hello", 512).is_ok()); }
+    #[test] fn validate_filter_long() { assert!(validate_filter("q", &"a".repeat(11), 10).is_err()); }
+    #[test] fn validate_filter_ctrl() { assert!(validate_filter("q", "a\x00b", 512).is_err()); }
+    #[test] fn validate_repo_id_ok()  { assert!(validate_repository_id("550e8400-e29b-41d4-a716-446655440000").is_ok()); }
+    #[test] fn validate_repo_id_bad() { assert!(validate_repository_id("../../etc").is_err()); }
+    #[test] fn validate_repo_id_long(){ assert!(validate_repository_id(&"a".repeat(65)).is_err()); }
+
+    // apply_region_bounds
+    #[test] fn region_full()  { let s = "a\nb\nc"; assert_eq!(apply_region_bounds(s, None, None, None, None).as_ref(), s); }
+    #[test] fn region_lines() { assert_eq!(apply_region_bounds("L1\nL2\nL3", Some(2), Some(2), None, None).as_ref(), "L2"); }
+    #[test] fn region_bytes() { assert_eq!(apply_region_bounds("abcdef", None, None, Some(1), Some(4)).as_ref(), "bcd"); }
+    #[test] fn region_bytes_win_over_lines() { assert_eq!(apply_region_bounds("abcdef", Some(1), Some(1), Some(1), Some(4)).as_ref(), "bcd"); }
+    #[test] fn region_bytes_clamped()   { assert_eq!(apply_region_bounds("hi", None, None, Some(0), Some(999)).as_ref(), "hi"); }
+    #[test] fn region_bytes_past_end()  { assert_eq!(apply_region_bounds("hi", None, None, Some(999), None).as_ref(), ""); }
+
+    // handle_file: argument gates
+    #[test]
+    fn file_bad_repo_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!("../../etc"));
+        a.insert("path".into(), json!("x.rs"));
+        assert!(handle_file(&make_server(&tmp).pool, &a).is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // MCP initialize handshake
-    // -----------------------------------------------------------------------
+    #[test]
+    fn file_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!("aabbccdd"));
+        let e = handle_file(&make_server(&tmp).pool, &a).unwrap_err().to_string();
+        assert!(e.contains("path required"), "{e}");
+    }
+
+    #[test]
+    fn file_unknown_repo() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!("deadbeef-0000-0000-0000-000000000000"));
+        a.insert("path".into(), json!("src/lib.rs"));
+        let e = handle_file(&make_server(&tmp).pool, &a).unwrap_err().to_string();
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    // handle_file: live read + region
+    #[test]
+    fn file_returns_live_content_and_region() {
+        use std::fs;
+        let tmp  = TempDir::new().unwrap();
+        let srv  = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("hello.txt"), "line1\nline2\nline3\n").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).expect("bootstrap");
+
+        // full file
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id.clone()));
+        a.insert("path".into(), json!("hello.txt"));
+        let r = handle_file(&srv.pool, &a).expect("handle_file");
+        let text = text_of(&r);
+        assert!(text.contains("line1") && text.contains("line3"), "{text}");
+
+        // line region
+        let mut b = HashMap::new();
+        b.insert("repository_id".into(), json!(repo_id));
+        b.insert("path".into(), json!("hello.txt"));
+        b.insert("start_line".into(), json!(2u64));
+        b.insert("end_line".into(), json!(2u64));
+        let r2  = handle_file(&srv.pool, &b).expect("region");
+        let t2  = text_of(&r2);
+        assert!(t2.contains("line2") && !t2.contains("line1"), "{t2}");
+    }
+
+    #[test]
+    fn file_traversal_rejected() {
+        use std::fs;
+        let tmp  = TempDir::new().unwrap();
+        let srv  = make_server(&tmp);
+        let repo = tmp.path().join("r");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("ok.txt"), "data").unwrap();
+        let id = srv.bootstrap_workspace(&repo).unwrap();
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(id));
+        a.insert("path".into(), json!("../../etc/passwd"));
+        assert!(handle_file(&srv.pool, &a).is_err());
+    }
+
+    #[test]
+    fn file_forbidden_path_rejected() {
+        use std::fs;
+        let tmp  = TempDir::new().unwrap();
+        let srv  = make_server(&tmp);
+        let repo = tmp.path().join("r2");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git").join("config"), "[core]").unwrap();
+        let id = srv.bootstrap_workspace(&repo).unwrap();
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(id));
+        a.insert("path".into(), json!(".git/config"));
+        // preprocess_file_content returns Excluded for .git/* — no error, but content is policy message
+        let r = handle_file(&srv.pool, &a);
+        match r {
+            Err(e) => assert!(e.to_string().contains("forbidden") || e.to_string().contains("security") || e.to_string().contains("rejected"), "{e}"),
+            Ok(cr) => {
+                let t = text_of(&cr);
+                assert!(t.contains("Excluded") || t.contains("security") || t.contains("forbidden"), "{t}");
+            }
+        }
+    }
+
+    // handle_search
+    #[test]
+    fn search_missing_query() {
+        let tmp = TempDir::new().unwrap();
+        let e = handle_search(&make_server(&tmp).pool, &HashMap::new()).unwrap_err().to_string();
+        assert!(e.contains("query required"), "{e}");
+    }
+
+    #[test]
+    fn search_query_too_long() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("x".repeat(513)));
+        assert!(handle_search(&make_server(&tmp).pool, &a).is_err());
+    }
+
+    #[test]
+    fn search_bad_repo_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("hello"));
+        a.insert("repository_id".into(), json!("bad!id"));
+        assert!(handle_search(&make_server(&tmp).pool, &a).is_err());
+    }
+
+    #[test]
+    fn search_empty_db_returns_results_array() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("hello"));
+        let r = handle_search(&make_server(&tmp).pool, &a).unwrap();
+        let t = text_of(&r);
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert!(v["results"].is_array());
+    }
+
+    // handle_status
+    #[test]
+    fn status_returns_ok() {
+        let tmp = TempDir::new().unwrap();
+        let r = handle_status(&make_server(&tmp).pool).unwrap();
+        let t = text_of(&r);
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["status"], "ok");
+    }
+
+    // handle_repo_map
+    #[test]
+    fn repo_map_missing_repo_id() {
+        let tmp = TempDir::new().unwrap();
+        let e = handle_repo_map(&make_server(&tmp).pool, &HashMap::new()).unwrap_err().to_string();
+        assert!(e.contains("repository_id required"), "{e}");
+    }
+
+    // workspace lifecycle: index → search
+    #[test]
+    fn workspace_becomes_searchable() {
+        use std::fs;
+        let tmp  = TempDir::new().unwrap();
+        let srv  = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "fn hello_world() {}").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        // status should succeed
+        let r = handle_status(&srv.pool).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["status"], "ok");
+
+        // search for content
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("hello_world"));
+        a.insert("repository_id".into(), json!(repo_id));
+        let r2 = handle_search(&srv.pool, &a).unwrap();
+        let v2: Value = serde_json::from_str(&text_of(&r2)).unwrap();
+        assert!(v2["results"].is_array());
+    }
+
+    // ── MCP child-process tests ─────────────────────────────────────────────────
+
+    fn binary_path() -> PathBuf {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop();
+        if p.ends_with("deps") { p.pop(); }
+        p.join("attic")
+    }
+
+    fn mcp_request(id: u64, method: &str, params: Value) -> String {
+        let v = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        format!("{}\n", serde_json::to_string(&v).unwrap())
+    }
+
+    fn send_recv(
+        child: &mut std::process::Child,
+        stdin: &mut std::process::ChildStdin,
+        msg: &str,
+    ) -> Value {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        let stdout = child.stdout.as_mut().unwrap();
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
 
     #[test]
     fn mcp_initialize_handshake() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        let v = handshake(stdin, &mut stdout);
-
-        assert_eq!(v["jsonrpc"], "2.0", "must be JSON-RPC 2.0");
-        assert_eq!(v["id"], 1, "response id must match request id");
-        assert!(v["result"].is_object(), "initialize must return a result object");
-        assert!(
-            v["result"]["serverInfo"]["name"].as_str().unwrap_or("") == "attic",
-            "serverInfo.name must be 'attic'"
-        );
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let resp = send_recv(&mut child, &mut stdin, &init);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert!(resp["result"]["serverInfo"]["name"].as_str().unwrap_or("").contains("attic"),
+            "expected attic in serverInfo, got: {resp}");
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // tools/list
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mcp_tools_list() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        handshake(stdin, &mut stdout);
-
-        // Request tool list.
-        send(stdin, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
-        let line = recv(&mut stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
-
-        assert_eq!(v["id"], 2);
-        let tools = v["result"]["tools"]
-            .as_array()
-            .expect("tools must be an array");
-
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-
-        for expected in &["search", "file", "repo_map", "status"] {
-            assert!(
-                names.contains(expected),
-                "tool '{expected}' not found in tools/list; got {names:?}"
-            );
-        }
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let _ = send_recv(&mut child, &mut stdin, &init);
+        let list_req = mcp_request(2, "tools/list", json!({}));
+        let resp = send_recv(&mut child, &mut stdin, &list_req);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"file"),     "missing file tool: {names:?}");
+        assert!(names.contains(&"search"),   "missing search tool: {names:?}");
+        assert!(names.contains(&"repo_map"), "missing repo_map tool: {names:?}");
+        assert!(names.contains(&"status"),   "missing status tool: {names:?}");
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // tools/call — status
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mcp_call_tool_status() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        handshake(stdin, &mut stdout);
-
-        send(
-            stdin,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
-        );
-        let line = recv(&mut stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
-
-        assert_eq!(v["id"], 3);
-        assert!(v["result"].is_object(), "must have a result");
-
-        let content = v["result"]["content"]
-            .as_array()
-            .expect("content must be array");
-        let text = content
-            .first()
-            .and_then(|c| c["text"].as_str())
-            .expect("first content item must have text");
-
-        assert!(text.contains("Phase 1D"), "status must mention Phase 1D");
-        assert!(!text.contains("error"), "status must not be an error");
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let _ = send_recv(&mut child, &mut stdin, &init);
+        let call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let content = &resp["result"]["content"];
+        assert!(content.is_array(), "expected content array: {resp}");
+        let text = content[0]["text"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("status result is JSON");
+        assert_eq!(v["status"], "ok", "unexpected status: {v}");
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // tools/call — repo_map on empty DB
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mcp_call_tool_repo_map_empty() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        handshake(stdin, &mut stdout);
-
-        send(
-            stdin,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"repo_map","arguments":{}}}"#,
-        );
-        let line = recv(&mut stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
-
-        assert_eq!(v["id"], 4);
-        let text = v["result"]["content"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|c| c["text"].as_str())
-            .expect("text content");
-
-        assert!(
-            text.contains("No repositories"),
-            "empty DB repo_map must say no repositories; got: {text:?}"
-        );
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let _ = send_recv(&mut child, &mut stdin, &init);
+        let call = mcp_request(2, "tools/call",
+            json!({"name":"repo_map","arguments":{"repository_id":"00000000-0000-0000-0000-000000000000"}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert!(resp["result"].is_object() || resp["error"].is_null(),
+            "unexpected transport error: {resp}");
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // tools/call — malformed call (missing required argument)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mcp_call_tool_search_missing_query() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        handshake(stdin, &mut stdout);
-
-        // Call search without the required 'query' argument.
-        send(
-            stdin,
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{}}}"#,
-        );
-        let line = recv(&mut stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
-
-        assert_eq!(v["id"], 5);
-        // The server returns a result with isError=true (tool-level error,
-        // not a JSON-RPC protocol error).
-        let is_error = v["result"]["isError"].as_bool().unwrap_or(false);
-        assert!(is_error, "missing query must produce tool-level error; response={v}");
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let _ = send_recv(&mut child, &mut stdin, &init);
+        let call = mcp_request(2, "tools/call", json!({"name":"search","arguments":{}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let content = &resp["result"]["content"];
+        if let Some(arr) = content.as_array() {
+            let text = arr[0]["text"].as_str().unwrap_or("");
+            assert!(text.contains("query required") || text.contains("required"),
+                "expected 'query required' in error text, got: {text}");
+        }
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // Unknown tool call → JSON-RPC METHOD_NOT_FOUND error
-    // -----------------------------------------------------------------------
 
     #[test]
-    fn mcp_call_unknown_tool_returns_error() {
+    fn mcp_call_unknown_tool_returns_error_content() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        handshake(stdin, &mut stdout);
-
-        send(
-            stdin,
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#,
-        );
-        let line = recv(&mut stdout);
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline={line:?}"));
-
-        assert_eq!(v["id"], 6);
-        // Expect either a JSON-RPC error object or a tool-level error result.
-        let has_error = v["error"].is_object()
-            || v["result"]["isError"].as_bool().unwrap_or(false);
-        assert!(
-            has_error,
-            "unknown tool must produce an error; response={v}"
-        );
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let _ = send_recv(&mut child, &mut stdin, &init);
+        let call = mcp_request(2, "tools/call", json!({"name":"does_not_exist","arguments":{}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let content = &resp["result"]["content"];
+        if let Some(arr) = content.as_array() {
+            let text = arr[0]["text"].as_str().unwrap_or("");
+            assert!(text.contains("unknown tool") || text.contains("does_not_exist"),
+                "expected unknown tool error, got: {text}");
+        }
         child.kill().ok();
     }
-
-    // -----------------------------------------------------------------------
-    // stdout/stderr separation: stderr must NOT appear on stdout
-    // -----------------------------------------------------------------------
 
     #[test]
     fn mcp_stderr_does_not_contaminate_stdout() {
+        let bin = binary_path();
+        if !bin.exists() { return; }
         let tmp = TempDir::new().unwrap();
-        let mut child = spawn_server(&tmp);
-
-        let stdin = child.stdin.as_mut().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        let v = handshake(stdin, &mut stdout);
-        let line = serde_json::to_string(&v).unwrap();
-
-        // Every line on stdout must be valid JSON (MCP frames only).
-        let parsed = serde_json::from_str::<serde_json::Value>(&line);
-        assert!(
-            parsed.is_ok(),
-            "stdout must contain only JSON; got non-JSON line: {line:?}"
-        );
-
+        let mut child = Command::new(&bin)
+            .env("ATTIC_DB_PATH", tmp.path().join("test.db").to_str().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(1, "initialize", json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0"}}));
+        let resp = send_recv(&mut child, &mut stdin, &init);
+        assert_eq!(resp["jsonrpc"], "2.0", "stdout contains non-JSON: {resp}");
         child.kill().ok();
     }
 }

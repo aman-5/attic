@@ -159,6 +159,61 @@ pub fn set_file_occurrence_indexed(
     Ok(())
 }
 
+/// Look up a file identity ID by its `stable_id_basis`, returning `None` if absent.
+///
+/// Used by `attic-indexing` to reuse the same UUID across reindex runs.
+pub fn lookup_file_identity_by_basis(
+    conn: &Connection,
+    stable_id_basis: &str,
+) -> Result<Option<FileIdentityId>, StorageError> {
+    use rusqlite::OptionalExtension;
+    let id_str: Option<String> = conn
+        .query_row(
+            "SELECT id FROM core_file_identities WHERE stable_id_basis = ?1 LIMIT 1",
+            rusqlite::params![stable_id_basis],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id_str {
+        Some(s) => {
+            let id = s.parse::<FileIdentityId>().map_err(|e| {
+                StorageError::Domain(attic_core::CoreError::UnknownVariant {
+                    type_name: "FileIdentityId",
+                    value: e.to_string(),
+                })
+            })?;
+            Ok(Some(id))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Look up the most recent file occurrence ID for a given repository and path.
+///
+/// Returns the `FileOccurrenceId` string of the latest occurrence (by rowid),
+/// or `None` if this path has never been indexed in the given repository.
+///
+/// Used by `attic-indexing` to find the previous occurrence for unit deletion.
+pub fn lookup_latest_file_occurrence_for_path(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+    path: &str,
+) -> Result<Option<String>, StorageError> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT fo.id
+           FROM core_file_occurrences fo
+           JOIN core_file_identities  fi ON fo.file_identity_id = fi.id
+          WHERE fi.repository_id = ?1 AND fo.path = ?2
+          ORDER BY fo.rowid DESC
+          LIMIT 1",
+        rusqlite::params![repository_id.to_string_repr(), path],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 /// Update the `secret_scan_state` and `secret_pattern_version` for a file occurrence.
 pub fn set_secret_scan_state(
     conn: &Connection,

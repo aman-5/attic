@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -40,7 +40,8 @@ use attic_storage::{
     NewFileOccurrence, NewRetrievalUnit, PublicationItem, StorageError,
     delete_retrieval_units_for_file, insert_index_generation,
     insert_retrieval_unit_with_fts, insert_source_revision_with_hashes,
-    publish_file_batch, run_migrations, upsert_repository,
+    lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    lookup_repository_by_root_path, publish_file_batch, run_migrations, upsert_repository,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,8 +54,6 @@ pub enum IndexError {
     Discovery(#[from] attic_discovery::DiscoveryError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("I/O error preprocessing {path}: {source}")]
     Io {
         path: String,
@@ -74,6 +73,13 @@ pub struct IndexOptions {
     pub repository_name: String,
     pub max_units_per_file: usize,
     pub refresh_existing: bool,
+    /// Skip running migrations before indexing.
+    ///
+    /// Set this to `true` when the caller has already run migrations on the
+    /// same connection (e.g. inside a `WriterQueueHandle::send` closure where
+    /// a transaction is already active and a nested `BEGIN IMMEDIATE` would
+    /// fail).
+    pub skip_migrations: bool,
 }
 
 impl Default for IndexOptions {
@@ -82,6 +88,7 @@ impl Default for IndexOptions {
             repository_name: "default".to_owned(),
             max_units_per_file: 512,
             refresh_existing: true,
+            skip_migrations: false,
         }
     }
 }
@@ -134,8 +141,11 @@ pub fn index_repository(
     policy: &DiscoveryPolicy,
     opts: &IndexOptions,
 ) -> Result<IndexResult, IndexError> {
-    // 1. Migrations.
-    run_migrations(conn)?;
+    // 1. Migrations — skip when the caller already holds a transaction (e.g.
+    //    inside WriterQueueHandle::send, which issues BEGIN IMMEDIATE first).
+    if !opts.skip_migrations {
+        run_migrations(conn)?;
+    }
 
     // 2. Phase 1B discovery — real manifest hash, git meta, security classification.
     let discovery = attic_discovery::discover(root, policy)?;
@@ -156,25 +166,17 @@ pub fn index_repository(
         .map(|e| (e.repo_relative.as_str(), e.content_hash.as_str()))
         .collect();
 
-    // 3. Bootstrap / retrieve repository record via approved API.
+    // 3. Bootstrap / retrieve repository record via approved storage API.
+    //    No ad-hoc SQL — lookup_repository_by_root_path is the authoritative accessor.
     let root_str = root.to_string_lossy();
     let repo_id: RepositoryId = {
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM core_repositories WHERE root_path = ?1 LIMIT 1",
-                rusqlite::params![root_str],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(s) = existing {
-            s.parse().map_err(|_| IndexError::Io {
-                path: root_str.to_string(),
-                source: std::io::Error::other("invalid repository_id UUID in DB"),
-            })?
-        } else {
-            let id = RepositoryId::new_v4();
-            upsert_repository(conn, &id, &root_str, &opts.repository_name)?;
-            id
+        match lookup_repository_by_root_path(conn, &root_str)? {
+            Some(id) => id,
+            None => {
+                let id = RepositoryId::new_v4();
+                upsert_repository(conn, &id, &root_str, &opts.repository_name)?;
+                id
+            }
         }
     };
 
@@ -275,40 +277,19 @@ pub fn index_repository(
         let stable_id_basis =
             format!("{}/{}", repo_id.to_string_repr(), entry.repo_relative);
 
-        // Look up existing file_identity by stable_id_basis so we reuse the same
-        // UUID across reindex runs — preserving stable FileIdentity per contract.
-        // INSERT OR IGNORE on `id` alone would insert a new row every run.
-        let fi_id: FileIdentityId = {
-            let existing_fi: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM core_file_identities WHERE stable_id_basis = ?1 LIMIT 1",
-                    rusqlite::params![stable_id_basis],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(s) = existing_fi {
-                s.parse().map_err(|_| IndexError::Io {
-                    path: entry.repo_relative.clone(),
-                    source: std::io::Error::other("invalid file_identity_id UUID in DB"),
-                })?
-            } else {
-                FileIdentityId::new_v4()
-            }
-        };
+        // Look up existing file_identity by stable_id_basis via approved storage API.
+        // This reuses the same UUID across reindex runs — preserving stable
+        // FileIdentity per contract. INSERT OR IGNORE on `id` alone would insert
+        // a new row every run.
+        let fi_id: FileIdentityId =
+            match lookup_file_identity_by_basis(conn, &stable_id_basis)? {
+                Some(id) => id,
+                None => FileIdentityId::new_v4(),
+            };
 
-        // Look up any existing file_occurrence for this path/repo (for refresh deletion).
-        let old_fo_id: Option<String> = conn
-            .query_row(
-                "SELECT fo.id
-                   FROM core_file_occurrences fo
-                   JOIN core_file_identities  fi ON fo.file_identity_id = fi.id
-                  WHERE fi.repository_id = ?1 AND fo.path = ?2
-                  ORDER BY fo.rowid DESC
-                  LIMIT 1",
-                rusqlite::params![repo_id.to_string_repr(), entry.repo_relative],
-                |r| r.get(0),
-            )
-            .optional()?;
+        // Look up any existing file_occurrence for this path/repo via approved API.
+        let old_fo_id: Option<String> =
+            lookup_latest_file_occurrence_for_path(conn, &repo_id, &entry.repo_relative)?;
 
         file_records.push(FileRecord {
             fi_id,

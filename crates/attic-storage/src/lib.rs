@@ -29,13 +29,14 @@ pub use writer::{WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{
-    NewFileOccurrence, insert_file_occurrence, upsert_file_identity,
+    NewFileOccurrence, insert_file_occurrence, lookup_file_identity_by_basis,
+    lookup_latest_file_occurrence_for_path, upsert_file_identity,
 };
 pub use repository::index_generation::insert_index_generation;
 pub use repository::publication::{PublicationItem, publish_file_batch};
 pub use repository::repository::{
-    get_db_stats, get_repository_path, get_repository_stats, upsert_repository, DbStats,
-    RepositoryStats,
+    get_db_stats, get_repository_path, get_repository_stats, lookup_repository_by_root_path,
+    upsert_repository, DbStats, RepositoryStats,
 };
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,

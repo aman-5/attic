@@ -138,6 +138,35 @@ pub fn get_repository_path(
     }
 }
 
+/// Look up a repository by its `root_path`, returning its ID or `None`.
+///
+/// Used by `attic-indexing` to avoid ad-hoc SQL for repository bootstrapping.
+pub fn lookup_repository_by_root_path(
+    conn: &Connection,
+    root_path: &str,
+) -> Result<Option<RepositoryId>, StorageError> {
+    use rusqlite::OptionalExtension;
+    let id_str: Option<String> = conn
+        .query_row(
+            "SELECT id FROM core_repositories WHERE root_path = ?1 LIMIT 1",
+            rusqlite::params![root_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id_str {
+        Some(s) => {
+            let id = s.parse::<RepositoryId>().map_err(|e| {
+                StorageError::Domain(attic_core::CoreError::UnknownVariant {
+                    type_name: "RepositoryId",
+                    value: e.to_string(),
+                })
+            })?;
+            Ok(Some(id))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

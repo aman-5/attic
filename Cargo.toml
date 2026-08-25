@@ -37,6 +37,7 @@ tokio              = { version = "1",        features = ["rt-multi-thread", "mac
 # Phase 1D: Official Rust MCP SDK (ADR-008)
 # Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
+anyhow             = "1"
 # Test utilities
 tempfile           = "3"
 attic-core         = { path = "crates/attic-core" }
