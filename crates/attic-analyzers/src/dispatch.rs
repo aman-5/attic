@@ -9,21 +9,27 @@
 //! 3. For specialized analyzers:
 //!    - Wrap the call in `std::panic::catch_unwind`.
 //!    - **Success, no error diagnostics** → return output as-is.
-//!    - **Success, error diagnostics** → annotate with `FALLBACK_USED`
-//!      (the specialized analyzer's partial output is still returned).
+//!    - **Success, error diagnostics** → run `GenericAnalyzer` on the
+//!      pre-cloned content (available for `FullBytes`/`RedactedBytes`);
+//!      append original error diagnostics + `FALLBACK_USED` for traceability.
 //!    - **Panic** → run `GenericAnalyzer` on a pre-cloned copy of the content
 //!      (available for `FullBytes`/`RedactedBytes`); annotate with
 //!      `PANIC_CAUGHT` + `FALLBACK_USED`.
 //!
 //! ## Streaming inputs
 //!
-//! `StreamingHandle` content cannot be cloned for a replay.  If a specialized
-//! analyzer panics on a streaming input, a minimal `AnalyzerOutput` is
-//! returned (zero retrieval units) with `PANIC_CAUGHT` + `FALLBACK_USED`.
+//! `StreamingHandle` content is **collected once** into `RedactedBytes` before
+//! splitting, so both specialized and fallback paths receive a replayable copy.
+//! Collection uses `attic_discovery::secrets::collect_all`, which respects the
+//! Phase 1B redaction boundary (no raw file path is ever reopened).
+//!
+//! If collection fails (I/O error), `fallback_input` is `None` and a minimal
+//! output is returned on failure.
 
 use std::panic::{self, AssertUnwindSafe};
 
 use attic_core::FileOccurrenceId;
+use attic_discovery::secrets;
 
 use crate::api::{
     Analyzer, AnalyzerContent, AnalyzerDiagnostic, AnalyzerInput, AnalyzerOutput,
@@ -51,6 +57,7 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
     }
 
     // Clone bytes content before passing ownership to the specialized analyzer.
+    // For streaming inputs, collect to RedactedBytes so fallback replay is possible.
     let (fallback_input, specialized_input) = split_for_fallback(input);
 
     // Wrap the specialized call in catch_unwind.
@@ -65,15 +72,32 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
         Ok(output) if !has_errors(&output) => output,
 
         // ── Specialized returned error diagnostics ──────────────────────────
-        Ok(mut output) => {
-            output.diagnostics.push(AnalyzerDiagnostic::warning(
-                diagnostic_codes::FALLBACK_USED,
-                "Specialized analyzer produced error diagnostics; \
-                 output may be partial.",
-            ));
-            output.fallback_used = true;
-            output
-        }
+        // Run GenericAnalyzer on the pre-cloned content so the caller always
+        // receives useful retrieval units. Original error diagnostics are
+        // preserved for traceability.
+        Ok(specialized_output) => match fallback_input {
+            Some(fb_input) => {
+                let generic = GenericAnalyzer::new();
+                let mut fb_output = generic.analyze(fb_input);
+                // Preserve the original error diagnostics for traceability.
+                fb_output.diagnostics.extend(specialized_output.diagnostics);
+                fb_output.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::FALLBACK_USED,
+                    "Specialized analyzer produced error diagnostics; \
+                     output produced by GenericAnalyzer fallback.",
+                ));
+                fb_output.fallback_used = true;
+                fb_output
+            }
+            None => {
+                // Streaming collection already happened in split_for_fallback;
+                // reaching None here means the collection itself failed.
+                minimal_error_output(
+                    "Specialized analyzer produced errors; \
+                     streaming content collection failed — no fallback replay possible.",
+                )
+            }
+        },
 
         // ── Specialized panicked ─────────────────────────────────────────────
         Err(_panic_payload) => match fallback_input {
@@ -93,7 +117,7 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
                 output
             }
             None => {
-                // StreamingHandle — stream was consumed; cannot replay.
+                // StreamingHandle collection failed; cannot replay.
                 minimal_panic_output(
                     "Specialized analyzer panicked on StreamingHandle input; \
                      no fallback replay is possible.",
@@ -119,7 +143,10 @@ fn has_errors(output: &AnalyzerOutput) -> bool {
 ///
 /// - `FullBytes`/`RedactedBytes`: the bytes are cloned so both inputs carry
 ///   the same content.
-/// - `StreamingHandle`: cannot be cloned; `fallback_input` is `None`.
+/// - `StreamingHandle`: the stream is collected once into `RedactedBytes` via
+///   `secrets::collect_all`, preserving the Phase 1B redaction boundary.
+///   Both inputs receive the same collected bytes.  If collection fails,
+///   `fallback_input` is `None`.
 fn split_for_fallback(input: AnalyzerInput) -> (Option<AnalyzerInput>, AnalyzerInput) {
     // Destructure to avoid partial-move issues.
     let AnalyzerInput {
@@ -134,20 +161,48 @@ fn split_for_fallback(input: AnalyzerInput) -> (Option<AnalyzerInput>, AnalyzerI
         resource_budget,
     } = input;
 
-    // Build fallback content (clone for bytes; None for streaming).
-    let fallback_content_opt: Option<AnalyzerContent> = match &content {
-        AnalyzerContent::FullBytes(bytes) => Some(AnalyzerContent::FullBytes(bytes.clone())),
-        AnalyzerContent::RedactedBytes(bytes) => {
-            Some(AnalyzerContent::RedactedBytes(bytes.clone()))
-        }
-        AnalyzerContent::StreamingHandle(_) => None,
-    };
+    // Build fallback content (clone for bytes; collect-then-clone for streaming).
+    let (fallback_content_opt, specialized_content): (Option<AnalyzerContent>, AnalyzerContent) =
+        match content {
+            AnalyzerContent::FullBytes(ref bytes) => (
+                Some(AnalyzerContent::FullBytes(bytes.clone())),
+                content,
+            ),
+            AnalyzerContent::RedactedBytes(ref bytes) => (
+                Some(AnalyzerContent::RedactedBytes(bytes.clone())),
+                content,
+            ),
+            AnalyzerContent::StreamingHandle(mut stream) => {
+                // Collect the already-redacted stream bytes so both paths can
+                // replay the content. This never reopens the raw file.
+                match secrets::collect_all(&mut stream) {
+                    Ok(scan_result) => {
+                        let collected = AnalyzerContent::RedactedBytes(
+                            scan_result.redacted.into_bytes(),
+                        );
+                        let collected_copy = match &collected {
+                            AnalyzerContent::RedactedBytes(b) => {
+                                AnalyzerContent::RedactedBytes(b.clone())
+                            }
+                            _ => unreachable!(),
+                        };
+                        (Some(collected_copy), collected)
+                    }
+                    Err(_) => {
+                        // Collection failed; no fallback possible.
+                        // Provide an empty RedactedBytes to the specialized path
+                        // (it will fail gracefully) and None for fallback.
+                        (None, AnalyzerContent::RedactedBytes(vec![]))
+                    }
+                }
+            }
+        };
 
-    // Specialized input consumes the original (possibly streaming) content.
+    // Specialized input uses the (possibly collected) content.
     let specialized = AnalyzerInput {
         file_occurrence_id,
         path: path.clone(),
-        content,
+        content: specialized_content,
         language_hint: language_hint.clone(),
         file_type,
         size_bytes,
@@ -156,7 +211,7 @@ fn split_for_fallback(input: AnalyzerInput) -> (Option<AnalyzerInput>, AnalyzerI
         resource_budget: resource_budget.clone(),
     };
 
-    // Fallback input uses the cloned bytes (or None for streaming).
+    // Fallback input uses the cloned bytes (or None if collection failed).
     let fallback = fallback_content_opt.map(|fc| AnalyzerInput {
         file_occurrence_id,
         path,
@@ -190,6 +245,27 @@ fn minimal_panic_output(message: &str) -> AnalyzerOutput {
                 diagnostic_codes::FALLBACK_USED,
                 "No fallback available for StreamingHandle after panic.",
             ),
+        ],
+        fallback_used: true,
+        capability_used: CapabilityKind::Lexical,
+    }
+}
+
+/// Build a minimal `AnalyzerOutput` for use when a specialized analyzer
+/// produced errors but no fallback replay is possible (streaming collection
+/// failed).
+fn minimal_error_output(message: &str) -> AnalyzerOutput {
+    AnalyzerOutput {
+        analyzer_id: "dispatch".to_string(),
+        analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
+        file_occurrence_id: FileOccurrenceId::new_v4(),
+        structural_nodes: vec![],
+        symbols: vec![],
+        imports: vec![],
+        relationships: vec![],
+        retrieval_units: vec![],
+        diagnostics: vec![
+            AnalyzerDiagnostic::warning(diagnostic_codes::FALLBACK_USED, message),
         ],
         fallback_used: true,
         capability_used: CapabilityKind::Lexical,
@@ -249,7 +325,7 @@ mod tests {
                 desc: AnalyzerDescriptor {
                     name: "success-stub".to_string(),
                     version: "0.1.0".to_string(),
-                    description: "always succeeds".to_string(),
+                    description: "always succeeds cleanly".to_string(),
                     supported_file_types: vec![file_type],
                     capabilities: AnalyzerCapabilities::single(
                         CapabilityKind::Lexical,
@@ -408,25 +484,38 @@ mod tests {
         assert!(output.diagnostics.is_empty(), "success path must have no diagnostics");
     }
 
-    /// Specialized analyzer that emits error diagnostics gets FALLBACK_USED appended.
+    /// Specialized analyzer that emits error diagnostics causes GenericAnalyzer
+    /// fallback to run. Output must have retrieval units, FALLBACK_USED, and
+    /// the original error diagnostic preserved.
     #[test]
-    fn dispatch_specialized_fatal_error_adds_fallback_used() {
+    fn dispatch_specialized_fatal_error_runs_generic_fallback_and_produces_units() {
         let stub = Arc::new(ErrorStub::new(FileType::Rust));
         let registry = registry_with_specialized(stub as Arc<dyn Analyzer>);
-        let input = make_text_input("fn main() {}", FileType::Rust);
+        // Use text that GenericAnalyzer can produce units from.
+        let input = make_text_input("fn main() {\n    println!(\"hello\");\n}\n", FileType::Rust);
 
         let output = dispatch(&registry, input);
 
-        // analyzer_id is still from the error stub (output is returned as-is + annotation).
-        assert_eq!(output.analyzer_id, "error-stub");
+        // Must have run GenericAnalyzer — output comes from the generic analyzer.
+        assert_eq!(
+            output.analyzer_id, "generic",
+            "error fallback must produce output from GenericAnalyzer; got: {}",
+            output.analyzer_id
+        );
         assert!(output.fallback_used, "error path must set fallback_used");
+
+        // Must have produced retrieval units from GenericAnalyzer.
+        assert!(
+            !output.retrieval_units.is_empty(),
+            "error fallback must produce retrieval units via GenericAnalyzer; got 0 units"
+        );
 
         let codes: Vec<&str> = output.diagnostics.iter().map(|d| d.code.as_str()).collect();
         assert!(
             codes.contains(&diagnostic_codes::FALLBACK_USED),
             "error path must emit FALLBACK_USED; got: {codes:?}"
         );
-        // Original error diagnostic must still be present.
+        // Original error diagnostic must still be present for traceability.
         assert!(
             codes.contains(&"TEST_ERROR"),
             "original error diagnostic must be preserved; got: {codes:?}"
