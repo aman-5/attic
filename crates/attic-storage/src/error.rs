@@ -59,7 +59,9 @@ pub enum StorageError {
     ///
     /// This is set when a `ROLLBACK` or `COMMIT` failure leaves the connection
     /// in a state that cannot be safely determined or recovered from.
-    #[error("writer connection poisoned (unrecoverable transaction finalization failure; restart required)")]
+    #[error(
+        "writer connection poisoned (unrecoverable transaction finalization failure; restart required)"
+    )]
     WriterPoisoned,
 }
 

@@ -56,8 +56,8 @@ use attic_core::FileOccurrenceId;
 use attic_discovery::secrets::LargeFileStream;
 
 use crate::api::{
-    Analyzer, AnalyzerContent, AnalyzerDiagnostic, AnalyzerInput, AnalyzerOutput,
-    CapabilityKind, DiagnosticSeverity, ResourceBudget, diagnostic_codes,
+    Analyzer, AnalyzerContent, AnalyzerDiagnostic, AnalyzerInput, AnalyzerOutput, CapabilityKind,
+    DiagnosticSeverity, ResourceBudget, diagnostic_codes,
 };
 use crate::cancellation::CancellationToken;
 use crate::generic::GenericAnalyzer;
@@ -856,8 +856,14 @@ mod tests {
         let input = make_text_input("hello\nworld\n", FileType::Rust);
         let output = dispatch(&registry, input);
 
-        assert!(!output.retrieval_units.is_empty(), "generic must produce units");
-        assert!(!output.fallback_used, "generic path must not set fallback_used");
+        assert!(
+            !output.retrieval_units.is_empty(),
+            "generic must produce units"
+        );
+        assert!(
+            !output.fallback_used,
+            "generic path must not set fallback_used"
+        );
         let codes: Vec<&str> = output.diagnostics.iter().map(|d| d.code.as_str()).collect();
         assert!(!codes.contains(&diagnostic_codes::PANIC_CAUGHT));
         assert!(!codes.contains(&diagnostic_codes::FALLBACK_USED));
@@ -1058,8 +1064,7 @@ mod tests {
         };
 
         let text = b"fn budget_test() {}\n";
-        let (input, _guard) =
-            make_streaming_input_with_budget(text, FileType::Rust, budget);
+        let (input, _guard) = make_streaming_input_with_budget(text, FileType::Rust, budget);
 
         let output = dispatch(&registry, input);
 
@@ -1149,7 +1154,10 @@ mod tests {
 
         // Spool file must exist while `prep` (and thus the guard) is alive.
         if let Some(ref p) = spool_path {
-            assert!(p.exists(), "spool must exist while SpoolPreparation is held");
+            assert!(
+                p.exists(),
+                "spool must exist while SpoolPreparation is held"
+            );
         }
 
         // Drop the preparation — this drops the NamedTempFile guard.
@@ -1185,7 +1193,10 @@ mod tests {
         };
 
         if let Some(ref p) = spool_path {
-            assert!(p.exists(), "partial spool must exist while Cancelled guard is held");
+            assert!(
+                p.exists(),
+                "partial spool must exist while Cancelled guard is held"
+            );
         }
 
         drop(prep);

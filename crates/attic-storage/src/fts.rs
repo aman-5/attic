@@ -219,10 +219,7 @@ pub fn insert_retrieval_unit_with_fts(
 /// Delete a retrieval unit by UUID and remove it from the FTS index.
 ///
 /// Returns `Ok(false)` if the row was not found.
-pub fn delete_retrieval_unit_with_fts(
-    conn: &Connection,
-    id: &str,
-) -> Result<bool, StorageError> {
+pub fn delete_retrieval_unit_with_fts(conn: &Connection, id: &str) -> Result<bool, StorageError> {
     let maybe = conn.query_row(
         "SELECT rowid, retrieval_text FROM core_retrieval_units WHERE id = ?1",
         rusqlite::params![id],
@@ -400,25 +397,22 @@ pub fn fts_path_lookup(
     ";
 
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![path, repository_id, limit],
-        |row| {
-            Ok(FtsSearchResult {
-                retrieval_unit_id: row.get("retrieval_unit_id")?,
-                file_occurrence_id: row.get("file_occurrence_id")?,
-                index_generation_id: row.get("index_generation_id")?,
-                repository_id: row.get("repository_id")?,
-                repository_name: row.get("repository_name")?,
-                path: row.get("path")?,
-                language: row.get("language")?,
-                file_type: row.get("file_type")?,
-                body: row.get("body")?,
-                score: 0.0,
-                start_line: row.get("start_line")?,
-                end_line: row.get("end_line")?,
-            })
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![path, repository_id, limit], |row| {
+        Ok(FtsSearchResult {
+            retrieval_unit_id: row.get("retrieval_unit_id")?,
+            file_occurrence_id: row.get("file_occurrence_id")?,
+            index_generation_id: row.get("index_generation_id")?,
+            repository_id: row.get("repository_id")?,
+            repository_name: row.get("repository_name")?,
+            path: row.get("path")?,
+            language: row.get("language")?,
+            file_type: row.get("file_type")?,
+            body: row.get("body")?,
+            score: 0.0,
+            start_line: row.get("start_line")?,
+            end_line: row.get("end_line")?,
+        })
+    })?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -436,12 +430,12 @@ mod tests {
     use super::*;
     use crate::connection::configure_connection;
     use crate::migration::run_migrations;
+    use crate::repository::file_occurrence::{
+        NewFileOccurrence, insert_file_occurrence, upsert_file_identity,
+    };
+    use crate::repository::index_generation::insert_index_generation;
     use crate::repository::repository::upsert_repository;
     use crate::repository::source_revision::insert_source_revision;
-    use crate::repository::index_generation::insert_index_generation;
-    use crate::repository::file_occurrence::{
-        upsert_file_identity, insert_file_occurrence, NewFileOccurrence,
-    };
     use attic_core::{
         DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
         IndexGenerationId, RepositoryId, SecurityState, SourceRevisionId, SourceType,
@@ -653,8 +647,7 @@ mod tests {
             )
             .unwrap();
 
-        fts_retrieval_unit_update(&conn, rowid, "old_function_alpha", "new_function_beta")
-            .unwrap();
+        fts_retrieval_unit_update(&conn, rowid, "old_function_alpha", "new_function_beta").unwrap();
 
         // Old text must be gone.
         let old_hits = fts_search(
@@ -783,7 +776,9 @@ mod tests {
                     file_occurrence_id: &occ_id.to_string_repr(),
                     index_generation_id: &gen_id.to_string_repr(),
                     repository_id: &repo_id.to_string_repr(),
-                    retrieval_text: &format!("fn bounded_item_{i}() {{ /* common_shared_token */ }}"),
+                    retrieval_text: &format!(
+                        "fn bounded_item_{i}() {{ /* common_shared_token */ }}"
+                    ),
                     analyzer_id: "generic",
                     analyzer_version: "1.0.0",
                     start_line: Some(i),
@@ -858,12 +853,19 @@ mod tests {
         .unwrap();
 
         let results = fts_path_lookup(&conn, "src/target.rs", None, 10).unwrap();
-        assert_eq!(results.len(), 3, "path lookup should return all 3 units for target.rs");
+        assert_eq!(
+            results.len(),
+            3,
+            "path lookup should return all 3 units for target.rs"
+        );
         for r in &results {
             assert_eq!(r.path, "src/target.rs");
         }
         let lines: Vec<Option<u32>> = results.iter().map(|r| r.start_line).collect();
-        assert!(lines.windows(2).all(|w| w[0] <= w[1]), "results not ordered by start_line");
+        assert!(
+            lines.windows(2).all(|w| w[0] <= w[1]),
+            "results not ordered by start_line"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -932,7 +934,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(del_results.is_empty(), "del.rs FTS entries should be purged");
+        assert!(
+            del_results.is_empty(),
+            "del.rs FTS entries should be purged"
+        );
 
         let keep_results = fts_search(
             &conn,
@@ -945,7 +950,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(keep_results.len(), 1, "keep.rs unit must survive deletion of del.rs");
+        assert_eq!(
+            keep_results.len(),
+            1,
+            "keep.rs unit must survive deletion of del.rs"
+        );
         assert_eq!(keep_results[0].retrieval_unit_id, uid_keep);
     }
 

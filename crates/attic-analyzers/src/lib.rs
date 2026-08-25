@@ -43,9 +43,9 @@ pub mod registry;
 
 pub use api::{
     Analyzer, AnalyzerCapabilities, AnalyzerContent, AnalyzerDescriptor, AnalyzerDiagnostic,
-    AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, DiagnosticSeverity,
-    ImportSpec, RelationshipSpec, ResourceBudget, RetrievalUnitSpec, StructuralNodeSpec,
-    SymbolSpec, diagnostic_codes,
+    AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, DiagnosticSeverity, ImportSpec,
+    RelationshipSpec, ResourceBudget, RetrievalUnitSpec, StructuralNodeSpec, SymbolSpec,
+    diagnostic_codes,
 };
 pub use cancellation::CancellationToken;
 pub use dispatch::dispatch;

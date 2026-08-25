@@ -122,19 +122,17 @@ fn resolve_git_dir(git_entry: &Path) -> Result<PathBuf, DiscoveryError> {
     }
 
     if git_entry.is_file() {
-        let contents = fs::read_to_string(git_entry).map_err(|source| DiscoveryError::Io {
-            source,
-        })?;
+        let contents =
+            fs::read_to_string(git_entry).map_err(|source| DiscoveryError::Io { source })?;
         let contents = contents.trim();
         if let Some(path) = contents.strip_prefix("gitdir: ") {
             let resolved = git_entry.parent().unwrap_or(Path::new(".")).join(path);
             // Canonicalise so relative `../` segments collapse correctly.
-            let canonical = fs::canonicalize(&resolved).map_err(|source| {
-                DiscoveryError::Canonicalize {
+            let canonical =
+                fs::canonicalize(&resolved).map_err(|source| DiscoveryError::Canonicalize {
                     path: resolved.clone(),
                     source,
-                }
-            })?;
+                })?;
             return Ok(canonical);
         }
     }
@@ -168,9 +166,11 @@ fn resolve_ref(ref_path: &str, git_dir: &Path) -> Option<String> {
             }
             let mut parts = line.splitn(2, ' ');
             if let (Some(sha), Some(name)) = (parts.next(), parts.next())
-                && name.trim() == ref_path && looks_like_sha(sha) {
-                    return Some(sha.to_string());
-                }
+                && name.trim() == ref_path
+                && looks_like_sha(sha)
+            {
+                return Some(sha.to_string());
+            }
         }
     }
 

@@ -105,11 +105,9 @@ mod tests {
         run_migrations(&conn).expect("first run should succeed");
 
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM core_schema_migrations",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM core_schema_migrations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 2, "both migration rows expected after first run");
     }
@@ -121,13 +119,14 @@ mod tests {
         run_migrations(&conn).expect("second run should be a no-op");
 
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM core_schema_migrations",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM core_schema_migrations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(count, 2, "still exactly two migration rows after second run");
+        assert_eq!(
+            count, 2,
+            "still exactly two migration rows after second run"
+        );
     }
 
     #[test]
@@ -172,7 +171,13 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
 
-        for col in &["analyzer_id", "analyzer_version", "start_line", "end_line", "is_redacted"] {
+        for col in &[
+            "analyzer_id",
+            "analyzer_version",
+            "start_line",
+            "end_line",
+            "is_redacted",
+        ] {
             assert!(
                 columns.contains(&col.to_string()),
                 "column '{col}' should exist in core_retrieval_units after phase1d migration"

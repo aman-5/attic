@@ -291,7 +291,10 @@ mod tests {
         }];
         let h2 = build_manifest(&entries_v2, root).manifest_hash;
 
-        assert_ne!(h1, h2, "manifest hash must change when file content changes");
+        assert_ne!(
+            h1, h2,
+            "manifest hash must change when file content changes"
+        );
     }
 
     #[test]
@@ -333,7 +336,10 @@ mod tests {
         };
 
         let m = build_manifest(&[good, bad], root);
-        assert!(!m.is_stable(), "manifest with read errors should not be stable");
+        assert!(
+            !m.is_stable(),
+            "manifest with read errors should not be stable"
+        );
         assert_eq!(m.read_errors.len(), 1);
         // Only the good file appears in entries.
         assert_eq!(m.entries.len(), 1);
@@ -408,11 +414,20 @@ mod tests {
     /// Identical values → returns `false`.
     #[test]
     fn unstable_capture_detected_when_stats_differ() {
-        let stat_a = FileStat { size: 10, modified: None };
-        let stat_b = FileStat { size: 20, modified: None };
+        let stat_a = FileStat {
+            size: 10,
+            modified: None,
+        };
+        let stat_b = FileStat {
+            size: 20,
+            modified: None,
+        };
         assert_ne!(stat_a, stat_b, "different sizes must produce != stats");
 
-        let stat_c = FileStat { size: 10, modified: None };
+        let stat_c = FileStat {
+            size: 10,
+            modified: None,
+        };
         assert_eq!(stat_a, stat_c, "identical stats must be equal");
     }
 

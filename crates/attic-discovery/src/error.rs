@@ -45,9 +45,7 @@ pub enum DiscoveryError {
     /// `include_untracked = false` was requested but the Git tracked-file set
     /// could not be obtained.  The walk did not proceed — refusing to silently
     /// broaden discovery scope.
-    #[error(
-        "include_untracked=false requested but git tracked-file set unavailable: {reason}"
-    )]
+    #[error("include_untracked=false requested but git tracked-file set unavailable: {reason}")]
     TrackedFileSetUnavailable { reason: String },
 }
 

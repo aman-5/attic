@@ -23,40 +23,30 @@ use crate::error::DiscoveryError;
 ///   - Glob-suffix file extensions
 ///   - Exact file names
 const FORBIDDEN_DIRS: &[&str] = &[
-    ".git",        // entire .git tree (internal objects, refs, etc.)
-    ".ssh",        // SSH keys
-    ".gnupg",      // GPG keys
+    ".git",   // entire .git tree (internal objects, refs, etc.)
+    ".ssh",   // SSH keys
+    ".gnupg", // GPG keys
 ];
 
 /// File extensions whose files are always security-excluded.
 /// Matched against the lowercase file extension (without leading dot).
 const FORBIDDEN_EXTENSIONS: &[&str] = &[
-    "pem",  // PEM-encoded keys
-    "key",  // private key files (heuristic)
-    "p12",  // PKCS#12 bundles
-    "jks",  // Java keystores
+    "pem", // PEM-encoded keys
+    "key", // private key files (heuristic)
+    "p12", // PKCS#12 bundles
+    "jks", // Java keystores
 ];
 
 /// Exact file names (at any depth) that are always security-excluded.
-const FORBIDDEN_FILENAMES: &[&str] = &[
-    ".env",
-];
+const FORBIDDEN_FILENAMES: &[&str] = &[".env"];
 
 /// Glob prefixes of `.env.*` files (e.g. `.env.local`, `.env.production`).
-const FORBIDDEN_FILENAME_PREFIXES: &[&str] = &[
-    ".env.",
-];
+const FORBIDDEN_FILENAME_PREFIXES: &[&str] = &[".env."];
 
 /// Path prefixes (in security context) that scan-exempt rules may not match.
 /// Used to block attempts to exempt `.ssh/`, `.gnupg/`, etc.
-const FORBIDDEN_SCAN_EXEMPT_PREFIXES: &[&str] = &[
-    ".ssh/",
-    ".ssh",
-    ".gnupg/",
-    ".gnupg",
-    ".git/",
-    ".git",
-];
+const FORBIDDEN_SCAN_EXEMPT_PREFIXES: &[&str] =
+    &[".ssh/", ".ssh", ".gnupg/", ".gnupg", ".git/", ".git"];
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -106,9 +96,7 @@ pub fn is_security_forbidden(repo_relative_path: &str) -> bool {
 pub fn assert_not_forbidden_prefix(path: &str) -> Result<(), DiscoveryError> {
     let normalized = path.trim_start_matches('/').to_ascii_lowercase();
     for forbidden in FORBIDDEN_SCAN_EXEMPT_PREFIXES {
-        if normalized == forbidden.trim_end_matches('/')
-            || normalized.starts_with(forbidden)
-        {
+        if normalized == forbidden.trim_end_matches('/') || normalized.starts_with(forbidden) {
             return Err(DiscoveryError::ScanExemptForbiddenPath(path.to_owned()));
         }
     }

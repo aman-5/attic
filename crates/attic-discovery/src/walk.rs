@@ -80,17 +80,15 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
     // and we cannot obtain the Git tracked-file set, we must NOT silently
     // fall back to include_untracked=true semantics.  Broadening the discovery
     // scope without authorisation violates the policy contract.
-    let tracked_files: Option<HashSet<String>> =
-        if policy.git_aware && !policy.include_untracked {
-            let set = git_tracked_files(root).map_err(|e| {
-                DiscoveryError::TrackedFileSetUnavailable {
-                    reason: e.to_string(),
-                }
+    let tracked_files: Option<HashSet<String>> = if policy.git_aware && !policy.include_untracked {
+        let set =
+            git_tracked_files(root).map_err(|e| DiscoveryError::TrackedFileSetUnavailable {
+                reason: e.to_string(),
             })?;
-            Some(set)
-        } else {
-            None
-        };
+        Some(set)
+    } else {
+        None
+    };
 
     // ── Step 2: main walk (gitignore-aware) ────────────────────────────────
     let mut main_entries: HashSet<String> = HashSet::new();
@@ -148,9 +146,10 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
             &mut |entry| {
                 // Only accept if an attic_include_rule matches this path
                 // and the path was NOT already captured in an earlier pass.
-                let explicitly_included = policy.attic_include_rules.iter().any(|rule| {
-                    glob_matches(&rule.pattern, &entry.repo_relative)
-                });
+                let explicitly_included = policy
+                    .attic_include_rules
+                    .iter()
+                    .any(|rule| glob_matches(&rule.pattern, &entry.repo_relative));
                 if explicitly_included && !main_entries.contains(&entry.repo_relative) {
                     main_entries.insert(entry.repo_relative.clone());
                     Some(entry)
@@ -162,7 +161,9 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
     }
 
     // Sort for determinism: repo-relative path, lexicographic.
-    result.entries.sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
+    result
+        .entries
+        .sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
 
     Ok(result)
 }
@@ -244,7 +245,10 @@ where
                     None => continue,
                 };
 
-                if submodule_prefixes.iter().any(|pfx| repo_rel.starts_with(pfx.as_str())) {
+                if submodule_prefixes
+                    .iter()
+                    .any(|pfx| repo_rel.starts_with(pfx.as_str()))
+                {
                     continue;
                 }
 
@@ -293,9 +297,10 @@ where
                 // made an explicit decision to include them).
                 if let Some(tracked) = tracked_files {
                     let is_tracked = tracked.contains(&repo_rel);
-                    let is_explicitly_included = policy.attic_include_rules.iter().any(|rule| {
-                        glob_matches(&rule.pattern, &repo_rel)
-                    });
+                    let is_explicitly_included = policy
+                        .attic_include_rules
+                        .iter()
+                        .any(|rule| glob_matches(&rule.pattern, &repo_rel));
                     if !is_tracked && !is_explicitly_included {
                         continue;
                     }
@@ -387,8 +392,15 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
-        assert!(paths.contains(&"src/main.rs"), "expected src/main.rs in {paths:?}");
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"src/main.rs"),
+            "expected src/main.rs in {paths:?}"
+        );
         assert!(paths.contains(&"src/lib.rs"));
     }
 
@@ -403,7 +415,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(paths.contains(&"src/index.js"));
         assert!(
             !paths.iter().any(|p| p.starts_with("node_modules/")),
@@ -422,7 +438,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(!paths.iter().any(|p| p.starts_with("target/")));
     }
 
@@ -436,7 +456,10 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let any_git = result.entries.iter().any(|e| e.repo_relative.starts_with(".git/"));
+        let any_git = result
+            .entries
+            .iter()
+            .any(|e| e.repo_relative.starts_with(".git/"));
         assert!(!any_git, ".git contents must never appear in walk output");
     }
 
@@ -451,7 +474,10 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let pem = result.entries.iter().any(|e| e.repo_relative.ends_with(".pem"));
+        let pem = result
+            .entries
+            .iter()
+            .any(|e| e.repo_relative.ends_with(".pem"));
         assert!(!pem, ".pem files must be security-excluded");
     }
 
@@ -467,9 +493,10 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let has_env = result.entries.iter().any(|e| {
-            e.repo_relative == ".env" || e.repo_relative.starts_with(".env.")
-        });
+        let has_env = result
+            .entries
+            .iter()
+            .any(|e| e.repo_relative == ".env" || e.repo_relative.starts_with(".env."));
         assert!(!has_env, ".env files must be security-excluded");
     }
 
@@ -485,7 +512,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(paths.contains(&"src/keep.rs"));
         assert!(
             !paths.iter().any(|p| p.starts_with("ignored_dir/")),
@@ -506,7 +537,11 @@ mod tests {
         policy.git_aware = false;
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(
             paths.iter().any(|p| p.starts_with("ignored_dir/")),
             "with git_aware=false, gitignore should be ignored: {paths:?}"
@@ -525,7 +560,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted, "walk result must be sorted");
@@ -545,7 +584,11 @@ mod tests {
         });
 
         let result = walk(root, &policy).unwrap();
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(
             paths.contains(&"vendor/special.rs"),
             "explicit include should keep vendor/special.rs: {paths:?}"
@@ -567,9 +610,16 @@ mod tests {
         });
 
         let result = walk(root, &policy).unwrap();
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(paths.contains(&"src/keep.rs"));
-        assert!(!paths.contains(&"src/drop.rs"), "explicit exclude should drop src/drop.rs");
+        assert!(
+            !paths.contains(&"src/drop.rs"),
+            "explicit exclude should drop src/drop.rs"
+        );
     }
 
     // ── New tests required by review ──────────────────────────────────────
@@ -597,9 +647,7 @@ mod tests {
         );
         match result.unwrap_err() {
             crate::error::DiscoveryError::TrackedFileSetUnavailable { .. } => {}
-            other => panic!(
-                "expected TrackedFileSetUnavailable, got {other:?}"
-            ),
+            other => panic!("expected TrackedFileSetUnavailable, got {other:?}"),
         }
     }
 
@@ -633,9 +681,19 @@ mod tests {
         policy.include_untracked = false;
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
-        assert!(paths.contains(&"src/tracked.rs"), "tracked file must appear: {paths:?}");
-        assert!(!paths.contains(&"src/untracked.rs"), "untracked file must be excluded: {paths:?}");
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"src/tracked.rs"),
+            "tracked file must appear: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"src/untracked.rs"),
+            "untracked file must be excluded: {paths:?}"
+        );
     }
 
     /// A tracked file that happens to match a `.gitignore` rule is still
@@ -659,14 +717,24 @@ mod tests {
         write(root, "generated/proto.rs", "// generated");
 
         // Track both files (git add -f to force-add the ignored one).
-        let _ = Command::new("git").args(["add", "src/lib.rs"]).current_dir(root).status();
-        let _ = Command::new("git").args(["add", "-f", "generated/proto.rs"]).current_dir(root).status();
+        let _ = Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(root)
+            .status();
+        let _ = Command::new("git")
+            .args(["add", "-f", "generated/proto.rs"])
+            .current_dir(root)
+            .status();
 
         let mut policy = DiscoveryPolicy::default_git();
         policy.include_untracked = false;
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         // generated/proto.rs is tracked but gitignored; with include_untracked=false
         // it must still appear because it is tracked.
         // The `ignore` crate gitignore prunes the directory in Pass 1, but the
@@ -708,7 +776,11 @@ mod tests {
         });
 
         let result = walk(root, &policy).unwrap();
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
 
         assert!(
             paths.contains(&"private/data.rs"),
@@ -740,7 +812,11 @@ mod tests {
         });
 
         let result = walk(root, &policy).unwrap();
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
 
         assert!(
             !paths.contains(&".env"),
@@ -772,7 +848,11 @@ mod tests {
         policy.include_untracked = true;
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
 
         // The submodule's file must NOT be in the output.
         assert!(
@@ -818,7 +898,11 @@ mod tests {
         policy.include_untracked = true;
         let result = walk(root, &policy).unwrap();
 
-        let paths: Vec<&str> = result.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
 
         assert!(
             !paths.contains(&"worktree/wt_file.rs"),

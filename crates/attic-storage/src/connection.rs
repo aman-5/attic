@@ -430,7 +430,10 @@ mod tests {
         });
 
         // catch_unwind should have caught the panic.
-        assert!(result.is_err(), "catch_unwind must return Err when closure panics");
+        assert!(
+            result.is_err(),
+            "catch_unwind must return Err when closure panics"
+        );
 
         // The PoolGuard Drop must have run during unwinding, returning the
         // connection to the idle pool.

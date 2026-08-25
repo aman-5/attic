@@ -156,17 +156,15 @@ fn best_entry(entries: &[RegistryEntry]) -> Option<&Arc<dyn Analyzer>> {
         .iter()
         .max_by(|a, b| {
             // Primary: higher CapabilityLevel wins.
-            a.max_level
-                .cmp(&b.max_level)
-                .then_with(|| {
-                    // Tie-break: lexicographically earlier name wins.
-                    // `max_by` returns the last "greatest" item; to get the
-                    // lexicographically smallest name we reverse the comparison.
-                    b.analyzer
-                        .descriptor()
-                        .name
-                        .cmp(&a.analyzer.descriptor().name)
-                })
+            a.max_level.cmp(&b.max_level).then_with(|| {
+                // Tie-break: lexicographically earlier name wins.
+                // `max_by` returns the last "greatest" item; to get the
+                // lexicographically smallest name we reverse the comparison.
+                b.analyzer
+                    .descriptor()
+                    .name
+                    .cmp(&a.analyzer.descriptor().name)
+            })
         })
         .map(|e| &e.analyzer)
 }
@@ -201,7 +199,12 @@ mod tests {
     }
 
     impl StubAnalyzer {
-        fn new(name: &str, file_type: FileType, capability: CapabilityKind, level: CapabilityLevel) -> Self {
+        fn new(
+            name: &str,
+            file_type: FileType,
+            capability: CapabilityKind,
+            level: CapabilityLevel,
+        ) -> Self {
             Self {
                 desc: AnalyzerDescriptor {
                     name: name.to_string(),
@@ -293,8 +296,8 @@ mod tests {
         let high = Arc::new(StubAnalyzer::new(
             "rust-high",
             FileType::Rust,
-            CapabilityKind::Lexical,        // lower-dimension kind
-            CapabilityLevel::Full,          // but higher level
+            CapabilityKind::Lexical, // lower-dimension kind
+            CapabilityLevel::Full,   // but higher level
         ));
         let low = Arc::new(StubAnalyzer::new(
             "rust-low",
@@ -416,9 +419,9 @@ mod tests {
                 }
             }
         }
-        registry.register_specialized(
-            Arc::new(AgnosticStub { desc: agnostic_desc }) as Arc<dyn Analyzer>
-        );
+        registry.register_specialized(Arc::new(AgnosticStub {
+            desc: agnostic_desc,
+        }) as Arc<dyn Analyzer>);
 
         // Still selects generic for any type.
         let (selected, is_generic) = registry.select(FileType::Rust);
@@ -466,9 +469,8 @@ mod tests {
                 CapabilityLevel::Full,
             ),
         };
-        registry.register_specialized(
-            Arc::new(MultiStub { desc: multi_desc }) as Arc<dyn Analyzer>
-        );
+        registry
+            .register_specialized(Arc::new(MultiStub { desc: multi_desc }) as Arc<dyn Analyzer>);
 
         let descs = registry.all_descriptors();
         let names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
@@ -519,7 +521,10 @@ mod tests {
         registry.register_specialized(partial as Arc<dyn Analyzer>);
 
         let (selected, _) = registry.select(FileType::JavaScript);
-        assert_eq!(selected.descriptor().name, "partial-analyzer",
-            "Partial level must beat Basic level");
+        assert_eq!(
+            selected.descriptor().name,
+            "partial-analyzer",
+            "Partial level must beat Basic level"
+        );
     }
 }

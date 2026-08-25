@@ -26,8 +26,8 @@ use tracing::debug;
 
 use crate::api::{
     Analyzer, AnalyzerCapabilities, AnalyzerContent, AnalyzerDescriptor, AnalyzerDiagnostic,
-    AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, RetrievalUnitSpec,
-    ResourceBudget, diagnostic_codes,
+    AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, ResourceBudget,
+    RetrievalUnitSpec, diagnostic_codes,
 };
 use crate::cancellation::CancellationToken;
 
@@ -53,9 +53,14 @@ impl GenericAnalyzer {
             desc: AnalyzerDescriptor {
                 name: "generic".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                description: "Language-agnostic line-based analyzer. Handles any decodable text file.".to_string(),
+                description:
+                    "Language-agnostic line-based analyzer. Handles any decodable text file."
+                        .to_string(),
                 supported_file_types: vec![],
-                capabilities: AnalyzerCapabilities::single(CapabilityKind::Lexical, CapabilityLevel::Full),
+                capabilities: AnalyzerCapabilities::single(
+                    CapabilityKind::Lexical,
+                    CapabilityLevel::Full,
+                ),
             },
         }
     }
@@ -108,7 +113,16 @@ fn analyze_generic(input: AnalyzerInput) -> AnalyzerOutput {
                 ));
             }
             let mut cum = 0u64;
-            chunk_text_into_units(&text, &mut retrieval_units, &mut diagnostics, &budget, &token, 0, start_time, &mut cum);
+            chunk_text_into_units(
+                &text,
+                &mut retrieval_units,
+                &mut diagnostics,
+                &budget,
+                &token,
+                0,
+                start_time,
+                &mut cum,
+            );
         }
 
         AnalyzerContent::RedactedBytes(bytes) => {
@@ -124,11 +138,27 @@ fn analyze_generic(input: AnalyzerInput) -> AnalyzerOutput {
                 ));
             }
             let mut cum = 0u64;
-            chunk_text_into_units(&text, &mut retrieval_units, &mut diagnostics, &budget, &token, 0, start_time, &mut cum);
+            chunk_text_into_units(
+                &text,
+                &mut retrieval_units,
+                &mut diagnostics,
+                &budget,
+                &token,
+                0,
+                start_time,
+                &mut cum,
+            );
         }
 
         AnalyzerContent::StreamingHandle(mut stream) => {
-            stream_into_units(&mut stream, &mut retrieval_units, &mut diagnostics, &budget, &token, start_time);
+            stream_into_units(
+                &mut stream,
+                &mut retrieval_units,
+                &mut diagnostics,
+                &budget,
+                &token,
+                start_time,
+            );
         }
     }
 
@@ -185,16 +215,26 @@ fn split_lines_bytes(text: &str) -> Vec<ParsedLine> {
     while pos < len {
         match memchr_newline(bytes, pos) {
             Some(nl) => {
-                let content_end = if nl > pos && bytes[nl - 1] == b'\r' { nl - 1 } else { nl };
+                let content_end = if nl > pos && bytes[nl - 1] == b'\r' {
+                    nl - 1
+                } else {
+                    nl
+                };
                 let content = text[pos..content_end].to_string();
                 let byte_len_with_terminator = nl + 1 - pos;
-                result.push(ParsedLine { content, byte_len_with_terminator });
+                result.push(ParsedLine {
+                    content,
+                    byte_len_with_terminator,
+                });
                 pos = nl + 1;
             }
             None => {
                 let content = text[pos..].to_string();
                 let byte_len_with_terminator = len - pos;
-                result.push(ParsedLine { content, byte_len_with_terminator });
+                result.push(ParsedLine {
+                    content,
+                    byte_len_with_terminator,
+                });
                 pos = len;
             }
         }
@@ -205,22 +245,32 @@ fn split_lines_bytes(text: &str) -> Vec<ParsedLine> {
 
 #[inline]
 fn memchr_newline(bytes: &[u8], from: usize) -> Option<usize> {
-    bytes[from..].iter().position(|&b| b == b'\n').map(|rel| from + rel)
+    bytes[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|rel| from + rel)
 }
 
 /// Find the largest UTF-8 char boundary <= max_bytes within `s`.
 #[inline]
 fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     let cap = max_bytes.min(s.len());
-    (0..=cap).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
+    (0..=cap)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build RetrievalUnitSpec — 0-based exclusive-end spans
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_retrieval_unit_from_lines(ordinal: u32, start_line_0: u32, lines: &[String]) -> RetrievalUnitSpec {
-    let end_line_0 = start_line_0 + lines.len() as u32;       // exclusive
+fn build_retrieval_unit_from_lines(
+    ordinal: u32,
+    start_line_0: u32,
+    lines: &[String],
+) -> RetrievalUnitSpec {
+    let end_line_0 = start_line_0 + lines.len() as u32; // exclusive
     let end_col_0 = lines.last().map(|l| l.len() as u32).unwrap_or(0); // exclusive
     let retrieval_text = lines.join("\n");
     RetrievalUnitSpec {
@@ -246,21 +296,32 @@ fn check_and_emit_resource(
     if units.len() as u64 >= budget.max_retrieval_units {
         diagnostics.push(AnalyzerDiagnostic::warning(
             diagnostic_codes::RESOURCE_EXHAUSTED,
-            format!("max_retrieval_units ({}) reached after {} units; output is partial.", budget.max_retrieval_units, units.len()),
+            format!(
+                "max_retrieval_units ({}) reached after {} units; output is partial.",
+                budget.max_retrieval_units,
+                units.len()
+            ),
         ));
         return true;
     }
     if cumulative_text_bytes >= budget.max_memory_bytes {
         diagnostics.push(AnalyzerDiagnostic::warning(
             diagnostic_codes::RESOURCE_EXHAUSTED,
-            format!("max_memory_bytes ({}) exceeded at {} cumulative bytes; output is partial.", budget.max_memory_bytes, cumulative_text_bytes),
+            format!(
+                "max_memory_bytes ({}) exceeded at {} cumulative bytes; output is partial.",
+                budget.max_memory_bytes, cumulative_text_bytes
+            ),
         ));
         return true;
     }
     if start_time.elapsed().as_millis() as u64 >= budget.max_time_ms {
         diagnostics.push(AnalyzerDiagnostic::warning(
             diagnostic_codes::RESOURCE_EXHAUSTED,
-            format!("max_time_ms ({} ms) exceeded after {} units; output is partial.", budget.max_time_ms, units.len()),
+            format!(
+                "max_time_ms ({} ms) exceeded after {} units; output is partial.",
+                budget.max_time_ms,
+                units.len()
+            ),
         ));
         return true;
     }
@@ -301,26 +362,43 @@ fn chunk_text_into_units(
         }
         // Check before building the next chunk.
         if token.is_cancelled() {
-            diagnostics.push(AnalyzerDiagnostic::warning(diagnostic_codes::CANCELLED, "Analysis cancelled; output is partial."));
+            diagnostics.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::CANCELLED,
+                "Analysis cancelled; output is partial.",
+            ));
             return;
         }
         if start_time.elapsed().as_millis() as u64 >= budget.max_time_ms {
             diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::RESOURCE_EXHAUSTED,
-                format!("max_time_ms ({} ms) exceeded after {} units; output is partial.", budget.max_time_ms, units.len()),
+                format!(
+                    "max_time_ms ({} ms) exceeded after {} units; output is partial.",
+                    budget.max_time_ms,
+                    units.len()
+                ),
             ));
             return;
         }
 
         let chunk_end = (chunk_start + MAX_LINES_PER_CHUNK).min(lines.len());
-        let chunk_lines: Vec<String> = lines[chunk_start..chunk_end].iter().map(|l| l.content.clone()).collect();
+        let chunk_lines: Vec<String> = lines[chunk_start..chunk_end]
+            .iter()
+            .map(|l| l.content.clone())
+            .collect();
         let start_line_0 = line_number_base + chunk_start as u32;
         let unit = build_retrieval_unit_from_lines(units.len() as u32, start_line_0, &chunk_lines);
         *cumulative_text_bytes += unit.retrieval_text.len() as u64;
         units.push(unit);
         chunk_start = chunk_end;
 
-        if check_and_emit_resource(units, diagnostics, budget, token, start_time, *cumulative_text_bytes) {
+        if check_and_emit_resource(
+            units,
+            diagnostics,
+            budget,
+            token,
+            start_time,
+            *cumulative_text_bytes,
+        ) {
             return;
         }
     }
@@ -355,17 +433,42 @@ fn stream_into_units(
     loop {
         // Check cancellation/time BEFORE fetching the next chunk.
         if token.is_cancelled() {
-            diagnostics.push(AnalyzerDiagnostic::warning(diagnostic_codes::CANCELLED, "Analysis cancelled; output is partial."));
+            diagnostics.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::CANCELLED,
+                "Analysis cancelled; output is partial.",
+            ));
             // Flush whatever we have.
-            flush_stream_pending(&mut pending_lines, units, diagnostics, budget, token, start_time, &mut cumulative_text_bytes, &mut next_line_0);
+            flush_stream_pending(
+                &mut pending_lines,
+                units,
+                diagnostics,
+                budget,
+                token,
+                start_time,
+                &mut cumulative_text_bytes,
+                &mut next_line_0,
+            );
             return;
         }
         if start_time.elapsed().as_millis() as u64 >= budget.max_time_ms {
             diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::RESOURCE_EXHAUSTED,
-                format!("max_time_ms ({} ms) exceeded after {} units; output is partial.", budget.max_time_ms, units.len()),
+                format!(
+                    "max_time_ms ({} ms) exceeded after {} units; output is partial.",
+                    budget.max_time_ms,
+                    units.len()
+                ),
             ));
-            flush_stream_pending(&mut pending_lines, units, diagnostics, budget, token, start_time, &mut cumulative_text_bytes, &mut next_line_0);
+            flush_stream_pending(
+                &mut pending_lines,
+                units,
+                diagnostics,
+                budget,
+                token,
+                start_time,
+                &mut cumulative_text_bytes,
+                &mut next_line_0,
+            );
             return;
         }
 
@@ -407,7 +510,11 @@ fn stream_into_units(
         let chunk_bytes = chunk_text.as_bytes();
         let ends_with_newline = chunk_bytes.last().map(|&b| b == b'\n').unwrap_or(false);
 
-        let complete_count = if ends_with_newline { n } else { n.saturating_sub(1) };
+        let complete_count = if ends_with_newline {
+            n
+        } else {
+            n.saturating_sub(1)
+        };
 
         // Collect complete lines into pending.
         for line in &lines[..complete_count] {
@@ -440,11 +547,19 @@ fn stream_into_units(
         // Flush complete chunks from pending_lines.
         while pending_lines.len() >= MAX_LINES_PER_CHUNK {
             let chunk_lines: Vec<String> = pending_lines.drain(..MAX_LINES_PER_CHUNK).collect();
-            let unit = build_retrieval_unit_from_lines(units.len() as u32, next_line_0, &chunk_lines);
+            let unit =
+                build_retrieval_unit_from_lines(units.len() as u32, next_line_0, &chunk_lines);
             next_line_0 += chunk_lines.len() as u32;
             cumulative_text_bytes += unit.retrieval_text.len() as u64;
             units.push(unit);
-            if check_and_emit_resource(units, diagnostics, budget, token, start_time, cumulative_text_bytes) {
+            if check_and_emit_resource(
+                units,
+                diagnostics,
+                budget,
+                token,
+                start_time,
+                cumulative_text_bytes,
+            ) {
                 return;
             }
         }
@@ -457,7 +572,16 @@ fn stream_into_units(
     }
 
     // Flush all remaining pending_lines.
-    flush_stream_pending(&mut pending_lines, units, diagnostics, budget, token, start_time, &mut cumulative_text_bytes, &mut next_line_0);
+    flush_stream_pending(
+        &mut pending_lines,
+        units,
+        diagnostics,
+        budget,
+        token,
+        start_time,
+        &mut cumulative_text_bytes,
+        &mut next_line_0,
+    );
 }
 
 /// Push a line into `pending_lines`, splitting it at `MAX_CARRY_BYTES`
@@ -495,14 +619,20 @@ fn flush_stream_pending(
 ) {
     while !pending_lines.is_empty() {
         if token.is_cancelled() {
-            diagnostics.push(AnalyzerDiagnostic::warning(diagnostic_codes::CANCELLED, "Analysis cancelled; output is partial."));
+            diagnostics.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::CANCELLED,
+                "Analysis cancelled; output is partial.",
+            ));
             pending_lines.clear();
             return;
         }
         if start_time.elapsed().as_millis() as u64 >= budget.max_time_ms {
             diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::RESOURCE_EXHAUSTED,
-                format!("max_time_ms ({} ms) exceeded; output is partial.", budget.max_time_ms),
+                format!(
+                    "max_time_ms ({} ms) exceeded; output is partial.",
+                    budget.max_time_ms
+                ),
             ));
             pending_lines.clear();
             return;
@@ -513,7 +643,14 @@ fn flush_stream_pending(
         *next_line_0 += chunk_lines.len() as u32;
         *cumulative_text_bytes += unit.retrieval_text.len() as u64;
         units.push(unit);
-        if check_and_emit_resource(units, diagnostics, budget, token, start_time, *cumulative_text_bytes) {
+        if check_and_emit_resource(
+            units,
+            diagnostics,
+            budget,
+            token,
+            start_time,
+            *cumulative_text_bytes,
+        ) {
             pending_lines.clear();
             return;
         }
@@ -551,11 +688,17 @@ mod tests {
     }
 
     fn text_input(text: &str) -> AnalyzerInput {
-        make_input(AnalyzerContent::FullBytes(text.as_bytes().to_vec()), text.len() as u64)
+        make_input(
+            AnalyzerContent::FullBytes(text.as_bytes().to_vec()),
+            text.len() as u64,
+        )
     }
 
     fn redacted_input(text: &str) -> AnalyzerInput {
-        make_input(AnalyzerContent::RedactedBytes(text.as_bytes().to_vec()), text.len() as u64)
+        make_input(
+            AnalyzerContent::RedactedBytes(text.as_bytes().to_vec()),
+            text.len() as u64,
+        )
     }
 
     fn analyzer() -> GenericAnalyzer {
@@ -567,7 +710,10 @@ mod tests {
     #[test]
     fn empty_file_produces_no_units() {
         let out = analyzer().analyze(text_input(""));
-        assert!(out.retrieval_units.is_empty(), "empty file must produce zero units");
+        assert!(
+            out.retrieval_units.is_empty(),
+            "empty file must produce zero units"
+        );
         assert!(out.diagnostics.is_empty());
     }
 
@@ -641,8 +787,14 @@ mod tests {
     fn redacted_bytes_emits_redacted_input_diagnostic() {
         let out = analyzer().analyze(redacted_input("hello\nworld\n"));
         let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&diagnostic_codes::REDACTED_INPUT), "must emit REDACTED_INPUT; got {codes:?}");
-        assert!(!out.retrieval_units.is_empty(), "redacted input must still produce units");
+        assert!(
+            codes.contains(&diagnostic_codes::REDACTED_INPUT),
+            "must emit REDACTED_INPUT; got {codes:?}"
+        );
+        assert!(
+            !out.retrieval_units.is_empty(),
+            "redacted input must still produce units"
+        );
     }
 
     // ── Invalid UTF-8 ─────────────────────────────────────────────────────────
@@ -652,8 +804,14 @@ mod tests {
         let bytes = vec![0xFF, 0xFE, b'h', b'i', b'\n'];
         let out = analyzer().analyze(make_input(AnalyzerContent::FullBytes(bytes), 5));
         let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-        assert!(codes.contains(&diagnostic_codes::MALFORMED_INPUT), "must emit MALFORMED_INPUT; got {codes:?}");
-        assert!(!out.retrieval_units.is_empty(), "invalid UTF-8 must still produce units");
+        assert!(
+            codes.contains(&diagnostic_codes::MALFORMED_INPUT),
+            "must emit MALFORMED_INPUT; got {codes:?}"
+        );
+        assert!(
+            !out.retrieval_units.is_empty(),
+            "invalid UTF-8 must still produce units"
+        );
     }
 
     // ── Cancellation ──────────────────────────────────────────────────────────
@@ -700,7 +858,11 @@ mod tests {
         let out = GenericAnalyzer::new().analyze(input);
 
         // Must have stopped at 1 unit.
-        assert_eq!(out.retrieval_units.len(), 1, "must stop at max_retrieval_units=1");
+        assert_eq!(
+            out.retrieval_units.len(),
+            1,
+            "must stop at max_retrieval_units=1"
+        );
 
         let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
         assert!(
@@ -729,9 +891,9 @@ mod tests {
 
     #[test]
     fn streaming_handle_produces_units() {
-        use tempfile::NamedTempFile;
-        use std::io::Write as IoWrite;
         use attic_discovery::LargeFileStream;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
         let content = "line one\nline two\nline three\n";
@@ -762,9 +924,9 @@ mod tests {
 
     #[test]
     fn streaming_bounded_carry_no_oom() {
-        use tempfile::NamedTempFile;
-        use std::io::Write as IoWrite;
         use attic_discovery::LargeFileStream;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
 
         // Write a file with no newlines, larger than MAX_CARRY_BYTES.
         let size = MAX_CARRY_BYTES * 2 + 1;
@@ -810,9 +972,9 @@ mod tests {
 
     #[test]
     fn streaming_span_0_based_exclusive() {
-        use tempfile::NamedTempFile;
-        use std::io::Write as IoWrite;
         use attic_discovery::LargeFileStream;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
 
         // Three lines; all within one chunk so span covers lines 0..3.
         let content = "alpha\nbeta\ngamma\n";
@@ -834,14 +996,27 @@ mod tests {
         };
 
         let out = GenericAnalyzer::new().analyze(input);
-        assert_eq!(out.retrieval_units.len(), 1, "3 lines must produce exactly 1 unit");
+        assert_eq!(
+            out.retrieval_units.len(),
+            1,
+            "3 lines must produce exactly 1 unit"
+        );
 
         let u = &out.retrieval_units[0];
-        assert_eq!(u.span.start_line, 0, "streaming: start_line must be 0-based");
+        assert_eq!(
+            u.span.start_line, 0,
+            "streaming: start_line must be 0-based"
+        );
         assert_eq!(u.span.start_col, 0, "streaming: start_col must be 0");
-        assert_eq!(u.span.end_line, 3, "streaming: end_line must be exclusive (3 for 3 lines)");
+        assert_eq!(
+            u.span.end_line, 3,
+            "streaming: end_line must be exclusive (3 for 3 lines)"
+        );
         // end_col = len("gamma") = 5
-        assert_eq!(u.span.end_col, 5, "streaming: end_col must be len of last line");
+        assert_eq!(
+            u.span.end_col, 5,
+            "streaming: end_col must be len of last line"
+        );
     }
 
     // ── floor_char_boundary ───────────────────────────────────────────────────

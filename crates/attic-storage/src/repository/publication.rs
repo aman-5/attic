@@ -14,7 +14,7 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 use crate::repository::file_occurrence::{
-    upsert_file_identity, insert_file_occurrence, NewFileOccurrence,
+    NewFileOccurrence, insert_file_occurrence, upsert_file_identity,
 };
 
 use attic_core::{FileIdentityId, RepositoryId};
@@ -89,13 +89,13 @@ mod tests {
     use crate::connection::configure_connection;
     use crate::migration::run_migrations;
     use crate::repository::file_occurrence::{
-        exists_file_identity, exists_file_occurrence, NewFileOccurrence,
+        NewFileOccurrence, exists_file_identity, exists_file_occurrence,
     };
     use crate::repository::repository::upsert_repository;
     use crate::repository::source_revision::insert_source_revision;
     use attic_core::{
-        DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
-        RepositoryId, SecurityState, SourceRevisionId, SourceType,
+        DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, RepositoryId,
+        SecurityState, SourceRevisionId, SourceType,
     };
     use rusqlite::Connection;
 
@@ -256,7 +256,7 @@ mod tests {
                 identity_repository_id: &repo_id,
                 identity_stable_id_basis: "blob:bbb",
                 occurrence: NewFileOccurrence {
-                    id: &shared_occ_id,  // duplicate — must trigger rollback
+                    id: &shared_occ_id, // duplicate — must trigger rollback
                     file_identity_id: &fid2,
                     source_revision_id: &rev_id,
                     index_generation_id: None,

@@ -7,25 +7,48 @@ pub const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 pub const SAFETY_WINDOW_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileSizeTier { Small, Large, VeryLarge }
+pub enum FileSizeTier {
+    Small,
+    Large,
+    VeryLarge,
+}
 
 pub fn classify_file_size(size_bytes: u64) -> FileSizeTier {
-    if size_bytes <= SMALL_FILE_THRESHOLD { FileSizeTier::Small }
-    else if size_bytes <= VERY_LARGE_FILE_THRESHOLD { FileSizeTier::Large }
-    else { FileSizeTier::VeryLarge }
+    if size_bytes <= SMALL_FILE_THRESHOLD {
+        FileSizeTier::Small
+    } else if size_bytes <= VERY_LARGE_FILE_THRESHOLD {
+        FileSizeTier::Large
+    } else {
+        FileSizeTier::VeryLarge
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanResult { pub redacted: String, pub findings: Vec<SecretFinding> }
+pub struct ScanResult {
+    pub redacted: String,
+    pub findings: Vec<SecretFinding>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretFinding { pub pattern_id: &'static str, pub offset: usize, pub length: usize }
+pub struct SecretFinding {
+    pub pattern_id: &'static str,
+    pub offset: usize,
+    pub length: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretScanDecision { Safe, Redacted, Excluded, PartialScan }
+pub enum SecretScanDecision {
+    Safe,
+    Redacted,
+    Excluded,
+    PartialScan,
+}
 
 #[derive(Debug, Clone)]
-pub struct StreamChunk { pub redacted: String, pub findings: Vec<SecretFinding> }
+pub struct StreamChunk {
+    pub redacted: String,
+    pub findings: Vec<SecretFinding>,
+}
 
 #[derive(Debug)]
 pub struct PreprocessResult {
@@ -43,7 +66,9 @@ pub struct PreprocessResult {
 /// can be as coarse as 1 second on some filesystems, making silent
 /// modification invisible to the identity check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileIdentity { pub(crate) content_hash: String }
+pub(crate) struct FileIdentity {
+    pub(crate) content_hash: String,
+}
 
 /// Compute the BLAKE3 content hash of a file.  Streams in `STREAM_CHUNK_SIZE`
 /// blocks to bound memory use.  Mirrors `hash_file_content` in `manifest.rs`.
@@ -53,16 +78,23 @@ fn file_identity(path: &Path) -> io::Result<FileIdentity> {
     let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
     loop {
         let n = read_exact_up_to(&mut file, &mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
-    Ok(FileIdentity { content_hash: hasher.finalize().to_hex().to_string() })
+    Ok(FileIdentity {
+        content_hash: hasher.finalize().to_hex().to_string(),
+    })
 }
 
 #[derive(Debug, Clone)]
 enum PemStreamState {
     Idle,
-    Draining { begin_file_offset: usize, tail: Vec<u8> },
+    Draining {
+        begin_file_offset: usize,
+        tail: Vec<u8>,
+    },
 }
 
 const PEM_BEGIN: &str = "-----BEGIN";
@@ -71,18 +103,29 @@ const PEM_END: &str = "-----END";
 const PEM_PLACEHOLDER: &str = "[REDACTED:PRIVATE-KEY]";
 
 pub fn scan_and_redact(text: &str) -> ScanResult {
-    struct PM<'d> { start: usize, length: usize, detector: &'d Detector }
+    struct PM<'d> {
+        start: usize,
+        length: usize,
+        detector: &'d Detector,
+    }
     let mut pending: Vec<PM<'_>> = Vec::new();
     for d in DETECTORS {
         for m in d.find_all(text) {
-            pending.push(PM { start: m.start, length: m.length, detector: d });
+            pending.push(PM {
+                start: m.start,
+                length: m.length,
+                detector: d,
+            });
         }
     }
     pending.sort_by(|a, b| a.start.cmp(&b.start).then(b.length.cmp(&a.length)));
     let mut non_overlapping: Vec<PM<'_>> = Vec::new();
     let mut next_free = 0usize;
     for pm in pending {
-        if pm.start >= next_free { next_free = pm.start + pm.length; non_overlapping.push(pm); }
+        if pm.start >= next_free {
+            next_free = pm.start + pm.length;
+            non_overlapping.push(pm);
+        }
     }
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut redacted = text.to_string();
@@ -94,29 +137,54 @@ pub fn scan_and_redact(text: &str) -> ScanResult {
             RedactMode::Full => pm.detector.placeholder.to_string(),
             RedactMode::Partial => partial_redact(&redacted[as_..ae]),
         };
-        let old = pm.length; let new_ = repl.len();
+        let old = pm.length;
+        let new_ = repl.len();
         redacted.replace_range(as_..ae, &repl);
         delta += new_ as isize - old as isize;
-        findings.push(SecretFinding { pattern_id: pm.detector.id, offset: pm.start, length: pm.length });
+        findings.push(SecretFinding {
+            pattern_id: pm.detector.id,
+            offset: pm.start,
+            length: pm.length,
+        });
     }
     ScanResult { redacted, findings }
 }
 
 pub fn preprocess(content: &str, repo_relative: &str) -> PreprocessResult {
     if is_known_secrets_file(repo_relative) {
-        return PreprocessResult { decision: SecretScanDecision::Excluded, content: None, stream: None, findings: Vec::new() };
+        return PreprocessResult {
+            decision: SecretScanDecision::Excluded,
+            content: None,
+            stream: None,
+            findings: Vec::new(),
+        };
     }
     let result = scan_and_redact(content);
     if result.findings.is_empty() {
-        PreprocessResult { decision: SecretScanDecision::Safe, content: Some(result.redacted), stream: None, findings: Vec::new() }
+        PreprocessResult {
+            decision: SecretScanDecision::Safe,
+            content: Some(result.redacted),
+            stream: None,
+            findings: Vec::new(),
+        }
     } else {
-        PreprocessResult { decision: SecretScanDecision::Redacted, content: Some(result.redacted), stream: None, findings: result.findings }
+        PreprocessResult {
+            decision: SecretScanDecision::Redacted,
+            content: Some(result.redacted),
+            stream: None,
+            findings: result.findings,
+        }
     }
 }
 
 pub fn preprocess_large_file(path: &Path, repo_relative: &str) -> io::Result<PreprocessResult> {
     if is_known_secrets_file(repo_relative) {
-        return Ok(PreprocessResult { decision: SecretScanDecision::Excluded, content: None, stream: None, findings: Vec::new() });
+        return Ok(PreprocessResult {
+            decision: SecretScanDecision::Excluded,
+            content: None,
+            stream: None,
+            findings: Vec::new(),
+        });
     }
     // The classify pass computes the BLAKE3 hash alongside the secret scan in
     // a single streaming read.  The returned hash becomes the FileIdentity
@@ -124,9 +192,16 @@ pub fn preprocess_large_file(path: &Path, repo_relative: &str) -> io::Result<Pre
     // the bytes it reads match this hash, detecting any modification between
     // the classify pass and actual streaming.
     let (decision, all_findings, classify_hash) = stream_scan_large_file_classify(path)?;
-    let identity = FileIdentity { content_hash: classify_hash };
+    let identity = FileIdentity {
+        content_hash: classify_hash,
+    };
     let stream = LargeFileStream::open_with_identity(path, identity)?;
-    Ok(PreprocessResult { decision, content: None, stream: Some(stream), findings: all_findings })
+    Ok(PreprocessResult {
+        decision,
+        content: None,
+        stream: Some(stream),
+        findings: all_findings,
+    })
 }
 
 /// Scan a large file for secrets and compute its BLAKE3 content hash in a
@@ -135,7 +210,9 @@ pub fn preprocess_large_file(path: &Path, repo_relative: &str) -> io::Result<Pre
 /// Returns `(decision, findings, content_hash)`.  The `content_hash` is fed
 /// into [`FileIdentity`] so that the subsequent [`LargeFileStream`] can verify
 /// it is reading the same bytes without a third full file read.
-pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDecision, Vec<SecretFinding>, String)> {
+pub fn stream_scan_large_file_classify(
+    path: &Path,
+) -> io::Result<(SecretScanDecision, Vec<SecretFinding>, String)> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut all_findings: Vec<SecretFinding> = Vec::new();
@@ -148,10 +225,22 @@ pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDec
         let mut new_chunk = vec![0u8; STREAM_CHUNK_SIZE];
         let n = read_exact_up_to(&mut file, &mut new_chunk)?;
         if n == 0 {
-            if let PemStreamState::Draining { begin_file_offset, .. } = pem_state {
-                let len = file_offset_of_new_bytes.saturating_sub(begin_file_offset).max(1);
-                if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == begin_file_offset) {
-                    all_findings.push(SecretFinding { pattern_id: "PK-001", offset: begin_file_offset, length: len });
+            if let PemStreamState::Draining {
+                begin_file_offset, ..
+            } = pem_state
+            {
+                let len = file_offset_of_new_bytes
+                    .saturating_sub(begin_file_offset)
+                    .max(1);
+                if !all_findings
+                    .iter()
+                    .any(|f| f.pattern_id == "PK-001" && f.offset == begin_file_offset)
+                {
+                    all_findings.push(SecretFinding {
+                        pattern_id: "PK-001",
+                        offset: begin_file_offset,
+                        length: len,
+                    });
                 }
             }
             break;
@@ -162,54 +251,104 @@ pub fn stream_scan_large_file_classify(path: &Path) -> io::Result<(SecretScanDec
         window.extend_from_slice(&new_chunk[..n]);
         let window_str = String::from_utf8_lossy(&window).into_owned();
         let window_file_base = file_offset_of_new_bytes.saturating_sub(overlap_len);
-        pem_classify_window(&window_str, window_file_base, &mut pem_state, &mut all_findings);
+        pem_classify_window(
+            &window_str,
+            window_file_base,
+            &mut pem_state,
+            &mut all_findings,
+        );
         let scan = scan_and_redact(&window_str);
         for f in &scan.findings {
-            if f.pattern_id == "PK-001" { continue; }
+            if f.pattern_id == "PK-001" {
+                continue;
+            }
             let abs = window_file_base + f.offset;
             let in_new = abs >= file_offset_of_new_bytes;
             let spans = f.offset < overlap_len && f.offset + f.length > overlap_len;
-            if (in_new || spans) && !all_findings.iter().any(|e| e.pattern_id == f.pattern_id && e.offset == abs) {
-                all_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: abs, length: f.length });
+            if (in_new || spans)
+                && !all_findings
+                    .iter()
+                    .any(|e| e.pattern_id == f.pattern_id && e.offset == abs)
+            {
+                all_findings.push(SecretFinding {
+                    pattern_id: f.pattern_id,
+                    offset: abs,
+                    length: f.length,
+                });
             }
         }
         file_offset_of_new_bytes += n;
         let new_slice = &new_chunk[..n];
-        overlap_buf = if n > SAFETY_WINDOW_SIZE { new_slice[n - SAFETY_WINDOW_SIZE..].to_vec() } else { new_slice.to_vec() };
+        overlap_buf = if n > SAFETY_WINDOW_SIZE {
+            new_slice[n - SAFETY_WINDOW_SIZE..].to_vec()
+        } else {
+            new_slice.to_vec()
+        };
         if n < STREAM_CHUNK_SIZE {
-            if let PemStreamState::Draining { begin_file_offset, .. } = &pem_state {
+            if let PemStreamState::Draining {
+                begin_file_offset, ..
+            } = &pem_state
+            {
                 let ps = *begin_file_offset;
                 let pl = file_offset_of_new_bytes.saturating_sub(ps).max(1);
-                if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == ps) {
-                    all_findings.push(SecretFinding { pattern_id: "PK-001", offset: ps, length: pl });
+                if !all_findings
+                    .iter()
+                    .any(|f| f.pattern_id == "PK-001" && f.offset == ps)
+                {
+                    all_findings.push(SecretFinding {
+                        pattern_id: "PK-001",
+                        offset: ps,
+                        length: pl,
+                    });
                 }
             }
             break;
         }
     }
-    let decision = if all_findings.is_empty() { SecretScanDecision::Safe } else { SecretScanDecision::Redacted };
+    let decision = if all_findings.is_empty() {
+        SecretScanDecision::Safe
+    } else {
+        SecretScanDecision::Redacted
+    };
     let content_hash = hasher.finalize().to_hex().to_string();
     Ok((decision, all_findings, content_hash))
 }
 
-fn pem_classify_window(window_str: &str, window_file_base: usize, pem_state: &mut PemStreamState, all_findings: &mut Vec<SecretFinding>) {
+fn pem_classify_window(
+    window_str: &str,
+    window_file_base: usize,
+    pem_state: &mut PemStreamState,
+    all_findings: &mut Vec<SecretFinding>,
+) {
     let mut from = 0usize;
     loop {
         match pem_state {
             PemStreamState::Idle => match find_pem_begin_private_key(window_str, from) {
                 None => break,
                 Some(begin_pos) => {
-                    *pem_state = PemStreamState::Draining { begin_file_offset: window_file_base + begin_pos, tail: Vec::new() };
+                    *pem_state = PemStreamState::Draining {
+                        begin_file_offset: window_file_base + begin_pos,
+                        tail: Vec::new(),
+                    };
                     from = begin_pos + PEM_BEGIN.len();
                 }
             },
-            PemStreamState::Draining { begin_file_offset, .. } => match find_pem_end(window_str, from) {
+            PemStreamState::Draining {
+                begin_file_offset, ..
+            } => match find_pem_end(window_str, from) {
                 None => break,
                 Some(end_pos) => {
                     let ps = *begin_file_offset;
                     let pl = (window_file_base + end_pos).saturating_sub(ps).max(1);
-                    if !all_findings.iter().any(|f| f.pattern_id == "PK-001" && f.offset == ps) {
-                        all_findings.push(SecretFinding { pattern_id: "PK-001", offset: ps, length: pl });
+                    if !all_findings
+                        .iter()
+                        .any(|f| f.pattern_id == "PK-001" && f.offset == ps)
+                    {
+                        all_findings.push(SecretFinding {
+                            pattern_id: "PK-001",
+                            offset: ps,
+                            length: pl,
+                        });
                     }
                     *pem_state = PemStreamState::Idle;
                     from = end_pos;
@@ -238,7 +377,9 @@ pub struct LargeFileStream {
 
 impl std::fmt::Debug for LargeFileStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LargeFileStream").field("done", &self.done).finish()
+        f.debug_struct("LargeFileStream")
+            .field("done", &self.done)
+            .finish()
     }
 }
 
@@ -268,7 +409,9 @@ impl LargeFileStream {
     /// An error is returned if the hashes differ, indicating that the file was
     /// modified between the classify pass and the streaming pass.
     fn verify_hash_at_eof(&mut self) -> io::Result<()> {
-        if self.hash_verified { return Ok(()); }
+        if self.hash_verified {
+            return Ok(());
+        }
         self.hash_verified = true;
         let actual = self.hasher.finalize().to_hex().to_string();
         if actual != self.identity.content_hash {
@@ -281,7 +424,9 @@ impl LargeFileStream {
     }
 
     #[cfg(test)]
-    pub fn withheld_len(&self) -> usize { self.withheld.len() }
+    pub fn withheld_len(&self) -> usize {
+        self.withheld.len()
+    }
 
     pub fn next_chunk(&mut self) -> Option<io::Result<StreamChunk>> {
         if self.done && self.withheld.is_empty() {
@@ -289,17 +434,24 @@ impl LargeFileStream {
                 return Some(self.flush_pem_eof());
             }
             // Fully drained: perform final hash integrity check.
-            if !self.hash_verified && let Err(e) = self.verify_hash_at_eof() {
+            if !self.hash_verified
+                && let Err(e) = self.verify_hash_at_eof()
+            {
                 return Some(Err(e));
             }
             return None;
         }
-        if self.done { return Some(self.flush_withheld()); }
+        if self.done {
+            return Some(self.flush_withheld());
+        }
 
         let mut new_buf = vec![0u8; STREAM_CHUNK_SIZE];
         let n = match read_exact_up_to(&mut self.file, &mut new_buf) {
             Ok(n) => n,
-            Err(e) => { self.done = true; return Some(Err(e)); }
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
         };
         if n == 0 {
             self.done = true;
@@ -309,7 +461,11 @@ impl LargeFileStream {
             if matches!(&self.pem_state, PemStreamState::Draining { .. }) {
                 return Some(self.flush_pem_eof());
             }
-            return if self.withheld.is_empty() { None } else { Some(self.flush_withheld()) };
+            return if self.withheld.is_empty() {
+                None
+            } else {
+                Some(self.flush_withheld())
+            };
         }
         // Feed raw bytes into the running content hasher.
         self.hasher.update(&new_buf[..n]);
@@ -325,14 +481,19 @@ impl LargeFileStream {
         let new_bytes = new_buf[..n].to_vec();
 
         match self.pem_state.clone() {
-            PemStreamState::Draining { begin_file_offset, tail } => {
-                self.process_draining_chunk(&new_bytes, is_eof, begin_file_offset, tail)
-            }
+            PemStreamState::Draining {
+                begin_file_offset,
+                tail,
+            } => self.process_draining_chunk(&new_bytes, is_eof, begin_file_offset, tail),
             PemStreamState::Idle => self.process_idle_chunk(&new_bytes, is_eof),
         }
     }
 
-    fn process_idle_chunk(&mut self, new_bytes: &[u8], is_eof: bool) -> Option<io::Result<StreamChunk>> {
+    fn process_idle_chunk(
+        &mut self,
+        new_bytes: &[u8],
+        is_eof: bool,
+    ) -> Option<io::Result<StreamChunk>> {
         let window_file_base = self.withheld_file_offset;
         let mut window = self.withheld.clone();
         window.extend_from_slice(new_bytes);
@@ -342,57 +503,100 @@ impl LargeFileStream {
             return Some(self.handle_pem_begin_in_window(window, window_file_base, bp, is_eof));
         }
 
-        let safe_emit_len = if is_eof { window.len() }
-            else if window.len() > SAFETY_WINDOW_SIZE { window.len() - SAFETY_WINDOW_SIZE }
-            else { 0 };
+        let safe_emit_len = if is_eof {
+            window.len()
+        } else if window.len() > SAFETY_WINDOW_SIZE {
+            window.len() - SAFETY_WINDOW_SIZE
+        } else {
+            0
+        };
 
         let scan = scan_and_redact(&window_str);
         let mut chunk_findings: Vec<SecretFinding> = Vec::new();
         for f in &scan.findings {
-            if f.pattern_id == "PK-001" { continue; }
+            if f.pattern_id == "PK-001" {
+                continue;
+            }
             if f.offset < safe_emit_len {
-                chunk_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: window_file_base + f.offset, length: f.length });
+                chunk_findings.push(SecretFinding {
+                    pattern_id: f.pattern_id,
+                    offset: window_file_base + f.offset,
+                    length: f.length,
+                });
             }
         }
         let redacted_emit_end = compute_redacted_offset(&scan.findings, &window_str, safe_emit_len);
         let emitted_redacted = scan.redacted[..redacted_emit_end].to_string();
         self.withheld = window[safe_emit_len..].to_vec();
         self.withheld_file_offset = window_file_base + safe_emit_len;
-        if emitted_redacted.is_empty() && chunk_findings.is_empty() { return None; }
-        Some(Ok(StreamChunk { redacted: emitted_redacted, findings: chunk_findings }))
+        if emitted_redacted.is_empty() && chunk_findings.is_empty() {
+            return None;
+        }
+        Some(Ok(StreamChunk {
+            redacted: emitted_redacted,
+            findings: chunk_findings,
+        }))
     }
 
-    fn handle_pem_begin_in_window(&mut self, window: Vec<u8>, window_file_base: usize, bp: usize, is_eof: bool) -> io::Result<StreamChunk> {
+    fn handle_pem_begin_in_window(
+        &mut self,
+        window: Vec<u8>,
+        window_file_base: usize,
+        bp: usize,
+        is_eof: bool,
+    ) -> io::Result<StreamChunk> {
         let pre_pem_str = String::from_utf8_lossy(&window[..bp]).into_owned();
         let pre_scan = scan_and_redact(&pre_pem_str);
         let mut chunk_findings: Vec<SecretFinding> = Vec::new();
         for f in &pre_scan.findings {
             if f.pattern_id != "PK-001" {
-                chunk_findings.push(SecretFinding { pattern_id: f.pattern_id, offset: window_file_base + f.offset, length: f.length });
+                chunk_findings.push(SecretFinding {
+                    pattern_id: f.pattern_id,
+                    offset: window_file_base + f.offset,
+                    length: f.length,
+                });
             }
         }
         let mut redacted_output = pre_scan.redacted;
         redacted_output.push_str(PEM_PLACEHOLDER);
         let begin_file_offset = window_file_base + bp;
         let body_start = find_line_end(&window, bp + PEM_BEGIN.len());
-        self.pem_state = PemStreamState::Draining { begin_file_offset, tail: Vec::new() };
+        self.pem_state = PemStreamState::Draining {
+            begin_file_offset,
+            tail: Vec::new(),
+        };
         self.withheld.clear();
         self.withheld_file_offset = 0;
         let body_bytes = window[body_start..].to_vec();
         if body_bytes.is_empty() {
-            return Ok(StreamChunk { redacted: redacted_output, findings: chunk_findings });
+            return Ok(StreamChunk {
+                redacted: redacted_output,
+                findings: chunk_findings,
+            });
         }
         match self.process_draining_chunk(&body_bytes, is_eof, begin_file_offset, Vec::new()) {
             Some(Ok(drain_chunk)) => {
                 chunk_findings.extend(drain_chunk.findings);
-                Ok(StreamChunk { redacted: redacted_output, findings: chunk_findings })
+                Ok(StreamChunk {
+                    redacted: redacted_output,
+                    findings: chunk_findings,
+                })
             }
             Some(Err(e)) => Err(e),
-            None => Ok(StreamChunk { redacted: redacted_output, findings: chunk_findings }),
+            None => Ok(StreamChunk {
+                redacted: redacted_output,
+                findings: chunk_findings,
+            }),
         }
     }
 
-    fn process_draining_chunk(&mut self, new_bytes: &[u8], is_eof: bool, begin_file_offset: usize, tail: Vec<u8>) -> Option<io::Result<StreamChunk>> {
+    fn process_draining_chunk(
+        &mut self,
+        new_bytes: &[u8],
+        is_eof: bool,
+        begin_file_offset: usize,
+        tail: Vec<u8>,
+    ) -> Option<io::Result<StreamChunk>> {
         let mut search_window = tail;
         let tail_len = search_window.len();
         search_window.extend_from_slice(new_bytes);
@@ -403,57 +607,118 @@ impl LargeFileStream {
             let remainder_start_in_new = end_line_finish.saturating_sub(tail_len);
             let after_end_bytes = new_bytes[remainder_start_in_new.min(new_bytes.len())..].to_vec();
             let bytes_before_end_in_new = end_pos.saturating_sub(tail_len);
-            let finding_end_file_offset = self.file_bytes_consumed.saturating_sub(new_bytes.len()).saturating_add(bytes_before_end_in_new);
-            let finding_length = finding_end_file_offset.saturating_sub(begin_file_offset).max(1);
-            let finding = SecretFinding { pattern_id: "PK-001", offset: begin_file_offset, length: finding_length };
+            let finding_end_file_offset = self
+                .file_bytes_consumed
+                .saturating_sub(new_bytes.len())
+                .saturating_add(bytes_before_end_in_new);
+            let finding_length = finding_end_file_offset
+                .saturating_sub(begin_file_offset)
+                .max(1);
+            let finding = SecretFinding {
+                pattern_id: "PK-001",
+                offset: begin_file_offset,
+                length: finding_length,
+            };
             self.pem_state = PemStreamState::Idle;
             self.withheld.clear();
             self.withheld_file_offset = finding_end_file_offset;
             if after_end_bytes.is_empty() {
-                return Some(Ok(StreamChunk { redacted: String::new(), findings: vec![finding] }));
+                return Some(Ok(StreamChunk {
+                    redacted: String::new(),
+                    findings: vec![finding],
+                }));
             }
             match self.process_idle_chunk(&after_end_bytes, is_eof) {
-                Some(Ok(mut idle_chunk)) => { idle_chunk.findings.insert(0, finding); Some(Ok(idle_chunk)) }
+                Some(Ok(mut idle_chunk)) => {
+                    idle_chunk.findings.insert(0, finding);
+                    Some(Ok(idle_chunk))
+                }
                 Some(Err(e)) => Some(Err(e)),
-                None => Some(Ok(StreamChunk { redacted: String::new(), findings: vec![finding] })),
+                None => Some(Ok(StreamChunk {
+                    redacted: String::new(),
+                    findings: vec![finding],
+                })),
             }
         } else if is_eof {
-            let finding_length = self.file_bytes_consumed.saturating_sub(begin_file_offset).max(1);
-            let finding = SecretFinding { pattern_id: "PK-001", offset: begin_file_offset, length: finding_length };
+            let finding_length = self
+                .file_bytes_consumed
+                .saturating_sub(begin_file_offset)
+                .max(1);
+            let finding = SecretFinding {
+                pattern_id: "PK-001",
+                offset: begin_file_offset,
+                length: finding_length,
+            };
             self.pem_state = PemStreamState::Idle;
-            Some(Ok(StreamChunk { redacted: String::new(), findings: vec![finding] }))
+            Some(Ok(StreamChunk {
+                redacted: String::new(),
+                findings: vec![finding],
+            }))
         } else {
             let new_tail = if search_window.len() > SAFETY_WINDOW_SIZE {
                 search_window[search_window.len() - SAFETY_WINDOW_SIZE..].to_vec()
-            } else { search_window };
-            self.pem_state = PemStreamState::Draining { begin_file_offset, tail: new_tail };
-            Some(Ok(StreamChunk { redacted: String::new(), findings: Vec::new() }))
+            } else {
+                search_window
+            };
+            self.pem_state = PemStreamState::Draining {
+                begin_file_offset,
+                tail: new_tail,
+            };
+            Some(Ok(StreamChunk {
+                redacted: String::new(),
+                findings: Vec::new(),
+            }))
         }
     }
 
     fn flush_pem_eof(&mut self) -> io::Result<StreamChunk> {
-        if let PemStreamState::Draining { begin_file_offset, .. } = &self.pem_state {
+        if let PemStreamState::Draining {
+            begin_file_offset, ..
+        } = &self.pem_state
+        {
             let bfo = *begin_file_offset;
             let len = self.file_bytes_consumed.saturating_sub(bfo).max(1);
             self.pem_state = PemStreamState::Idle;
-            return Ok(StreamChunk { redacted: String::new(), findings: vec![SecretFinding { pattern_id: "PK-001", offset: bfo, length: len }] });
+            return Ok(StreamChunk {
+                redacted: String::new(),
+                findings: vec![SecretFinding {
+                    pattern_id: "PK-001",
+                    offset: bfo,
+                    length: len,
+                }],
+            });
         }
-        Ok(StreamChunk { redacted: String::new(), findings: Vec::new() })
+        Ok(StreamChunk {
+            redacted: String::new(),
+            findings: Vec::new(),
+        })
     }
 
     fn flush_withheld(&mut self) -> io::Result<StreamChunk> {
         let window = std::mem::take(&mut self.withheld);
-        if window.is_empty() { return Ok(StreamChunk { redacted: String::new(), findings: Vec::new() }); }
+        if window.is_empty() {
+            return Ok(StreamChunk {
+                redacted: String::new(),
+                findings: Vec::new(),
+            });
+        }
         let window_file_base = self.withheld_file_offset;
         let window_str = String::from_utf8_lossy(&window).into_owned();
         let scan = scan_and_redact(&window_str);
         let mut findings: Vec<SecretFinding> = Vec::new();
         for f in &scan.findings {
             if f.pattern_id != "PK-001" {
-                findings.push(SecretFinding { pattern_id: f.pattern_id, offset: window_file_base + f.offset, length: f.length });
+                findings.push(SecretFinding {
+                    pattern_id: f.pattern_id,
+                    offset: window_file_base + f.offset,
+                    length: f.length,
+                });
             }
         }
-        Ok(StreamChunk { redacted: scan.redacted, findings })
+        Ok(StreamChunk {
+            redacted: scan.redacted,
+            findings,
+        })
     }
 }
 
@@ -473,7 +738,12 @@ fn read_exact_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usiz
     loop {
         match file.read(&mut buf[total..]) {
             Ok(0) => break,
-            Ok(n) => { total += n; if total == buf.len() { break; } }
+            Ok(n) => {
+                total += n;
+                if total == buf.len() {
+                    break;
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -515,10 +785,16 @@ fn find_line_end(buf: &[u8], from: usize) -> usize {
     }
 }
 
-fn compute_redacted_offset(findings: &[SecretFinding], original: &str, original_offset: usize) -> usize {
+fn compute_redacted_offset(
+    findings: &[SecretFinding],
+    original: &str,
+    original_offset: usize,
+) -> usize {
     let mut delta: isize = 0;
     for f in findings {
-        if f.offset >= original_offset { break; }
+        if f.offset >= original_offset {
+            break;
+        }
         let end = f.offset + f.length;
         let detector = DETECTORS.iter().find(|d| d.id == f.pattern_id);
         let repl_len = if let Some(d) = detector {
@@ -529,7 +805,9 @@ fn compute_redacted_offset(findings: &[SecretFinding], original: &str, original_
                     partial_redact(&original[f.offset..end_clamped]).len()
                 }
             }
-        } else { f.length };
+        } else {
+            f.length
+        };
         if end <= original_offset {
             delta += repl_len as isize - f.length as isize;
         } else {
@@ -542,7 +820,9 @@ fn compute_redacted_offset(findings: &[SecretFinding], original: &str, original_
 fn partial_redact(token: &str) -> String {
     let chars: Vec<char> = token.chars().collect();
     let n = chars.len();
-    if n <= 8 { return "*".repeat(n); }
+    if n <= 8 {
+        return "*".repeat(n);
+    }
     let keep = (n / 4).min(4);
     let prefix: String = chars[..keep].iter().collect();
     let suffix: String = chars[n - keep..].iter().collect();
@@ -551,9 +831,21 @@ fn partial_redact(token: &str) -> String {
 
 pub(crate) fn is_known_secrets_file(repo_relative: &str) -> bool {
     let lower = repo_relative.to_lowercase();
-    let known = [".env", ".pem", ".key", ".p12", ".pfx", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+    let known = [
+        ".env",
+        ".pem",
+        ".key",
+        ".p12",
+        ".pfx",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    ];
     for k in &known {
-        if lower.ends_with(k) || lower.contains(&format!("/{}", k)) || lower == *k { return true; }
+        if lower.ends_with(k) || lower.contains(&format!("/{}", k)) || lower == *k {
+            return true;
+        }
     }
     false
 }
@@ -562,10 +854,16 @@ pub(crate) fn is_known_secrets_file(repo_relative: &str) -> bool {
 // Pattern engine
 // ---------------------------------------------------------------------------
 
-struct Match { start: usize, length: usize }
+struct Match {
+    start: usize,
+    length: usize,
+}
 
 #[derive(Clone, Copy)]
-enum RedactMode { Full, Partial }
+enum RedactMode {
+    Full,
+    Partial,
+}
 
 struct Detector {
     id: &'static str,
@@ -581,11 +879,36 @@ impl Detector {
 }
 
 static DETECTORS: &[Detector] = &[
-    Detector { id: "PK-001", placeholder: PEM_PLACEHOLDER, redact_mode: RedactMode::Full, find_all: find_pem_private_key_matches },
-    Detector { id: "AWS-001", placeholder: "[REDACTED:AWS-KEY]", redact_mode: RedactMode::Partial, find_all: find_aws_key_matches },
-    Detector { id: "GH-001",  placeholder: "[REDACTED:GH-TOKEN]", redact_mode: RedactMode::Partial, find_all: find_gh_token_matches },
-    Detector { id: "JWT-001", placeholder: "[REDACTED:JWT]", redact_mode: RedactMode::Partial, find_all: find_jwt_matches },
-    Detector { id: "HE-001",  placeholder: "[REDACTED:HE]", redact_mode: RedactMode::Partial, find_all: find_high_entropy_matches },
+    Detector {
+        id: "PK-001",
+        placeholder: PEM_PLACEHOLDER,
+        redact_mode: RedactMode::Full,
+        find_all: find_pem_private_key_matches,
+    },
+    Detector {
+        id: "AWS-001",
+        placeholder: "[REDACTED:AWS-KEY]",
+        redact_mode: RedactMode::Partial,
+        find_all: find_aws_key_matches,
+    },
+    Detector {
+        id: "GH-001",
+        placeholder: "[REDACTED:GH-TOKEN]",
+        redact_mode: RedactMode::Partial,
+        find_all: find_gh_token_matches,
+    },
+    Detector {
+        id: "JWT-001",
+        placeholder: "[REDACTED:JWT]",
+        redact_mode: RedactMode::Partial,
+        find_all: find_jwt_matches,
+    },
+    Detector {
+        id: "HE-001",
+        placeholder: "[REDACTED:HE]",
+        redact_mode: RedactMode::Partial,
+        find_all: find_high_entropy_matches,
+    },
 ];
 
 fn find_pem_private_key_matches(text: &str) -> Vec<Match> {
@@ -593,10 +916,19 @@ fn find_pem_private_key_matches(text: &str) -> Vec<Match> {
     let mut from = 0;
     while let Some(begin_pos) = find_pem_begin_private_key(text, from) {
         match find_pem_end(text, begin_pos + PEM_BEGIN.len()) {
-            None => { out.push(Match { start: begin_pos, length: text.len() - begin_pos }); break; }
+            None => {
+                out.push(Match {
+                    start: begin_pos,
+                    length: text.len() - begin_pos,
+                });
+                break;
+            }
             Some(end_pos) => {
                 let end_of_line = find_str_line_end_pos(text, end_pos);
-                out.push(Match { start: begin_pos, length: end_of_line - begin_pos });
+                out.push(Match {
+                    start: begin_pos,
+                    length: end_of_line - begin_pos,
+                });
                 from = end_of_line;
             }
         }
@@ -613,19 +945,35 @@ fn find_aws_key_matches(text: &str) -> Vec<Match> {
         for prefix in &prefixes {
             if let Some(pos) = text[from..].find(prefix) {
                 let abs = from + pos;
-                best = Some(match best { Some(b) => b.min(abs), None => abs });
+                best = Some(match best {
+                    Some(b) => b.min(abs),
+                    None => abs,
+                });
             }
         }
-        let pos = match best { Some(p) => p, None => break };
+        let pos = match best {
+            Some(p) => p,
+            None => break,
+        };
         let candidate = &text[pos..];
         let key_len = 20;
         if candidate.len() >= key_len {
             let key = &candidate[..key_len];
-            if key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+            if key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            {
                 let not_continued = candidate.len() == key_len
-                    || !candidate.chars().nth(key_len).map(|c| c.is_ascii_alphanumeric()).unwrap_or(false);
+                    || !candidate
+                        .chars()
+                        .nth(key_len)
+                        .map(|c| c.is_ascii_alphanumeric())
+                        .unwrap_or(false);
                 if not_continued {
-                    out.push(Match { start: pos, length: key_len });
+                    out.push(Match {
+                        start: pos,
+                        length: key_len,
+                    });
                     from = pos + key_len;
                     continue;
                 }
@@ -645,17 +993,29 @@ fn find_gh_token_matches(text: &str) -> Vec<Match> {
         for prefix in &prefixes {
             if let Some(pos) = text[from..].find(prefix) {
                 let abs = from + pos;
-                best = Some(match best { Some(b) => b.min(abs), None => abs });
+                best = Some(match best {
+                    Some(b) => b.min(abs),
+                    None => abs,
+                });
             }
         }
-        let pos = match best { Some(p) => p, None => break };
+        let pos = match best {
+            Some(p) => p,
+            None => break,
+        };
         let candidate = &text[pos..];
         let suffix_len = 36;
         let total_len = 4 + suffix_len;
         if candidate.len() >= total_len {
             let suffix = &candidate[4..total_len];
-            if suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                out.push(Match { start: pos, length: total_len });
+            if suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.push(Match {
+                    start: pos,
+                    length: total_len,
+                });
                 from = pos + total_len;
                 continue;
             }
@@ -672,7 +1032,9 @@ fn find_jwt_matches(text: &str) -> Vec<Match> {
         let start = from + rel;
         let rest = &text[start..];
         let is_b64url = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=';
-        let end = rest.find(|c: char| !is_b64url(c) && c != '.').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !is_b64url(c) && c != '.')
+            .unwrap_or(rest.len());
         let candidate = &rest[..end];
         let parts: Vec<&str> = candidate.splitn(4, '.').collect();
         if parts.len() >= 3 && parts[0].len() >= 4 && parts[1].len() >= 4 && parts[2].len() >= 4 {
@@ -693,10 +1055,15 @@ fn find_high_entropy_matches(text: &str) -> Vec<Match> {
     while i < bytes.len() {
         if is_b64(bytes[i] as char) {
             let start = i;
-            while i < bytes.len() && is_b64(bytes[i] as char) { i += 1; }
+            while i < bytes.len() && is_b64(bytes[i] as char) {
+                i += 1;
+            }
             let token = &text[start..i];
             if token.len() >= 20 && shannon_entropy(token) > 4.5 {
-                out.push(Match { start, length: token.len() });
+                out.push(Match {
+                    start,
+                    length: token.len(),
+                });
             }
         } else {
             i += 1;
@@ -707,12 +1074,17 @@ fn find_high_entropy_matches(text: &str) -> Vec<Match> {
 
 fn shannon_entropy(s: &str) -> f64 {
     let mut freq = [0u32; 256];
-    for b in s.bytes() { freq[b as usize] += 1; }
+    for b in s.bytes() {
+        freq[b as usize] += 1;
+    }
     let len = s.len() as f64;
-    freq.iter().filter(|&&c| c > 0).map(|&c| {
-        let p = c as f64 / len;
-        -p * p.log2()
-    }).sum()
+    freq.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +1117,8 @@ mod tests {
 
     #[test]
     fn scan_pem_private_key_redacted() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
         let r = scan_and_redact(pem);
         assert!(r.redacted.contains(PEM_PLACEHOLDER));
         assert!(!r.redacted.contains("MIIEowIBAAKCAQEA"));
@@ -787,7 +1160,10 @@ mod tests {
     fn scan_redacted_text_does_not_contain_raw_token() {
         let text = "token: ghp_abcdefghijklmnopqrstuvwxyz1234567890ab end";
         let r = scan_and_redact(text);
-        assert!(!r.redacted.contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab"));
+        assert!(
+            !r.redacted
+                .contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab")
+        );
     }
 
     #[test]
@@ -798,8 +1174,12 @@ mod tests {
         let mut sorted = r.findings.clone();
         sorted.sort_by_key(|f| f.offset);
         for i in 1..sorted.len() {
-            assert!(sorted[i].offset >= sorted[i - 1].offset + sorted[i - 1].length,
-                "findings overlap at indices {}/{}", i - 1, i);
+            assert!(
+                sorted[i].offset >= sorted[i - 1].offset + sorted[i - 1].length,
+                "findings overlap at indices {}/{}",
+                i - 1,
+                i
+            );
         }
     }
 
@@ -809,8 +1189,11 @@ mod tests {
         let r = scan_and_redact(text);
         for f in &r.findings {
             let raw_slice = &text[f.offset..f.offset + f.length];
-            assert!(!r.redacted.contains(raw_slice),
-                "raw secret value '{}' found verbatim in redacted output", raw_slice);
+            assert!(
+                !r.redacted.contains(raw_slice),
+                "raw secret value '{}' found verbatim in redacted output",
+                raw_slice
+            );
         }
     }
 
@@ -842,7 +1225,10 @@ mod tests {
 
     #[test]
     fn preprocess_pem_file_extension_excluded() {
-        let r = preprocess("-----BEGIN RSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\n", "cert.pem");
+        let r = preprocess(
+            "-----BEGIN RSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\n",
+            "cert.pem",
+        );
         assert_eq!(r.decision, SecretScanDecision::Excluded);
     }
 
@@ -869,18 +1255,30 @@ mod tests {
     #[test]
     fn file_size_tier_small() {
         assert_eq!(classify_file_size(0), FileSizeTier::Small);
-        assert_eq!(classify_file_size(SMALL_FILE_THRESHOLD), FileSizeTier::Small);
+        assert_eq!(
+            classify_file_size(SMALL_FILE_THRESHOLD),
+            FileSizeTier::Small
+        );
     }
 
     #[test]
     fn file_size_tier_large() {
-        assert_eq!(classify_file_size(SMALL_FILE_THRESHOLD + 1), FileSizeTier::Large);
-        assert_eq!(classify_file_size(VERY_LARGE_FILE_THRESHOLD), FileSizeTier::Large);
+        assert_eq!(
+            classify_file_size(SMALL_FILE_THRESHOLD + 1),
+            FileSizeTier::Large
+        );
+        assert_eq!(
+            classify_file_size(VERY_LARGE_FILE_THRESHOLD),
+            FileSizeTier::Large
+        );
     }
 
     #[test]
     fn file_size_tier_very_large() {
-        assert_eq!(classify_file_size(VERY_LARGE_FILE_THRESHOLD + 1), FileSizeTier::VeryLarge);
+        assert_eq!(
+            classify_file_size(VERY_LARGE_FILE_THRESHOLD + 1),
+            FileSizeTier::VeryLarge
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -901,12 +1299,16 @@ mod tests {
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         let result = collect_all(&mut stream).unwrap();
         assert!(result.findings.is_empty());
-        assert_eq!(result.redacted.trim_end_matches('\0'), "hello world no secrets here");
+        assert_eq!(
+            result.redacted.trim_end_matches('\0'),
+            "hello world no secrets here"
+        );
     }
 
     #[test]
     fn large_file_stream_pem_single_chunk() {
-        let pem = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
+        let pem =
+            b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
         let f = tmp_file(pem);
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         let result = collect_all(&mut stream).unwrap();
@@ -945,10 +1347,14 @@ mod tests {
         let f = tmp_file(&data);
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         let result = collect_all(&mut stream).unwrap();
-        assert!(result.findings.iter().any(|f| f.pattern_id == "PK-001"),
-            "PEM spanning chunks must be detected");
-        assert!(!result.redacted.contains("AAAA"),
-            "PEM body must not appear in redacted output");
+        assert!(
+            result.findings.iter().any(|f| f.pattern_id == "PK-001"),
+            "PEM spanning chunks must be detected"
+        );
+        assert!(
+            !result.redacted.contains("AAAA"),
+            "PEM body must not appear in redacted output"
+        );
     }
 
     #[test]
@@ -964,9 +1370,12 @@ mod tests {
         let f = tmp_file(&data);
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         loop {
-            assert!(stream.withheld_len() <= SAFETY_WINDOW_SIZE,
+            assert!(
+                stream.withheld_len() <= SAFETY_WINDOW_SIZE,
                 "withheld buffer exceeded SAFETY_WINDOW_SIZE: {} > {}",
-                stream.withheld_len(), SAFETY_WINDOW_SIZE);
+                stream.withheld_len(),
+                SAFETY_WINDOW_SIZE
+            );
             match stream.next_chunk() {
                 None => break,
                 Some(Ok(_)) => {}
@@ -988,7 +1397,8 @@ mod tests {
     #[test]
     fn large_file_modification_between_classify_and_open_detected() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"original content for blake3 identity test").unwrap();
+        f.write_all(b"original content for blake3 identity test")
+            .unwrap();
         f.flush().unwrap();
 
         // Capture identity of the original file.
@@ -996,8 +1406,13 @@ mod tests {
 
         // Overwrite with different content — BLAKE3 hash will differ.
         {
-            let mut fh = std::fs::OpenOptions::new().write(true).truncate(true).open(f.path()).unwrap();
-            fh.write_all(b"completely different modified content xyz").unwrap();
+            let mut fh = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(f.path())
+                .unwrap();
+            fh.write_all(b"completely different modified content xyz")
+                .unwrap();
             fh.flush().unwrap();
         }
 
@@ -1010,7 +1425,8 @@ mod tests {
                     let msg = e.to_string();
                     assert!(
                         msg.contains("source identity changed") || msg.contains("unstable capture"),
-                        "unexpected error message: {}", msg
+                        "unexpected error message: {}",
+                        msg
                     );
                     got_error = true;
                     break;
@@ -1019,9 +1435,11 @@ mod tests {
                 None => break,
             }
         }
-        assert!(got_error,
+        assert!(
+            got_error,
             "streaming a file with a stale BLAKE3 identity MUST return an error; \
-             no fallback is acceptable — the content hashes are different");
+             no fallback is acceptable — the content hashes are different"
+        );
     }
 
     /// Modifying a file between the first and second next_chunk calls MUST
@@ -1048,8 +1466,13 @@ mod tests {
         // The running BLAKE3 hasher will accumulate bytes from the new content,
         // producing a final hash that differs from the classify-pass hash.
         {
-            let mut fh = std::fs::OpenOptions::new().write(true).truncate(true).open(f.path()).unwrap();
-            fh.write_all(b"completely different shorter content").unwrap();
+            let mut fh = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(f.path())
+                .unwrap();
+            fh.write_all(b"completely different shorter content")
+                .unwrap();
             fh.flush().unwrap();
         }
 
@@ -1061,7 +1484,8 @@ mod tests {
                     let msg = e.to_string();
                     assert!(
                         msg.contains("source identity changed") || msg.contains("unstable capture"),
-                        "unexpected error: {}", msg
+                        "unexpected error: {}",
+                        msg
                     );
                     got_error = true;
                     break;
@@ -1070,9 +1494,11 @@ mod tests {
                 None => break,
             }
         }
-        assert!(got_error,
+        assert!(
+            got_error,
             "modifying a file during streaming MUST produce an error by EOF; \
-             BLAKE3 identity is not subject to mtime-resolution races");
+             BLAKE3 identity is not subject to mtime-resolution races"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1094,17 +1520,25 @@ mod tests {
         let f2 = tmp_file(b"content B");
         let id1 = file_identity(f1.path()).unwrap();
         let id2 = file_identity(f2.path()).unwrap();
-        assert_ne!(id1, id2, "different content must produce different FileIdentity");
+        assert_ne!(
+            id1, id2,
+            "different content must produce different FileIdentity"
+        );
     }
 
     #[test]
     fn file_identity_hash_is_64_hex_chars() {
         let f = tmp_file(b"some file content");
         let id = file_identity(f.path()).unwrap();
-        assert_eq!(id.content_hash.len(), 64,
-            "BLAKE3 hex hash must be 64 characters");
-        assert!(id.content_hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "BLAKE3 hash must contain only hex digits");
+        assert_eq!(
+            id.content_hash.len(),
+            64,
+            "BLAKE3 hex hash must be 64 characters"
+        );
+        assert!(
+            id.content_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "BLAKE3 hash must contain only hex digits"
+        );
     }
 
     #[test]
@@ -1121,13 +1555,19 @@ mod tests {
     #[test]
     fn entropy_uniform_string_high() {
         let s = "aB3dE6gH9jKlMnOpQrStUvWxYz012345";
-        assert!(shannon_entropy(s) > 4.0, "entropy should be > 4.0 for varied string");
+        assert!(
+            shannon_entropy(s) > 4.0,
+            "entropy should be > 4.0 for varied string"
+        );
     }
 
     #[test]
     fn entropy_repeated_char_low() {
         let s = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        assert!(shannon_entropy(s) < 0.01, "entropy of repeated char should be near 0");
+        assert!(
+            shannon_entropy(s) < 0.01,
+            "entropy of repeated char should be near 0"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1162,7 +1602,8 @@ mod tests {
 
     #[test]
     fn classify_file_with_pem() {
-        let data = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
+        let data =
+            b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n";
         let f = tmp_file(data);
         let (decision, findings, hash) = stream_scan_large_file_classify(f.path()).unwrap();
         assert_eq!(decision, SecretScanDecision::Redacted);
@@ -1187,8 +1628,10 @@ mod tests {
         let f = tmp_file(data);
         let (_, _, classify_hash) = stream_scan_large_file_classify(f.path()).unwrap();
         let id = file_identity(f.path()).unwrap();
-        assert_eq!(classify_hash, id.content_hash,
-            "classify hash must equal file_identity hash for the same file");
+        assert_eq!(
+            classify_hash, id.content_hash,
+            "classify hash must equal file_identity hash for the same file"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1225,7 +1668,10 @@ mod tests {
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         let streamed = collect_all(&mut stream).unwrap();
         let direct = scan_and_redact(text);
-        assert_eq!(streamed.redacted.trim_end_matches('\0'), direct.redacted.trim_end_matches('\0'));
+        assert_eq!(
+            streamed.redacted.trim_end_matches('\0'),
+            direct.redacted.trim_end_matches('\0')
+        );
     }
 
     #[test]
@@ -1235,7 +1681,11 @@ mod tests {
         let mut stream = LargeFileStream::open(f.path()).unwrap();
         let result = collect_all(&mut stream).unwrap();
         assert!(result.findings.iter().any(|f| f.pattern_id == "GH-001"));
-        assert!(!result.redacted.contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab"));
+        assert!(
+            !result
+                .redacted
+                .contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1277,8 +1727,11 @@ mod tests {
             let key = format!("{}IOSFODNN7EXAMPLE", prefix);
             let text = format!("key={}", key);
             let r = scan_and_redact(&text);
-            assert!(r.findings.iter().any(|f| f.pattern_id == "AWS-001"),
-                "prefix {} not detected", prefix);
+            assert!(
+                r.findings.iter().any(|f| f.pattern_id == "AWS-001"),
+                "prefix {} not detected",
+                prefix
+            );
         }
     }
 
@@ -1305,8 +1758,11 @@ mod tests {
         for prefix in &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
             let token = format!("{}abcdefghijklmnopqrstuvwxyz1234567890ab", prefix);
             let r = scan_and_redact(&token);
-            assert!(r.findings.iter().any(|f| f.pattern_id == "GH-001"),
-                "prefix {} not detected", prefix);
+            assert!(
+                r.findings.iter().any(|f| f.pattern_id == "GH-001"),
+                "prefix {} not detected",
+                prefix
+            );
         }
     }
 
@@ -1316,7 +1772,8 @@ mod tests {
 
     #[test]
     fn jwt_three_part_detected() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let r = scan_and_redact(jwt);
         assert!(r.findings.iter().any(|f| f.pattern_id == "JWT-001"));
     }
@@ -1325,7 +1782,9 @@ mod tests {
     fn jwt_two_parts_not_detected() {
         let text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0";
         let r = scan_and_redact(text);
-        assert!(!r.findings.iter().any(|f| f.pattern_id == "JWT-001"),
-            "two-part eyJ string should not be detected as JWT");
+        assert!(
+            !r.findings.iter().any(|f| f.pattern_id == "JWT-001"),
+            "two-part eyJ string should not be detected as JWT"
+        );
     }
 }

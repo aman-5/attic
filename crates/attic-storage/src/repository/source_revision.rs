@@ -174,10 +174,8 @@ mod tests {
         upsert_repository(&conn, &repo_id, "/repo", "test").unwrap();
         let rev_id = SourceRevisionId::new_v4();
 
-        let manifest_hash =
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let policy_hash =
-            "9988776655443322110099887766554433221100998877665544332211009988";
+        let manifest_hash = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let policy_hash = "9988776655443322110099887766554433221100998877665544332211009988";
 
         insert_source_revision_with_hashes(
             &conn,

@@ -60,9 +60,9 @@
 //! - [`BATCH_SIZE`]: flush after 256 mutations
 //! - [`FLUSH_INTERVAL`]: flush at least every 50 ms
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -181,12 +181,10 @@ impl WriterQueueHandle {
         };
 
         // Non-blocking enqueue.
-        self.tx
-            .try_send(item)
-            .map_err(|e| match e {
-                mpsc::TrySendError::Full(_) => StorageError::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => StorageError::QueueShutdown,
-            })?;
+        self.tx.try_send(item).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => StorageError::QueueFull,
+            mpsc::TrySendError::Disconnected(_) => StorageError::QueueShutdown,
+        })?;
 
         // Block until the worker sends back the result.
         result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
@@ -223,7 +221,10 @@ impl WriterQueue {
     /// Create a new `WriterQueue` with a custom [`TransactionFinalizer`].
     ///
     /// Intended for testing; production code should use [`WriterQueue::new`].
-    pub(crate) fn new_with_finalizer<F>(conn: Connection, finalizer: F) -> Result<Self, StorageError>
+    pub(crate) fn new_with_finalizer<F>(
+        conn: Connection,
+        finalizer: F,
+    ) -> Result<Self, StorageError>
     where
         F: TransactionFinalizer,
     {
@@ -375,7 +376,9 @@ fn flush_batch(
         let msg = e.to_string();
         error!("attic-writer: BEGIN IMMEDIATE failed: {msg}");
         for (_, tx) in fns_and_txs {
-            let _ = tx.send(Err(StorageError::Worker(format!("BEGIN IMMEDIATE failed: {msg}"))));
+            let _ = tx.send(Err(StorageError::Worker(format!(
+                "BEGIN IMMEDIATE failed: {msg}"
+            ))));
         }
         return;
     }
@@ -685,7 +688,10 @@ mod tests {
 
         // At least one must be an error (either the failure or BatchRolledBack).
         let both_ok = r1.is_ok() && r2.is_ok();
-        assert!(!both_ok, "at least one mutation in the conflict pair must fail");
+        assert!(
+            !both_ok,
+            "at least one mutation in the conflict pair must fail"
+        );
 
         // If they landed in the same batch, at least one should be BatchRolledBack
         // or Sqlite error. Neither should silently succeed a conflicting insert.
@@ -719,8 +725,14 @@ mod tests {
         // Fill the queue.
         let (dummy_tx1, _) = mpsc::sync_channel(1);
         let (dummy_tx2, _) = mpsc::sync_channel(1);
-        let _ = handle.tx.try_send(WorkItem { f: Box::new(|_| Ok(())), result_tx: dummy_tx1 });
-        let _ = handle.tx.try_send(WorkItem { f: Box::new(|_| Ok(())), result_tx: dummy_tx2 });
+        let _ = handle.tx.try_send(WorkItem {
+            f: Box::new(|_| Ok(())),
+            result_tx: dummy_tx1,
+        });
+        let _ = handle.tx.try_send(WorkItem {
+            f: Box::new(|_| Ok(())),
+            result_tx: dummy_tx2,
+        });
 
         // Third should return QueueFull.
         let result = handle.send(|_| Ok(()));
@@ -755,9 +767,11 @@ mod tests {
     fn rollback_failure_after_mutation_error_poisons_writer() {
         let (path, writer_conn) = migrated_file_db();
 
-        let queue =
-            WriterQueue::new_with_finalizer(writer_conn, FailRollbackFinalizer { msg: "disk full" })
-                .unwrap();
+        let queue = WriterQueue::new_with_finalizer(
+            writer_conn,
+            FailRollbackFinalizer { msg: "disk full" },
+        )
+        .unwrap();
         let handle = queue.handle();
 
         // This mutation will succeed (no constraint error), but we need the
@@ -887,6 +901,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         configure_connection(&conn).unwrap();
         let queue = WriterQueue::new(conn);
-        assert!(queue.is_ok(), "WriterQueue::new should return Ok for a valid connection");
+        assert!(
+            queue.is_ok(),
+            "WriterQueue::new should return Ok for a valid connection"
+        );
     }
 }

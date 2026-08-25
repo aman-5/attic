@@ -69,9 +69,7 @@ pub fn upsert_repository(
 ///
 /// Results are ordered by `display_name` ascending.
 /// The query never returns `root_path` — absolute paths are kept server-side.
-pub fn get_repository_stats(
-    conn: &Connection,
-) -> Result<Vec<RepositoryStats>, StorageError> {
+pub fn get_repository_stats(conn: &Connection) -> Result<Vec<RepositoryStats>, StorageError> {
     let sql = "
         SELECT r.id, r.display_name,
                COUNT(DISTINCT fo.id) AS files,
@@ -101,21 +99,15 @@ pub fn get_repository_stats(
 
 /// Return database-level statistics (migration count, repository count, unit count).
 pub fn get_db_stats(conn: &Connection) -> Result<DbStats, StorageError> {
-    let migration_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM core_schema_migrations",
-        [],
-        |r| r.get(0),
-    )?;
-    let repository_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM core_repositories",
-        [],
-        |r| r.get(0),
-    )?;
-    let unit_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM core_retrieval_units",
-        [],
-        |r| r.get(0),
-    )?;
+    let migration_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM core_schema_migrations", [], |r| {
+            r.get(0)
+        })?;
+    let repository_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM core_repositories", [], |r| r.get(0))?;
+    let unit_count: i64 = conn.query_row("SELECT COUNT(*) FROM core_retrieval_units", [], |r| {
+        r.get(0)
+    })?;
     Ok(DbStats {
         migration_count,
         repository_count,
@@ -128,9 +120,7 @@ pub fn get_repository_path(
     conn: &Connection,
     id: &RepositoryId,
 ) -> Result<Option<String>, StorageError> {
-    let mut stmt = conn.prepare(
-        "SELECT root_path FROM core_repositories WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT root_path FROM core_repositories WHERE id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![id.to_string_repr()])?;
     match rows.next()? {
         Some(row) => Ok(Some(row.get(0)?)),

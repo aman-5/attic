@@ -23,12 +23,18 @@ pub struct GlobRule {
 impl GlobRule {
     /// Construct an exclude rule.
     pub fn exclude(pattern: impl Into<String>) -> Self {
-        GlobRule { pattern: pattern.into(), negation: false }
+        GlobRule {
+            pattern: pattern.into(),
+            negation: false,
+        }
     }
 
     /// Construct a negation/include-override rule.
     pub fn include(pattern: impl Into<String>) -> Self {
-        GlobRule { pattern: pattern.into(), negation: true }
+        GlobRule {
+            pattern: pattern.into(),
+            negation: true,
+        }
     }
 }
 
@@ -162,9 +168,8 @@ impl DiscoveryPolicy {
     ///
     /// Used to compute the `discovery_policy_hash` stored in `SourceRevision`.
     pub fn to_canonical_json(&self) -> Result<String, crate::error::DiscoveryError> {
-        serde_json::to_string(self).map_err(|e| {
-            crate::error::DiscoveryError::PolicySerialize(e.to_string())
-        })
+        serde_json::to_string(self)
+            .map_err(|e| crate::error::DiscoveryError::PolicySerialize(e.to_string()))
     }
 
     /// Compute the BLAKE3 hex hash of the canonical JSON representation.

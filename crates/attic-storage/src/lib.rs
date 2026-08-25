@@ -13,16 +13,21 @@
 pub mod connection;
 pub mod error;
 pub mod fts;
+pub mod indexing_publication;
 pub mod migration;
 pub mod repository;
 pub mod writer;
 
-pub use connection::{open_db, DbPool};
+pub use connection::{DbPool, open_db};
 pub use error::StorageError;
 pub use fts::{
-    FtsSearchParams, FtsSearchResult, NewRetrievalUnit, MAX_SEARCH_RESULTS,
-    delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup,
-    fts_search, insert_retrieval_unit_with_fts,
+    FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit,
+    delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup, fts_search,
+    insert_retrieval_unit_with_fts,
+};
+pub use indexing_publication::{
+    IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
+    PublicationRetrievalUnit, submit_index_publication,
 };
 pub use migration::run_migrations;
 pub use writer::{WriterQueue, WriterQueueHandle};
@@ -35,8 +40,8 @@ pub use repository::file_occurrence::{
 pub use repository::index_generation::insert_index_generation;
 pub use repository::publication::{PublicationItem, publish_file_batch};
 pub use repository::repository::{
-    get_db_stats, get_repository_path, get_repository_stats, lookup_repository_by_root_path,
-    upsert_repository, DbStats, RepositoryStats,
+    DbStats, RepositoryStats, get_db_stats, get_repository_path, get_repository_stats,
+    lookup_repository_by_root_path, upsert_repository,
 };
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,

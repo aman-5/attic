@@ -8,7 +8,7 @@ pub mod constants;
 pub mod domain;
 pub mod error;
 
-pub use constants::{subsystem_keys, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION};
+pub use constants::{CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_keys};
 pub use domain::{
     enums::{
         ArtifactType, Authority, CompatibilityClass, DependencyBasis, DiscoveryClass,
@@ -17,9 +17,9 @@ pub use domain::{
         TaskState, TaskType, VerificationState,
     },
     ids::{
-        EvidenceId, FileIdentityId, FileOccurrenceId, IndexGenerationId, OpsAuditId,
-        RepositoryId, RetrievalUnitId, SchemaMigrationId, SourceRevisionId, StructuralNodeId,
-        SymbolIdentityId, SymbolOccurrenceId,
+        EvidenceId, FileIdentityId, FileOccurrenceId, IndexGenerationId, OpsAuditId, RepositoryId,
+        RetrievalUnitId, SchemaMigrationId, SourceRevisionId, StructuralNodeId, SymbolIdentityId,
+        SymbolOccurrenceId,
     },
     subsystem_versions::SubsystemVersions,
     value_types::SourceSpan,

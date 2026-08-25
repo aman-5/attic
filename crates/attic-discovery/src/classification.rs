@@ -37,12 +37,8 @@ const DEFAULT_IGNORED_PATTERNS: &[&str] = &[
 ];
 
 /// Patterns for directories that are low-priority by default (not excluded).
-const DEFAULT_LOW_PRIORITY_PREFIXES: &[&str] = &[
-    "vendor/",
-    "generated/",
-    "fixtures/",
-    "snapshots/",
-];
+const DEFAULT_LOW_PRIORITY_PREFIXES: &[&str] =
+    &["vendor/", "generated/", "fixtures/", "snapshots/"];
 
 /// Patterns for directories that are high-priority by default.
 const DEFAULT_HIGH_PRIORITY_PREFIXES: &[&str] = &[
@@ -121,10 +117,7 @@ fn matches_default_ignored(path: &str) -> bool {
         // Pattern ends with '/' → directory prefix match
         if let Some(dir) = pattern.strip_suffix('/') {
             // Matches if path starts with "dir/" or is exactly "dir"
-            if path == dir
-                || path.starts_with(&format!("{dir}/"))
-                || is_path_component(path, dir)
-            {
+            if path == dir || path.starts_with(&format!("{dir}/")) || is_path_component(path, dir) {
                 return true;
             }
         } else if path == *pattern {
@@ -186,7 +179,15 @@ fn default_priority(path: &str) -> DiscoveryPriority {
     }
 
     // Files in well-known test/docs directories
-    for prefix in &["tests/", "test/", "__tests__/", "spec/", "docs/", "config/", "migrations/"] {
+    for prefix in &[
+        "tests/",
+        "test/",
+        "__tests__/",
+        "spec/",
+        "docs/",
+        "config/",
+        "migrations/",
+    ] {
         if path.starts_with(prefix) || is_path_component(path, prefix.trim_end_matches('/')) {
             return DiscoveryPriority::Normal;
         }
@@ -314,75 +315,141 @@ mod tests {
 
     #[test]
     fn node_modules_is_ignored() {
-        assert_eq!(classify("node_modules/lodash/index.js", &default_policy()), DiscoveryPriority::Ignored);
-        assert_eq!(classify("node_modules/react/package.json", &default_policy()), DiscoveryPriority::Ignored);
+        assert_eq!(
+            classify("node_modules/lodash/index.js", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
+        assert_eq!(
+            classify("node_modules/react/package.json", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
     fn target_dir_is_ignored() {
-        assert_eq!(classify("target/debug/attic", &default_policy()), DiscoveryPriority::Ignored);
-        assert_eq!(classify("target/release/attic.exe", &default_policy()), DiscoveryPriority::Ignored);
+        assert_eq!(
+            classify("target/debug/attic", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
+        assert_eq!(
+            classify("target/release/attic.exe", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
     fn build_dist_out_ignored() {
-        assert_eq!(classify("build/output/bundle.js", &default_policy()), DiscoveryPriority::Ignored);
-        assert_eq!(classify("dist/index.js", &default_policy()), DiscoveryPriority::Ignored);
-        assert_eq!(classify("out/server.js", &default_policy()), DiscoveryPriority::Ignored);
+        assert_eq!(
+            classify("build/output/bundle.js", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
+        assert_eq!(
+            classify("dist/index.js", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
+        assert_eq!(
+            classify("out/server.js", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
     fn coverage_ignored() {
-        assert_eq!(classify("coverage/lcov.info", &default_policy()), DiscoveryPriority::Ignored);
-        assert_eq!(classify(".nyc_output/coverage.json", &default_policy()), DiscoveryPriority::Ignored);
+        assert_eq!(
+            classify("coverage/lcov.info", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
+        assert_eq!(
+            classify(".nyc_output/coverage.json", &default_policy()),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
     fn src_is_high_priority() {
-        assert_eq!(classify("src/main.rs", &default_policy()), DiscoveryPriority::HighPriority);
-        assert_eq!(classify("lib/utils.ts", &default_policy()), DiscoveryPriority::HighPriority);
+        assert_eq!(
+            classify("src/main.rs", &default_policy()),
+            DiscoveryPriority::HighPriority
+        );
+        assert_eq!(
+            classify("lib/utils.ts", &default_policy()),
+            DiscoveryPriority::HighPriority
+        );
     }
 
     #[test]
     fn tests_are_normal() {
-        assert_eq!(classify("tests/integration.rs", &default_policy()), DiscoveryPriority::Normal);
-        assert_eq!(classify("test/unit/foo.js", &default_policy()), DiscoveryPriority::Normal);
+        assert_eq!(
+            classify("tests/integration.rs", &default_policy()),
+            DiscoveryPriority::Normal
+        );
+        assert_eq!(
+            classify("test/unit/foo.js", &default_policy()),
+            DiscoveryPriority::Normal
+        );
     }
 
     #[test]
     fn vendor_is_low_priority() {
-        assert_eq!(classify("vendor/lib/foo.js", &default_policy()), DiscoveryPriority::LowPriority);
+        assert_eq!(
+            classify("vendor/lib/foo.js", &default_policy()),
+            DiscoveryPriority::LowPriority
+        );
     }
 
     #[test]
     fn generated_is_low_priority() {
-        assert_eq!(classify("generated/proto/foo.rs", &default_policy()), DiscoveryPriority::LowPriority);
+        assert_eq!(
+            classify("generated/proto/foo.rs", &default_policy()),
+            DiscoveryPriority::LowPriority
+        );
     }
 
     #[test]
     fn fixtures_are_low_priority() {
-        assert_eq!(classify("fixtures/git/repo1/file.rs", &default_policy()), DiscoveryPriority::LowPriority);
+        assert_eq!(
+            classify("fixtures/git/repo1/file.rs", &default_policy()),
+            DiscoveryPriority::LowPriority
+        );
     }
 
     #[test]
     fn migrations_are_normal() {
-        assert_eq!(classify("migrations/0001_initial.sql", &default_policy()), DiscoveryPriority::Normal);
+        assert_eq!(
+            classify("migrations/0001_initial.sql", &default_policy()),
+            DiscoveryPriority::Normal
+        );
     }
 
     #[test]
     fn attic_exclude_rule_ignores_path() {
         let mut policy = default_policy();
-        policy.attic_exclude_rules.push(GlobRule::exclude("vendor/**"));
-        assert_eq!(classify("vendor/foo/bar.js", &policy), DiscoveryPriority::Ignored);
+        policy
+            .attic_exclude_rules
+            .push(GlobRule::exclude("vendor/**"));
+        assert_eq!(
+            classify("vendor/foo/bar.js", &policy),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
     fn attic_include_rule_re_includes_excluded() {
         let mut policy = default_policy();
-        policy.attic_exclude_rules.push(GlobRule::exclude("vendor/**"));
-        policy.attic_include_rules.push(GlobRule::include("vendor/critical-lib/**"));
-        assert_eq!(classify("vendor/critical-lib/index.js", &policy), DiscoveryPriority::Normal);
-        assert_eq!(classify("vendor/other/index.js", &policy), DiscoveryPriority::Ignored);
+        policy
+            .attic_exclude_rules
+            .push(GlobRule::exclude("vendor/**"));
+        policy
+            .attic_include_rules
+            .push(GlobRule::include("vendor/critical-lib/**"));
+        assert_eq!(
+            classify("vendor/critical-lib/index.js", &policy),
+            DiscoveryPriority::Normal
+        );
+        assert_eq!(
+            classify("vendor/other/index.js", &policy),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
@@ -403,7 +470,10 @@ mod tests {
         let mut policy = default_policy();
         policy.default_exclusions = false;
         // target/ no longer ignored
-        assert_ne!(classify("target/debug/bin", &policy), DiscoveryPriority::Ignored);
+        assert_ne!(
+            classify("target/debug/bin", &policy),
+            DiscoveryPriority::Ignored
+        );
     }
 
     #[test]
@@ -414,6 +484,9 @@ mod tests {
             pattern: "docs/**".to_string(),
             priority: DiscoveryPriority::HighPriority,
         });
-        assert_eq!(classify("docs/architecture.md", &policy), DiscoveryPriority::HighPriority);
+        assert_eq!(
+            classify("docs/architecture.md", &policy),
+            DiscoveryPriority::HighPriority
+        );
     }
 }

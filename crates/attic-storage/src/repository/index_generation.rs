@@ -44,13 +44,13 @@ pub fn insert_index_generation(
         rusqlite::params![
             id.to_string_repr(),
             source_revision_id.to_string_repr(),
-            "1.0.0",   // schema_version
-            "1.0.0",   // analyzer_registry_version
-            "{}",      // analyzer_versions_json
-            "1.0.0",   // segmentation_version
-            "1.0.0",   // indexer_version
+            "1.0.0", // schema_version
+            "1.0.0", // analyzer_registry_version
+            "{}",    // analyzer_versions_json
+            "1.0.0", // segmentation_version
+            "1.0.0", // indexer_version
             "0000000000000000000000000000000000000000000000000000000000000000", // discovery_policy_hash
-            "1.0.0",   // ranking_version
+            "1.0.0",                                                            // ranking_version
             "0000000000000000000000000000000000000000000000000000000000000000", // configuration_hash
             secret_detector_version,
             sv_json,
@@ -65,9 +65,8 @@ pub fn get_subsystem_versions(
     conn: &Connection,
     id: &IndexGenerationId,
 ) -> Result<Option<SubsystemVersions>, StorageError> {
-    let mut stmt = conn.prepare(
-        "SELECT subsystem_versions_json FROM core_index_generations WHERE id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT subsystem_versions_json FROM core_index_generations WHERE id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![id.to_string_repr()])?;
     match rows.next()? {
         Some(row) => {
@@ -86,7 +85,7 @@ mod tests {
     use crate::migration::run_migrations;
     use crate::repository::repository::upsert_repository;
     use crate::repository::source_revision::insert_source_revision;
-    use attic_core::{constants::subsystem_keys, SourceType};
+    use attic_core::{SourceType, constants::subsystem_keys};
     use rusqlite::Connection;
 
     fn migrated_conn() -> Connection {

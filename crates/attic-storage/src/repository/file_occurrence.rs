@@ -7,8 +7,8 @@
 use rusqlite::Connection;
 
 use attic_core::{
-    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
-    IndexGenerationId, RepositoryId, SecretScanState, SecurityState, SourceRevisionId,
+    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
+    RepositoryId, SecretScanState, SecurityState, SourceRevisionId,
 };
 
 use crate::error::StorageError;
@@ -42,10 +42,7 @@ pub fn upsert_file_identity(
 }
 
 /// Return `true` if a file identity with the given `id` exists.
-pub fn exists_file_identity(
-    conn: &Connection,
-    id: &FileIdentityId,
-) -> Result<bool, StorageError> {
+pub fn exists_file_identity(conn: &Connection, id: &FileIdentityId) -> Result<bool, StorageError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM core_file_identities WHERE id = ?1",
         rusqlite::params![id.to_string_repr()],
@@ -226,11 +223,7 @@ pub fn set_secret_scan_state(
          SET secret_scan_state      = ?2,
              secret_pattern_version = ?3
          WHERE id = ?1",
-        rusqlite::params![
-            id.to_string_repr(),
-            state.as_str(),
-            pattern_version,
-        ],
+        rusqlite::params![id.to_string_repr(), state.as_str(), pattern_version,],
     )?;
     Ok(())
 }

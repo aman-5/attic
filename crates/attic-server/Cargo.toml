@@ -17,8 +17,8 @@ attic-core.workspace      = true
 attic-storage.workspace   = true
 attic-indexing.workspace  = true
 attic-discovery.workspace = true
-rmcp.workspace            = true
-tokio.workspace           = true
+rmcp  = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["process", "io-util"] }
 serde.workspace           = true
 serde_json.workspace      = true
 tracing.workspace         = true

@@ -70,16 +70,15 @@ pub mod walk;
 // Convenience re-exports
 // ---------------------------------------------------------------------------
 
-pub use policy::DiscoveryPriority;
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use error::DiscoveryError;
 pub use git::GitRepoMeta;
 pub use manifest::{ManifestEntry, SourceManifest};
+pub use policy::DiscoveryPriority;
 pub use policy::{DiscoveryPolicy, GlobRule, PriorityRule};
 pub use secrets::{
-    FileSizeTier, LargeFileStream, PreprocessResult, ScanResult, SecretFinding, SecretScanDecision,
-    SMALL_FILE_THRESHOLD as MAX_FULL_LOAD_BYTES,
-    VERY_LARGE_FILE_THRESHOLD as MAX_LARGE_BYTES,
+    FileSizeTier, LargeFileStream, PreprocessResult, SMALL_FILE_THRESHOLD as MAX_FULL_LOAD_BYTES,
+    ScanResult, SecretFinding, SecretScanDecision, VERY_LARGE_FILE_THRESHOLD as MAX_LARGE_BYTES,
 };
 pub use security::canonicalize_within_root;
 pub use walk::{EligibleEntry, WalkResult};
@@ -211,10 +210,12 @@ pub struct DiscoveryOutput {
 /// manifest build are captured in diagnostics / `SourceManifest::read_errors`.
 pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput, DiscoveryError> {
     // 1. Canonicalise root — rejects symlink escapes and non-directories.
-    let canonical_root = root.canonicalize().map_err(|source| DiscoveryError::Canonicalize {
-        path: root.to_path_buf(),
-        source,
-    })?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|source| DiscoveryError::Canonicalize {
+            path: root.to_path_buf(),
+            source,
+        })?;
 
     if !canonical_root.is_dir() {
         return Err(DiscoveryError::RootNotDirectory(canonical_root));
@@ -249,8 +250,11 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
         Vec::with_capacity(walk_result.entries.len());
 
     for entry in &walk_result.entries {
-        let classification =
-            classify_file_for_downstream(&entry.abs_path, &entry.repo_relative, &mut all_diagnostics);
+        let classification = classify_file_for_downstream(
+            &entry.abs_path,
+            &entry.repo_relative,
+            &mut all_diagnostics,
+        );
         downstream_classifications.push((entry.repo_relative.clone(), classification));
     }
 
@@ -333,9 +337,9 @@ fn classify_file_for_downstream(
                 return DownstreamClassification::Excluded;
             }
             match secrets::stream_scan_large_file_classify(abs_path) {
-                Ok((SecretScanDecision::Safe, _, _)) => {
-                    DownstreamClassification::Safe { size_tier: FileSizeTier::Large }
-                }
+                Ok((SecretScanDecision::Safe, _, _)) => DownstreamClassification::Safe {
+                    size_tier: FileSizeTier::Large,
+                },
                 Ok((SecretScanDecision::Redacted, findings, _)) => {
                     DownstreamClassification::Redacted {
                         size_tier: FileSizeTier::Large,
@@ -504,7 +508,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let output = discover(root, &policy).unwrap();
 
-        let paths: Vec<&str> = output.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = output
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(paths.contains(&"src/main.rs"));
         assert!(paths.contains(&"src/lib.rs"));
     }
@@ -520,7 +528,13 @@ mod tests {
         let output = discover(root, &policy).unwrap();
 
         assert_eq!(output.manifest.manifest_hash.len(), 64);
-        assert!(output.manifest.manifest_hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            output
+                .manifest
+                .manifest_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 
     #[test]
@@ -562,7 +576,11 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let output = discover(root, &policy).unwrap();
 
-        let paths: Vec<&str> = output.entries.iter().map(|e| e.repo_relative.as_str()).collect();
+        let paths: Vec<&str> = output
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
         assert!(!paths.contains(&"private.key"));
         assert!(!paths.contains(&".env"));
         assert!(paths.contains(&"src/main.rs"));
@@ -637,7 +655,7 @@ mod tests {
     ///     public preprocess_file_content API.
     #[test]
     fn preprocess_file_content_large_boundary_spanning_secret_redacted() {
-        use secrets::{STREAM_CHUNK_SIZE, SAFETY_WINDOW_SIZE};
+        use secrets::{SAFETY_WINDOW_SIZE, STREAM_CHUNK_SIZE};
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
