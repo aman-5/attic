@@ -35,6 +35,7 @@
 
 pub mod api;
 pub mod cancellation;
+pub mod dispatch;
 pub mod generic;
 pub mod registry;
 
@@ -47,5 +48,6 @@ pub use api::{
     SymbolSpec, diagnostic_codes,
 };
 pub use cancellation::CancellationToken;
+pub use dispatch::dispatch;
 pub use generic::GenericAnalyzer;
 pub use registry::AnalyzerRegistry;

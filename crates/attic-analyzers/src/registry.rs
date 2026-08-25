@@ -3,24 +3,20 @@
 //!
 //! Selection algorithm (from `docs/contracts/analyzers.md`):
 //!
-//! 1. If the file's security state is FORBIDDEN, refuse immediately.  
-//!    (`AnalyzerInput::is_partial_scan` is checked by the caller before
-//!    invoking `select`; see note below.)
-//! 2. Look up specialized analyzers registered for the detected language /
-//!    `FileType`.  If multiple match, prefer the one with the highest declared
-//!    `CapabilityKind` level.  Ties are broken by name (lexicographic) for
-//!    determinism.
-//! 3. If no specialized analyzer matches, fall back to `GenericAnalyzer`.
-//! 4. If a specialized analyzer is selected but its `analyze()` call panics
-//!    or otherwise fails (as detected by the caller), the caller falls back
-//!    to `GenericAnalyzer` and adds a `FALLBACK_USED` diagnostic.  The
-//!    registry itself does not run the analysis; it only selects.
+//! 1. Look up specialized analyzers registered for the detected `FileType`.
+//!    If multiple match, prefer the one with the highest declared
+//!    `CapabilityLevel` (via `AnalyzerCapabilities::max_level()`).
+//!    Ties are broken by name (lexicographic ascending) for determinism.
+//! 2. If no specialized analyzer matches, fall back to `GenericAnalyzer`.
 //!
-//! `PartialScan` handling note:
-//!   Phase 1C callers are responsible for setting `AnalyzerInput::is_partial_scan`
-//!   and for NOT emitting retrieval units whose `retrieval_text` may contain
-//!   un-inspected mid-body content.  The registry does not enforce this
-//!   itself but the `GenericAnalyzer` respects it.
+//! ## Capability selection semantics
+//!
+//! `CapabilityKind` variants are **independent dimensions** with no implicit
+//! ordering between them.  Registry selection therefore compares
+//! `CapabilityLevel` (the quality axis, ordered `None < Basic < Partial <
+//! Full`) across whichever dimension the analyzer declares at its best level.
+//! This avoids treating a high-ordinal `CapabilityKind` as universally
+//! "better" than a low-ordinal one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,14 +24,14 @@ use std::sync::Arc;
 use attic_core::FileType;
 use tracing::debug;
 
-use crate::api::{Analyzer, AnalyzerDescriptor, CapabilityKind};
+use crate::api::{Analyzer, AnalyzerDescriptor, CapabilityLevel};
 
 /// Entry stored in the registry for one registered analyzer.
 struct RegistryEntry {
     analyzer: Arc<dyn Analyzer>,
-    /// The highest `CapabilityKind` level this analyzer declares for its
-    /// supported file types.  Used for tie-breaking during selection.
-    max_capability: CapabilityKind,
+    /// The highest `CapabilityLevel` this analyzer declares across all its
+    /// supported capabilities.  Used for deterministic selection.
+    max_level: CapabilityLevel,
 }
 
 /// Registry of all available analyzers.
@@ -45,8 +41,8 @@ pub struct AnalyzerRegistry {
     /// Specialized analyzers keyed by the `FileType` they handle.
     ///
     /// Multiple analyzers may be registered for the same `FileType`.  When
-    /// selecting, the one with the highest `max_capability` wins; ties
-    /// broken by `descriptor().name` (lexicographic ascending).
+    /// selecting, the one with the highest `max_level` wins; ties broken by
+    /// `descriptor().name` (lexicographic ascending).
     specialized: HashMap<FileType, Vec<RegistryEntry>>,
 
     /// The mandatory language-agnostic fallback — always present.
@@ -85,12 +81,12 @@ impl AnalyzerRegistry {
             return;
         }
 
-        let max_capability = max_capability_kind(desc);
+        let max_level = max_capability_level(desc);
 
         for ft in &desc.supported_file_types {
             let entry = RegistryEntry {
                 analyzer: Arc::clone(&analyzer),
-                max_capability,
+                max_level,
             };
             self.specialized.entry(*ft).or_default().push(entry);
         }
@@ -151,18 +147,21 @@ impl AnalyzerRegistry {
     }
 }
 
-/// Return the analyzer with the highest `max_capability`; break ties by name.
+/// Return the analyzer with the highest `max_level`; break ties by name
+/// (lexicographic ascending — "aaa" beats "zzz").
 ///
 /// Returns `None` only if `entries` is empty.
 fn best_entry(entries: &[RegistryEntry]) -> Option<&Arc<dyn Analyzer>> {
     entries
         .iter()
         .max_by(|a, b| {
-            a.max_capability
-                .cmp(&b.max_capability)
+            // Primary: higher CapabilityLevel wins.
+            a.max_level
+                .cmp(&b.max_level)
                 .then_with(|| {
-                    // Lower name wins (lexicographic ascending → "a" beats "z").
-                    // We want the "first" name deterministically so we reverse.
+                    // Tie-break: lexicographically earlier name wins.
+                    // `max_by` returns the last "greatest" item; to get the
+                    // lexicographically smallest name we reverse the comparison.
                     b.analyzer
                         .descriptor()
                         .name
@@ -172,15 +171,11 @@ fn best_entry(entries: &[RegistryEntry]) -> Option<&Arc<dyn Analyzer>> {
         .map(|e| &e.analyzer)
 }
 
-/// Compute the highest `CapabilityKind` level declared in an
-/// `AnalyzerDescriptor`.
-fn max_capability_kind(desc: &AnalyzerDescriptor) -> CapabilityKind {
-    desc.capabilities
-        .entries
-        .iter()
-        .map(|(kind, _level)| *kind)
-        .max()
-        .unwrap_or(CapabilityKind::Lexical)
+/// Compute the highest `CapabilityLevel` declared across all entries in an
+/// `AnalyzerDescriptor`.  Returns `CapabilityLevel::None` for an empty
+/// capabilities list (should not occur for well-formed descriptors).
+fn max_capability_level(desc: &AnalyzerDescriptor) -> CapabilityLevel {
+    desc.capabilities.max_level()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,14 +201,14 @@ mod tests {
     }
 
     impl StubAnalyzer {
-        fn new(name: &str, file_type: FileType, capability: CapabilityKind) -> Self {
+        fn new(name: &str, file_type: FileType, capability: CapabilityKind, level: CapabilityLevel) -> Self {
             Self {
                 desc: AnalyzerDescriptor {
                     name: name.to_string(),
                     version: "0.1.0".to_string(),
                     description: "stub".to_string(),
                     supported_file_types: vec![file_type],
-                    capabilities: AnalyzerCapabilities::single(capability, CapabilityLevel::Full),
+                    capabilities: AnalyzerCapabilities::single(capability, level),
                 },
             }
         }
@@ -278,6 +273,7 @@ mod tests {
             "rust-stub",
             FileType::Rust,
             CapabilityKind::SymbolExtraction,
+            CapabilityLevel::Full,
         ));
         registry.register_specialized(stub as Arc<dyn Analyzer>);
 
@@ -286,22 +282,25 @@ mod tests {
         assert_eq!(selected.descriptor().name, "rust-stub");
     }
 
-    /// Selection is deterministic: same inputs → same result.
+    /// Selection is deterministic: higher CapabilityLevel wins regardless of CapabilityKind.
     #[test]
     fn registry_selection_is_deterministic() {
         let generic = Arc::new(GenericAnalyzer::new());
         let mut registry = AnalyzerRegistry::new(Arc::clone(&generic) as Arc<dyn Analyzer>);
 
-        // Register two analyzers for Rust; higher capability wins.
+        // Register two analyzers for Rust: one Full level, one Basic level.
+        // Full must always win regardless of CapabilityKind dimension.
         let high = Arc::new(StubAnalyzer::new(
             "rust-high",
             FileType::Rust,
-            CapabilityKind::SymbolExtraction,
+            CapabilityKind::Lexical,        // lower-dimension kind
+            CapabilityLevel::Full,          // but higher level
         ));
         let low = Arc::new(StubAnalyzer::new(
             "rust-low",
             FileType::Rust,
-            CapabilityKind::Lexical,
+            CapabilityKind::SymbolExtraction, // higher-dimension kind
+            CapabilityLevel::Basic,           // but lower level
         ));
         registry.register_specialized(high as Arc<dyn Analyzer>);
         registry.register_specialized(low as Arc<dyn Analyzer>);
@@ -309,11 +308,46 @@ mod tests {
         for _ in 0..10 {
             let (selected, is_generic) = registry.select(FileType::Rust);
             assert!(!is_generic);
+            // Full > Basic → rust-high must always win
             assert_eq!(selected.descriptor().name, "rust-high");
         }
     }
 
-    /// Tie-breaking by name (lexicographic): "aaa" beats "zzz" with equal capability.
+    /// Capabilities are independent dimensions: CapabilityKind ordinal does NOT
+    /// determine selection — only CapabilityLevel (quality) does.
+    #[test]
+    fn registry_selection_uses_capability_level_not_kind_ordinal() {
+        let generic = Arc::new(GenericAnalyzer::new());
+        let mut registry = AnalyzerRegistry::new(Arc::clone(&generic) as Arc<dyn Analyzer>);
+
+        // "semantic-basic" declares the "highest" CapabilityKind (SemanticResolution)
+        // but only at Basic level.
+        // "lexical-full" declares the "lowest" CapabilityKind (Lexical) but at Full.
+        // Full > Basic, so "lexical-full" must win.
+        let semantic_basic = Arc::new(StubAnalyzer::new(
+            "semantic-basic",
+            FileType::Python,
+            CapabilityKind::SemanticResolution,
+            CapabilityLevel::Basic,
+        ));
+        let lexical_full = Arc::new(StubAnalyzer::new(
+            "lexical-full",
+            FileType::Python,
+            CapabilityKind::Lexical,
+            CapabilityLevel::Full,
+        ));
+        registry.register_specialized(semantic_basic as Arc<dyn Analyzer>);
+        registry.register_specialized(lexical_full as Arc<dyn Analyzer>);
+
+        let (selected, _) = registry.select(FileType::Python);
+        assert_eq!(
+            selected.descriptor().name,
+            "lexical-full",
+            "CapabilityLevel::Full must beat CapabilityLevel::Basic regardless of CapabilityKind"
+        );
+    }
+
+    /// Tie-breaking by name (lexicographic): "aaa" beats "zzz" with equal level.
     #[test]
     fn registry_tie_broken_by_name_lexicographic() {
         let generic = Arc::new(GenericAnalyzer::new());
@@ -323,11 +357,13 @@ mod tests {
             "aaa-rust",
             FileType::Rust,
             CapabilityKind::Lexical,
+            CapabilityLevel::Full,
         ));
         let z = Arc::new(StubAnalyzer::new(
             "zzz-rust",
             FileType::Rust,
             CapabilityKind::Lexical,
+            CapabilityLevel::Full,
         ));
         registry.register_specialized(z as Arc<dyn Analyzer>);
         registry.register_specialized(a as Arc<dyn Analyzer>);
@@ -459,5 +495,31 @@ mod tests {
         output.fallback_used = true;
 
         assert!(output.fallback_used);
+    }
+
+    /// Partial level still beats None level in selection.
+    #[test]
+    fn registry_partial_beats_none_level() {
+        let generic = Arc::new(GenericAnalyzer::new());
+        let mut registry = AnalyzerRegistry::new(Arc::clone(&generic) as Arc<dyn Analyzer>);
+
+        let partial = Arc::new(StubAnalyzer::new(
+            "partial-analyzer",
+            FileType::JavaScript,
+            CapabilityKind::SymbolExtraction,
+            CapabilityLevel::Partial,
+        ));
+        let basic = Arc::new(StubAnalyzer::new(
+            "basic-analyzer",
+            FileType::JavaScript,
+            CapabilityKind::SymbolExtraction,
+            CapabilityLevel::Basic,
+        ));
+        registry.register_specialized(basic as Arc<dyn Analyzer>);
+        registry.register_specialized(partial as Arc<dyn Analyzer>);
+
+        let (selected, _) = registry.select(FileType::JavaScript);
+        assert_eq!(selected.descriptor().name, "partial-analyzer",
+            "Partial level must beat Basic level");
     }
 }

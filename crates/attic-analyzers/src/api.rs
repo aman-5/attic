@@ -15,34 +15,36 @@ use crate::cancellation::CancellationToken;
 // Capability model
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The kind of analysis capability an analyzer provides.
+/// The *dimension* of analysis an analyzer performs.
 ///
-/// Ordered from cheapest/simplest (LEXICAL) to most expensive/deepest
-/// (SEMANTIC_RESOLUTION). Each numeric value encodes the implied ordering
-/// used during registry selection: a higher level implies all lower levels
-/// are also available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// These are **independent** dimensions, not an ordered hierarchy.
+/// An analyzer may declare any combination of them at any level.
+/// Registry selection must not assume that a higher numeric value implies
+/// a superset of lower values — capabilities are orthogonal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CapabilityKind {
-    /// Line/token-based lexical decomposition only. Level 0.
-    Lexical = 0,
-    /// Full parse tree / AST-backed structural decomposition. Level 1.
-    StructuralParse = 1,
-    /// Extraction of named symbol definitions (functions, classes, …). Level 2.
-    SymbolExtraction = 2,
-    /// Extraction of import/dependency edges. Level 3.
-    ImportExtraction = 3,
-    /// Cross-file reference edges within a single repo. Level 4.
-    ReferenceExtraction = 4,
-    /// Multi-file relationship resolution. Level 5.
-    RelationshipResolution = 5,
-    /// Build-system integration resolution. Level 6.
-    BuildResolution = 6,
-    /// Full semantic (type-checked) resolution. Level 7.
-    SemanticResolution = 7,
+    /// Line/token-based lexical decomposition.
+    Lexical,
+    /// Full parse tree / AST-backed structural decomposition.
+    StructuralParse,
+    /// Extraction of named symbol definitions (functions, classes, …).
+    SymbolExtraction,
+    /// Extraction of import/dependency edges.
+    ImportExtraction,
+    /// Cross-file reference edges within a single repo.
+    ReferenceExtraction,
+    /// Multi-file relationship resolution.
+    RelationshipResolution,
+    /// Build-system integration resolution.
+    BuildResolution,
+    /// Full semantic (type-checked) resolution.
+    SemanticResolution,
 }
 
 /// How well the analyzer supports a given `CapabilityKind`.
+///
+/// Ordered: `None < Basic < Partial < Full`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CapabilityLevel {
@@ -82,6 +84,18 @@ impl AnalyzerCapabilities {
             .find_map(|(k, l)| if *k == kind { Some(*l) } else { None })
             .unwrap_or(CapabilityLevel::None)
     }
+
+    /// Return the best (highest) `CapabilityLevel` across all declared entries.
+    ///
+    /// This is the score used for registry selection when no specific capability
+    /// dimension is requested.
+    pub fn max_level(&self) -> CapabilityLevel {
+        self.entries
+            .iter()
+            .map(|(_, l)| *l)
+            .max()
+            .unwrap_or(CapabilityLevel::None)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,6 +128,16 @@ pub struct AnalyzerDescriptor {
 ///
 /// When a limit is hit the analyzer MUST emit a `RESOURCE_EXHAUSTED` diagnostic
 /// and return partial output rather than continuing indefinitely.
+///
+/// ## Field semantics per analyzer type
+///
+/// | Field | AST-materializing analyzers | GenericAnalyzer (lexical) |
+/// |---|---|---|
+/// | `max_memory_bytes` | max heap for AST/symbol tables | max cumulative `retrieval_text` bytes |
+/// | `max_time_ms` | total wall-time budget | total wall-time budget |
+/// | `max_ast_nodes` | max AST node count | not used (set to `u64::MAX`) |
+/// | `max_retrieval_units` | advisory cap on output units | hard cap on `RetrievalUnit`s emitted |
+/// | `max_recursion_depth` | max tree traversal depth | not used |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceBudget {
     /// Maximum memory the analyzer may allocate, in bytes.
@@ -123,8 +147,14 @@ pub struct ResourceBudget {
     /// Default: 30 000 ms (30 s).
     pub max_time_ms: u64,
     /// Maximum number of AST nodes that may be materialised.
+    /// For `GenericAnalyzer` (no AST), this field is unused. Use
+    /// `max_retrieval_units` to bound lexical output.
     /// Default: 1 000 000.
     pub max_ast_nodes: u64,
+    /// Maximum number of `RetrievalUnit`s that may be emitted.
+    /// Applies to all analyzers; enforced by `GenericAnalyzer` directly.
+    /// Default: 10 000.
+    pub max_retrieval_units: u64,
     /// Maximum recursion depth for tree traversal.
     /// Default: 500.
     pub max_recursion_depth: u32,
@@ -136,6 +166,7 @@ impl Default for ResourceBudget {
             max_memory_bytes: 256 * 1024 * 1024,
             max_time_ms: 30_000,
             max_ast_nodes: 1_000_000,
+            max_retrieval_units: 10_000,
             max_recursion_depth: 500,
         }
     }
@@ -151,12 +182,12 @@ impl Default for ResourceBudget {
 /// through this enum, which encodes the Phase 1B security decision.
 ///
 /// Invariant (from secrets contract):
-///   - `FullBytes`: safe, no secret bytes present (or post-redaction for
-///     `RedactedBytes`). Retrieval text may be stored.
+///   - `FullBytes`: safe, no secret bytes present.  Retrieval text may be stored.
+///   - `RedactedBytes`: secrets were detected and replaced; retrieval text is safe.
+///     Diagnostics must note redaction.
 ///   - `StreamingHandle`: LARGE file; the `LargeFileStream` has already applied
-///     per-chunk redaction. The accumulated text of each chunk is safe to index.
-///   - `RedactedBytes`: small/medium file where secrets were found and replaced.
-///     Retrieval text from this content is safe. Diagnostics must note redaction.
+///     per-chunk redaction. Each `StreamChunk::redacted` is safe to index.
+///     The stream MUST be consumed chunk by chunk; never accumulated fully.
 pub enum AnalyzerContent {
     /// SMALL (≤4 MiB) or MEDIUM file — fully buffered, no secrets detected.
     FullBytes(Vec<u8>),
@@ -274,11 +305,23 @@ pub struct RelationshipSpec {
 /// Security invariant: `retrieval_text` MUST NOT contain raw secret bytes.
 /// If the source was `RedactedBytes` or `StreamingHandle`, only the
 /// already-redacted text may appear here.
+///
+/// ## Span semantics
+///
+/// `span.start_line` and `span.end_line` are **1-based** line numbers in the
+/// source file as delivered (post-redaction for `RedactedBytes`; the emitted
+/// chunk bytes for `StreamingHandle`).
+///
+/// `span.start_byte` and `span.end_byte` are byte offsets within the content
+/// as delivered to this analyzer (i.e. within `retrieval_text`, not the
+/// original pre-redaction file when redaction changed byte lengths).
+///
+/// For `FullBytes` inputs with no redaction the byte offsets correspond exactly
+/// to the original file positions.  For `RedactedBytes` and `StreamingHandle`
+/// inputs they correspond to positions in the redacted representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalUnitSpec {
-    /// Byte-level span within the original (pre-redaction) source. Used for
-    /// offset navigation; must be correct even when `retrieval_text` is
-    /// redacted.
+    /// Span within the content as delivered to this analyzer.
     pub span: SourceSpan,
     /// Safe-to-store text for full-text indexing. Never contains raw secrets.
     pub retrieval_text: String,
@@ -306,6 +349,7 @@ pub enum DiagnosticSeverity {
 /// | Code                | Meaning |
 /// |---------------------|---------|
 /// | `FALLBACK_USED`     | Specialized analyzer failed; output is from GenericAnalyzer |
+/// | `PANIC_CAUGHT`      | Specialized analyzer panicked; recovered via fallback |
 /// | `PARTIAL_SCAN`      | Input was a VERY_LARGE partial scan; output is incomplete |
 /// | `RESOURCE_EXHAUSTED`| A resource budget limit was hit; output truncated |
 /// | `REDACTED_INPUT`    | Input contained redacted secrets; retrieval units reflect redaction |
@@ -359,6 +403,7 @@ impl AnalyzerDiagnostic {
 /// Well-known diagnostic codes. Use these constants instead of raw strings.
 pub mod diagnostic_codes {
     pub const FALLBACK_USED: &str = "FALLBACK_USED";
+    pub const PANIC_CAUGHT: &str = "PANIC_CAUGHT";
     pub const PARTIAL_SCAN: &str = "PARTIAL_SCAN";
     pub const RESOURCE_EXHAUSTED: &str = "RESOURCE_EXHAUSTED";
     pub const REDACTED_INPUT: &str = "REDACTED_INPUT";
@@ -417,7 +462,9 @@ impl AnalyzerOutput {
 /// 1. Must check `input.cancellation_token.is_cancelled()` at the start of
 ///    every O(n) loop and return partial output with a `CANCELLED` diagnostic.
 /// 2. Must respect `input.resource_budget` and emit `RESOURCE_EXHAUSTED`
-///    when a limit is approached.
+///    when a limit is approached.  `max_retrieval_units` bounds lexical output.
+///    `max_memory_bytes` bounds cumulative retrieval_text bytes.
+///    `max_time_ms` bounds wall-clock time.
 /// 3. `AnalyzerOutput::retrieval_units[*].retrieval_text` MUST NOT contain
 ///    raw secret bytes.
 /// 4. `analyze()` must never panic. If a parse or internal error occurs, emit
