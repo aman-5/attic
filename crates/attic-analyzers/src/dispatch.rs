@@ -85,16 +85,25 @@ enum SpoolPreparation {
     },
     /// A cancellation signal was received while spooling the stream.
     Cancelled {
+        /// Original `AnalyzerInput.file_occurrence_id` — preserved for
+        /// canonical provenance in the returned `AnalyzerOutput`.
+        file_occurrence_id: FileOccurrenceId,
         /// Spool guard (may be partial); dropped to delete the temp file.
         _spool_guard: Option<tempfile::NamedTempFile>,
     },
     /// The `max_time_ms` budget was exhausted while spooling the stream.
     TimeBudgetExhausted {
+        /// Original `AnalyzerInput.file_occurrence_id` — preserved for
+        /// canonical provenance in the returned `AnalyzerOutput`.
+        file_occurrence_id: FileOccurrenceId,
         /// Spool guard (may be partial); dropped to delete the temp file.
         _spool_guard: Option<tempfile::NamedTempFile>,
     },
     /// An I/O error occurred while writing to or reading from the spool.
     IoFailure {
+        /// Original `AnalyzerInput.file_occurrence_id` — preserved for
+        /// canonical provenance in the returned `AnalyzerOutput`.
+        file_occurrence_id: FileOccurrenceId,
         /// Spool guard (may be partial or None if creation itself failed);
         /// dropped to delete the temp file.
         _spool_guard: Option<tempfile::NamedTempFile>,
@@ -137,13 +146,19 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
             _spool_guard,
         } => (fallback_input, *specialized_input, _spool_guard),
 
-        SpoolPreparation::Cancelled { .. } => return preparation_cancelled_output(),
+        SpoolPreparation::Cancelled {
+            file_occurrence_id, ..
+        } => return preparation_cancelled_output(file_occurrence_id),
 
-        SpoolPreparation::TimeBudgetExhausted { .. } => {
-            return preparation_budget_exhausted_output();
+        SpoolPreparation::TimeBudgetExhausted {
+            file_occurrence_id, ..
+        } => {
+            return preparation_budget_exhausted_output(file_occurrence_id);
         }
 
-        SpoolPreparation::IoFailure { .. } => return preparation_io_failure_output(),
+        SpoolPreparation::IoFailure {
+            file_occurrence_id, ..
+        } => return preparation_io_failure_output(file_occurrence_id),
     };
 
     // Wrap the specialized call in catch_unwind.
@@ -334,13 +349,19 @@ fn spool_streaming(
     // Phase 1: create the spool and write redacted chunks.
     let mut spool = match tempfile::NamedTempFile::new() {
         Ok(s) => s,
-        Err(_) => return SpoolPreparation::IoFailure { _spool_guard: None },
+        Err(_) => {
+            return SpoolPreparation::IoFailure {
+                file_occurrence_id,
+                _spool_guard: None,
+            };
+        }
     };
 
     loop {
         // Check cancellation at the top of every iteration (before each chunk).
         if cancellation_token.is_cancelled() {
             return SpoolPreparation::Cancelled {
+                file_occurrence_id,
                 _spool_guard: Some(spool),
             };
         }
@@ -348,6 +369,7 @@ fn spool_streaming(
         // Check time budget at the top of every iteration (before each chunk).
         if started_at.elapsed().as_millis() as u64 >= max_time_ms {
             return SpoolPreparation::TimeBudgetExhausted {
+                file_occurrence_id,
                 _spool_guard: Some(spool),
             };
         }
@@ -356,6 +378,7 @@ fn spool_streaming(
             None => break, // stream exhausted — normal completion
             Some(Err(_)) => {
                 return SpoolPreparation::IoFailure {
+                    file_occurrence_id,
                     _spool_guard: Some(spool),
                 };
             }
@@ -363,6 +386,7 @@ fn spool_streaming(
                 // Write only the already-redacted text — never raw secrets.
                 if spool.write_all(chunk.redacted.as_bytes()).is_err() {
                     return SpoolPreparation::IoFailure {
+                        file_occurrence_id,
                         _spool_guard: Some(spool),
                     };
                 }
@@ -372,6 +396,7 @@ fn spool_streaming(
 
     if spool.flush().is_err() {
         return SpoolPreparation::IoFailure {
+            file_occurrence_id,
             _spool_guard: Some(spool),
         };
     }
@@ -408,6 +433,7 @@ fn spool_streaming(
             _spool_guard: Some(spool),
         },
         _ => SpoolPreparation::IoFailure {
+            file_occurrence_id,
             _spool_guard: Some(spool),
         },
     }
@@ -441,11 +467,14 @@ fn make_input(
 
 /// Output returned when the cancellation token fired during spool preparation.
 /// The specialized analyzer was never invoked.
-fn preparation_cancelled_output() -> AnalyzerOutput {
+///
+/// `file_occurrence_id` is the original value from the `AnalyzerInput` — never
+/// synthesized — so the output retains canonical provenance.
+fn preparation_cancelled_output(file_occurrence_id: FileOccurrenceId) -> AnalyzerOutput {
     AnalyzerOutput {
         analyzer_id: "dispatch".to_string(),
         analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
-        file_occurrence_id: FileOccurrenceId::new_v4(),
+        file_occurrence_id,
         structural_nodes: vec![],
         symbols: vec![],
         imports: vec![],
@@ -463,11 +492,14 @@ fn preparation_cancelled_output() -> AnalyzerOutput {
 
 /// Output returned when the time budget was exhausted during spool preparation.
 /// The specialized analyzer was never invoked.
-fn preparation_budget_exhausted_output() -> AnalyzerOutput {
+///
+/// `file_occurrence_id` is the original value from the `AnalyzerInput` — never
+/// synthesized — so the output retains canonical provenance.
+fn preparation_budget_exhausted_output(file_occurrence_id: FileOccurrenceId) -> AnalyzerOutput {
     AnalyzerOutput {
         analyzer_id: "dispatch".to_string(),
         analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
-        file_occurrence_id: FileOccurrenceId::new_v4(),
+        file_occurrence_id,
         structural_nodes: vec![],
         symbols: vec![],
         imports: vec![],
@@ -486,11 +518,14 @@ fn preparation_budget_exhausted_output() -> AnalyzerOutput {
 /// Output returned when an I/O error occurred during spool preparation.
 /// The specialized analyzer was never invoked — no fabricated empty content
 /// is passed to any analyzer.
-fn preparation_io_failure_output() -> AnalyzerOutput {
+///
+/// `file_occurrence_id` is the original value from the `AnalyzerInput` — never
+/// synthesized — so the output retains canonical provenance.
+fn preparation_io_failure_output(file_occurrence_id: FileOccurrenceId) -> AnalyzerOutput {
     AnalyzerOutput {
         analyzer_id: "dispatch".to_string(),
         analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
-        file_occurrence_id: FileOccurrenceId::new_v4(),
+        file_occurrence_id,
         structural_nodes: vec![],
         symbols: vec![],
         imports: vec![],
@@ -573,6 +608,31 @@ mod tests {
             is_partial_scan: false,
             cancellation_token: CancellationToken::new(),
             resource_budget: budget,
+        };
+        (input, f)
+    }
+
+    /// Create a streaming input with a caller-supplied `FileOccurrenceId`.
+    /// Returns the input AND the known id so tests can assert provenance.
+    fn make_streaming_input_with_id(
+        content: &[u8],
+        file_type: FileType,
+        file_occurrence_id: FileOccurrenceId,
+    ) -> (AnalyzerInput, tempfile::NamedTempFile) {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        let stream = LargeFileStream::open(f.path()).unwrap();
+        let input = AnalyzerInput {
+            file_occurrence_id,
+            path: f.path().to_path_buf(),
+            content: AnalyzerContent::StreamingHandle(Box::new(stream)),
+            language_hint: None,
+            file_type,
+            size_bytes: content.len() as u64,
+            is_partial_scan: false,
+            cancellation_token: CancellationToken::new(),
+            resource_budget: ResourceBudget::default(),
         };
         (input, f)
     }
@@ -1035,7 +1095,7 @@ mod tests {
         // analyzer_id is NOT present in the output.
 
         // Build the preparation_io_failure_output directly and verify its shape.
-        let io_output = preparation_io_failure_output();
+        let io_output = preparation_io_failure_output(FileOccurrenceId::new_v4());
         let codes: Vec<&str> = io_output
             .diagnostics
             .iter()
@@ -1119,6 +1179,7 @@ mod tests {
         let spool_path: Option<std::path::PathBuf> = match &prep {
             SpoolPreparation::Cancelled {
                 _spool_guard: Some(sg),
+                ..
             } => Some(sg.path().to_path_buf()),
             _ => None,
         };
@@ -1162,5 +1223,75 @@ mod tests {
         // No retrieval units from the content-capturing stub (it doesn't
         // produce them), but no panic either — bounded memory is implied by
         // test completion without OOM.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Provenance invariant tests — preparation-failure outputs must carry the
+    // original AnalyzerInput.file_occurrence_id, never a synthesized identity.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Cancellation during spool preparation preserves the original
+    /// `file_occurrence_id` in the returned `AnalyzerOutput`.
+    #[test]
+    fn cancellation_output_preserves_original_file_occurrence_id() {
+        let stub = Arc::new(SuccessStub::new(FileType::Rust));
+        let registry = registry_with_specialized(stub as Arc<dyn Analyzer>);
+
+        let original_id = FileOccurrenceId::new_v4();
+        let (mut input, _guard) =
+            make_streaming_input_with_id(b"fn provenance() {}\n", FileType::Rust, original_id);
+        // Override the cancellation token so the spool loop aborts immediately.
+        let token = CancellationToken::new();
+        token.cancel();
+        input.cancellation_token = token;
+
+        let output = dispatch(&registry, input);
+
+        assert_eq!(
+            output.file_occurrence_id, original_id,
+            "cancelled output must carry the original file_occurrence_id, not a synthesized one"
+        );
+    }
+
+    /// Time-budget exhaustion during spool preparation preserves the original
+    /// `file_occurrence_id` in the returned `AnalyzerOutput`.
+    #[test]
+    fn time_budget_exhausted_output_preserves_original_file_occurrence_id() {
+        let stub = Arc::new(SuccessStub::new(FileType::Rust));
+        let registry = registry_with_specialized(stub as Arc<dyn Analyzer>);
+
+        let original_id = FileOccurrenceId::new_v4();
+        let (mut input, _guard) = make_streaming_input_with_id(
+            b"fn budget_provenance() {}\n",
+            FileType::Rust,
+            original_id,
+        );
+        // Override the budget so it is already exhausted before the first chunk.
+        input.resource_budget = ResourceBudget {
+            max_time_ms: 0,
+            ..ResourceBudget::default()
+        };
+
+        let output = dispatch(&registry, input);
+
+        assert_eq!(
+            output.file_occurrence_id, original_id,
+            "time-budget-exhausted output must carry the original file_occurrence_id"
+        );
+    }
+
+    /// I/O failure during spool preparation preserves the original
+    /// `file_occurrence_id` in the returned `AnalyzerOutput`.
+    #[test]
+    fn io_failure_output_preserves_original_file_occurrence_id() {
+        // Test the helper directly: preparation_io_failure_output must echo
+        // back exactly the id that was passed in — never synthesize a new one.
+        let original_id = FileOccurrenceId::new_v4();
+        let output = preparation_io_failure_output(original_id);
+
+        assert_eq!(
+            output.file_occurrence_id, original_id,
+            "io_failure output must carry the original file_occurrence_id, not a new_v4()"
+        );
     }
 }
