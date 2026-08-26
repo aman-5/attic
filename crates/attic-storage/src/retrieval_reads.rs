@@ -180,12 +180,15 @@ pub struct RelationshipEdge {
     /// [0.0, 1.0].
     pub confidence: f64,
     /// Structured provenance JSON (no secret content), when present.
-    /// Structured provenance JSON (no secret content), when present.
     pub provenance_json: Option<String>,
     /// Revision that produced this edge.
     pub source_revision_id: String,
     /// CURRENT | STALE | INVALID
     pub freshness_state: String,
+    /// Repository that owns the source entity.
+    pub source_repository_id: String,
+    /// Repository that owns the target entity.
+    pub target_repository_id: String,
 }
 
 /// Fetch CURRENT-or-STALE edges touching `entity_id` in either direction.
@@ -202,7 +205,8 @@ pub fn relationships_for_entity(
         SELECT id, source_entity_id, source_entity_type,
                target_entity_id, target_entity_type,
                rel_type, resolution, confidence, provenance_json,
-               source_revision_id, freshness_state
+               source_revision_id, freshness_state,
+               source_repository_id, target_repository_id
           FROM core_relationships
          WHERE freshness_state IN ('CURRENT', 'STALE')
            AND (source_entity_id = ?1 OR target_entity_id = ?1)
@@ -222,6 +226,8 @@ pub fn relationships_for_entity(
             provenance_json: r.get(8)?,
             source_revision_id: r.get(9)?,
             freshness_state: r.get(10)?,
+            source_repository_id: r.get(11)?,
+            target_repository_id: r.get(12)?,
         })
     })?;
     let mut out = Vec::new();

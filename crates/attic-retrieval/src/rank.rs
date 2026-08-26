@@ -84,6 +84,7 @@ pub fn origin_intent_match(qt: QueryType, kind: RetrieverKind) -> f64 {
         RetrieverKind::Relationship => rel,
         RetrieverKind::Knowledge => kno,
         RetrieverKind::Semantic => sem,
+        RetrieverKind::CrossRepo => rel,
     }
 }
 

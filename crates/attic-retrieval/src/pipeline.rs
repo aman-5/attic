@@ -17,8 +17,8 @@ use rusqlite::Connection;
 
 use crate::budget::BudgetAccountant;
 use crate::candidates::{
-    GeneratorEnv, KnowledgeGenerator, LexicalGenerator, PathExactGenerator, RelationshipGenerator,
-    StructuralGenerator, SymbolGenerator, retriever_from_str,
+    CrossRepoGenerator, GeneratorEnv, KnowledgeGenerator, LexicalGenerator, PathExactGenerator,
+    RelationshipGenerator, StructuralGenerator, SymbolGenerator, retriever_from_str,
 };
 use crate::context;
 use crate::contract::{FallbackStrategy, QueryEvidenceContract, contract_for};
@@ -466,6 +466,15 @@ impl RetrievalService {
                     "direct_relationship_edges",
                     "seeds",
                     |env| RelationshipGenerator::run(env, &seed_files),
+                );
+                // Phase 6: cross-repository dependency edges from other
+                // workspaces the user has added to the catalog.
+                ctx.run(
+                    plan,
+                    SubsystemTag::GraphWalk,
+                    "cross_repo_dependency_edges",
+                    "seeds",
+                    |env| CrossRepoGenerator::run(env, &seed_files),
                 );
             }
         }

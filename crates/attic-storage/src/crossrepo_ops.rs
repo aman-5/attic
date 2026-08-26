@@ -191,7 +191,8 @@ pub fn cross_edges_between(
         SELECT id, source_entity_id, source_entity_type,
                target_entity_id, target_entity_type,
                rel_type, resolution, confidence, provenance_json,
-               source_revision_id, freshness_state
+               source_revision_id, freshness_state,
+               source_repository_id, target_repository_id
           FROM core_relationships
          WHERE rel_type = 'DEPENDS_ON'
            AND source_repository_id != target_repository_id
@@ -257,6 +258,8 @@ fn map_edge(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::retrieval_reads::R
         provenance_json: r.get(8)?,
         source_revision_id: r.get(9)?,
         freshness_state: r.get(10)?,
+        source_repository_id: r.get(11)?,
+        target_repository_id: r.get(12)?,
     })
 }
 

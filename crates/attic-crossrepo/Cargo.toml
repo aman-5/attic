@@ -10,6 +10,7 @@ repository.workspace   = true
 
 [dependencies]
 attic-core.workspace      = true
+attic-discovery.workspace = true
 attic-evidence.workspace  = true
 attic-storage.workspace   = true
 blake3.workspace          = true
@@ -22,3 +23,8 @@ thiserror.workspace       = true
 
 [dev-dependencies]
 tempfile.workspace        = true
+criterion                 = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crossrepo_bench"
+harness = false

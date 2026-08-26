@@ -74,6 +74,7 @@ pub use repository::repository::{
 };
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
+    latest_source_revision_for_repository,
 };
 pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occurrence};
 pub use retrieval_reads::{

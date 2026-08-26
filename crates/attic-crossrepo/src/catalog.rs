@@ -59,6 +59,9 @@ pub fn indexed_manifest_paths(
 }
 
 /// Read one manifest with hard bounds and path containment.
+///
+/// Uses Phase 1B safe-content boundary: `canonicalize_within_root` for path
+/// containment and `scan_and_redact` for secret scanning defense-in-depth.
 fn read_manifest_bounded(
     repo_root: &std::path::Path,
     rel_path: &str,
@@ -66,13 +69,14 @@ fn read_manifest_bounded(
     if rel_path.split('/').any(|seg| seg == "..") {
         return Ok(None);
     }
-    let joined = repo_root.join(rel_path.replace('\\', "/"));
+    // Canonicalize the root first so starts_with comparison works on Windows
+    // (where std::fs::canonicalize adds \\?\ prefix).
     let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
         return Ok(None);
     };
-    let canon = match std::fs::canonicalize(&joined) {
-        Ok(c) => c,
-        Err(_) => return Ok(None),
+    let joined = repo_root.join(rel_path.replace('\\', "/"));
+    let Ok(canon) = std::fs::canonicalize(&joined) else {
+        return Ok(None);
     };
     if !canon.starts_with(&canon_root) {
         return Err(CrossRepoError::PathEscape(rel_path.to_owned()));
@@ -90,13 +94,29 @@ fn read_manifest_bounded(
             context: format!("{rel_path} is {} bytes", meta.len()),
         });
     }
-    match std::fs::read(&canon) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(_) => Ok(None),
+    let raw = match std::fs::read(&canon) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    // Defense-in-depth: scan for secrets even though manifests are
+    // dependency declarations, not secret material.
+    if let Ok(text) = std::str::from_utf8(&raw) {
+        let scan = attic_discovery::secrets::scan_and_redact(text);
+        if !scan.findings.is_empty() {
+            debug!(
+                path = rel_path,
+                findings = scan.findings.len(),
+                "manifest contains secret patterns, redacting"
+            );
+            return Ok(Some(scan.redacted.into_bytes()));
+        }
     }
+    Ok(Some(raw))
 }
 
 /// Read one proto file with hard bounds.
+///
+/// Uses Phase 1B safe-content boundary for path containment.
 fn read_proto_bounded(
     repo_root: &std::path::Path,
     rel_path: &str,
@@ -104,13 +124,12 @@ fn read_proto_bounded(
     if rel_path.split('/').any(|seg| seg == "..") {
         return Ok(None);
     }
-    let joined = repo_root.join(rel_path.replace('\\', "/"));
     let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
         return Ok(None);
     };
-    let canon = match std::fs::canonicalize(&joined) {
-        Ok(c) => c,
-        Err(_) => return Ok(None),
+    let joined = repo_root.join(rel_path.replace('\\', "/"));
+    let Ok(canon) = std::fs::canonicalize(&joined) else {
+        return Ok(None);
     };
     if !canon.starts_with(&canon_root) {
         return Ok(None);
@@ -122,10 +141,9 @@ fn read_proto_bounded(
     if !meta.is_file() || meta.len() > limits::MAX_MANIFEST_BYTES {
         return Ok(None);
     }
-    match std::fs::read(&canon) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(_) => Ok(None),
-    }
+    std::fs::read(&canon)
+        .map(Some)
+        .map_err(|_| CrossRepoError::InvalidRoot("proto read failed".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -526,5 +544,32 @@ mod tests {
 
         let data = build_repo_catalog_data("repo-x", "/ws/x", "rev-x", &scan);
         assert_eq!(data.provides.len(), limits::MAX_PROVIDES_PER_REPO);
+    }
+
+    #[test]
+    fn read_manifest_bounded_redacts_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A manifest containing a pattern that looks like an AWS key
+        let content = "module x\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\n";
+        std::fs::write(root.join("go.mod"), content).unwrap();
+
+        let result = read_manifest_bounded(root, "go.mod").unwrap();
+        assert!(result.is_some(), "should return redacted content");
+        let bytes = result.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        // The secret pattern should be redacted (not present in output)
+        assert!(
+            !text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret must be redacted"
+        );
+    }
+
+    #[test]
+    fn read_manifest_bounded_path_escape_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let result = read_manifest_bounded(root, "../../etc/passwd");
+        assert!(result.unwrap().is_none(), "path escape should return None");
     }
 }

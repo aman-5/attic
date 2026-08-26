@@ -599,4 +599,126 @@ mod tests {
         let e2 = e1.clone();
         assert_eq!(e1.identity_key(), e2.identity_key());
     }
+
+    #[test]
+    fn mutual_dependency_cycle_produces_edges() {
+        let a = make_repo(
+            "repo-a",
+            "/ws/a",
+            vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Go,
+                name: "example.com/a".to_owned(),
+            }],
+            vec![DependencyDeclaration {
+                path: "go.mod".to_owned(),
+                ecosystem: Ecosystem::Go,
+                name: "example.com/b".to_owned(),
+                version_req: None,
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+        );
+        let b = make_repo(
+            "repo-b",
+            "/ws/b",
+            vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Go,
+                name: "example.com/b".to_owned(),
+            }],
+            vec![DependencyDeclaration {
+                path: "go.mod".to_owned(),
+                ecosystem: Ecosystem::Go,
+                name: "example.com/a".to_owned(),
+                version_req: None,
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+        );
+
+        let (edges, diag) = resolve_workspace(&[a, b], &HashMap::new());
+        // Mutual dependency: A→B and B→A, both edges exist.
+        assert_eq!(edges.len(), 2, "cycle edges should be emitted");
+        assert!(diag.is_empty(), "cycle is not ambiguous");
+    }
+
+    #[test]
+    fn transitive_chain_resolves_all_edges() {
+        let lib = make_repo(
+            "lib",
+            "/ws/lib",
+            vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Npm,
+                name: "utils".to_owned(),
+            }],
+            vec![DependencyDeclaration {
+                path: "package.json".to_owned(),
+                ecosystem: Ecosystem::Npm,
+                name: "core".to_owned(),
+                version_req: None,
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+        );
+        let core = make_repo(
+            "core",
+            "/ws/core",
+            vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Npm,
+                name: "core".to_owned(),
+            }],
+            vec![],
+        );
+        let app = make_repo(
+            "app",
+            "/ws/app",
+            vec![],
+            vec![DependencyDeclaration {
+                path: "package.json".to_owned(),
+                ecosystem: Ecosystem::Npm,
+                name: "utils".to_owned(),
+                version_req: None,
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+        );
+
+        let (edges, diag) = resolve_workspace(&[lib, core, app], &HashMap::new());
+        assert_eq!(edges.len(), 2, "app→lib and lib→core edges");
+        assert!(diag.is_empty());
+        // Verify direction
+        let app_to_lib = edges.iter().find(|e| e.source_repository_id == "app").unwrap();
+        assert_eq!(app_to_lib.target_repository_id, "lib");
+        let lib_to_core = edges.iter().find(|e| e.source_repository_id == "lib").unwrap();
+        assert_eq!(lib_to_core.target_repository_id, "core");
+    }
+
+    #[test]
+    fn source_revision_propagated_to_edge() {
+        let provider = make_repo(
+            "provider",
+            "/ws/p",
+            vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Go,
+                name: "example.com/p".to_owned(),
+            }],
+            vec![],
+        );
+        let consumer = make_repo(
+            "consumer",
+            "/ws/c",
+            vec![],
+            vec![DependencyDeclaration {
+                path: "go.mod".to_owned(),
+                ecosystem: Ecosystem::Go,
+                name: "example.com/p".to_owned(),
+                version_req: Some("v2.0.0".to_owned()),
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+        );
+
+        let (edges, _) = resolve_workspace(&[provider, consumer], &HashMap::new());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_revision_id, "rev-consumer");
+    }
 }

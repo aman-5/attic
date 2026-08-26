@@ -11,7 +11,6 @@ members = [
     "crates/attic-indexing",
     "crates/attic-incremental",
     "crates/attic-retrieval",
-    "crates/attic-crossrepo",
     "crates/attic-server",
     "crates/attic-test-support",
 ]

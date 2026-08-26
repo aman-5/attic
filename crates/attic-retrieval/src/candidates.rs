@@ -25,6 +25,8 @@ pub enum RetrieverKind {
     Knowledge,
     /// Phase 5: nearest-neighbor over the disposable semantic layer.
     Semantic,
+    /// Phase 6: cross-repository dependency edges.
+    CrossRepo,
 }
 
 /// Parse a canonical retriever tag back to its kind.
@@ -37,6 +39,7 @@ pub fn retriever_from_str(s: &str) -> Option<RetrieverKind> {
         "RELATIONSHIP" | "GRAPH" => Some(RetrieverKind::Relationship),
         "KNOWLEDGE" => Some(RetrieverKind::Knowledge),
         "SEMANTIC" | "VECTOR" => Some(RetrieverKind::Semantic),
+        "CROSS_REPO" => Some(RetrieverKind::CrossRepo),
         _ => None,
     }
 }
@@ -52,6 +55,7 @@ impl RetrieverKind {
             Self::Relationship => "RELATIONSHIP",
             Self::Knowledge => "KNOWLEDGE",
             Self::Semantic => "SEMANTIC",
+            Self::CrossRepo => "CROSS_REPO",
         }
     }
 }
@@ -516,5 +520,61 @@ impl KnowledgeGenerator {
                 c
             })
             .collect())
+    }
+}
+
+/// Cross-repository dependency generator: produces evidence from cross-repo
+/// DEPENDS_ON edges where source and target reside in different repositories.
+pub struct CrossRepoGenerator;
+
+impl CrossRepoGenerator {
+    pub fn run(
+        env: &mut GeneratorEnv<'_>,
+        seed_entity_ids: &[String],
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        let mut out = Vec::new();
+        for entity in seed_entity_ids.iter().take(16) {
+            if !env.budget.candidates_available() {
+                break;
+            }
+            for e in attic_storage::relationships_for_entity(env.conn, entity, 24)? {
+                // Only emit cross-repo edges (source != target repository).
+                if e.source_repository_id == e.target_repository_id {
+                    continue;
+                }
+                if e.rel_type != "DEPENDS_ON" {
+                    continue;
+                }
+                if !env.budget.admit_candidate() {
+                    break;
+                }
+                let resolution = ResolutionLevel::from_db_str(&e.resolution)
+                    .unwrap_or(ResolutionLevel::Syntactic);
+                let mut ev = Evidence::new(uuid::Uuid::new_v4().to_string(), e.source_repository_id.clone());
+                ev.source_type = EvidenceSourceType::Relationship;
+                ev.source_id = e.id.clone();
+                ev.path = format!(
+                    "CROSS_REPO {} [{}] → {} [{}]",
+                    e.source_entity_id, e.source_repository_id,
+                    e.target_entity_id, e.target_repository_id
+                );
+                ev.source_revision_id = Some(e.source_revision_id.clone());
+                ev.freshness_state = freshness_of(&e.freshness_state);
+                ev.authority = AuthorityLevel::Derived;
+                ev.confidence = e.confidence.clamp(0.0, 0.99);
+                ev.relationship_confidence = Some(e.confidence.clamp(0.0, 0.99));
+                ev.relationship = Some(RelationshipProvenance {
+                    edge_id: e.id.clone(),
+                    rel_type: e.rel_type.clone(),
+                    resolution,
+                    confidence: e.confidence,
+                    hop_depth: 0,
+                });
+                ev.signals.relationship_confidence = Some(e.confidence);
+                ev.signals.structural_proximity = Some(0.5);
+                out.push(Candidate::new(RetrieverKind::CrossRepo, ev));
+            }
+        }
+        Ok(out)
     }
 }

@@ -207,6 +207,8 @@ pub fn sync_workspace(
         let root_path = attic_storage::get_repository_path(reader_conn, &repo_id_parsed)?
             .unwrap_or_default();
 
+        // Use the real source_revision_id from the catalog (derived from
+        // the persisted DB state, not an empty placeholder).
         let source_revision_id = catalog
             .as_ref()
             .map(|c| c.source_revision_id.clone())
@@ -253,13 +255,12 @@ pub fn sync_workspace(
         .send(move |conn| {
             // Delete all existing cross-repo DEPENDS_ON edges (clean replacement).
             for repo_id in &repo_ids_for_cleanup {
-                let _ =
-                    attic_storage::crossrepo_ops::delete_all_xrepo_edges_touching(conn, repo_id);
+                attic_storage::crossrepo_ops::delete_all_xrepo_edges_touching(conn, repo_id)?;
             }
 
             // Insert resolved edges.
             for e in &edges_clone {
-                let _ = attic_storage::crossrepo_ops::insert_xrepo_edge(
+                attic_storage::crossrepo_ops::insert_xrepo_edge(
                     conn,
                     &e.source_repository_id,
                     &e.source_entity_id,
@@ -270,7 +271,7 @@ pub fn sync_workspace(
                     &e.dependency_basis,
                     &e.provenance_json,
                     &e.source_revision_id,
-                );
+                )?;
             }
 
             Ok(())
@@ -326,7 +327,7 @@ pub fn incremental_sync(
         repo = repository_id,
         "manifest change detected, resyncing"
     );
-    let _ = sync_repository(conn, repository_id, source_revision_id)?;
+    sync_repository(conn, repository_id, source_revision_id)?;
     Ok(true)
 }
 
@@ -537,5 +538,102 @@ mod tests {
         // The report is valid — provides_count is 0 because no occurrences exist.
         assert_eq!(report.provides_count, 0);
         assert_eq!(report.declarations_count, 0);
+    }
+
+    #[test]
+    fn source_revision_id_stored_in_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("go.mod"), b"module x\n").unwrap();
+
+        let conn = seeded_conn();
+        let rid = test_id("src-rev-test");
+        attic_storage::repository::repository::upsert_repository(
+            &conn,
+            &rid,
+            &root.to_string_lossy(),
+            "src-rev-test",
+        )
+        .unwrap();
+        let rev = insert_rev(&conn, "src-rev-test");
+
+        sync_repository(&conn, &tid("src-rev-test"), &rev).unwrap();
+
+        let catalog = attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("src-rev-test"))
+            .unwrap()
+            .expect("catalog row should exist");
+        assert_eq!(
+            catalog.source_revision_id, rev,
+            "source_revision_id must be stored correctly"
+        );
+    }
+
+    #[test]
+    fn repository_removed_deletes_edges_and_catalog() {
+        let conn = seeded_conn();
+        insert_repo(&conn, "r0", "/ws/0");
+        insert_repo(&conn, "r1", "/ws/1");
+        let rev0 = insert_rev(&conn, "r0");
+        let rev1 = insert_rev(&conn, "r1");
+
+        // Insert catalog for both repos
+        let cat0 = attic_storage::crossrepo_ops::CatalogRow {
+            repository_id: tid("r0"),
+            source_revision_id: rev0.clone(),
+            provides_json: "[]".to_owned(),
+            manifest_hash: "hash0".to_owned(),
+            entry_count: 0,
+            freshness_state: "CURRENT".to_owned(),
+        };
+        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat0, &cat0.provides_json).unwrap();
+
+        let cat1 = attic_storage::crossrepo_ops::CatalogRow {
+            repository_id: tid("r1"),
+            source_revision_id: rev1.clone(),
+            provides_json: "[]".to_owned(),
+            manifest_hash: "hash1".to_owned(),
+            entry_count: 0,
+            freshness_state: "CURRENT".to_owned(),
+        };
+        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat1, &cat1.provides_json).unwrap();
+
+        // Insert edges r0→r1 and r1→r0
+        let _e1 = attic_storage::crossrepo_ops::insert_xrepo_edge(
+            &conn, &tid("r0"), "s0", &tid("r1"), "t1", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev0,
+        ).unwrap();
+        let _e2 = attic_storage::crossrepo_ops::insert_xrepo_edge(
+            &conn, &tid("r1"), "s1", &tid("r0"), "t0", "PACKAGE_RESOLVED", 0.8, "GO_MODULE", "{}", &rev1,
+        ).unwrap();
+
+        let (edges_deleted, decls_deleted) = repository_removed(&conn, &tid("r0")).unwrap();
+        assert!(edges_deleted >= 2, "should delete both edges touching r0");
+        assert_eq!(decls_deleted, 0, "no declarations to delete");
+
+        // Verify no edges remain
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_relationships WHERE source_repository_id = ?1 OR target_repository_id = ?1",
+                rusqlite::params![tid("r0")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "no edges should remain for removed repo");
+
+        // Verify r1 catalog still exists
+        let r1_cat = attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("r1")).unwrap();
+        assert!(r1_cat.is_some(), "r1 catalog should still exist");
+    }
+
+    #[test]
+    fn incremental_sync_propagates_error_on_db_failure() {
+        let conn = seeded_conn();
+        // Try to sync a repository that doesn't exist — should propagate error
+        let result = incremental_sync(
+            &conn,
+            &tid("nonexistent"),
+            "rev-1",
+            &["go.mod".to_owned()],
+        );
+        assert!(result.is_err(), "should propagate error for missing repo");
     }
 }
