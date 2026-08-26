@@ -82,14 +82,23 @@ pub trait SemanticProvider: Send + Sync {
         true
     }
 
-    /// Embed a batch. Returns outputs for the items it managed to embed;
-    /// on cancellation/partial failure it returns `Cancelled`/`EmbeddingFailed`
+    /// Embed a batch under an ENFORCEABLE time contract (§20): `deadline`
+    /// (when set) bounds the whole call — implementations must check it
+    /// cooperatively between items/slices and return
+    /// [`SemanticError::Cancelled`] with nothing committed when it fires, so
+    /// callers can degrade inside their configured semantic budget instead
+    /// of blocking indefinitely. A provider that ignores the deadline is in
+    /// violation of this contract and fails the conformance tests.
+    ///
+    /// Returns outputs for the items it managed to embed; on
+    /// cancellation/partial failure it returns `Cancelled`/`EmbeddingFailed`
     /// with whatever completed so far attached via `completed`.
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
         cancel: &CancelFlag,
         usage: &mut ResourceUsage,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError>;
 }
 

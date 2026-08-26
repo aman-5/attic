@@ -8,7 +8,6 @@
 //! baseline; see ADR-013 for why a neural provider is optional, not
 //! required, for V1).
 
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::error::SemanticError;
@@ -121,11 +120,12 @@ impl SemanticProvider for HashingEmbedder {
         inputs: &[EmbeddingInput],
         cancel: &CancelFlag,
         usage: &mut ResourceUsage,
+        deadline: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         let t0 = Instant::now();
         let mut out = Vec::with_capacity(inputs.len());
         for input in inputs {
-            if cancel.is_cancelled() || cancel.0.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(SemanticError::Cancelled {
                     completed: out.len(),
                     total: inputs.len(),
@@ -180,6 +180,7 @@ impl SemanticProvider for UnavailableProvider {
         _: &[EmbeddingInput],
         _: &CancelFlag,
         _: &mut ResourceUsage,
+        _: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         Err(SemanticError::ProviderUnavailable {
             provider: "unavailable".into(),
@@ -214,6 +215,7 @@ impl SemanticProvider for FailingProvider {
         inputs: &[EmbeddingInput],
         _cancel: &CancelFlag,
         usage: &mut ResourceUsage,
+        _deadline: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         let mut out = Vec::new();
         for (i, input) in inputs.iter().enumerate() {
@@ -260,16 +262,30 @@ impl SemanticProvider for SlowProvider {
         inputs: &[EmbeddingInput],
         cancel: &CancelFlag,
         usage: &mut ResourceUsage,
+        deadline: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         let mut out = Vec::new();
         for input in inputs {
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(SemanticError::Cancelled {
                     completed: out.len(),
                     total: inputs.len(),
                 });
             }
-            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            // Sleep in small slices so deadline/cancel are honored MID-delay —
+            // a provider must never block past the caller's budget.
+            let mut remaining = self.delay_ms;
+            while remaining > 0 {
+                if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(SemanticError::Cancelled {
+                        completed: out.len(),
+                        total: inputs.len(),
+                    });
+                }
+                let step = remaining.min(5);
+                std::thread::sleep(std::time::Duration::from_millis(step));
+                remaining -= step;
+            }
             out.push(EmbeddingOutput {
                 unit_key: input.unit_key.clone(),
                 vector: vec![1.0, 0.0],
@@ -308,6 +324,7 @@ impl SemanticProvider for RecordingProvider {
         inputs: &[EmbeddingInput],
         _cancel: &CancelFlag,
         usage: &mut ResourceUsage,
+        _deadline: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         self.seen_texts
             .lock()

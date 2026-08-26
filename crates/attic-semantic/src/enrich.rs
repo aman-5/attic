@@ -106,7 +106,9 @@ pub fn drive(
         }
 
         let mut usage = ResourceUsage::default();
-        match provider.embed_batch(&inputs, cancel, &mut usage) {
+        // Enrichment's own wall-clock budget is the provider deadline: a
+        // slow/hung backend must never hold the drive loop past it.
+        match provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline)) {
             Ok(outputs) => {
                 for out in outputs {
                     if let Some(r) = meta.get(&out.unit_key) {

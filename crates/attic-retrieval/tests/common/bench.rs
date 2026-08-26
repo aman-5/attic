@@ -232,3 +232,61 @@ pub fn evaluate_tier(per_case: &[(usize, Vec<String>)], cs: &[Case]) -> TierMetr
             / n,
     }
 }
+
+/// Semantic-TARGET cases (Phase 5 value gate): each question is written so
+/// its content words do NOT appear verbatim in the target unit (FTS5
+/// unicode61 has no stemming) — pure paraphrase / synonym / conceptual /
+/// weak-overlap queries where embeddings are the ONLY plausible advantage.
+/// S06 is a strong-lexical CONTROL that must not regress.
+pub fn semantic_cases() -> Vec<Case> {
+    vec![
+        Case {
+            id: "S01",
+            question: "How are incoming HTTP requests routed to their handlers?",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["src/main/java/com/sable/Router.java"],
+            related: &["src/main/java/com/sable/RouteRegistry.java"],
+            expect_evidence: true,
+        },
+        Case {
+            id: "S02",
+            question: "Which component dispatches URLs to controller classes?",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["src/main/java/com/sable/RouteRegistry.java"],
+            related: &["src/main/java/com/sable/Router.java"],
+            expect_evidence: true,
+        },
+        Case {
+            id: "S03",
+            question: "What happens when someone visits an undefined endpoint?",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["src/main/java/com/sable/Router.java"],
+            related: &[],
+            expect_evidence: true,
+        },
+        Case {
+            id: "S04",
+            question: "transaction processing implementation",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["services/pay.py"],
+            related: &[],
+            expect_evidence: true,
+        },
+        Case {
+            id: "S05",
+            question: "verification suite for the routing behavior",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["src/test/java/com/sable/RouterTest.java"],
+            related: &["src/main/java/com/sable/Router.java"],
+            expect_evidence: true,
+        },
+        Case {
+            id: "S06",
+            question: "healthEndpointReturnsOk test assertion",
+            mode: attic_retrieval::AnswerMode::Normal,
+            expected: &["src/test/java/com/sable/RouterTest.java"],
+            related: &[],
+            expect_evidence: true,
+        },
+    ]
+}

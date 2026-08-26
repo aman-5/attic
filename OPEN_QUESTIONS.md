@@ -272,12 +272,15 @@ violating FS budgets is left for measurement on larger corpora.
 
 ## OQ-001 - Embedding Provider / Model Choice
 
-**Status:** RESOLVED (Phase 5, ADR-013)
-**Resolution:** Provider-neutral `SemanticProvider` trait; V1 default is the
-in-tree deterministic `HashingEmbedder` (offline, reproducible gates,
-privacy-preserving). fastembed-rs + bge-small-en-v1.5 documented as the
-sanctioned neural swap-in behind the same trait; cloud providers rejected
-by default.
+**Status:** RESOLVED-DEFERRED (Phase 5, ADR-013 incl. post-review revision)
+**Resolution:** Provider-neutral `SemanticProvider` trait with an enforceable
+query-time deadline contract; the shipped `HashingEmbedder` is honestly
+classified as a deterministic feature-hashing BASELINE/test provider — not a
+neural semantic model. True neural embeddings (fastembed-rs +
+bge-small-en-v1.5 sanctioned first swap-in) are EXPLICITLY DEFERRED until
+benchmark evidence demands them. Production semantic retrieval is therefore
+DISABLED by default and opt-in via `ATTIC_SEMANTIC=1`; when enabled it is
+non-regressing and instantly degradable to the canonical path.
 
 ## OQ-002 - Cross-Encoder Reranking
 

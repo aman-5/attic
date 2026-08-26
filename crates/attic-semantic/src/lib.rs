@@ -39,7 +39,7 @@ pub use selection::{
     EX_GENERATED_TYPE, EX_TOO_LARGE, SEMANTIC_SELECTION_VERSION, SelectedUnit, SelectionConfig,
     SelectionReport, SelectionSignals, select_units,
 };
-pub use store::{EmbeddingRecord, NearestHit, QueueItem, SemanticStore};
+pub use store::{EmbeddingRecord, KnnResult, NearestHit, QueueItem, ScanBudget, SemanticStore};
 
 /// Re-exported canonical read types the layer consumes.
 pub use attic_storage::{SemanticUnitRow, UnitAnchor};

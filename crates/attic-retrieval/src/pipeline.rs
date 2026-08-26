@@ -340,7 +340,10 @@ impl RetrievalService {
         plan.policy_trace.fs_bytes_read = budget.fs_bytes_used;
         plan.policy_trace.context_tokens_used = plan.context_tokens;
         plan.policy_trace.semantic_invoked = semantic_outcome.candidates > 0;
-        plan.policy_trace.reranking_invoked = policy.reranking_allowed;
+        // Truthful observability: NO reranker exists in Phase 5 (ADR-014 D7).
+        // Policy permission is NOT execution — this stays false until a
+        // reranker actually runs.
+        plan.policy_trace.reranking_invoked = false;
         plan.policy_trace.repair_cycles = plan.repair_cycles;
         plan.policy_trace.semantic_candidates_returned = semantic_outcome.candidates as u32;
         plan.policy_trace.semantic_fallback_reason = semantic_outcome.fallback.as_str().to_owned();

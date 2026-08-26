@@ -31,12 +31,6 @@ const FULL: EnrichmentConfig = EnrichmentConfig {
     budget_ms: 10_000,
 };
 
-fn first_pass(fx: &Fixture) -> f64 {
-    // Fraction of cases whose FIRST served path is fully relevant.
-    let _ = fx;
-    0.0
-}
-
 #[test]
 fn phase5_semantic_benchmark_gate() {
     let fx = Fixture::bootstrap();
@@ -105,15 +99,23 @@ fn phase5_semantic_benchmark_gate() {
                     }],
                     &cancel,
                     &mut usage.clone(),
+                    None,
                 )
                 .expect("embed query");
             let qv = outs[0].vector.clone();
-            let hits = stack
+            let kn = stack
                 .store
-                .knn(&qv, 10, "hashing", "hashed-ngram-v1", None)
+                .knn(
+                    &qv,
+                    10,
+                    "hashing",
+                    "hashed-ngram-v1",
+                    None,
+                    &attic_semantic::ScanBudget::unbounded(&cancel),
+                )
                 .expect("knn");
             let mut paths: Vec<String> = Vec::new();
-            for h in hits {
+            for h in kn.hits {
                 if let Ok(Some(anchor)) =
                     attic_storage::retrieval_unit_anchor(&conn, &h.retrieval_unit_id)
                     && !paths.contains(&anchor.path)
@@ -143,6 +145,46 @@ fn phase5_semantic_benchmark_gate() {
         c_paths.push((i, path_order(&served)));
     }
     let c = evaluate_tier(&c_paths, &cs);
+
+    // ── Semantic-target subset (§23/§24): paraphrase/synonym/conceptual ────
+    // Same fixture, same services: does hybrid BEAT Phase 4 where semantics
+    // is the only plausible advantage?
+    let scs = common::bench::semantic_cases();
+    let mut a_s = Vec::new();
+    let mut c_s = Vec::new();
+    for (i, c) in scs.iter().enumerate() {
+        let oa = plain
+            .answer(&AnswerRequest::new(c.question, c.mode))
+            .unwrap();
+        let oc = hybrid
+            .answer(&AnswerRequest::new(c.question, c.mode))
+            .unwrap();
+        let pa = path_order(
+            &oa.context_text
+                .as_deref()
+                .map(served_paths)
+                .unwrap_or_default(),
+        );
+        let pc = path_order(
+            &oc.context_text
+                .as_deref()
+                .map(served_paths)
+                .unwrap_or_default(),
+        );
+        a_s.push((i, pa));
+        c_s.push((i, pc));
+    }
+    let a_sem = evaluate_tier(&a_s, &scs);
+    let c_sem = evaluate_tier(&c_s, &scs);
+    for (i, _) in a_s.iter().enumerate() {
+        println!(
+            "SEMSUB {} A_first={:?} C_first={:?} C_R5={:.0}",
+            scs[i].id,
+            a_s[i].1.first(),
+            c_s[i].1.first(),
+            recall_at(&c_s[i].1, &scs[i], 5)
+        );
+    }
 
     // ── Operational: incremental enrichment after ONE source edit ──────────
     std::fs::write(
@@ -193,7 +235,15 @@ fn phase5_semantic_benchmark_gate() {
     println!("embedded items             = {}", enrich_stats.embedded);
     println!("incremental enrichment     = {incremental_ms} ms");
     println!("hybrid latency per case ms = {c_latencies:?}");
-    let _ = first_pass(&fx);
+    println!("\n--- semantic-target subset (paraphrase/synonym/conceptual) ---");
+    println!(
+        "A(P4) subset: R@5={:.3} MRR={:.3} nDCG={:.3}",
+        a_sem.recall5, a_sem.mrr, a_sem.ndcg10
+    );
+    println!(
+        "C(hyb) subset: R@5={:.3} MRR={:.3} nDCG={:.3}",
+        c_sem.recall5, c_sem.mrr, c_sem.ndcg10
+    );
 
     // ── Hard gates ──────────────────────────────────────────────────────────
     assert!(
@@ -212,6 +262,23 @@ fn phase5_semantic_benchmark_gate() {
             cs[i].id
         );
     }
+    // Control case S06 (strong lexical overlap) must stay perfect.
+    assert_eq!(
+        recall_at(&c_s[5].1, &scs[5], 5),
+        1.0,
+        "lexical control S06 must not regress under hybrid"
+    );
+    // VALUE GATE (§24/§7): semantics must ADD measurable benefit where it is
+    // the only plausible advantage. Hybrid subset MRR/nDCG must strictly
+    // beat the Phase 4 baseline on the semantic-target cases.
+    assert!(
+        c_sem.mrr > a_sem.mrr || c_sem.ndcg10 > a_sem.ndcg10,
+        "no measurable semantic benefit (A_mrr={} C_mrr={} A_ndcg={} C_ndcg={})",
+        a_sem.mrr,
+        c_sem.mrr,
+        a_sem.ndcg10,
+        c_sem.ndcg10
+    );
     assert_eq!(
         fx.query_i64(
             |c| c.query_row("SELECT COUNT(*) FROM core_retrieval_units", [], |r| r

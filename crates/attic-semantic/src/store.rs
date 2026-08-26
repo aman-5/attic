@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::error::SemanticError;
+use crate::provider::CancelFlag;
 use rusqlite::{Connection, params};
 
 /// One stored embedding with full lineage.
@@ -38,6 +39,51 @@ pub struct EmbeddingRecord {
 pub struct NearestHit {
     pub retrieval_unit_id: String,
     pub similarity: f32,
+}
+
+/// Enforceable scan bounds for nearest-neighbor search (§20). The scan
+/// checks EVERY row against these bounds, so a large model can never turn a
+/// bounded query into an unbounded wait.
+#[derive(Debug)]
+pub struct ScanBudget<'a> {
+    /// Cooperative cancellation (query dropped / shutdown).
+    pub cancel: &'a CancelFlag,
+    /// Wall-clock deadline; `None` = no time bound.
+    pub deadline: Option<std::time::Instant>,
+    /// Hard cap on rows examined; `0` = unlimited.
+    pub max_rows: u64,
+}
+
+impl<'a> ScanBudget<'a> {
+    pub fn unbounded(cancel: &'a CancelFlag) -> Self {
+        Self {
+            cancel,
+            deadline: None,
+            max_rows: 0,
+        }
+    }
+
+    fn exhausted(&self, scanned: u64) -> bool {
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        if let Some(d) = self.deadline
+            && std::time::Instant::now() >= d
+        {
+            return true;
+        }
+        self.max_rows > 0 && scanned >= self.max_rows
+    }
+}
+
+/// kNN outcome including honest observability about how much was searched.
+#[derive(Debug, Clone)]
+pub struct KnnResult {
+    pub hits: Vec<NearestHit>,
+    pub rows_scanned: u64,
+    /// True when the scan stopped EARLY because of the budget (results are
+    /// then best-effort, not exhaustive over the active model).
+    pub truncated_by_budget: bool,
 }
 
 /// Queue row states.
@@ -98,6 +144,26 @@ impl SemanticStore {
         })
     }
 
+    /// Fallible lock acquisition: a poisoned mutex (a panic while the lock
+    /// was held) must surface as [`SemanticError::StoreUnavailable`] and let
+    /// callers degrade to canonical retrieval — NEVER an unwrap/panic.
+    fn guard(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SemanticError> {
+        self.conn
+            .lock()
+            .map_err(|_| SemanticError::StoreUnavailable("store mutex poisoned".into()))
+    }
+
+    /// TEST SUPPORT ONLY: deliberately poisons the internal mutex by panicking
+    /// while holding the guard. Call from a sacrificial thread.
+    #[doc(hidden)]
+    pub fn debug_poison_mutex(&self) {
+        let _g = self
+            .conn
+            .lock()
+            .expect("poison helper requires healthy lock");
+        panic!("intentional poison");
+    }
+
     fn migrate(conn: &Connection) -> Result<(), SemanticError> {
         conn.execute_batch(
             r"
@@ -153,7 +219,7 @@ impl SemanticStore {
         for v in &rec.vector {
             blob.extend_from_slice(&v.to_le_bytes());
         }
-        self.conn.lock().expect("semantic store mutex").execute(
+        self.guard()?.execute(
             "INSERT INTO sem_embeddings
                  (retrieval_unit_id, repository_id, source_revision_id,
                   index_generation_id, selection_version, provider_id, model_id,
@@ -187,7 +253,7 @@ impl SemanticStore {
     ) -> Result<usize, SemanticError> {
         match (provider, model) {
             (Some(p), Some(m)) => {
-                let n = self.conn.lock().expect("semantic store mutex").execute(
+                let n = self.guard()?.execute(
                     "DELETE FROM sem_embeddings
                       WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3",
                     params![unit_id, p, m],
@@ -195,7 +261,7 @@ impl SemanticStore {
                 Ok(n)
             }
             _ => {
-                let n = self.conn.lock().expect("semantic store mutex").execute(
+                let n = self.guard()?.execute(
                     "DELETE FROM sem_embeddings WHERE retrieval_unit_id=?1",
                     params![unit_id],
                 )?;
@@ -211,7 +277,7 @@ impl SemanticStore {
         provider: &str,
         model: &str,
     ) -> Result<Option<EmbeddingRecord>, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare(
             "SELECT retrieval_unit_id, repository_id, source_revision_id,
                     index_generation_id, selection_version, provider_id, model_id,
@@ -252,6 +318,11 @@ impl SemanticStore {
 
     /// Bounded brute-force kNN over ONE active (provider, model). Vectors are
     /// L2-normalized at write time so cosine similarity is the dot product.
+    ///
+    /// The scan honors [`ScanBudget`] DURING iteration: cancellation, a wall
+    /// clock deadline, or the row cap stop the scan immediately and the
+    /// partial result is returned with `truncated_by_budget = true` — the
+    /// caller decides how to degrade (never an unbounded wait).
     pub fn knn(
         &self,
         query: &[f32],
@@ -259,12 +330,17 @@ impl SemanticStore {
         provider: &str,
         model: &str,
         repository_filter: Option<&str>,
-    ) -> Result<Vec<NearestHit>, SemanticError> {
+        budget: &ScanBudget<'_>,
+    ) -> Result<KnnResult, SemanticError> {
         let qnorm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if qnorm <= 0.0 || k == 0 {
-            return Ok(Vec::new());
+        if qnorm <= 0.0 || k == 0 || budget.exhausted(0) {
+            return Ok(KnnResult {
+                hits: Vec::new(),
+                rows_scanned: 0,
+                truncated_by_budget: budget.max_rows > 0 || budget.deadline.is_some(),
+            });
         }
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare(
             "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
               WHERE provider_id=?1 AND model_id=?2
@@ -273,7 +349,14 @@ impl SemanticStore {
         let mut rows = stmt.query(params![provider, model, repository_filter])?;
         // Bounded top-k via a small sorted list (k is policy-capped).
         let mut top: Vec<(f32, String)> = Vec::with_capacity(k + 1);
+        let mut scanned: u64 = 0;
+        let mut truncated = false;
         while let Some(r) = rows.next()? {
+            if budget.exhausted(scanned) {
+                truncated = true;
+                break;
+            }
+            scanned += 1;
             let unit_id: String = r.get(0)?;
             let stored_norm: f32 = r.get(1)?;
             let blob: Vec<u8> = r.get(2)?;
@@ -296,14 +379,18 @@ impl SemanticStore {
                 top.pop();
             }
         }
-        let out: Vec<NearestHit> = top
+        let hits: Vec<NearestHit> = top
             .into_iter()
             .map(|(sim, id)| NearestHit {
                 retrieval_unit_id: id,
                 similarity: sim,
             })
             .collect();
-        Ok(out)
+        Ok(KnnResult {
+            hits,
+            rows_scanned: scanned,
+            truncated_by_budget: truncated,
+        })
     }
 
     /// Delete ALL embeddings whose (provider, model) differ from the active
@@ -313,7 +400,7 @@ impl SemanticStore {
         active_provider: &str,
         active_model: &str,
     ) -> Result<usize, SemanticError> {
-        Ok(self.conn.lock().expect("semantic store mutex").execute(
+        Ok(self.guard()?.execute(
             "DELETE FROM sem_embeddings WHERE provider_id!=?1 OR model_id!=?2",
             params![active_provider, active_model],
         )?)
@@ -321,7 +408,7 @@ impl SemanticStore {
 
     /// Delete everything for one model (full semantic-layer reset).
     pub fn purge_model(&self, provider: &str, model: &str) -> Result<usize, SemanticError> {
-        Ok(self.conn.lock().expect("semantic store mutex").execute(
+        Ok(self.guard()?.execute(
             "DELETE FROM sem_embeddings WHERE provider_id=?1 AND model_id=?2",
             params![provider, model],
         )?)
@@ -334,7 +421,7 @@ impl SemanticStore {
         model: &str,
         repository_filter: Option<&str>,
     ) -> Result<u64, SemanticError> {
-        Ok(self.conn.lock().expect("semantic store mutex").query_row(
+        Ok(self.guard()?.query_row(
             "SELECT COUNT(*) FROM sem_embeddings
               WHERE provider_id=?1 AND model_id=?2
                 AND (?3 IS NULL OR repository_id=?3)",
@@ -345,7 +432,7 @@ impl SemanticStore {
 
     /// Distinct (provider, model) pairs present with row counts.
     pub fn model_inventory(&self) -> Result<HashMap<(String, String), u64>, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare(
             "SELECT provider_id, model_id, COUNT(*) FROM sem_embeddings
              GROUP BY provider_id, model_id",
@@ -368,7 +455,7 @@ impl SemanticStore {
     pub fn queue_enqueue(&self, unit_ids: &[String], priority: f64) -> Result<(), SemanticError> {
         let t = Self::now_ms();
         for id in unit_ids {
-            self.conn.lock().expect("semantic store mutex").execute(
+            self.guard()?.execute(
                 "INSERT INTO sem_queue (retrieval_unit_id, priority, state, attempts, enqueued_at_ms)
                  VALUES (?1, ?2, ?3, 0, ?4)
                  ON CONFLICT(retrieval_unit_id) DO UPDATE
@@ -383,7 +470,7 @@ impl SemanticStore {
     pub fn queue_enqueue_scored(&self, items: &[(String, f64)]) -> Result<(), SemanticError> {
         let t = Self::now_ms();
         for (id, priority) in items {
-            self.conn.lock().expect("semantic store mutex").execute(
+            self.guard()?.execute(
                 "INSERT INTO sem_queue (retrieval_unit_id, priority, state, attempts, enqueued_at_ms)
                  VALUES (?1, ?2, ?3, 0, ?4)
                  ON CONFLICT(retrieval_unit_id) DO UPDATE
@@ -401,7 +488,7 @@ impl SemanticStore {
         // write phase below (std Mutex is not reentrant — holding it across
         // the update loop would self-deadlock).
         let items: Vec<QueueItem> = {
-            let conn = self.conn.lock().expect("semantic store mutex");
+            let conn = self.guard()?;
             let mut stmt = conn.prepare(
                 "SELECT retrieval_unit_id, priority, attempts FROM sem_queue
                   WHERE state=?1
@@ -421,7 +508,7 @@ impl SemanticStore {
         };
         // Write phase: guard reacquired per statement.
         for it in &items {
-            self.conn.lock().expect("semantic store mutex").execute(
+            self.guard()?.execute(
                 "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
                 params![it.retrieval_unit_id, Q_INFLIGHT],
             )?;
@@ -430,7 +517,7 @@ impl SemanticStore {
     }
 
     pub fn queue_mark_done(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.conn.lock().expect("semantic store mutex").execute(
+        self.guard()?.execute(
             "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
             params![unit_id, Q_DONE],
         )?;
@@ -438,7 +525,7 @@ impl SemanticStore {
     }
 
     pub fn queue_mark_failed(&self, unit_id: &str, max_attempts: u32) -> Result<(), SemanticError> {
-        self.conn.lock().expect("semantic store mutex").execute(
+        self.guard()?.execute(
             "UPDATE sem_queue
                 SET attempts = attempts + 1,
                     state = CASE WHEN attempts + 1 >= ?2 THEN ?3 ELSE ?4 END
@@ -450,7 +537,7 @@ impl SemanticStore {
 
     /// Permanently quarantine an item (security refusal / hard-invalid).
     pub fn queue_fail_permanently(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.conn.lock().expect("semantic store mutex").execute(
+        self.guard()?.execute(
             "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
             params![unit_id, Q_FAILED],
         )?;
@@ -460,7 +547,7 @@ impl SemanticStore {
     /// Return an INFLIGHT item to PENDING (cancellation / crash resume).
     /// Items already DONE are unaffected.
     pub fn queue_reset(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.conn.lock().expect("semantic store mutex").execute(
+        self.guard()?.execute(
             "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1 AND state=?3",
             params![unit_id, Q_PENDING, Q_INFLIGHT],
         )?;
@@ -474,7 +561,7 @@ impl SemanticStore {
         provider: &str,
         model: &str,
     ) -> Result<Vec<ActiveIdentityRow>, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare(
             "SELECT retrieval_unit_id, content_hash, index_generation_id,
                     selection_version
@@ -515,7 +602,7 @@ impl SemanticStore {
     }
 
     pub fn queue_counts(&self) -> Result<HashMap<String, u64>, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM sem_queue GROUP BY state")?;
         let mut out = HashMap::new();
         let mut rows = stmt.query([])?;
@@ -527,7 +614,7 @@ impl SemanticStore {
 
     /// Remove DONE rows entirely (bounded queue; done work needs no history).
     pub fn queue_prune_done(&self) -> Result<usize, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         Ok(conn.execute("DELETE FROM sem_queue WHERE state=?1", params![Q_DONE])?)
     }
 
@@ -536,7 +623,7 @@ impl SemanticStore {
     pub fn bump_demand(&self, paths: &[String]) -> Result<(), SemanticError> {
         let t = Self::now_ms();
         for p in paths {
-            self.conn.lock().expect("semantic store mutex").execute(
+            self.guard()?.execute(
                 "INSERT INTO sem_query_demand (path, hits, last_at_ms) VALUES (?1, 1, ?2)
                  ON CONFLICT(path) DO UPDATE SET hits = hits + 1, last_at_ms = ?2",
                 params![p, t],
@@ -546,7 +633,7 @@ impl SemanticStore {
     }
 
     pub fn demand_map(&self) -> Result<HashMap<String, u64>, SemanticError> {
-        let conn = self.conn.lock().expect("semantic store mutex");
+        let conn = self.guard()?;
         let mut stmt = conn.prepare("SELECT path, hits FROM sem_query_demand")?;
         let mut out = HashMap::new();
         let mut rows = stmt.query([])?;
@@ -607,19 +694,35 @@ mod tests {
         other.model_id = "old-model".into();
         s.put(&other).unwrap();
 
+        let cancel = crate::provider::CancelFlag::new();
         let hits = s
-            .knn(&[1.0, 0.0], 2, "hashing", "hashed-ngram-v1", None)
+            .knn(
+                &[1.0, 0.0],
+                2,
+                "hashing",
+                "hashed-ngram-v1",
+                None,
+                &ScanBudget::unbounded(&cancel),
+            )
             .unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].retrieval_unit_id, "near");
-        assert!((hits[0].similarity - 1.0).abs() < 1e-6);
+        assert_eq!(hits.hits.len(), 2);
+        assert!(!hits.truncated_by_budget);
+        assert_eq!(hits.hits[0].retrieval_unit_id, "near");
+        assert!((hits.hits[0].similarity - 1.0).abs() < 1e-6);
 
         // Old-model row invisible under the active pair.
         let hits_old = s
-            .knn(&[1.0, 0.0], 10, "hashing", "old-model", None)
+            .knn(
+                &[1.0, 0.0],
+                10,
+                "hashing",
+                "old-model",
+                None,
+                &ScanBudget::unbounded(&cancel),
+            )
             .unwrap();
-        assert_eq!(hits_old.len(), 1);
-        assert_eq!(hits_old[0].retrieval_unit_id, "other-model");
+        assert_eq!(hits_old.hits.len(), 1);
+        assert_eq!(hits_old.hits[0].retrieval_unit_id, "other-model");
     }
 
     #[test]

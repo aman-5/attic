@@ -95,18 +95,29 @@ impl AtticServer {
         let queue = WriterQueue::new(conn).map_err(ServerError::Storage)?;
         let writer = queue.handle();
         let _queue = Arc::new(queue);
-        // Phase 5: semantic layer is OPTIONAL by design — if its disposable
-        // store cannot open, the server runs fully canonical (ADR-014).
+        // Phase 5: semantic layer is OPT-IN and EXPERIMENTAL (ADR-013 rev /
+        // OQ-001): the default embedder is a deterministic hashing baseline,
+        // not a neural model, so Attic ships with production semantic
+        // retrieval DISABLED unless ATTIC_SEMANTIC=1 is set explicitly.
+        // Absent/disabled/degraded semantic layers never affect canonical
+        // intelligence (ADR-014 D1).
         let semantic_path = db_path.with_file_name("semantic.db");
-        let semantic = match attic_retrieval::semantic::SemanticStack::open(
-            &semantic_path,
-            Arc::new(attic_semantic::HashingEmbedder::new()),
-        ) {
-            Ok(stack) => Some(Arc::new(stack)),
-            Err(e) => {
-                tracing::warn!("semantic layer unavailable ({e}); running non-semantic");
-                None
+        let semantic = if std::env::var("ATTIC_SEMANTIC").as_deref() == Ok("1") {
+            match attic_retrieval::semantic::SemanticStack::open(
+                &semantic_path,
+                Arc::new(attic_semantic::HashingEmbedder::new()),
+            ) {
+                Ok(stack) => {
+                    info!("semantic layer ENABLED (experimental, hashing baseline)");
+                    Some(Arc::new(stack))
+                }
+                Err(e) => {
+                    tracing::warn!("semantic layer unavailable ({e}); running non-semantic");
+                    None
+                }
             }
+        } else {
+            None
         };
         Ok(AtticServer {
             pool,

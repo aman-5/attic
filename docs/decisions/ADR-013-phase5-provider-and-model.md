@@ -1,8 +1,10 @@
 # ADR-013: Semantic Provider Abstraction & Default Model Choice
 
-**Status:** Accepted (Phase 5)
+**Status:** Accepted (Phase 5) · **Revised** post-review (same date): provider
+reclassified, neural embeddings explicitly DEFERRED, production semantic
+retrieval OPT-IN
 **Date:** 2026-08-26
-**Resolves:** OQ-001
+**Resolves:** OQ-001 (as RESOLVED-DEFERRED)
 **Supersedes:** none
 
 ## Context
@@ -64,3 +66,32 @@ gate, and never logged with results attached.
   `attic-semantic::providers` plus one construction site per binary.
 * Embedding-quality headroom is intentionally deferred until a workload
   demonstrates the hashing baseline is insufficient (value gate).
+
+## Revision (post value-gate review)
+
+Measured evidence on the semantic-target subset (paraphrase/synonym/
+conceptual/weak-overlap cases, `phase5_semantic_benchmark`): hybrid beats
+the Phase 4 baseline on MRR (0.306 → 0.389) driven by one clear paraphrase
+win (S01), ties elsewhere, and misses on fully conceptual gaps. That is a
+real but NARROW benefit — it does NOT demonstrate neural-grade semantic
+quality, because a feature-hashing baseline cannot represent paraphrase
+meaning beyond shared morphology.
+
+Therefore:
+
+1. **`HashingEmbedder` is reclassified honestly**: a deterministic
+   feature-hashing BASELINE and test/conformance provider — not proof of
+   neural semantic retrieval quality. It stays the default only for
+   reproducible gates and as the reference implementation of the trait.
+2. **True neural embeddings are EXPLICITLY DEFERRED** (OQ-001 =
+   RESOLVED-DEFERRED). fastembed-rs + bge-small-en-v1.5 remains the
+   sanctioned first swap-in under the unchanged trait contract.
+3. **Production semantic retrieval ships DISABLED by default**: the server
+   enables the layer only when `ATTIC_SEMANTIC=1` is set. NORMAL/DEEP mode
+   policies keep their bounded semantic budgets so the experimental layer,
+   when enabled, remains non-regressing (overall benchmark C == A on every
+   metric) and instantly degradable (store failure ⇒
+   `SEMANTIC_STORE_UNAVAILABLE`, canonical answer unaffected).
+4. Provider query-time execution carries an enforceable deadline parameter;
+   providers that ignore it violate the trait contract and fail the
+   conformance tests (`SlowProvider` sliced-sleep model defines compliance).

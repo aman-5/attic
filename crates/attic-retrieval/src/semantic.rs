@@ -74,6 +74,9 @@ pub enum SemanticFallback {
     TimeBudget,
     /// Contributed candidates (no fallback).
     Contributed,
+    /// The disposable store itself failed (poisoned/IO) — canonical path
+    /// continues untouched (disposable-layer invariant).
+    StoreUnavailable,
 }
 
 impl SemanticFallback {
@@ -83,6 +86,7 @@ impl SemanticFallback {
             Self::NoEmbeddings => "NO_EMBEDDINGS_FOR_MODEL",
             Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::TimeBudget => "SEMANTIC_TIME_BUDGET",
+            Self::StoreUnavailable => "SEMANTIC_STORE_UNAVAILABLE",
             Self::Contributed => "",
         }
     }
@@ -134,16 +138,25 @@ impl SemanticCandidateGenerator {
             ));
         }
         // ── Coverage probe: embeddings for THIS scope under ACTIVE model ───
-        let coverage = stack
-            .store
-            .count(
-                stack.provider.id(),
-                stack.provider.model_id(),
-                env.repository_id.as_deref(),
-            )
-            .map_err(|e| {
-                RetrievalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
-            })?;
+        let coverage = match stack.store.count(
+            stack.provider.id(),
+            stack.provider.model_id(),
+            env.repository_id.as_deref(),
+        ) {
+            Ok(n) => n,
+            // Store-level failure degrades to canonical retrieval — never a
+            // hard error (disposable-layer invariant).
+            Err(e) => {
+                tracing::warn!("semantic store unavailable (coverage probe): {e}");
+                return Ok((
+                    Vec::new(),
+                    SemanticOutcome {
+                        candidates: 0,
+                        fallback: SemanticFallback::StoreUnavailable,
+                    },
+                ));
+            }
+        };
         if coverage == 0 {
             return Ok((
                 Vec::new(),
@@ -164,6 +177,17 @@ impl SemanticCandidateGenerator {
             }
             q.truncate(cut);
         }
+        // ── Query embedding under the mode's time budget (§14/§20) ─────────
+        let deadline = t0 + std::time::Duration::from_millis(policy.semantic_time_budget_ms);
+        if std::time::Instant::now() >= deadline || !env.budget.candidates_available() {
+            return Ok((
+                Vec::new(),
+                SemanticOutcome {
+                    candidates: 0,
+                    fallback: SemanticFallback::TimeBudget,
+                },
+            ));
+        }
         let mut usage = attic_semantic::ResourceUsage::default();
         let cancel = attic_semantic::CancelFlag::new();
         let outs = stack
@@ -175,6 +199,7 @@ impl SemanticCandidateGenerator {
                 }],
                 &cancel,
                 &mut usage,
+                Some(deadline),
             )
             .map_err(|e| {
                 RetrievalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
@@ -189,36 +214,46 @@ impl SemanticCandidateGenerator {
             ));
         };
 
-        // ── Bounded kNN within the mode's time budget ──────────────────────
-        let deadline = t0 + std::time::Duration::from_millis(policy.semantic_time_budget_ms);
-        if std::time::Instant::now() >= deadline || !env.budget.candidates_available() {
-            return Ok((
-                Vec::new(),
-                SemanticOutcome {
-                    candidates: 0,
-                    fallback: SemanticFallback::TimeBudget,
-                },
-            ));
-        }
+        // ── Bounded kNN: deadline/cancel enforced DURING the scan (§20) ────
         let k = (policy.max_semantic_candidates as usize).min(env.limit);
-        let hits = stack
-            .store
-            .knn(
-                &qv,
-                k,
-                stack.provider.id(),
-                stack.provider.model_id(),
-                env.repository_id.as_deref(),
-            )
-            .map_err(|e| {
-                RetrievalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
-            })?;
+        let scan_budget = attic_semantic::ScanBudget {
+            cancel: &cancel,
+            deadline: Some(deadline),
+            max_rows: (k.max(1) as u64) * 8, // bounded work even on huge models
+        };
+        let kn = match stack.store.knn(
+            &qv,
+            k,
+            stack.provider.id(),
+            stack.provider.model_id(),
+            env.repository_id.as_deref(),
+            &scan_budget,
+        ) {
+            Ok(kn) => kn,
+            // Store-level failure degrades to canonical retrieval — it must
+            // NEVER fail the answer (disposable-layer invariant).
+            Err(e) => {
+                tracing::warn!("semantic store unavailable during query: {e}");
+                return Ok((
+                    Vec::new(),
+                    SemanticOutcome {
+                        candidates: 0,
+                        fallback: SemanticFallback::StoreUnavailable,
+                    },
+                ));
+            }
+        };
+        let hits = kn.hits;
         if hits.is_empty() {
             return Ok((
                 Vec::new(),
                 SemanticOutcome {
                     candidates: 0,
-                    fallback: SemanticFallback::NoEmbeddings,
+                    fallback: if kn.truncated_by_budget {
+                        SemanticFallback::TimeBudget
+                    } else {
+                        SemanticFallback::NoEmbeddings
+                    },
                 },
             ));
         }

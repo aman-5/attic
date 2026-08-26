@@ -30,6 +30,12 @@ pub enum SemanticError {
 
     #[error("canonical index read failed: {0}")]
     Canonical(String),
+
+    /// Semantic store itself is unusable (e.g. mutex poisoned after a panic
+    /// while holding the lock). NEVER fatal: callers degrade to the Phase 4
+    /// non-semantic path.
+    #[error("semantic store unavailable: {0}")]
+    StoreUnavailable(String),
 }
 
 impl From<attic_storage::StorageError> for SemanticError {

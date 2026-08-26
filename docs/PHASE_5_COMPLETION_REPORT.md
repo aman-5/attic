@@ -90,13 +90,10 @@ index = 256 f32 × selected units. No-regression slices (exact/definition/
 config/simple lexical) R@5 = 1.000 under C. Deletion of the semantic layer
 leaves canonical retrieval byte-identical (tested).
 
-## 11. Value-gate verdict (§24)
+## 11. Value-gate verdict (§24) — REVISED post-review
 
-B alone is worse than lexical → not shipped as a mode. C with floor equals A
-everywhere while adding coverage headroom and paraphrase robustness potential
-→ retained as the smallest justified layer: selection + hashing provider +
-store + hybrid generator + policies. Reranking/summaries rejected for lack
-of measurable value today.
+B alone is worse than lexical → not shipped as a mode. See §11b for the
+semantic-target measurement and the honest final verdict.
 
 ## 12. Tests added (§22 — 30 new)
 
@@ -143,3 +140,61 @@ cargo test -p attic-retrieval -p attic-semantic --target x86_64-pc-windows-msvc
 fmt PASS · clippy `-D warnings` PASS · **workspace tests PASS — 550 passed / 0 failed**
 (incl. MCP context tool + rmcp stdio integration) · P4 gate PASS · P5 gate PASS ·
 §22 coverage COMPLETE · **STOP before Phase 6.**
+
+## 11b. Semantic-target value gate (post-review measurement)
+
+Cases S01-S06 in `common/bench.rs`: paraphrase / synonym / conceptual /
+weak-overlap questions whose content words do NOT appear verbatim in the
+target unit (FTS5 unicode61 has no stemming). S06 is a strong-lexical
+control.
+
+| subset metric | A Phase 4 | C hybrid |
+|---|---|---|
+| R@5   | 0.500 | 0.500 |
+| MRR   | 0.306 | **0.389** |
+| nDCG@10 | 0.402 | 0.367 |
+
+S01 flips the FIRST served file to the correct Router.java under hybrid
+(Phase 4 served RouteRegistry.java); ties on S02/S06; conceptual gaps
+(S03/S04/S05) missed by BOTH tiers - a hashing baseline cannot bridge them.
+Overall corpus stays byte-equal to Phase 4 (1.000 / .962 / .900).
+
+VERDICT: measurable but NARROW benefit. Therefore (ADR-013 revision,
+OQ-001 = RESOLVED-DEFERRED):
+1. HashingEmbedder reclassified honestly as a deterministic feature-hashing
+   BASELINE and test/conformance provider - NOT neural semantic quality.
+2. True neural embeddings EXPLICITLY DEFERRED (fastembed-rs + bge-small-en-v1.5
+   remains the sanctioned first swap-in behind the unchanged trait).
+3. Production semantic retrieval ships DISABLED by default; the server
+   enables the layer only with ATTIC_SEMANTIC=1. Experimental when enabled;
+   non-regressing; degrades instantly to canonical retrieval.
+4. Reranking/summaries stay rejected/deferred (no ordering problem remains).
+
+## 16. Post-review hardening round (all seven review items)
+
+1. Panic-free store: all 22 mutex sites replaced by fallible `guard()`;
+   poisoning surfaces as `SemanticError::StoreUnavailable`. Generator
+   degrades coverage-probe AND kNN failures to `SEMANTIC_STORE_UNAVAILABLE`;
+   answer succeeds canonically (tested with a deliberately poisoned mutex).
+2. `SemanticStore::knn` now enforces a `ScanBudget` DURING iteration
+   (cancel + wall-clock deadline + row cap) and returns
+   `KnnResult{rows_scanned, truncated_by_budget}`. Proven on a 20k-row model:
+   passed deadline = instant stop; cap 500 of 20 000 stops exactly at cap;
+   pre-cancel = zero scans.
+3. Provider contract: `embed_batch` takes an enforceable deadline;
+   implementations must yield cooperatively mid-sleep (SlowProvider slices
+   its delay). Enrichment and query paths pass their own budgets. A slow
+   backend can no longer stretch NORMAL beyond its 250 ms semantic budget -
+   pipeline-level test bounds total answer time.
+4. Observability: `reranking_invoked` is now hardwired FALSE - permission is
+   not execution; no reranker exists in Phase 5 (tested for NORMAL+DEEP).
+5. Value gate re-run on semantic-target cases S01-S06 (section 11b).
+6. OQ-001 resolved honestly: hashing embedder = baseline/test provider,
+   neural embeddings deferred, production semantic retrieval opt-in via
+   ATTIC_SEMANTIC=1.
+7. Retention per measured evidence: infrastructure + experimental hybrid
+   retained; production default disabled.
+
+New tests: `phase5_hardening` (4): poisoned-mutex degradation, kNN
+deadline/cap/cancel on large scan, slow-provider deadline conformance +
+pipeline bound, truthful rerank observability.
