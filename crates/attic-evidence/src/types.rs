@@ -164,8 +164,20 @@ pub struct Evidence {
     /// Observable per-dimension ranking signals.
     pub signals: RankingSignals,
 
-    /// Verification state at validation time.
+    /// Per-evidence verification state at validation time.
     pub verification_state: VerificationStatus,
+
+    /// True when this exact FACT was confirmed against the LIVE working
+    /// tree through bounded direct-source verification during THIS query.
+    ///
+    /// This flag NEVER alters the indexed artifact's own freshness /
+    /// source-revision / generation lineage: a STALE indexed occurrence
+    /// remains STALE as an indexed artifact. Sufficiency rules may accept
+    /// `live_source_verified` evidence under CURRENT_ONLY contracts because
+    /// the verification itself establishes current truth (ADR-012 D3),
+    /// without falsifying what the index knows.
+    #[serde(default)]
+    pub live_source_verified: bool,
 
     /// Bounded redacted snippet used for context assembly. Secret bytes are
     /// never allowed here (defense-in-depth scan runs before serving).
@@ -194,6 +206,7 @@ impl Evidence {
             retrieval_sources: Vec::new(),
             signals: RankingSignals::default(),
             verification_state: VerificationStatus::Unverified,
+            live_source_verified: false,
             snippet: None,
         }
     }

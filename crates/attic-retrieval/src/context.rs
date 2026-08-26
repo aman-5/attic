@@ -143,6 +143,25 @@ pub fn build(
         block.push_str(snippet.trim_end());
         block.push_str("\n```\n");
 
+        // ── SECRET-SAFETY PASS (per item, before inclusion) ────────────────
+        // The approved Phase 1B detector runs over the fully-assembled BLOCK
+        // (provenance header + snippet). Any finding drops the ENTIRE item:
+        // the block never enters `text`, no EvidenceRef is created for it,
+        // and the drop is recorded as SECRET_CONTENT_DETECTED so accounting
+        // stays truthful. Raw secrets can therefore never ride into context,
+        // claims (claims must cite served refs), or MCP responses — even if
+        // upstream redaction layers were bypassed.
+        let block_scan = attic_discovery::secrets::scan_and_redact(&block);
+        if !block_scan.findings.is_empty() {
+            dropped.push(DroppedEvidence {
+                evidence_id: ev.id.clone(),
+                source_type: ev.source_type.as_str().to_owned(),
+                drop_reason: DropReason::SecretContentDetected,
+                score: ev.signals.combined_score.unwrap_or(0.0),
+            });
+            continue;
+        }
+
         // Budget guard on the assembled bytes.
         if text.len() + block.len() > budget_bytes {
             dropped.push(DroppedEvidence {
@@ -165,11 +184,45 @@ pub fn build(
         rank += 1;
     }
 
-    // Contradiction disclosure section — never silently resolved.
+    // Contradiction disclosure section - never silently resolved.
     if !contradictions.is_empty() {
         text.push_str("\n## Contradictions detected\n\n");
         for c in contradictions.iter().take(10) {
             text.push_str(&format!("- [{}] {}\n", c.kind.as_str(), c.description));
+        }
+    }
+
+    // ── SECRET-SAFETY PASS (fail-closed, whole document) ───────────────────
+    // Defense in depth: every block was already scanned individually; this
+    // final pass covers header/disclosure assembly. If ANYTHING is still
+    // flagged, the builder refuses to serve assembled content at all: every
+    // served ref is demoted to a recorded SECRET_CONTENT_DETECTED drop, the
+    // refs list is emptied (so claims cannot cite withheld support), and
+    // only the skeleton + disclosure remain. Token accounting stays exact
+    // because it is computed AFTER this decision.
+    let final_scan = attic_discovery::secrets::scan_and_redact(&text);
+    if !final_scan.findings.is_empty() {
+        tracing::warn!(
+            findings = final_scan.findings.len(),
+            "secret-safety pass flagged assembled context; withholding all blocks"
+        );
+        for r in &refs {
+            dropped.push(DroppedEvidence {
+                evidence_id: r.evidence_id.clone(),
+                source_type: r.source_type.clone(),
+                drop_reason: DropReason::SecretContentDetected,
+                score: r.score as f64,
+            });
+        }
+        refs.clear();
+        text.clear();
+        text.push_str(&header);
+        text.push_str("[content withheld by secret-safety policy]\n");
+        if !contradictions.is_empty() {
+            text.push_str("\n## Contradictions detected\n\n");
+            for c in contradictions.iter().take(10) {
+                text.push_str(&format!("- [{}] {}\n", c.kind.as_str(), c.description));
+            }
         }
     }
 
@@ -202,6 +255,14 @@ fn authority_label(ev: &Evidence) -> &'static str {
 }
 
 fn freshness_note(ev: &Evidence) -> String {
+    if ev.live_source_verified && ev.freshness_state != FreshnessState::Current {
+        // Lineage-honest caveat: the INDEXED artifact keeps its stale state;
+        // the fact was separately confirmed against live source this query.
+        return format!(
+            "- freshness: {} as indexed - fact VERIFIED against current source this query\n",
+            ev.freshness_state.as_str()
+        );
+    }
     match (ev.freshness_state, ev.verification_state) {
         (FreshnessState::Current, VerificationStatus::Verified) => {
             "- freshness: CURRENT (verified against source)\n".to_owned()

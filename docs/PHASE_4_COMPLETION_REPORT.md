@@ -105,8 +105,18 @@ disclosure verdicts.
 leadership; two-tier score floor + per-section caps (ADR-012 D6);
 content-fingerprint dedup; byte/token budget dropping lowest-first with
 recorded reasons; staleness/verification caveats inline; contradiction
-disclosure section; bounded snippets (no whole-file dumps); final Phase 1B
-secret scan fail-safe.
+disclosure section; bounded snippets (no whole-file dumps).
+
+**Secret-safety pass (implemented, two layers):**
+1. Per-item, pre-inclusion: the approved Phase 1B detector scans each fully
+   assembled block (header + snippet). Any finding drops the ENTIRE item —
+   the block never enters `text`, no EvidenceRef is created for it, and the
+   drop is recorded as `SECRET_CONTENT_DETECTED` (truthful accounting).
+2. Fail-closed whole-document scan after assembly: if anything is still
+   flagged, ALL served refs are demoted to recorded secret drops, the refs
+   list is emptied (so claims cannot cite withheld support), and only a
+   skeleton + disclosure section is served. Token accounting is computed
+   AFTER this decision (RP-INV-7 holds in every path).
 
 ## 11. Claim / Answer Verification
 
@@ -150,6 +160,9 @@ with observable exhaustion fields in PolicyExecutionTrace.
 | phase4_pipeline_e2e | 14 | definition/config/knowledge/test/navigation/impact/dependency/generic/exact end-to-end on REAL index; empty-corpus INSUFFICIENT_EVIDENCE; plan round-trip+persistence+traceability+token-sum; reproducibility; provenance completeness; planted-secret leak guard |
 | phase4_evidence_quality | 12 | stale high-rank rejection/recovery, INVALID filtration, weak-relationship exclusion, graph budget caps, dirty-tree verification recovery, config contradiction surfacing, knowledge mismatch flagging, PENDING_REFRESH/UNKNOWN handling, FAST-never-reads-FS, context budget trimming records, unsupported-claim rejection, resolved-edge relationship assertions |
 | phase4_benchmark | 1 | §22 gate below |
+| phase4_lineage | 3 | verification NEVER rewrites indexed freshness/revision/generation; live truth via flag; sufficiency acceptance traces to verifier steps |
+| phase4_fs_budgets | 4 | actual-byte accounting: SMALL overrun ≤2048 B blocked+recorded; LARGE stream stop within 64 KiB; LARGE early-marker success; `max_fs_files` hard cap |
+| phase4_context_secrets | 1 | builder-level secret block on post-validation injection; truthful drops; benign served |
 | attic-server mcp_context | 1 | capability advertised + legacy tools intact + missing-query error hygiene |
 
 ## 16. Benchmark methodology + results (§22 gate)
@@ -198,6 +211,18 @@ falsified numbers).
   ALONE lifted nDCG 0.775→0.900 and precision 0.487→0.833 while recall rose
   to 1.000.
 
+## 17b. Review-hardening fixes (final correctness/security round)
+
+| # | Issue | Fix | Proof tests |
+|---|---|---|---|
+| 1 | Verification mutated stale indexed evidence to CURRENT, falsifying artifact lineage | `Evidence.live_source_verified` flag + `verification_state=VERIFIED` express live truth; freshness/revision/generation NEVER rewritten; sufficiency/claims accept the flag under CURRENT_ONLY; context renders lineage-honest caveats (`STALE as indexed — fact VERIFIED…`) | `phase4_lineage.rs` ×3: DB revision/generation/freshness byte-identical before↔after SUCCESS-with-verification; direct verifier call asserts flag set with Stale state and ids untouched |
+| 2 | Fixed 4096-byte estimate charged, then reads up to 256 KiB | Reader consumes at most `fs_bytes_remaining()` sanitized bytes (SMALL truncates; LARGE streams stop pulling chunks), commits ACTUAL bytes via `commit_verification_read`; truncation that prevents a containment verdict ⇒ `BlockedByBudget`; file slots charged separately so `max_fs_files` is hard | `phase4_fs_budgets.rs` ×4: SMALL overrun stops ≤2048 B w/ limits_hit; LARGE (4 MiB) late-marker stream blocked within 64 KiB; LARGE early-marker verifies inside budget; second file blocked at `max_fs_files=1` |
+| 3 | Context Builder documented but did not run the final secret scan | Two-layer pass: per-item block scan pre-inclusion (finding ⇒ whole item dropped, no ref created, recorded `SECRET_CONTENT_DETECTED`) + fail-closed whole-document scan (any finding ⇒ every served ref demoted to recorded secret drop, refs emptied, skeleton+disclosure only); tokens computed after decision so RP-INV-7 always holds | `phase4_context_secrets.rs`: AWS-shaped key injected directly post-validation ⇒ absent from text, no ref for it, truthful drop recorded, benign item still served |
+
+All three preserve Phase 1–3 guarantees, the existing retrieval architecture,
+and benchmark results (re-run unchanged: P4 R@5/R@10 = 1.000, MRR 0.962,
+nDCG@10 0.900, precision 0.833).
+
 ## 18. Exact commands executed (final gate)
 
 ```
@@ -223,7 +248,7 @@ existing kill-on-exit pattern.
 | cargo fmt --check | PASS |
 | cargo check --workspace | PASS |
 | cargo clippy -D warnings | PASS |
-| cargo test --workspace | **PASS — 511 passed / 0 failed** |
+| cargo test --workspace | **PASS — 519 passed / 0 failed** |
 | §21 required test areas | COVERED (table §15) |
 | §22 non-semantic benchmark gate | PASS (metrics §16) |
 | Phase boundary (no embeddings/vector/LLM summaries) | ENFORCED |

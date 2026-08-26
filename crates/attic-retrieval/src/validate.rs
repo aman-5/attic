@@ -129,7 +129,13 @@ pub fn validate(ev: &Evidence, contract: &QueryEvidenceContract) -> ValidationVe
     }
 
     // 4. Freshness vs contract for non-relationship evidence.
-    if !freshness_permits(ev.freshness_state, contract.freshness_requirement) {
+    //
+    // Live-source verification (ADR-012 D3) may establish current truth for
+    // a fact whose INDEXED artifact is stale; such evidence counts fully
+    // without the index state being rewritten.
+    if !ev.live_source_verified
+        && !freshness_permits(ev.freshness_state, contract.freshness_requirement)
+    {
         // CURRENT_ONLY with STALE evidence: not counted toward requirements.
         // It stays context-eligible only if verification later upgrades it —
         // handled by the manager's source-verification strategy.
@@ -180,12 +186,15 @@ pub fn satisfies_requirement(
         }
     }
     match contract.freshness_requirement {
-        FreshnessRequirement::CurrentOnly => ev.freshness_state == FreshnessState::Current,
+        FreshnessRequirement::CurrentOnly => {
+            ev.freshness_state == FreshnessState::Current || ev.live_source_verified
+        }
         FreshnessRequirement::CurrentOrStale => {
-            matches!(
+            (matches!(
                 ev.freshness_state,
                 FreshnessState::Current | FreshnessState::Stale | FreshnessState::PendingRefresh
-            ) && ev.verification_state != VerificationStatus::Contradicted
+            ) || ev.live_source_verified)
+                && ev.verification_state != VerificationStatus::Contradicted
         }
         FreshnessRequirement::Any => ev.verification_state != VerificationStatus::Contradicted,
     }

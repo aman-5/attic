@@ -275,13 +275,14 @@ pub fn verify_claims(
                 }
             }
 
-            // 4. Freshness consistency with the contract.
+            // 4. Freshness consistency with the contract. Live-source
+            // verified facts satisfy CURRENT_ONLY without the indexed
+            // artifact's freshness being rewritten (ADR-012 D3).
             match cfg.freshness_requirement {
                 FreshnessRequirement::CurrentOnly => {
-                    if backing
-                        .iter()
-                        .all(|e| e.freshness_state != FreshnessState::Current)
-                    {
+                    if backing.iter().all(|e| {
+                        e.freshness_state != FreshnessState::Current && !e.live_source_verified
+                    }) {
                         reasons.push(
                             "all backing evidence is below CURRENT_ONLY freshness".to_owned(),
                         );

@@ -44,18 +44,39 @@ nothing in V1 consumes its extra columns (authority/supersedes/applicable
 versions), and FTS over knowledge content already flows through retrieval
 units. Recorded as OQ-021.
 
-### D3 — Source verification is SPAN-LOCAL containment, not file-hash equality
+### D3 — Source verification is SPAN-LOCAL containment with STRICT LINEAGE PRESERVATION
 
 The index stores whole-file BLAKE3 hashes; a query-relevant window rarely
 hashes to them, so CHECKSUM-level verification confirms that the evidenced
 FACT (first non-empty snippet line, whitespace-normalized) still appears
 verbatim inside the corresponding region of the live file read through the
 Phase 1B secure path (`canonicalize_within_root` + secrets preprocessing).
-Outcome mapping: contained → VERIFIED (+ freshness upgraded to CURRENT where
-contractually recoverable); absent → STALE/ContentChanged; unreadable/
-excluded/no-span → Unavailable; zero FS budget → BlockedByBudget (FAST never
-reads). Repository roots are resolved PER REPOSITORY from the index at
-verification time — caller-supplied roots do not exist in the API.
+Outcome mapping: contained → `verification_state = VERIFIED` +
+`live_source_verified = true`; absent → STALE/ContentChanged; unreadable/
+excluded/no-span → Unavailable; zero FS budget or truncated read →
+BlockedByBudget (observable degradation; FAST never reads).
+
+LINEAGE RULE (hardened post-review): successful verification NEVER rewrites
+the indexed artifact's `freshness_state`, `source_revision_id`, or
+`index_generation_id`. A stale indexed occurrence remains STALE as an
+indexed artifact. Sufficiency rules accept live-source-verified evidence
+under CURRENT_ONLY contracts through the explicit flag, because the
+verification itself establishes current truth — never by falsifying what
+the index knows.
+
+Repository roots are resolved PER REPOSITORY from the index at verification
+time — caller-supplied roots do not exist in the API.
+
+### D3b — Verification charges ACTUAL sanitized bytes
+
+No fixed estimates. Each read consumes at most the REMAINING filesystem-byte
+budget (`max_fs_bytes − fs_bytes_used`) and stops mid-stream the moment that
+budget is exhausted (SMALL files truncate at the cap; LARGE streams stop
+pulling chunks). The consumed byte count is committed afterwards via
+`BudgetAccountant::commit_verification_read`. If truncation prevented
+answering containment, the outcome is BlockedByBudget — never a guess.
+File slots are charged one per verified file; `max_fs_files` cannot be
+exceeded.
 
 ### D4 — Proactive checksum pass in NORMAL/DEEP
 

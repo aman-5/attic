@@ -98,6 +98,43 @@ impl BudgetAccountant {
         true
     }
 
+    /// Whether another filesystem file slot is available (byte budget
+    /// checked separately — see [`Self::fs_bytes_remaining`]).
+    pub fn fs_file_slot_available(&self) -> bool {
+        if self.max_fs_files == 0 {
+            return false;
+        }
+        self.fs_files_used < self.max_fs_files
+    }
+
+    /// Remaining filesystem-byte budget.
+    pub fn fs_bytes_remaining(&self) -> u64 {
+        self.max_fs_bytes.saturating_sub(self.fs_bytes_used)
+    }
+
+    /// Commit the ACTUAL sanitized bytes consumed by one verification read.
+    ///
+    /// The value is clamped to the remaining budget by construction (the
+    /// reader never exceeds it); recorded here so accounting matches what
+    /// truly entered memory. Marks the byte ceiling as hit when it lands
+    /// exactly on the boundary.
+    pub fn commit_verification_read(&mut self, actual_bytes: u64) {
+        let clamped = actual_bytes.min(self.fs_bytes_remaining());
+        self.fs_bytes_used = self.fs_bytes_used.saturating_add(clamped);
+        self.fs_files_used = self.fs_files_used.saturating_add(1);
+        if self.fs_bytes_used >= self.max_fs_bytes {
+            self.note_limit("max_fs_bytes");
+        }
+        if self.fs_files_used >= self.max_fs_files {
+            self.note_limit("max_fs_files");
+        }
+    }
+
+    /// Record that the filesystem-byte budget blocked work (observable).
+    pub fn note_fs_exhaustion(&mut self) {
+        self.note_limit("max_fs_bytes");
+    }
+
     /// Charge one visited node in a graph walk (AM-E3).
     pub fn charge_graph_node(&mut self) -> bool {
         if self.graph_nodes_used >= self.max_graph_nodes {

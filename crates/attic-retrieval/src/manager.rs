@@ -78,6 +78,7 @@ pub fn next_expansion(
         == crate::contract::FreshnessRequirement::CurrentOnly
         && evidence.iter().any(|ev| {
             ev.source_type != attic_evidence::EvidenceSourceType::Relationship
+                && !ev.live_source_verified
                 && (ev.freshness_state != attic_core::FreshnessState::Current
                     || ev.verification_state == VerificationStatus::Unverified)
         });
@@ -86,6 +87,7 @@ pub fn next_expansion(
             .iter()
             .filter(|ev| {
                 ev.source_type != attic_evidence::EvidenceSourceType::Relationship
+                    && !ev.live_source_verified
                     && (ev.freshness_state != attic_core::FreshnessState::Current
                         || ev.verification_state == VerificationStatus::Unverified)
             })
