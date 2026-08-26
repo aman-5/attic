@@ -49,6 +49,9 @@ pub struct RetrievalService {
     pub readers: DbPool,
     /// Coordinated single-writer endpoint (plan persistence only).
     pub writer: WriterQueueHandle,
+    /// Phase 5 disposable semantic layer; `None` keeps byte-identical
+    /// Phase 4 behavior (deleting the semantic DB must degrade, never break).
+    pub semantic: Option<std::sync::Arc<crate::semantic::SemanticStack>>,
 }
 
 /// One inbound answer request.
@@ -121,6 +124,7 @@ struct DbPhaseOutcome {
     contradictions: Vec<Contradiction>,
     budget: BudgetAccountant,
     hard_cancelled: bool,
+    semantic: crate::semantic::SemanticOutcome,
 }
 
 /// Generation context: everything the per-step generator invocations share.
@@ -306,6 +310,7 @@ impl RetrievalService {
             contradictions,
             budget,
             hard_cancelled,
+            semantic: semantic_outcome,
         } = phase.map_err(RetrievalError::Storage)?;
 
         // ── Outcome assembly ────────────────────────────────────────────────
@@ -334,9 +339,11 @@ impl RetrievalService {
         plan.policy_trace.fs_files_read = budget.fs_files_used;
         plan.policy_trace.fs_bytes_read = budget.fs_bytes_used;
         plan.policy_trace.context_tokens_used = plan.context_tokens;
-        plan.policy_trace.semantic_invoked = false;
+        plan.policy_trace.semantic_invoked = semantic_outcome.candidates > 0;
         plan.policy_trace.reranking_invoked = policy.reranking_allowed;
         plan.policy_trace.repair_cycles = plan.repair_cycles;
+        plan.policy_trace.semantic_candidates_returned = semantic_outcome.candidates as u32;
+        plan.policy_trace.semantic_fallback_reason = semantic_outcome.fallback.as_str().to_owned();
         plan.policy_trace.budget_fields_hit = budget.limits_hit().to_vec();
         plan.insufficiency_reason = insufficient_reason.clone();
         plan.policy_trace.final_result =
@@ -457,6 +464,85 @@ impl RetrievalService {
                     "seeds",
                     |env| RelationshipGenerator::run(env, &seed_files),
                 );
+            }
+        }
+
+        // ── Phase 5: semantic candidate generation (§12–§15) ────────────────
+        // Another bounded producer feeding the SAME fusion/rank/validation
+        // chain below. Every non-contribution reason is recorded.
+        let mut semantic_outcome = crate::semantic::SemanticOutcome {
+            candidates: 0,
+            fallback: crate::semantic::SemanticFallback::Disabled,
+        };
+        if let Some(stack) = self.semantic.as_ref() {
+            // Query text for embedding: extracted terms (+ symbol/path hints)
+            // — the same canonical extraction every other generator consumes.
+            let mut semantic_query = ex.terms.join(" ");
+            if let Some(sym) = &ex.symbol_hint {
+                semantic_query.push(' ');
+                semantic_query.push_str(sym);
+            }
+            if let Some(p) = &ex.path_hint {
+                semantic_query.push(' ');
+                semantic_query.push_str(p);
+            }
+            if !semantic_query.trim().is_empty() {
+                let s_sem = plan.begin_step(
+                    SubsystemTag::FtsSearch, // nearest tag; per-candidate origin is SEMANTIC
+                    "semantic_knn",
+                    &format!(
+                        "provider={} model={}",
+                        stack.provider_id(),
+                        stack.model_id()
+                    ),
+                    now_us(),
+                );
+                let mut env = GeneratorEnv {
+                    conn,
+                    repository_id: repo_filter.clone(),
+                    budget: &mut budget,
+                    limit: 48,
+                };
+                match crate::semantic::SemanticCandidateGenerator::run(
+                    &mut env,
+                    stack,
+                    policy,
+                    &semantic_query,
+                ) {
+                    Ok((cands, outcome)) => {
+                        semantic_outcome = outcome;
+                        let n = cands.len() as u32;
+                        collected.extend(cands);
+                        plan.complete_step(
+                            s_sem,
+                            if n > 0 {
+                                StepStatus::Completed
+                            } else {
+                                StepStatus::Skipped
+                            },
+                            if n > 0 {
+                                "candidates"
+                            } else {
+                                outcome.fallback.as_str()
+                            },
+                            0,
+                            n,
+                            now_us(),
+                        );
+                    }
+                    Err(e) => {
+                        semantic_outcome.fallback =
+                            crate::semantic::SemanticFallback::ProviderUnavailable;
+                        plan.complete_step(
+                            s_sem,
+                            StepStatus::Failed,
+                            &e.to_string(),
+                            0,
+                            0,
+                            now_us(),
+                        );
+                    }
+                }
             }
         }
 
@@ -876,6 +962,7 @@ impl RetrievalService {
             contradictions,
             budget,
             hard_cancelled,
+            semantic: semantic_outcome,
         })
     }
 }

@@ -29,225 +29,8 @@ mod common;
 use attic_retrieval::{AnswerMode, AnswerRequest};
 use common::Fixture;
 
-// ─── case suite ──────────────────────────────────────────────────────────────
-
-struct Case {
-    id: &'static str,
-    question: &'static str,
-    mode: AnswerMode,
-    /// Paths that fully answer the question (relevance 3).
-    expected: &'static [&'static str],
-    /// Supporting paths (relevance 2).
-    related: &'static [&'static str],
-    /// Whether the contract is satisfiable on this corpus.
-    expect_evidence: bool,
-}
-
-fn cases() -> Vec<Case> {
-    vec![
-        // ── definition lookups ───────────────────────────────────────────
-        Case {
-            id: "B01",
-            question: "Where is the Router class defined?",
-            mode: AnswerMode::Fast,
-            expected: &["src/main/java/com/sable/Router.java"],
-            related: &["src/test/java/com/sable/RouterTest.java"],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B02",
-            question: "Where is process_payment defined?",
-            mode: AnswerMode::Fast,
-            expected: &["services/pay.py"],
-            related: &[],
-            expect_evidence: true,
-        },
-        // ── exact / configuration ────────────────────────────────────────
-        Case {
-            id: "B03",
-            question: "config/app.yml",
-            mode: AnswerMode::Fast,
-            expected: &["config/app.yml"],
-            related: &[],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B04",
-            question: "What is the server port setting?",
-            mode: AnswerMode::Normal,
-            expected: &["config/app.yml"],
-            related: &["docs/runbook.md"],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B05",
-            question: "What is the retry_limit setting value?",
-            mode: AnswerMode::Normal,
-            expected: &["config/app.yml"],
-            related: &["knowledge/architecture.md"],
-            expect_evidence: true,
-        },
-        // ── knowledge ─────────────────────────────────────────────────────
-        Case {
-            id: "B06",
-            question: "What does the architecture documentation say about dispatch?",
-            mode: AnswerMode::Normal,
-            expected: &["knowledge/architecture.md"],
-            related: &["src/main/java/com/sable/RouteRegistry.java"],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B07",
-            question: "What does the runbook say about rotating endpoints?",
-            mode: AnswerMode::Normal,
-            expected: &["docs/runbook.md"],
-            related: &[],
-            expect_evidence: true,
-        },
-        // ── tests ──────────────────────────────────────────────────────────
-        Case {
-            id: "B08",
-            question: "What scenarios does RouterTest cover?",
-            mode: AnswerMode::Normal,
-            expected: &["src/test/java/com/sable/RouterTest.java"],
-            related: &["src/main/java/com/sable/Router.java"],
-            expect_evidence: true,
-        },
-        // ── navigation / impact / dependency / debugging ───────────────────
-        Case {
-            id: "B09",
-            question: "Show me references to RouteRegistry",
-            mode: AnswerMode::Deep,
-            expected: &[
-                "src/main/java/com/sable/RouteRegistry.java",
-                "src/main/java/com/sable/Router.java",
-            ],
-            related: &[],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B10",
-            question: "What would break if I change Router.handle?",
-            mode: AnswerMode::Deep,
-            expected: &["src/main/java/com/sable/Router.java"],
-            related: &["src/main/java/com/sable/RouteRegistry.java"],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B11",
-            question: "Which services depend on the sable package?",
-            mode: AnswerMode::Normal,
-            expected: &["config/app.yml"],
-            related: &["src/main/java/com/sable/RouteRegistry.java"],
-            expect_evidence: true,
-        },
-        Case {
-            id: "B12",
-            question: "Why does request handling fail for unknown paths?",
-            mode: AnswerMode::Deep,
-            expected: &["src/main/java/com/sable/Router.java"],
-            related: &[
-                "src/test/java/com/sable/RouterTest.java",
-                "knowledge/architecture.md",
-            ],
-            expect_evidence: true,
-        },
-        // ── generic ─────────────────────────────────────────────────────────
-        Case {
-            id: "B13",
-            question: "payment provider charge logic",
-            mode: AnswerMode::Fast,
-            expected: &["services/pay.py"],
-            related: &[],
-            expect_evidence: true,
-        },
-    ]
-}
-
-// ─── ranking helpers ─────────────────────────────────────────────────────────
-
-fn relevance(path: &str, c: &Case) -> f64 {
-    if c.expected.iter().any(|e| path.contains(e)) {
-        3.0
-    } else if c.related.iter().any(|r| path.contains(r)) {
-        2.0
-    } else {
-        0.0
-    }
-}
-
-/// Parse served-context order from the assembled document headers
-/// (`## [TYPE] path:span`) — the observable serving order.
-///
-/// RELATIONSHIP blocks carry entity-edge labels instead of repo paths and
-/// are excluded from path-based metrics (they are graded via groundedness).
-fn served_paths(context: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in context.lines() {
-        let line = line.trim_start_matches('#').trim();
-        if let Some(rest) = line.strip_prefix('[')
-            && let Some(close) = rest.find(']')
-        {
-            let stype = rest[..close].to_owned();
-            let after = rest[close + 1..].trim();
-            let path = after.split_whitespace().next().unwrap_or("");
-            let path = path.split(':').next().unwrap_or(path);
-            if !path.is_empty() {
-                out.push((stype, path.to_owned()));
-            }
-        }
-    }
-    out
-}
-
-fn path_order(served: &[(String, String)]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (_, p) in served {
-        if !out.contains(p) {
-            out.push(p.clone());
-        }
-    }
-    out
-}
-
-fn recall_at(ranked: &[String], c: &Case, k: usize) -> f64 {
-    if ranked.iter().take(k).any(|p| relevance(p, c) >= 3.0) {
-        1.0
-    } else {
-        0.0
-    }
-}
-
-fn mrr(ranked: &[String], c: &Case) -> f64 {
-    for (i, p) in ranked.iter().enumerate() {
-        if relevance(p, c) >= 3.0 {
-            return 1.0 / (i as f64 + 1.0);
-        }
-    }
-    0.0
-}
-
-fn ndcg_at(ranked: &[String], c: &Case, k: usize) -> f64 {
-    let dcg: f64 = ranked
-        .iter()
-        .take(k)
-        .enumerate()
-        .map(|(i, p)| {
-            let rel = relevance(p, c);
-            rel / (i as f64 + 2.0).log2()
-        })
-        .sum();
-    // Ideal: expected(3s) first, then related(2s).
-    let mut ideal_rels: Vec<f64> = c.expected.iter().map(|_| 3.0).collect();
-    ideal_rels.extend(c.related.iter().map(|_| 2.0));
-    ideal_rels.truncate(k);
-    let idcg: f64 = ideal_rels
-        .iter()
-        .enumerate()
-        .map(|(i, rel)| rel / (i as f64 + 2.0).log2())
-        .sum();
-    if idcg <= 0.0 { 0.0 } else { dcg / idcg }
-}
+// Case table + metrics now shared with the Phase 5 benchmark (single source).
+use common::bench::{Case, cases, evaluate_tier, path_order, recall_at, relevance, served_paths};
 
 // ─── baseline tiers (capability-faithful, index-API-level) ──────────────────
 
@@ -290,7 +73,6 @@ fn tier_l0(fx: &Fixture, c: &Case) -> Vec<String> {
 
 fn tier_l1(fx: &Fixture, c: &Case) -> Vec<String> {
     let mut ranked = tier_l0(fx, c);
-    // Phase 1D also exposed exact symbol definitions (fts_symbol_names).
     let sym = attic_retrieval::classify(c.question)
         .ok()
         .and_then(|cl| cl.extracted.symbol_hint.clone());
@@ -316,7 +98,6 @@ fn tier_l1(fx: &Fixture, c: &Case) -> Vec<String> {
 
 fn tier_l2(fx: &Fixture, c: &Case) -> Vec<String> {
     let mut ranked = tier_l1(fx, c);
-    // Phase 3 adds relationships anchored at discovered files.
     let fo_ids: Vec<String> = fx
         .pool
         .with_reader(|conn| {
@@ -363,37 +144,6 @@ fn dedup(v: Vec<String>) -> Vec<String> {
         }
     }
     out
-}
-
-// ─── the gate ────────────────────────────────────────────────────────────────
-
-struct TierMetrics {
-    recall5: f64,
-    recall10: f64,
-    mrr: f64,
-    ndcg10: f64,
-}
-
-fn evaluate_tier(per_case: &[(usize, Vec<String>)], cs: &[Case]) -> TierMetrics {
-    let n = cs.len() as f64;
-    TierMetrics {
-        recall5: per_case
-            .iter()
-            .map(|(i, r)| recall_at(r, &cs[*i], 5))
-            .sum::<f64>()
-            / n,
-        recall10: per_case
-            .iter()
-            .map(|(i, r)| recall_at(r, &cs[*i], 10))
-            .sum::<f64>()
-            / n,
-        mrr: per_case.iter().map(|(i, r)| mrr(r, &cs[*i])).sum::<f64>() / n,
-        ndcg10: per_case
-            .iter()
-            .map(|(i, r)| ndcg_at(r, &cs[*i], 10))
-            .sum::<f64>()
-            / n,
-    }
 }
 
 #[test]

@@ -84,6 +84,8 @@ struct AtticServer {
     /// Which change-detection mechanism is running (`None` = incremental
     /// disabled explicitly).
     watch_mode: Option<attic_incremental::WatchMode>,
+    /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
+    semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
 }
 
 impl AtticServer {
@@ -93,12 +95,26 @@ impl AtticServer {
         let queue = WriterQueue::new(conn).map_err(ServerError::Storage)?;
         let writer = queue.handle();
         let _queue = Arc::new(queue);
+        // Phase 5: semantic layer is OPTIONAL by design — if its disposable
+        // store cannot open, the server runs fully canonical (ADR-014).
+        let semantic_path = db_path.with_file_name("semantic.db");
+        let semantic = match attic_retrieval::semantic::SemanticStack::open(
+            &semantic_path,
+            Arc::new(attic_semantic::HashingEmbedder::new()),
+        ) {
+            Ok(stack) => Some(Arc::new(stack)),
+            Err(e) => {
+                tracing::warn!("semantic layer unavailable ({e}); running non-semantic");
+                None
+            }
+        };
         Ok(AtticServer {
             pool,
             writer,
             _queue,
             incremental: None,
             watch_mode: None,
+            semantic,
         })
     }
 
@@ -718,6 +734,7 @@ fn handle_status(
 /// RetrievalPlan internals stay in `ops_retrieval_log`, not in the tool
 /// surface.
 fn handle_context(
+    semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     pool: &DbPool,
     writer: &WriterQueueHandle,
     args: &HashMap<String, Value>,
@@ -748,6 +765,7 @@ fn handle_context(
     let service = attic_retrieval::RetrievalService {
         readers: pool.clone(),
         writer: writer.clone(),
+        semantic,
     };
     let outcome = service
         .answer(&request)
@@ -886,6 +904,7 @@ impl ServerHandler for AtticServer {
         let pool = self.pool.clone();
         let writer = self.writer.clone();
         let incremental = self.incremental.clone();
+        let semantic = self.semantic.clone();
         let watch_mode = self.watch_mode;
         let name = request.name.clone();
         let args: HashMap<String, Value> =
@@ -897,7 +916,7 @@ impl ServerHandler for AtticServer {
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
                 "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
-                "context" => handle_context(&pool, &writer, &args),
+                "context" => handle_context(semantic, &pool, &writer, &args),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {

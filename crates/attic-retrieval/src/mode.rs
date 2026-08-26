@@ -72,8 +72,12 @@ pub struct AnswerModePolicy {
     pub max_fs_bytes: u64,
     /// Max tokens assembled into context (approx. bytes/4 accounting).
     pub max_context_tokens: u32,
-    /// Semantic search permitted — always `false` in Phase 4 plans.
+    /// Semantic search permitted — Phase 5: FAST=false, NORMAL/DEEP=true.
     pub semantic_allowed: bool,
+    /// Max candidates the semantic generator may return (0 = none).
+    pub max_semantic_candidates: u32,
+    /// Wall-clock budget for the semantic generator step (ms).
+    pub semantic_time_budget_ms: u64,
     /// Re-ranking pass permitted (deterministic re-scoring only).
     pub reranking_allowed: bool,
     /// Source verification depth.
@@ -104,6 +108,8 @@ impl AnswerModePolicy {
                 max_fs_bytes: 0,
                 max_context_tokens: 4096,
                 semantic_allowed: false,
+                max_semantic_candidates: 0,
+                semantic_time_budget_ms: 0,
                 reranking_allowed: false,
                 source_verification_level: VerificationLevel::None,
                 repair_attempts: 0,
@@ -117,7 +123,9 @@ impl AnswerModePolicy {
                 max_fs_files: 20,
                 max_fs_bytes: 4 * 1024 * 1024,
                 max_context_tokens: 16_384,
-                semantic_allowed: false, // Phase 4: no embeddings exist yet
+                semantic_allowed: true, // Phase 5: selective use (§14)
+                max_semantic_candidates: 48,
+                semantic_time_budget_ms: 250,
                 reranking_allowed: true,
                 source_verification_level: VerificationLevel::Checksum,
                 repair_attempts: 1,
@@ -131,7 +139,9 @@ impl AnswerModePolicy {
                 max_fs_files: 200,
                 max_fs_bytes: 100 * 1024 * 1024,
                 max_context_tokens: 65_536,
-                semantic_allowed: false, // Phase 4: no embeddings exist yet
+                semantic_allowed: true, // Phase 5: broader bounded use (§14)
+                max_semantic_candidates: 120,
+                semantic_time_budget_ms: 2_000,
                 reranking_allowed: true,
                 source_verification_level: VerificationLevel::Full,
                 repair_attempts: 3,
@@ -176,10 +186,14 @@ impl AnswerModePolicy {
             ));
         }
         if self.mode == AnswerMode::Fast
-            && (self.repair_attempts != 0 || self.max_fs_files != 0 || self.max_fs_bytes != 0)
+            && (self.repair_attempts != 0
+                || self.max_fs_files != 0
+                || self.max_fs_bytes != 0
+                || self.semantic_allowed
+                || self.max_semantic_candidates != 0)
         {
             return Err(crate::error::RetrievalError::InvalidQuery(
-                "FAST must have repair_attempts=0 and zero filesystem budget".into(),
+                "FAST must have zero repair/fs/semantic budget".into(),
             ));
         }
         if self.max_context_tokens > 131_072 {
@@ -209,10 +223,14 @@ pub struct PolicyExecutionTrace {
     pub fs_bytes_read: u64,
     pub context_tokens_used: u32,
     /// Always false in Phase 4 — recorded so absence of semantic work is
-    /// itself observable.
+    /// itself observable. Phase 5 sets it when the semantic generator runs.
     pub semantic_invoked: bool,
     pub reranking_invoked: bool,
     pub repair_cycles: u8,
+    /// Semantic generator outcome details (§21 observability).
+    pub semantic_candidates_returned: u32,
+    /// Why semantic retrieval did not contribute (empty = it did or N/A).
+    pub semantic_fallback_reason: String,
     /// Which limits were reached (field names, deterministic order).
     pub budget_fields_hit: Vec<String>,
     pub final_result: PolicyResult,
@@ -230,6 +248,8 @@ impl PolicyExecutionTrace {
             semantic_invoked: false,
             reranking_invoked: false,
             repair_cycles: 0,
+            semantic_candidates_returned: 0,
+            semantic_fallback_reason: String::new(),
             budget_fields_hit: Vec::new(),
             final_result: PolicyResult::CompletedWithinBudget,
         }
@@ -291,9 +311,29 @@ mod tests {
     }
 
     #[test]
-    fn phase4_semantic_always_false() {
-        for m in [AnswerMode::Fast, AnswerMode::Normal, AnswerMode::Deep] {
-            assert!(!AnswerModePolicy::for_mode(m).semantic_allowed);
-        }
+    fn phase5_semantic_mode_table() {
+        let fast = AnswerModePolicy::for_mode(AnswerMode::Fast);
+        assert!(!fast.semantic_allowed);
+        assert_eq!(fast.max_semantic_candidates, 0);
+        assert!(fast.validate().is_ok());
+
+        let normal = AnswerModePolicy::for_mode(AnswerMode::Normal);
+        assert!(normal.semantic_allowed);
+        assert!(normal.max_semantic_candidates > 0);
+        assert!(normal.semantic_time_budget_ms > 0);
+
+        let deep = AnswerModePolicy::for_mode(AnswerMode::Deep);
+        assert!(deep.semantic_allowed);
+        assert!(
+            deep.max_semantic_candidates > normal.max_semantic_candidates,
+            "DEEP must be broader than NORMAL (§14)"
+        );
+    }
+
+    #[test]
+    fn fast_configured_with_semantic_budget_is_rejected() {
+        let mut p = AnswerModePolicy::for_mode(AnswerMode::Fast);
+        p.max_semantic_candidates = 10;
+        assert!(p.validate().is_err());
     }
 }

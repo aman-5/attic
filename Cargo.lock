@@ -138,6 +138,7 @@ dependencies = [
  "attic-discovery",
  "attic-evidence",
  "attic-indexing",
+ "attic-semantic",
  "attic-storage",
  "blake3",
  "rusqlite",
@@ -147,6 +148,21 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "attic-semantic"
+version = "0.1.0"
+dependencies = [
+ "attic-discovery",
+ "attic-storage",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -160,6 +176,7 @@ dependencies = [
  "attic-incremental",
  "attic-indexing",
  "attic-retrieval",
+ "attic-semantic",
  "attic-storage",
  "rmcp",
  "serde",

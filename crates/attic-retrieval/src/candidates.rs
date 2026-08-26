@@ -23,6 +23,8 @@ pub enum RetrieverKind {
     Structural,
     Relationship,
     Knowledge,
+    /// Phase 5: nearest-neighbor over the disposable semantic layer.
+    Semantic,
 }
 
 /// Parse a canonical retriever tag back to its kind.
@@ -34,6 +36,7 @@ pub fn retriever_from_str(s: &str) -> Option<RetrieverKind> {
         "STRUCTURAL" => Some(RetrieverKind::Structural),
         "RELATIONSHIP" | "GRAPH" => Some(RetrieverKind::Relationship),
         "KNOWLEDGE" => Some(RetrieverKind::Knowledge),
+        "SEMANTIC" | "VECTOR" => Some(RetrieverKind::Semantic),
         _ => None,
     }
 }
@@ -48,6 +51,7 @@ impl RetrieverKind {
             Self::Structural => "STRUCTURAL",
             Self::Relationship => "RELATIONSHIP",
             Self::Knowledge => "KNOWLEDGE",
+            Self::Semantic => "SEMANTIC",
         }
     }
 }
@@ -149,7 +153,7 @@ fn parse_stored_span(s: &str) -> Option<attic_core::SourceSpan> {
 }
 
 /// Unit line window as a span (columns unknown at unit granularity).
-fn unit_span(start_line: Option<u32>, end_line: Option<u32>) -> Option<attic_core::SourceSpan> {
+pub fn unit_span(start_line: Option<u32>, end_line: Option<u32>) -> Option<attic_core::SourceSpan> {
     Some(attic_core::SourceSpan::new(
         start_line.unwrap_or(0),
         0,
