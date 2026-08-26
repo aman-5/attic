@@ -52,6 +52,10 @@ pub struct RetrievalService {
     /// Phase 5 disposable semantic layer; `None` keeps byte-identical
     /// Phase 4 behavior (deleting the semantic DB must degrade, never break).
     pub semantic: Option<std::sync::Arc<crate::semantic::SemanticStack>>,
+    /// Phase 6 cross-repo subsystem health.  When `true`, cross-repo
+    /// evidence generation is skipped (subsystem degraded/unknown).
+    /// Local retrieval continues unaffected.
+    pub crossrepo_degraded: bool,
 }
 
 /// One inbound answer request.
@@ -469,13 +473,19 @@ impl RetrievalService {
                 );
                 // Phase 6: cross-repository dependency edges from other
                 // workspaces the user has added to the catalog.
-                ctx.run(
-                    plan,
-                    SubsystemTag::GraphWalk,
-                    "cross_repo_dependency_edges",
-                    "seeds",
-                    |env| CrossRepoGenerator::run(env, &seed_files),
-                );
+                if self.crossrepo_degraded {
+                    tracing::warn!(
+                        "cross-repo subsystem degraded; skipping cross-repo evidence generation"
+                    );
+                } else {
+                    ctx.run(
+                        plan,
+                        SubsystemTag::GraphWalk,
+                        "cross_repo_dependency_edges",
+                        "seeds",
+                        |env| CrossRepoGenerator::run(env, &seed_files),
+                    );
+                }
             }
         }
 

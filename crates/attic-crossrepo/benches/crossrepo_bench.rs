@@ -291,6 +291,7 @@ fn bench_integrated_retrieval_pipeline(c: &mut criterion::Criterion) {
         readers: pool.clone(),
         writer: writer_handle.clone(),
         semantic: None,
+        crossrepo_degraded: false,
     };
     let req = AnswerRequest::new("What depends on the library?", AnswerMode::Normal);
     c.bench_function("integrated_retrieval_crossrepo", |b| {

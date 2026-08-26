@@ -69,18 +69,21 @@ fn read_manifest_bounded(
     if rel_path.split('/').any(|seg| seg == "..") {
         return Ok(None);
     }
-    // Canonicalize the root first so starts_with comparison works on Windows
+    // Canonicalize root first so starts_with comparison works on Windows
     // (where std::fs::canonicalize adds \\?\ prefix).
     let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
         return Ok(None);
     };
     let joined = repo_root.join(rel_path.replace('\\', "/"));
-    let Ok(canon) = std::fs::canonicalize(&joined) else {
-        return Ok(None);
+    // Phase 1B safe-content boundary: canonicalize within root, reject escapes.
+    let canon = match attic_discovery::canonicalize_within_root(&joined, &canon_root) {
+        Ok(p) => p,
+        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => return Ok(None),
+        Err(attic_discovery::DiscoveryError::PathEscape { .. }) => {
+            return Err(CrossRepoError::PathEscape(rel_path.to_owned()));
+        }
+        Err(_) => return Ok(None),
     };
-    if !canon.starts_with(&canon_root) {
-        return Err(CrossRepoError::PathEscape(rel_path.to_owned()));
-    }
     let meta = match std::fs::metadata(&canon) {
         Ok(m) => m,
         Err(_) => return Ok(None),
@@ -128,12 +131,13 @@ fn read_proto_bounded(
         return Ok(None);
     };
     let joined = repo_root.join(rel_path.replace('\\', "/"));
-    let Ok(canon) = std::fs::canonicalize(&joined) else {
-        return Ok(None);
+    // Phase 1B safe-content boundary: canonicalize within root, reject escapes.
+    let canon = match attic_discovery::canonicalize_within_root(&joined, &canon_root) {
+        Ok(p) => p,
+        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => return Ok(None),
+        Err(attic_discovery::DiscoveryError::PathEscape { .. }) => return Ok(None),
+        Err(_) => return Ok(None),
     };
-    if !canon.starts_with(&canon_root) {
-        return Ok(None);
-    }
     let meta = match std::fs::metadata(&canon) {
         Ok(m) => m,
         Err(_) => return Ok(None),
@@ -141,9 +145,21 @@ fn read_proto_bounded(
     if !meta.is_file() || meta.len() > limits::MAX_MANIFEST_BYTES {
         return Ok(None);
     }
-    std::fs::read(&canon)
-        .map(Some)
-        .map_err(|_| CrossRepoError::InvalidRoot("proto read failed".into()))
+    let raw = std::fs::read(&canon)
+        .map_err(|_| CrossRepoError::InvalidRoot("proto read failed".into()))?;
+    // Phase 1B defense-in-depth: apply secret scan even though proto
+    // content is only parsed for import specifiers.  Raw bytes are never
+    // persisted or surfaced to users.
+    if let Ok(text) = std::str::from_utf8(&raw) {
+        let scan = attic_discovery::secrets::scan_and_redact(text);
+        if scan.findings.is_empty() {
+            Ok(Some(raw))
+        } else {
+            Ok(Some(scan.redacted.into_bytes()))
+        }
+    } else {
+        Ok(Some(raw))
+    }
 }
 
 // ---------------------------------------------------------------------------

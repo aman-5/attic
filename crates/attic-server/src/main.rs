@@ -87,6 +87,10 @@ struct AtticServer {
     watch_mode: Option<attic_incremental::WatchMode>,
     /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
+    /// Phase 6 cross-repo subsystem health.  `true` = degraded: sync
+    /// failed or has not yet completed.  Cross-repo-dependent answers are
+    /// prevented until this clears.
+    crossrepo_degraded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AtticServer {
@@ -133,6 +137,7 @@ impl AtticServer {
             incremental: None,
             watch_mode: None,
             semantic,
+            crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -755,6 +760,7 @@ fn handle_context(
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     pool: &DbPool,
     writer: &WriterQueueHandle,
+    crossrepo_degraded: bool,
     args: &HashMap<String, Value>,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
@@ -784,6 +790,7 @@ fn handle_context(
         readers: pool.clone(),
         writer: writer.clone(),
         semantic,
+        crossrepo_degraded,
     };
     let outcome = service
         .answer(&request)
@@ -924,6 +931,9 @@ impl ServerHandler for AtticServer {
         let incremental = self.incremental.clone();
         let semantic = self.semantic.clone();
         let watch_mode = self.watch_mode;
+        let crossrepo_degraded = self
+            .crossrepo_degraded
+            .load(std::sync::atomic::Ordering::SeqCst);
         let name = request.name.clone();
         let args: HashMap<String, Value> =
             request.arguments.unwrap_or_default().into_iter().collect();
@@ -934,7 +944,7 @@ impl ServerHandler for AtticServer {
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
                 "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
-                "context" => handle_context(semantic, &pool, &writer, &args),
+                "context" => handle_context(semantic, &pool, &writer, crossrepo_degraded, &args),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {
@@ -1051,9 +1061,20 @@ async fn main() -> anyhow::Result<()> {
                         edges = result.edges_emitted,
                         "cross-repo workspace sync complete"
                     );
+                    // Sync succeeded: cross-repo subsystem is healthy.
+                    server
+                        .crossrepo_degraded
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                Ok(Err(e)) => warn!("cross-repo workspace sync failed: {e}"),
-                Err(e) => warn!("cross-repo workspace sync task failed: {e}"),
+                Ok(Err(e)) => {
+                    warn!("cross-repo workspace sync failed: {e}");
+                    // Sync failed: cross-repo subsystem remains degraded
+                    // (initialized to true). Cross-repo-dependent answers
+                    // are prevented; local retrieval continues unaffected.
+                }
+                Err(e) => {
+                    warn!("cross-repo workspace sync task failed: {e}");
+                }
             }
         }
 

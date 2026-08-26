@@ -55,6 +55,7 @@ fn poisoned_store_mutex_degrades_to_canonical_retrieval() {
         readers: fx.pool.clone(),
         writer: fx.writer.clone(),
         semantic: Some(stack.clone()),
+        crossrepo_degraded: false,
     };
     let out = manual
         .answer(&AnswerRequest::new(
