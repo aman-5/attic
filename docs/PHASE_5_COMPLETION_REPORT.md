@@ -16,13 +16,16 @@ enrich/invalidate). Retrieval-side integration lives in
 `attic-retrieval/src/semantic.rs` (`SemanticStack`, generator, fallback
 reasons); the server opens an optional stack beside the canonical DB.
 
-## 2. Provider abstraction + decision (OQ-001 → ADR-013)
+## 2. Provider abstraction + decision (OQ-001 → ADR-013, RESOLVED-DEFERRED)
 
 `SemanticProvider` trait is the only embedding contract; zero vendor types
-leak. Default provider = in-tree deterministic `HashingEmbedder`
-("hashed-ngram-v1", 256 dims) chosen over fastembed/candle/cloud after the
-evaluation recorded in ADR-013 (reproducible offline gates won V1; bge-small
-documented as sanctioned swap-in; cloud rejected by default for privacy).
+leak. The shipped in-tree `HashingEmbedder` ("hashed-ngram-v1", 256 dims)
+is a deterministic feature-hashing BASELINE and test/conformance provider —
+NOT validated neural semantic retrieval. True neural embeddings are
+explicitly deferred (bge-small-en-v1.5 via fastembed is the sanctioned
+first swap-in; cloud rejected by default for privacy). Production semantic
+retrieval ships DISABLED by default, opt-in via `ATTIC_SEMANTIC=1` (see
+§11b/§16 for the measured value-gate basis of this decision).
 
 ## 3. Selection policy ("sem-sel-v1", §4)
 

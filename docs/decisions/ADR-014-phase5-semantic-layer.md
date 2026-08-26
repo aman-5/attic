@@ -74,6 +74,10 @@ enrichment after one edit 5 ms, hybrid adds ≈0 ms to foreground latency
 
 ## D7 — Reranking DEFERRED (resolves OQ-002 for now)
 
+Production status note (aligned with the ADR-013 revision): the semantic
+layer is OPT-IN and experimental — enabled only with `ATTIC_SEMANTIC=1`;
+default server startup never enables it.
+
 Sequence followed: embeddings → benchmark → hybrid → benchmark. After the
 noise-floor fix there is NO remaining candidate-ordering problem on the
 gated corpus (C == A on MRR/nDCG), so a reranker has nothing measurable to

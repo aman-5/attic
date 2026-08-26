@@ -1,12 +1,13 @@
 //! Built-in deterministic embedder plus test doubles (ADR-013).
 //!
-//! `HashingEmbedder` is the V1 DEFAULT provider: pure Rust, zero model
-//! downloads, fully offline, byte-deterministic — which is what makes the
-//! Phase 5 benchmark gate and all §22 tests reproducible. It hashes word
-//! unigrams + character trigrams into a fixed 256-dimensional bag-of-
-//! features space with L2 normalization (a standard "feature hashing"
-//! baseline; see ADR-013 for why a neural provider is optional, not
-//! required, for V1).
+//! `HashingEmbedder` is a deterministic feature-hashing BASELINE and
+//! test/conformance provider — NOT validated neural semantic retrieval.
+//! It is pure Rust, zero model downloads, fully offline, and byte-
+//! deterministic, which is what makes the Phase 5 benchmark gate and all
+//! §22 tests reproducible. Production semantic retrieval is opt-in
+//! (`ATTIC_SEMANTIC=1`) precisely because no neural provider is shipped
+//! yet; a neural backend (e.g. fastembed + bge-small-en-v1.5) is the
+//! sanctioned first swap-in behind the unchanged trait.
 
 use std::time::Instant;
 

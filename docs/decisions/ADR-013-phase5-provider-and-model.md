@@ -24,7 +24,11 @@ codebase (`id`, `model_id`, `dimensions`, `max_input_bytes`, `available`,
 trait and on `SemanticStack`; no ONNX/tokenizer/vendor type appears outside
 `attic-semantic`.
 
-### D2 — Default provider: built-in deterministic hashing embedder
+### D2 — Shipped BASELINE provider: built-in deterministic hashing embedder
+
+(Reclassified by the Revision below: this is a feature-hashing
+baseline/test/conformance provider, not validated neural semantic
+retrieval.)
 
 V1 ships `HashingEmbedder` ("hashing" / "hashed-ngram-v1", 256 dims): word
 unigrams + char trigrams feature-hashed via BLAKE3 into an L2-normalized
