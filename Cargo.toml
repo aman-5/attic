@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/attic-core",
+    "crates/attic-crossrepo",
     "crates/attic-storage",
     "crates/attic-analyzers",
     "crates/attic-discovery",
@@ -10,6 +11,7 @@ members = [
     "crates/attic-indexing",
     "crates/attic-incremental",
     "crates/attic-retrieval",
+    "crates/attic-crossrepo",
     "crates/attic-server",
     "crates/attic-test-support",
 ]
@@ -27,7 +29,7 @@ rusqlite           = { version = "0.40.2",  default-features = false, features =
 thiserror          = "2.0.20"
 serde              = { version = "1.0.219", features = ["derive"] }
 serde_json         = "1.0.140"
-uuid               = { version = "1.11.0",  features = ["v4", "serde"] }
+uuid               = { version = "1.11.0",  features = ["v4", "v5", "serde"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3",     features = ["env-filter"] }
 # Phase 1B: gitignore-aware walking (ripgrep/ignore, MSRV 1.88, Unlicense OR MIT)
@@ -64,3 +66,5 @@ attic-indexing     = { path = "crates/attic-indexing" }
 attic-incremental  = { path = "crates/attic-incremental" }
 attic-retrieval    = { path = "crates/attic-retrieval" }
 attic-semantic     = { path = "crates/attic-semantic" }
+attic-evidence     = { path = "crates/attic-evidence" }
+attic-crossrepo    = { path = "crates/attic-crossrepo" }
