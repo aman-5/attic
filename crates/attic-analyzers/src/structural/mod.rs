@@ -9,7 +9,7 @@
 //!        |                              |
 //! arbitrary text            Tree-sitter engine (parser mechanics)
 //!                                      |
-//!                        LanguageSpec adapters (per-language knowledge)
+//!                        TreeSitterLanguageSpec adapters (per-language knowledge)
 //!                          Java / Python / Go / JavaScript / TypeScript
 //!                                      |
 //!                          canonical AnalyzerOutput
@@ -25,14 +25,14 @@
 //! traversal accounting, source-span conversion, malformed-tree handling,
 //! diagnostics, and canonical structural-node production.
 //!
-//! Language-specific behaviour lives exclusively in [`LanguageSpec`]
+//! Language-specific behaviour lives exclusively in [`TreeSitterLanguageSpec`]
 //! implementations: grammar handle, supported file types, capability
 //! declarations, declaration/symbol/import/reference mappings, qualified-name
 //! rules and package semantics.
 //!
 //! ## Adding a language later
 //!
-//! Register a grammar crate, implement `LanguageSpec`, add fixtures/tests,
+//! Register a grammar crate, implement `TreeSitterLanguageSpec`, add fixtures/tests,
 //! expose an `analyzer()` factory and list it in [`default_registry`].
 //! No storage, indexing, registry, MCP, incremental or GenericAnalyzer code
 //! changes are required — proven by
@@ -163,8 +163,9 @@ pub(crate) struct CanonRel {
     pub owner_symbol: Option<usize>,
 }
 
-/// Accumulator handed to [`LanguageSpec::extract`]. All mutation goes through
-/// its methods so resource accounting stays centralized in the engine.
+/// Accumulator handed to [`TreeSitterLanguageSpec::extract`]. All mutation
+/// goes through its methods so resource accounting stays centralized in the
+/// engine.
 pub(crate) struct Extraction<'a> {
     pub(crate) nodes: Vec<CanonNode>,
     pub(crate) symbols: Vec<CanonSymbol>,
@@ -178,10 +179,21 @@ pub(crate) struct Extraction<'a> {
     token: &'a CancellationToken,
     ops: u32,
     pub(crate) stop: bool,
+    /// Effective per-entity-kind ceiling: min(hard safety cap,
+    /// `ResourceBudget::max_ast_nodes`) so budgets stay reconciled with the
+    /// approved resource contract while retaining a hard safety net.
+    entity_cap: usize,
+    /// Machine-readable record of every truncation that occurred
+    /// (`"symbols"`, `"imports"`, `"relationships"`, `"nodes"`, `"time"`,
+    /// `"cancelled"`). Non-empty ⇒ output is explicitly PARTIAL.
+    pub(crate) truncations: Vec<&'static str>,
+    warned_symbols: bool,
+    warned_imports: bool,
+    warned_rels: bool,
 }
 
 impl<'a> Extraction<'a> {
-    fn new(deadline: Instant, token: &'a CancellationToken) -> Self {
+    fn new(deadline: Instant, token: &'a CancellationToken, entity_cap: usize) -> Self {
         Self {
             nodes: Vec::new(),
             symbols: Vec::new(),
@@ -193,6 +205,11 @@ impl<'a> Extraction<'a> {
             token,
             ops: 0,
             stop: false,
+            entity_cap,
+            truncations: Vec::new(),
+            warned_symbols: false,
+            warned_imports: false,
+            warned_rels: false,
         }
     }
 
@@ -208,17 +225,19 @@ impl<'a> Extraction<'a> {
         }
         if self.token.is_cancelled() {
             self.stop = true;
+            self.truncations.push("cancelled");
             self.diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::CANCELLED,
-                "Structural analysis cancelled; output is partial.",
+                "Structural analysis cancelled mid-extraction; output is PARTIAL.",
             ));
             return false;
         }
         if Instant::now() >= self.deadline {
             self.stop = true;
-            self.diagnostics.push(AnalyzerDiagnostic::error(
+            self.truncations.push("time");
+            self.diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::RESOURCE_EXHAUSTED,
-                "Time budget exhausted during structural extraction.",
+                "Time budget exhausted during structural extraction; output is PARTIAL.",
             ));
             return false;
         }
@@ -226,7 +245,8 @@ impl<'a> Extraction<'a> {
     }
 
     /// Register a structural node. `parent_index` refers to a previously
-    /// pushed node. Returns the new node's index.
+    /// pushed node. Returns the new node's index, or `None` when the node
+    /// budget is exhausted (truncation recorded).
     pub fn push_node(
         &mut self,
         node_type: &str,
@@ -234,7 +254,22 @@ impl<'a> Extraction<'a> {
         node: Node<'_>,
         identity_basis: String,
         parent_index: Option<usize>,
-    ) -> usize {
+    ) -> Option<usize> {
+        if self.nodes.len() >= self.entity_cap {
+            if self.truncations.iter().all(|t| *t != "nodes") {
+                self.truncations.push("nodes");
+                self.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    format!(
+                        "node cap ({}) reached; remaining structural nodes skipped — \
+                         output is PARTIAL",
+                        self.entity_cap
+                    ),
+                ));
+                self.stop = true;
+            }
+            return None;
+        }
         let idx = self.nodes.len();
         self.nodes.push(CanonNode {
             node_type: node_type.to_string(),
@@ -244,7 +279,7 @@ impl<'a> Extraction<'a> {
             identity_basis,
             byte_range: (node.start_byte(), node.end_byte()),
         });
-        idx
+        Some(idx)
     }
 
     /// Mark a just-pushed node as a top-level declaration for unit splitting.
@@ -253,31 +288,46 @@ impl<'a> Extraction<'a> {
         self.top_level.push((s, e, node_index));
     }
 
-    /// Register a symbol definition/signature.
+    /// Register a symbol definition/signature. Truncates at the effective
+    /// entity cap with an observable diagnostic (warned once per kind).
     pub fn push_symbol(&mut self, sym: CanonSymbol) {
         if self.stop {
             return;
         }
-        if self.symbols.len() >= MAX_ENTITIES_PER_KIND {
-            self.warn(
-                "STRUCTURAL_ENTITY_CAP",
-                "symbol cap reached; remaining symbols skipped".to_string(),
-            );
+        if self.symbols.len() >= self.entity_cap {
+            if !self.warned_symbols {
+                self.warned_symbols = true;
+                self.truncations.push("symbols");
+                self.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    format!(
+                        "symbol cap ({}) reached; further symbols skipped — output is PARTIAL",
+                        self.entity_cap
+                    ),
+                ));
+            }
             return;
         }
         self.symbols.push(sym);
     }
 
-    /// Register an import edge.
+    /// Register an import edge (budget-aware, observable truncation).
     pub fn push_import(&mut self, raw_specifier: String, import_kind: &str, node: Node<'_>) {
         if self.stop {
             return;
         }
-        if self.imports.len() >= MAX_ENTITIES_PER_KIND {
-            self.warn(
-                "STRUCTURAL_ENTITY_CAP",
-                "import cap reached; remaining imports skipped".to_string(),
-            );
+        if self.imports.len() >= self.entity_cap {
+            if !self.warned_imports {
+                self.warned_imports = true;
+                self.truncations.push("imports");
+                self.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    format!(
+                        "import cap ({}) reached; further imports skipped — output is PARTIAL",
+                        self.entity_cap
+                    ),
+                ));
+            }
             return;
         }
         self.imports.push(crate::api::ImportSpec {
@@ -288,7 +338,7 @@ impl<'a> Extraction<'a> {
         });
     }
 
-    /// Register a relationship edge.
+    /// Register a relationship edge (budget-aware, observable truncation).
     pub fn push_rel(
         &mut self,
         relationship_type: &str,
@@ -301,11 +351,18 @@ impl<'a> Extraction<'a> {
         if self.stop {
             return;
         }
-        if self.rels.len() >= MAX_ENTITIES_PER_KIND {
-            self.warn(
-                "STRUCTURAL_ENTITY_CAP",
-                "relationship cap reached; remaining edges skipped".to_string(),
-            );
+        if self.rels.len() >= self.entity_cap {
+            if !self.warned_rels {
+                self.warned_rels = true;
+                self.truncations.push("relationships");
+                self.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    format!(
+                        "relationship cap ({}) reached; further edges skipped — output is PARTIAL",
+                        self.entity_cap
+                    ),
+                ));
+            }
             return;
         }
         self.rels.push(CanonRel {
@@ -317,23 +374,24 @@ impl<'a> Extraction<'a> {
             owner_symbol,
         });
     }
-
-    /// Push a warning diagnostic.
-    pub fn warn(&mut self, code: &str, message: String) {
-        self.diagnostics
-            .push(AnalyzerDiagnostic::warning(code, message));
-    }
 }
 
 // ---------------------------------------------------------------------------
-// LanguageSpec — the ONLY per-language extension point
+// TreeSitterLanguageSpec — the Tree-sitter BACKEND adapter trait
 // ---------------------------------------------------------------------------
 
 /// Per-language knowledge supplied to the shared Tree-sitter engine.
 ///
-/// Implementations contain *only* what genuinely differs between languages:
-/// the grammar handle, supported file types, capability declarations and
-/// extraction rules mapping observed node kinds to canonical entities.
+/// **Backend boundary.** This trait is deliberately Tree-sitter-specific and
+/// `pub(crate)`: it is the contract between the bundled TS backend and its
+/// language adapters — nothing else. The PUBLIC extension point for ANY
+/// parser backend (Tree-sitter, a compiler/native API, an external protocol
+/// analyzer, …) is [`crate::Analyzer`] itself: implement it, register via
+/// [`crate::AnalyzerRegistry::register_specialized`], and storage /
+/// indexing / MCP / incremental code is untouched (proven by
+/// `tests/phase3_extensibility.rs`). Built-in language enumeration in
+/// [`default_registry`] is a composition-root concern only; central dispatch
+/// contains no per-language branching.
 ///
 /// # Contract
 ///
@@ -342,7 +400,7 @@ impl<'a> Extraction<'a> {
 /// - All entity registration goes through `out` so budgets/cancellation are
 ///   enforced centrally. Check `out.tick()` in loops and bail when `false`.
 /// - Never fabricate resolution levels above actual evidence.
-pub(crate) trait LanguageSpec: Send + Sync {
+pub(crate) trait TreeSitterLanguageSpec: Send + Sync {
     /// Stable analyzer id (e.g. `"java-treesitter"`); never changes.
     fn analyzer_id(&self) -> &'static str;
     /// Human-readable description for the descriptor.
@@ -401,7 +459,7 @@ pub(crate) mod engine {
     /// Run the shared engine for `spec` over `input`. Never panics on
     /// repository input; fatal conditions surface as `Error` diagnostics so
     /// the dispatcher falls back to `GenericAnalyzer` (contract §Failure).
-    pub fn run(spec: &dyn LanguageSpec, mut input: AnalyzerInput) -> AnalyzerOutput {
+    pub fn run(spec: &dyn TreeSitterLanguageSpec, mut input: AnalyzerInput) -> AnalyzerOutput {
         let started = Instant::now();
         let deadline = started
             + Duration::from_millis(input.resource_budget.max_time_ms.min(u64::from(u32::MAX)));
@@ -420,6 +478,7 @@ pub(crate) mod engine {
 
         // ── 1. Acquire bounded content ──────────────────────────────────────
         let mut streamed_tail: Option<Vec<String>> = None;
+        let mut prefix_truncated = false;
         let bytes: Vec<u8> =
             match std::mem::replace(&mut input.content, AnalyzerContent::FullBytes(Vec::new())) {
                 AnalyzerContent::FullBytes(b) => b,
@@ -455,6 +514,7 @@ pub(crate) mod engine {
                                         tail.push(buf);
                                     }
                                     streamed_tail = Some(tail);
+                                    prefix_truncated = true;
                                     diags.push(AnalyzerDiagnostic::warning(
                                         "STRUCTURAL_TRUNCATED",
                                         "LARGE file: structural analysis covered the first \
@@ -510,7 +570,12 @@ pub(crate) mod engine {
             ));
         }
 
-        // ── 3. AST node-count budget (pre-pass, depth-capped) ────────────────
+        // ── 3. AST budget pre-pass: node count AND depth ─────────────────────
+        // Depth is enforced as a HARD ceiling (fatal → fallback): language
+        // extractors recurse over the tree, so a tree deeper than
+        // `max_recursion_depth` must never reach them. This keeps the
+        // recursion guard aligned with `ResourceBudget` instead of an
+        // invisible engine constant.
         let counted = count_nodes(
             root,
             input.resource_budget.max_ast_nodes,
@@ -520,17 +585,38 @@ pub(crate) mod engine {
             diags.push(AnalyzerDiagnostic::error(
                 diagnostic_codes::RESOURCE_EXHAUSTED,
                 format!(
-                    "AST exceeds budget ({} nodes > max_ast_nodes {}; depth cap {})",
-                    counted.visited,
-                    input.resource_budget.max_ast_nodes,
-                    input.resource_budget.max_recursion_depth
+                    "AST exceeds budget ({} nodes > max_ast_nodes {})",
+                    counted.visited, input.resource_budget.max_ast_nodes
+                ),
+            ));
+            return fatal(spec, &input, diags);
+        }
+        if !counted.depth_overflow.is_empty() {
+            diags.push(AnalyzerDiagnostic::error(
+                diagnostic_codes::RESOURCE_EXHAUSTED,
+                format!(
+                    "AST nesting exceeds max_recursion_depth ({}) at node kinds {:?}; \
+                     refusing unbounded recursive extraction",
+                    input.resource_budget.max_recursion_depth, counted.depth_overflow
                 ),
             ));
             return fatal(spec, &input, diags);
         }
 
         // ── 4. Language extraction ───────────────────────────────────────────
-        let mut ex = Extraction::new(deadline, &input.cancellation_token);
+        // Effective entity ceiling reconciles the hard safety cap with the
+        // approved per-file budget: `max_retrieval_units` bounds emitted
+        // output size, so entities (nodes/symbols/imports/edges) share that
+        // ceiling rather than an invisible constant. The hard safety cap
+        // remains for defence-in-depth.
+        let entity_cap = MAX_ENTITIES_PER_KIND.min(
+            usize::try_from(input.resource_budget.max_retrieval_units)
+                .unwrap_or(MAX_ENTITIES_PER_KIND),
+        );
+        let mut ex = Extraction::new(deadline, &input.cancellation_token, entity_cap.max(1));
+        if prefix_truncated {
+            ex.truncations.push("prefix");
+        }
         spec.extract(root, &src, &mut ex);
         diags.append(&mut ex.diagnostics);
 
@@ -596,9 +682,10 @@ pub(crate) mod engine {
         }
 
         let capability_used = capability_used_for(&ex);
-        if streamed_tail.is_some() {
-            // Partial-scan provenance preserved through the pipeline.
-        }
+
+        // §4/§5: ANY truncation makes the structural result explicitly
+        // PARTIAL — never presented as complete.
+        let structurally_complete = ex.truncations.is_empty();
 
         AnalyzerOutput {
             analyzer_id: spec.analyzer_id().to_string(),
@@ -611,6 +698,7 @@ pub(crate) mod engine {
             retrieval_units: units,
             diagnostics: diags,
             fallback_used: false,
+            structurally_complete,
             capability_used,
         }
     }
@@ -629,39 +717,51 @@ pub(crate) mod engine {
         }
     }
 
-    /// Depth-capped iterative node count. Stops early once `limit` is exceeded
-    /// so hostile inputs cost O(limit).
+    /// Iterative node count with depth measurement. Stops early once `limit`
+    /// is exceeded so hostile inputs cost O(limit). Records the kinds of the
+    /// first nodes found BEYOND `max_depth` so the refusal is diagnosable.
     fn count_nodes(root: Node<'_>, limit: u64, max_depth: u32) -> CountResult {
         let mut visited: u64 = 0;
         let mut stack: Vec<(Node<'_>, u32)> = vec![(root, 0)];
+        let mut depth_overflow: Vec<&'static str> = Vec::new();
         while let Some((node, depth)) = stack.pop() {
             visited += 1;
             if visited > limit {
                 return CountResult {
                     visited,
                     overflowed: true,
+                    depth_overflow: std::mem::take(&mut depth_overflow),
                 };
             }
-            if depth < max_depth {
-                let mut c = node.walk();
-                for child in node.children(&mut c) {
-                    stack.push((child, depth + 1));
+            if depth > max_depth {
+                if depth_overflow.len() < 4 && !depth_overflow.contains(&node.kind()) {
+                    // SAFETY-free leak of a 'static str from kind(): node
+                    // kinds are &'static str by tree-sitter's API.
+                    depth_overflow.push(node.kind());
                 }
+                continue; // do not descend past the ceiling
+            }
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                stack.push((child, depth + 1));
             }
         }
         CountResult {
             visited,
             overflowed: false,
+            depth_overflow,
         }
     }
 
     struct CountResult {
         visited: u64,
         overflowed: bool,
+        /// Kinds of the first nodes found beyond the recursion ceiling.
+        depth_overflow: Vec<&'static str>,
     }
 
     fn partial_output(
-        spec: &dyn LanguageSpec,
+        spec: &dyn TreeSitterLanguageSpec,
         input: &AnalyzerInput,
         diags: Vec<AnalyzerDiagnostic>,
     ) -> AnalyzerOutput {
@@ -676,6 +776,7 @@ pub(crate) mod engine {
             retrieval_units: vec![],
             diagnostics: diags,
             fallback_used: false,
+            structurally_complete: false,
             capability_used: CapabilityKind::Lexical,
         }
     }
@@ -683,7 +784,7 @@ pub(crate) mod engine {
     /// Fatal failure output: carries `Error` diagnostics so the dispatcher
     /// routes to `GenericAnalyzer` (file remains fully searchable).
     fn fatal(
-        spec: &dyn LanguageSpec,
+        spec: &dyn TreeSitterLanguageSpec,
         input: &AnalyzerInput,
         diags: Vec<AnalyzerDiagnostic>,
     ) -> AnalyzerOutput {
@@ -698,6 +799,7 @@ pub(crate) mod engine {
             retrieval_units: vec![],
             diagnostics: diags,
             fallback_used: false,
+            structurally_complete: false,
             capability_used: CapabilityKind::Lexical,
         }
     }
@@ -817,18 +919,18 @@ pub(crate) mod engine {
 // Public analyzer wrapper
 // ---------------------------------------------------------------------------
 
-/// A `LanguageSpec` exposed through the Phase 1C `Analyzer` contract.
+/// A `TreeSitterLanguageSpec` exposed through the Phase 1C `Analyzer` contract.
 ///
 /// The wrapper is intentionally thin: all behaviour comes from the spec plus
 /// the shared engine. Panic safety is provided by `dispatch`'s
 /// `catch_unwind`; this type additionally avoids panicking on its own.
 pub struct TreeSitterAnalyzer {
     descriptor: AnalyzerDescriptor,
-    inner: &'static dyn LanguageSpec,
+    inner: &'static dyn TreeSitterLanguageSpec,
 }
 
 impl TreeSitterAnalyzer {
-    fn new(inner: &'static dyn LanguageSpec) -> Self {
+    fn new(inner: &'static dyn TreeSitterLanguageSpec) -> Self {
         let descriptor = AnalyzerDescriptor {
             name: inner.analyzer_id().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -878,6 +980,6 @@ pub fn default_registry() -> AnalyzerRegistry {
 }
 
 /// Shared helper for language modules: construct the public analyzer.
-pub(crate) fn make_analyzer(spec: &'static dyn LanguageSpec) -> Arc<dyn Analyzer> {
+pub(crate) fn make_analyzer(spec: &'static dyn TreeSitterLanguageSpec) -> Arc<dyn Analyzer> {
     Arc::new(TreeSitterAnalyzer::new(spec))
 }

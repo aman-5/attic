@@ -127,7 +127,9 @@ ANALYZER_REGISTRY subsystem version recorded per generation
 
 Fixtures: `tests/fixtures/{OrderService.java,sample.py,server.go,widget.js,widget.ts}`.
 
-## 10. Benchmark results (fixture corpus, committed metrics)
+## 10. Benchmark results (fixture corpus, MEASURED via
+`phase3_benchmark.rs`; baseline = `IndexOptions { structural: false }`,
+i.e. real Phase 1D behaviour on an identical fresh database)
 
 | metric                | baseline (L0) | structural |
 |-----------------------|---------------|------------|
@@ -135,7 +137,11 @@ Fixtures: `tests/fixtures/{OrderService.java,sample.py,server.go,widget.js,widge
 | resolved imports      | 0             | 4          |
 | resolved references   | 0             | 1          |
 | navigation links      | 0             | 8          |
-| FTS hits (8 queries)  | 13            | 17 (≥ baseline) |
+| FTS hits (8 queries)  | 13            | 17         |
+
+Re-measured after the review-correction round (same values). Baseline rows
+are asserted to be zero in the test itself, so improvement claims are backed
+by executable measurement, not narrative.
 
 ## 11. Commands executed
 
@@ -165,6 +171,21 @@ runs ~10 s by design (5 MiB fixture) within its budget.
 - Cross-file CALL resolution is intentionally deferred (references stay
   intra-file or import-bound) — Phase 6 territory.
 
-## 14. Gate status
+## 14. Review-correction round (post-approval fixes)
 
-**PHASE 3 COMPLETE.** Stopping here; Phase 4 requires explicit approval.
+| # | Issue | Resolution | Proof |
+|---|-------|------------|-------|
+| 1 | Production `unwrap` in symbol-identity insertion | Propagated as contextual `StorageError`; scan confirms zero `unwrap/expect/panic!` in structural storage + pipeline + engine (non-test) | `double_publish_reuses_symbol_identities_without_panic` |
+| 2 | `LanguageSpec` was Tree-sitter-specific by name | Renamed to `pub(crate) TreeSitterLanguageSpec`; documented as the TS **backend adapter**; the public backend-neutral extension point is `trait Analyzer` itself | compile-time rename + `central_dispatch_has_no_language_specific_branching` |
+| 3 | Extensibility via real registry, no central branching | Third-party mock composed onto the production `default_registry()` through the public API only; source-scan proves dispatch.rs/registry.rs contain zero per-language names | `third_party_language_composes_onto_default_registry_without_central_changes`, `central_dispatch_has_no_language_specific_branching` |
+| 4 | Ceilings reconciled with `ResourceBudget` | Entity caps = min(hard cap 20 000, `max_retrieval_units`); recursion depth enforced as HARD fatal limit against `max_recursion_depth` (protects recursive extractors); every truncation emits a named warning and records an internal truncation cause | `recursion_depth_ceiling_refuses_extraction_and_falls_back`, `entity_cap_truncation_is_observable_and_never_claims_completeness` |
+| 5 | Prefix-parsed LARGE files must advertise partiality | New canonical field `AnalyzerOutput.structurally_complete` (GenericAnalyzer = false: it performs no structural analysis); persisted as `"structural_partial": true` in every node's metadata_json | `large_prefix_parse_advertises_partial_structure` |
+| 6 | Deletion ordering explicit + ghost tests | Documented dependent-first order (links → relationships → symbol occurrences → leaf-first node loop with convergence guard); ghost tests for re-analysis (existing), deletion, and rename incl. identity link | `deleted_file_leaves_no_structural_ghosts`, `rename_removes_old_artifacts_and_keeps_new`, strengthened single-file scoping test |
+| 7 | Benchmark honesty | Baseline is REAL Phase 1D behaviour via toggle; measured numbers recorded above; test asserts baseline structural counters are exactly zero | `structural_benchmark_improves_capability_slices_without_fts_regression` |
+
+## 15. Gate status
+
+**PHASE 3 COMPLETE** after correction round. Workspace totals:
+fmt clean · clippy `-D warnings` clean · **435 PASS / 0 FAIL**
+(42 Phase-3-correction/analyzer-side tests + 10 indexing integration +
+1 benchmark among them). Stopping here; Phase 4 requires explicit approval.

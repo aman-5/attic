@@ -20,7 +20,7 @@ use crate::api::{
     Analyzer, AnalyzerCapabilities, CapabilityKind, CapabilityLevel, ResolutionLevel,
 };
 use crate::structural::{
-    CanonSymbol, Extraction, LanguageSpec, SourceText, make_analyzer, span_of,
+    CanonSymbol, Extraction, SourceText, TreeSitterLanguageSpec, make_analyzer, span_of,
 };
 
 pub(crate) static GO_SPEC: GoSpec = GoSpec;
@@ -32,7 +32,7 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&GO_SPEC)
 }
 
-impl LanguageSpec for GoSpec {
+impl TreeSitterLanguageSpec for GoSpec {
     fn analyzer_id(&self) -> &'static str {
         "go-treesitter"
     }
@@ -143,7 +143,9 @@ fn extract_function(st: &mut St<'_>, node: Node<'_>, out: &mut Extraction<'_>) {
     let signature = format!("{name}{params_text}{result_text}");
     let qname = qualified(st, &name);
     let identity = format!("go|{qname}|FUNCTION|{signature}");
-    let idx = out.push_node("FUNCTION", &name, node, identity, None);
+    let Some(idx) = out.push_node("FUNCTION", &name, node, identity, None) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -181,13 +183,15 @@ fn extract_method(st: &mut St<'_>, node: Node<'_>, out: &mut Extraction<'_>) {
     // Convention: pkg.T.Name (value and pointer receivers share the name).
     let qname = format!("{}.{}.{}", st.package, receiver_base, name);
     let identity = format!("go|{qname}|METHOD|{params_text}");
-    let idx = out.push_node(
+    let Some(idx) = out.push_node(
         "METHOD",
         &format!("{receiver_base}.{name}"),
         node,
         identity,
         None,
-    );
+    ) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -234,7 +238,9 @@ fn extract_type_decl(st: &mut St<'_>, node: Node<'_>, out: &mut Extraction<'_>) 
                 };
                 let qname = qualified(st, &name);
                 let identity = format!("go|{qname}|{tag}");
-                let idx = out.push_node(tag, &name, spec, identity, None);
+                let Some(idx) = out.push_node(tag, &name, spec, identity, None) else {
+                    return;
+                };
                 out.push_symbol(CanonSymbol {
                     qualified_name: qname.clone(),
                     short_name: name.clone(),
@@ -288,8 +294,11 @@ fn extract_type_decl(st: &mut St<'_>, node: Node<'_>, out: &mut Extraction<'_>) 
                 };
                 let name = text(name_node, st.src);
                 let qname = qualified(st, &name);
-                let idx =
-                    out.push_node("TYPE_ALIAS", &name, spec, format!("go|{qname}|ALIAS"), None);
+                let Some(idx) =
+                    out.push_node("TYPE_ALIAS", &name, spec, format!("go|{qname}|ALIAS"), None)
+                else {
+                    return;
+                };
                 out.push_symbol(CanonSymbol {
                     qualified_name: qname,
                     short_name: name.clone(),

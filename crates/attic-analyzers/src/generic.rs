@@ -180,6 +180,7 @@ fn analyze_generic(input: AnalyzerInput) -> AnalyzerOutput {
         retrieval_units,
         diagnostics,
         fallback_used: false,
+        structurally_complete: false,
         capability_used: CapabilityKind::Lexical,
     }
 }

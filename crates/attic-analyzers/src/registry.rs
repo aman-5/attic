@@ -234,6 +234,7 @@ mod tests {
                 retrieval_units: vec![],
                 diagnostics: vec![],
                 fallback_used: false,
+                structurally_complete: true,
                 capability_used: CapabilityKind::Lexical,
             }
         }
@@ -415,6 +416,7 @@ mod tests {
                     retrieval_units: vec![],
                     diagnostics: vec![],
                     fallback_used: false,
+                    structurally_complete: true,
                     capability_used: CapabilityKind::Lexical,
                 }
             }
@@ -455,6 +457,7 @@ mod tests {
                     retrieval_units: vec![],
                     diagnostics: vec![],
                     fallback_used: false,
+                    structurally_complete: true,
                     capability_used: CapabilityKind::Lexical,
                 }
             }

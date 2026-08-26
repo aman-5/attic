@@ -525,6 +525,12 @@ pub struct AnalyzerOutput {
     pub fallback_used: bool,
     /// The highest `CapabilityKind` that was successfully applied.
     pub capability_used: CapabilityKind,
+    /// Phase 3 — `false` when structural coverage is PARTIAL for any reason
+    /// (LARGE-file prefix truncation, entity caps, mid-extraction budget or
+    /// cancellation stop). Partial outputs always carry an explicit
+    /// diagnostic naming the truncation cause and are persisted with the
+    /// partial marker; they must never be presented as complete structure.
+    pub structurally_complete: bool,
 }
 
 impl AnalyzerOutput {

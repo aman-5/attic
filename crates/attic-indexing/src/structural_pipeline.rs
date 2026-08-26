@@ -66,6 +66,10 @@ pub(crate) struct CapturedFile {
     analyzer_id: String,
     analyzer_version: String,
     language_tag: String,
+    /// `false` when the analyzer reported PARTIAL structural coverage
+    /// (prefix truncation, entity caps, mid-extraction stop). Persisted so
+    /// partial structure is never presented as complete.
+    structurally_complete: bool,
     nodes: Vec<PublicationNode>,
     symbols: Vec<PublicationSymbolDef>,
     raw_rels: Vec<RawRel>,
@@ -144,6 +148,7 @@ pub(crate) fn capture_structural(
         analyzer_id: output.analyzer_id.clone(),
         analyzer_version: output.analyzer_version.clone(),
         language_tag,
+        structurally_complete: output.structurally_complete,
         nodes,
         symbols,
         raw_rels,
@@ -359,6 +364,7 @@ impl StructuralPipeline {
 
             out.push(PublicationStructuralFile {
                 file_occurrence_id: occ,
+                structurally_complete: f.structurally_complete,
                 analyzer_id: f.analyzer_id,
                 analyzer_version: f.analyzer_version,
                 nodes: f.nodes,

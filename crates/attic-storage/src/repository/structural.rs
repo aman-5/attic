@@ -26,13 +26,15 @@ use crate::indexing_publication::PublicationStructuralFile;
 pub fn delete_structural_for_occurrences(
     conn: &Connection,
     occurrence_ids: &[String],
-) -> Result<(usize, usize, usize), StorageError> {
-    let mut nodes = 0;
-    let mut symbols = 0;
+) -> Result<(usize, usize, usize, usize), StorageError> {
+    let mut links = 0;
     let mut rels = 0;
+    let mut symbols = 0;
+    let mut nodes = 0;
+
+    // ── 1. Unit↔node links (FK → retrieval_units AND structural_nodes) ─────
+    // Dependent state must go before BOTH of its parents.
     {
-        // Unit↔node links referencing THIS file's units or nodes must go
-        // first — they carry FKs into both core tables.
         let mut stmt = conn.prepare(
             "DELETE FROM core_retrieval_unit_nodes
               WHERE retrieval_unit_id IN (
@@ -41,23 +43,12 @@ pub fn delete_structural_for_occurrences(
                     SELECT id FROM core_structural_nodes WHERE file_occurrence_id = ?1)",
         )?;
         for id in occurrence_ids {
-            stmt.execute([id])?;
+            links += stmt.execute([id])?;
         }
     }
-    {
-        let mut stmt =
-            conn.prepare("DELETE FROM core_structural_nodes WHERE file_occurrence_id = ?1")?;
-        for id in occurrence_ids {
-            nodes += stmt.execute([id])?;
-        }
-    }
-    {
-        let mut stmt =
-            conn.prepare("DELETE FROM core_symbol_occurrences WHERE file_occurrence_id = ?1")?;
-        for id in occurrence_ids {
-            symbols += stmt.execute([id])?;
-        }
-    }
+
+    // ── 2. Relationships — logical references to symbol/file occurrences;
+    //       removed first so no edge outlives its endpoints.
     {
         let mut stmt = conn.prepare(
             "DELETE FROM core_relationships
@@ -68,7 +59,70 @@ pub fn delete_structural_for_occurrences(
             rels += stmt.execute([id])?;
         }
     }
-    Ok((nodes, symbols, rels))
+
+    // ── 3. Symbol occurrences (FK → identities + file occurrences) ─────────
+    {
+        let mut stmt =
+            conn.prepare("DELETE FROM core_symbol_occurrences WHERE file_occurrence_id = ?1")?;
+        for id in occurrence_ids {
+            symbols += stmt.execute([id])?;
+        }
+    }
+
+    // ── 4. Structural nodes — leaves first (self-referential parent FK) ────
+    //
+    // Repeatedly delete only nodes that are nobody's parent (within the
+    // whole table; parents and children always share one occurrence).
+    // Bounded by row count so a corrupt parent chain fails loudly instead
+    // of looping.
+    let mut remaining: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM core_structural_nodes WHERE file_occurrence_id = ?1")?;
+        let mut all = Vec::new();
+        for id in occurrence_ids {
+            let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                all.push(r?);
+            }
+        }
+        all
+    };
+    let total = remaining.len();
+    while !remaining.is_empty() {
+        let mut leaf_ids: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM core_structural_nodes n
+                  WHERE n.id = ?1
+                    AND NOT EXISTS (
+                          SELECT 1 FROM core_structural_nodes c
+                           WHERE c.parent_id = n.id)",
+            )?;
+            for id in &remaining {
+                if stmt.query_row([id], |_| Ok(())).is_ok() {
+                    leaf_ids.push(id.clone());
+                }
+            }
+        }
+        if leaf_ids.is_empty() {
+            return Err(StorageError::Worker(
+                "structural deletion stalled: no leaf nodes among remaining rows \
+                 (corrupt parent_id chain)"
+                    .into(),
+            ));
+        }
+        {
+            let mut del = conn.prepare("DELETE FROM core_structural_nodes WHERE id = ?1")?;
+            for id in &leaf_ids {
+                nodes += del.execute([id])?;
+            }
+        }
+        let done: std::collections::HashSet<&String> = leaf_ids.iter().collect();
+        remaining.retain(|id| !done.contains(id));
+    }
+    debug_assert_eq!(nodes, total);
+
+    Ok((links, rels, symbols, nodes))
 }
 
 /// Insert one file's structural payload. Node parent links are resolved via
@@ -87,6 +141,9 @@ pub fn insert_structural_file(
     }
     for (idx, n) in sf.nodes.iter().enumerate() {
         let parent_id = n.parent_index.and_then(|p| node_ids.get(p)).cloned();
+        // Merge the partial-analysis marker into per-row metadata so any
+        // consumer reading a node sees the completeness verdict directly.
+        let metadata_json = merge_partial_marker(&n.metadata_json, sf.structurally_complete);
         conn.execute(
             "INSERT INTO core_structural_nodes
                  (id, repository_id, file_occurrence_id, parent_id, node_type,
@@ -104,7 +161,7 @@ pub fn insert_structural_file(
                 n.content_hash,
                 sf.analyzer_id,
                 sf.analyzer_version,
-                n.metadata_json,
+                metadata_json,
             ],
         )
         .map_err(StorageError::from)?;
@@ -132,25 +189,27 @@ pub fn insert_structural_file(
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let identity_id = existing.unwrap_or_else(|| {
-            let id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO core_symbol_identities
-                     (id, repository_id, language, qualified_name, kind, disambiguator)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    id,
-                    repository_id,
-                    s.language,
-                    s.qualified_name,
-                    s.kind,
-                    s.disambiguator
-                ],
-            )
-            .map_err(StorageError::from)
-            .unwrap();
-            id
-        });
+        let identity_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO core_symbol_identities
+                         (id, repository_id, language, qualified_name, kind, disambiguator)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        id,
+                        repository_id,
+                        s.language,
+                        s.qualified_name,
+                        s.kind,
+                        s.disambiguator
+                    ],
+                )
+                .map_err(StorageError::from)?;
+                id
+            }
+        };
         let occ_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO core_symbol_occurrences
@@ -243,6 +302,29 @@ pub fn insert_structural_file(
 fn logical_target_id(target: &str) -> String {
     let hex = blake3::hash(target.as_bytes()).to_hex();
     format!("logical:{}", &hex[..32])
+}
+
+/// Merge the partial-analysis marker into a node's metadata JSON.
+/// Complete files keep metadata unchanged; partial files gain
+/// `"structural_partial": true` (existing keys are preserved verbatim).
+fn merge_partial_marker(metadata: &Option<String>, complete: bool) -> Option<String> {
+    if complete {
+        return metadata.clone();
+    }
+    let mut value = match metadata.as_deref() {
+        Some(s) => serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "structural_partial".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    serde_json::to_string(&value)
+        .ok()
+        .or_else(|| metadata.clone())
 }
 
 /// Look up a defining symbol occurrence by qualified name (exact first, then

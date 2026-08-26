@@ -19,7 +19,7 @@ use crate::api::{
     Analyzer, AnalyzerCapabilities, CapabilityKind, CapabilityLevel, ResolutionLevel,
 };
 use crate::structural::{
-    CanonSymbol, Extraction, LanguageSpec, SourceText, make_analyzer, span_of,
+    CanonSymbol, Extraction, SourceText, TreeSitterLanguageSpec, make_analyzer, span_of,
 };
 
 pub(crate) static JAVA_SPEC: JavaSpec = JavaSpec;
@@ -31,7 +31,7 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&JAVA_SPEC)
 }
 
-impl LanguageSpec for JavaSpec {
+impl TreeSitterLanguageSpec for JavaSpec {
     fn analyzer_id(&self) -> &'static str {
         "java-treesitter"
     }
@@ -143,7 +143,9 @@ fn extract_type_decl(
     let qualified = qparts.join(".");
 
     let identity = format!("java|{qualified}|{kind_tag}");
-    let idx = out.push_node(kind_tag, &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node(kind_tag, &name, node, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -276,13 +278,15 @@ fn extract_method(
     let signature = format!("{name}{params_text}");
     let qualified = format!("{owner_qualified}.{name}");
     let identity = format!("java|{qualified}|METHOD|{signature}");
-    let idx = out.push_node(
+    let Some(idx) = out.push_node(
         if is_ctor { "CONSTRUCTOR" } else { "METHOD" },
         &name,
         node,
         identity,
         owner_node,
-    );
+    ) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {

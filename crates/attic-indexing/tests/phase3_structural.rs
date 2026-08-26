@@ -75,11 +75,23 @@ impl Fixture {
     }
 
     fn reindex_changed(&self, upserts: &[&str]) -> attic_indexing::ScopedIndexResult {
+        self.reindex(upserts, &[], &[])
+    }
+
+    fn reindex(
+        &self,
+        upserts: &[&str],
+        deletes: &[&str],
+        renames: &[(&str, &str)],
+    ) -> attic_indexing::ScopedIndexResult {
         use attic_indexing::ScopedChanges;
         let changes = ScopedChanges {
             upserts: upserts.iter().map(|s| s.to_string()).collect(),
-            deletes: vec![],
-            rename_hints: vec![],
+            deletes: deletes.iter().map(|s| s.to_string()).collect(),
+            rename_hints: renames
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
         };
         attic_indexing::index_changes(
             &self.store(),
@@ -422,4 +434,189 @@ fn redacted_java_secret_never_reaches_published_artifacts() {
             Ok(())
         })
         .unwrap();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 3 corrections — panic-free idempotency, ghost artifacts on
+// re-analysis / deletion / rename.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Fix 1 verification: a full refresh re-runs symbol-identity insertion for
+/// every file; the upsert path must reuse identities WITHOUT panicking and
+/// must not duplicate identity rows.
+#[test]
+fn double_publish_reuses_symbol_identities_without_panic() {
+    let fx = Fixture::bootstrap(&[("src/A.java", JAVA_BASE), ("src/B.java", JAVA_HELPER)]);
+
+    let identities_first: i64 = fx.query_i64(|c| {
+        c.query_row("SELECT COUNT(*) FROM core_symbol_identities", [], |r| {
+            r.get(0)
+        })
+    });
+
+    // Second FULL run (refresh path replays insert_structural_file for every
+    // file, exercising the identity-conflict branch).
+    let _again = index_repository(
+        &fx.store(),
+        &fx.root,
+        &DiscoveryPolicy::default_git(),
+        &opts(),
+    )
+    .expect("second full publish must succeed without panicking");
+
+    let identities_second: i64 = fx.query_i64(|c| {
+        c.query_row("SELECT COUNT(*) FROM core_symbol_identities", [], |r| {
+            r.get(0)
+        })
+    });
+    assert_eq!(
+        identities_first, identities_second,
+        "identity rows must be reused, never duplicated"
+    );
+
+    // Definitions still resolve to exactly one CURRENT occurrence per symbol.
+    let dup_defs: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT si.id FROM core_symbol_identities si
+                   JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+                  WHERE so.is_definition = 1
+                  GROUP BY si.id HAVING COUNT(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(dup_defs, 0, "no symbol may carry duplicate definitions");
+}
+
+/// Fix 6 — DELETION ghosts: tombstoning a file must remove its structural
+/// nodes, symbol occurrences, relationships and unit links entirely.
+#[test]
+fn deleted_file_leaves_no_structural_ghosts() {
+    let fx = Fixture::bootstrap(&[("src/Keep.java", JAVA_BASE), ("src/Gone.java", JAVA_HELPER)]);
+
+    let before: i64 = fx.query_i64(|c| {
+        c.query_row("SELECT COUNT(*) FROM core_structural_nodes", [], |r| {
+            r.get(0)
+        })
+    });
+    assert!(before > 0);
+
+    std::fs::remove_file(fx.root.join("src/Gone.java")).unwrap();
+    let scoped = fx.reindex(&[], &["src/Gone.java"], &[]);
+    // files_published counts NON-tombstone publications: only the deletion
+    // was scoped, so zero live files were republished.
+    assert_eq!(scoped.files_published, 0);
+
+    // The tombstone row exists.
+    let tombstones: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_file_occurrences
+              WHERE path='src/Gone.java' AND existence_state='deleted'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(tombstones, 1, "deletion recorded as tombstone");
+
+    // No structural row may reference a DEAD occurrence (existence=deleted).
+    let ghosts: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_structural_nodes n
+               JOIN core_file_occurrences fo ON fo.id = n.file_occurrence_id
+              WHERE fo.existence_state = 'deleted'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(ghosts, 0, "structural nodes of deleted files must vanish");
+
+    let sym_ghosts: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_symbol_occurrences so
+               JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
+              WHERE fo.existence_state = 'deleted'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        sym_ghosts, 0,
+        "symbol occurrences of deleted files must vanish"
+    );
+
+    // Helper symbol occurrences are gone; Keep's remain.
+    let helper_left: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_symbol_identities si
+               JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+              WHERE si.qualified_name LIKE '%Helper%'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(helper_left, 0);
+}
+
+/// Fix 6 — RENAME ghosts: an identical-content rename removes the old
+/// occurrence's artifacts, creates the new ones, and records the identity
+/// link. Nothing may reference the dead old occurrence.
+#[test]
+fn rename_removes_old_artifacts_and_keeps_new() {
+    let fx = Fixture::bootstrap(&[("src/Base.java", JAVA_BASE), ("src/Old.java", JAVA_HELPER)]);
+    let old_node_ids: Vec<String> = fx
+        .pool
+        .with_reader(|c| {
+            let mut stmt = c.prepare(
+                "SELECT n.id FROM core_structural_nodes n
+                   JOIN core_file_occurrences fo ON fo.id = n.file_occurrence_id
+                  WHERE fo.path = 'src/Old.java'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert!(!old_node_ids.is_empty());
+
+    // Content-identical move on disk.
+    std::fs::rename(fx.root.join("src/Old.java"), fx.root.join("src/New.java")).unwrap();
+
+    let scoped = fx.reindex(
+        &["src/New.java"],
+        &["src/Old.java"],
+        &[("src/Old.java", "src/New.java")],
+    );
+    assert_eq!(scoped.files_published, 1, "only the new location is live");
+
+    // Old occurrence: no nodes left.
+    let old_left: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_structural_nodes n
+               JOIN core_file_occurrences fo ON fo.id = n.file_occurrence_id
+              WHERE fo.path = 'src/Old.java' OR fo.existence_state='deleted'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        old_left, 0,
+        "renamed-away occurrence keeps no structural rows"
+    );
+
+    // New occurrence: fresh nodes exist.
+    let new_count: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_structural_nodes n
+               JOIN core_file_occurrences fo ON fo.id = n.file_occurrence_id
+              WHERE fo.path = 'src/New.java'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert!(new_count > 0, "new location carries structure");
+
+    // Identity link recorded for the content match (ADR-009).
+    let links: i64 =
+        fx.query_i64(|c| c.query_row("SELECT COUNT(*) FROM core_identity_links", [], |r| r.get(0)));
+    assert!(links >= 1, "rename identity link expected");
 }

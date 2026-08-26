@@ -85,6 +85,7 @@ impl Analyzer for MockLanguageAnalyzer {
             }],
             diagnostics: vec![],
             fallback_used: false,
+            structurally_complete: true,
             capability_used: CapabilityKind::SymbolExtraction,
         }
     }
@@ -154,6 +155,7 @@ fn capabilities_are_independent_not_ordinal() {
                 retrieval_units: vec![],
                 diagnostics: vec![],
                 fallback_used: false,
+                structurally_complete: true,
                 capability_used: CapabilityKind::StructuralParse,
             }
         }

@@ -233,6 +233,11 @@ pub struct PublicationUnitLink {
 pub struct PublicationStructuralFile {
     /// Target file occurrence (UUID string).
     pub file_occurrence_id: String,
+    /// `false` when the analyzer reported PARTIAL structural coverage
+    /// (LARGE-file prefix truncation, entity caps, mid-extraction stop).
+    /// Persisted on every node row so partial structure can never be
+    /// presented as complete.
+    pub structurally_complete: bool,
     /// Analyzer that produced this payload.
     pub analyzer_id: String,
     /// Analyzer version.
@@ -348,14 +353,15 @@ fn execute_index_publication(
     };
 
     // ── Phase 3 FIRST: structural replacement + unit↔node link cleanup.
-    // Links reference both core_retrieval_units and core_structural_nodes,
-    // so they (and their nodes/symbols/relationships) must be removed BEFORE
-    // the old retrieval units are deleted, or FK constraints fire.
+    // Dependent state (links → relationships → symbol occurrences → leaf
+    // nodes) is removed before its parents; see
+    // `delete_structural_for_occurrences` for the explicit ordering.
     let deleted_structural = crate::repository::structural::delete_structural_for_occurrences(
         conn,
         &p.delete_structural_for_occurrences,
     )?;
-    stats.structural_deleted = deleted_structural.0 + deleted_structural.1 + deleted_structural.2;
+    stats.structural_deleted =
+        deleted_structural.0 + deleted_structural.1 + deleted_structural.2 + deleted_structural.3;
 
     for old_occurrence_id in &p.delete_units_for_occurrences {
         stats.units_deleted += delete_retrieval_units_for_file(conn, old_occurrence_id)?;

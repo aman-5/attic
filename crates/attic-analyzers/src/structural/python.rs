@@ -19,7 +19,7 @@ use crate::api::{
     Analyzer, AnalyzerCapabilities, CapabilityKind, CapabilityLevel, ResolutionLevel,
 };
 use crate::structural::{
-    CanonSymbol, Extraction, LanguageSpec, SourceText, make_analyzer, span_of,
+    CanonSymbol, Extraction, SourceText, TreeSitterLanguageSpec, make_analyzer, span_of,
 };
 
 pub(crate) static PYTHON_SPEC: PythonSpec = PythonSpec;
@@ -31,7 +31,7 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&PYTHON_SPEC)
 }
 
-impl LanguageSpec for PythonSpec {
+impl TreeSitterLanguageSpec for PythonSpec {
     fn analyzer_id(&self) -> &'static str {
         "python-treesitter"
     }
@@ -168,7 +168,9 @@ fn extract_class(
         def
     };
     let identity = format!("python|{qualified}|CLASS");
-    let idx = out.push_node("CLASS", &name, span_node, identity, parent_idx);
+    let Some(idx) = out.push_node("CLASS", &name, span_node, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -262,7 +264,9 @@ fn extract_method_or_nested(
         "python|{qualified}|METHOD|{signature}{}",
         if is_async { "|async" } else { "" }
     );
-    let idx = out.push_node("METHOD", &name, span_node, identity, owner_node);
+    let Some(idx) = out.push_node("METHOD", &name, span_node, identity, owner_node) else {
+        return;
+    };
 
     let method_sym = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -335,7 +339,9 @@ fn extract_function(
         "python|{qualified}|FUNCTION|{signature}{}",
         if is_async { "|async" } else { "" }
     );
-    let idx = out.push_node("FUNCTION", &name, def, identity, parent_idx);
+    let Some(idx) = out.push_node("FUNCTION", &name, def, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {

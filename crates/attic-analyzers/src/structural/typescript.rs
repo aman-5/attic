@@ -15,7 +15,7 @@ use tree_sitter::Node;
 use crate::api::{Analyzer, AnalyzerCapabilities, CapabilityKind, CapabilityLevel};
 use crate::structural::javascript as js;
 use crate::structural::{
-    CanonSymbol, Extraction, LanguageSpec, SourceText, make_analyzer, span_of,
+    CanonSymbol, Extraction, SourceText, TreeSitterLanguageSpec, make_analyzer, span_of,
 };
 
 pub(crate) static TYPESCRIPT_SPEC: TypeScriptSpec = TypeScriptSpec;
@@ -27,7 +27,7 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&TYPESCRIPT_SPEC)
 }
 
-impl LanguageSpec for TypeScriptSpec {
+impl TreeSitterLanguageSpec for TypeScriptSpec {
     fn analyzer_id(&self) -> &'static str {
         "typescript-treesitter"
     }
@@ -180,7 +180,9 @@ fn extract_interface(
     let name = js::text(name_node, st.src);
     let qualified = qname_of(scope, &name);
     let identity = format!("{}|{qualified}|INTERFACE", st.lang_tag);
-    let idx = out.push_node("INTERFACE", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("INTERFACE", &name, node, identity, parent_idx) else {
+        return;
+    };
 
     let exported = node
         .parent()
@@ -295,7 +297,9 @@ fn extract_type_alias(
     let name = js::text(name_node, st.src);
     let qualified = qname_of(scope, &name);
     let identity = format!("{}|{qualified}|TYPE_ALIAS", st.lang_tag);
-    let idx = out.push_node("TYPE_ALIAS", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("TYPE_ALIAS", &name, node, identity, parent_idx) else {
+        return;
+    };
     out.push_symbol(CanonSymbol {
         qualified_name: qualified,
         short_name: name,
@@ -327,7 +331,9 @@ fn extract_enum(
     let name = js::text(name_node, st.src);
     let qualified = qname_of(scope, &name);
     let identity = format!("{}|{qualified}|ENUM", st.lang_tag);
-    let idx = out.push_node("ENUM", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("ENUM", &name, node, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx_holder = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -392,7 +398,9 @@ fn extract_namespace(
     let name = js::text(name_node, st.src);
     let qualified = qname_of(scope, &name);
     let identity = format!("{}|{qualified}|NAMESPACE", st.lang_tag);
-    let idx = out.push_node("NAMESPACE", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("NAMESPACE", &name, node, identity, parent_idx) else {
+        return;
+    };
     out.push_symbol(CanonSymbol {
         qualified_name: qualified.clone(),
         short_name: name,
@@ -441,7 +449,9 @@ fn extract_abstract_class(
     let qualified = qparts.join(".");
 
     let identity = format!("{}|{qualified}|ABSTRACT_CLASS", st.lang_tag);
-    let idx = out.push_node("ABSTRACT_CLASS", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("ABSTRACT_CLASS", &name, node, identity, parent_idx) else {
+        return;
+    };
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
         qualified_name: qualified.clone(),
@@ -505,13 +515,15 @@ fn extract_abstract_class(
                     let params = member.child_by_field_name("parameters");
                     let params_text = params.map(|p| js::text(p, st.src)).unwrap_or_default();
                     let m_qualified = format!("{qualified}.{m_name}");
-                    let m_idx = out.push_node(
+                    let Some(m_idx) = out.push_node(
                         "ABSTRACT_METHOD",
                         &m_name,
                         member,
                         format!("{}|{m_qualified}|ABSTRACT_METHOD", st.lang_tag),
                         Some(idx),
-                    );
+                    ) else {
+                        return;
+                    };
                     out.push_symbol(CanonSymbol {
                         qualified_name: m_qualified,
                         short_name: m_name.clone(),

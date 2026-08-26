@@ -21,7 +21,7 @@ use crate::api::{
     Analyzer, AnalyzerCapabilities, CapabilityKind, CapabilityLevel, ResolutionLevel,
 };
 use crate::structural::{
-    CanonSymbol, Extraction, LanguageSpec, SourceText, make_analyzer, span_of,
+    CanonSymbol, Extraction, SourceText, TreeSitterLanguageSpec, make_analyzer, span_of,
 };
 
 pub(crate) static JAVASCRIPT_SPEC: JavaScriptSpec = JavaScriptSpec;
@@ -33,7 +33,7 @@ pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&JAVASCRIPT_SPEC)
 }
 
-impl LanguageSpec for JavaScriptSpec {
+impl TreeSitterLanguageSpec for JavaScriptSpec {
     fn analyzer_id(&self) -> &'static str {
         "javascript-treesitter"
     }
@@ -221,7 +221,9 @@ pub(crate) fn extract_class_inner(
     let qualified = qparts.join(".");
 
     let identity = format!("{}|{qualified}|CLASS", st.lang_tag);
-    let idx = out.push_node("CLASS", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("CLASS", &name, node, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -343,7 +345,7 @@ pub(crate) fn extract_method_definition(
 
     let qualified = format!("{}.{}", owner_qparts.join("."), name);
     let identity = format!("{}|{qualified}|METHOD|{params_text}", st.lang_tag);
-    let idx = out.push_node(
+    let Some(idx) = out.push_node(
         if name == "constructor" {
             "CONSTRUCTOR"
         } else {
@@ -353,7 +355,9 @@ pub(crate) fn extract_method_definition(
         node,
         identity,
         owner_node,
-    );
+    ) else {
+        return;
+    };
 
     out.push_symbol(CanonSymbol {
         qualified_name: qualified,
@@ -460,7 +464,9 @@ pub(crate) fn extract_function_decl_inner(
         params = params_text,
         gen = if is_generator { "|gen" } else { "" }
     );
-    let idx = out.push_node("FUNCTION", &name, node, identity, parent_idx);
+    let Some(idx) = out.push_node("FUNCTION", &name, node, identity, parent_idx) else {
+        return;
+    };
 
     let sym_idx = out.symbols.len();
     out.push_symbol(CanonSymbol {
@@ -574,7 +580,9 @@ fn extract_variable_declarators(
                 lang = st.lang_tag,
                 params = params_text
             );
-            let idx = out.push_node("FUNCTION", &name, node, identity, None);
+            let Some(idx) = out.push_node("FUNCTION", &name, node, identity, None) else {
+                return;
+            };
             let sym_idx = out.symbols.len();
             out.push_symbol(CanonSymbol {
                 qualified_name: qualified,
