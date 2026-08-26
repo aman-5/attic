@@ -221,3 +221,31 @@ When an open question is resolved:
 **Status**: RESOLVED (Phase 2)
 **Owning phase**: Phase 2
 **Resolution**: Occurrences published with `existence_state='deleted'` are set to `freshness_state='INVALID'` immediately after publication (`attic-indexing::incremental`, step 9). Deleted state is therefore never exposed as CURRENT anywhere (fts read boundary additionally filters `existence_state != 'deleted'`). Recorded in the Phase 2 completion report and test `file_deletion_removes_fts_entries_no_ghosts`.
+
+## OQ-019 - Java Build-System-Aware Resolution (Maven/Gradle)
+
+**Status:** Open (raised Phase 3)
+**Blocking:** No
+
+Phase 3 resolves Java imports via source-layout candidates
+(`src/main/java/...`) plus in-run/DB symbol evidence. True build-aware
+resolution (`BUILD_RESOLVED` level) requires parsing `pom.xml` /
+`build.gradle` source sets and dependency scopes. Defer to a later phase;
+the relationship schema already carries `dependency_basis=MAVEN|GRADLE` for
+it.
+
+## OQ-020 - Automatic Analyzer-Version Delta Invalidation
+
+**Status:** Open (raised Phase 3)
+**Blocking:** No
+
+Every index generation now records
+`subsystem_versions["analyzer_registry"] = 0.2.0`
+(ANALYZER_REGISTRY_VERSION). The compatibility contract requires artifacts
+to be invalidated when this version changes. Current behaviour: new
+generations always record the current value, and republication replaces
+analyzer-derived artifacts wholesale; however NO background job diffs a
+stored older version against the running version to schedule repository-wide
+invalidation. Wiring that diff into server startup is deferred with this
+record; until then an analyzer upgrade should be accompanied by a manual
+re-index.

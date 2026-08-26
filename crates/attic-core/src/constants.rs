@@ -3,6 +3,12 @@
 /// Current schema version string, embedded in every index generation.
 pub const CURRENT_SCHEMA_VERSION: &str = "1.0.0";
 
+/// Analyzer registry implementation version (compatibility contract:
+/// recorded per index generation under `analyzer_registry`; bumped when the
+/// bundled analyzer set changes so operators can detect stale generations).
+/// 0.1.x = Phase 1C generic-only; 0.2.0 = Phase 3 structural languages.
+pub const ANALYZER_REGISTRY_VERSION: &str = "0.2.0";
+
 /// Version of the secret-pattern ruleset used during scanning.
 /// Increment this whenever the ruleset changes to trigger re-scanning.
 pub const SECRET_PATTERN_VERSION: i64 = 1;

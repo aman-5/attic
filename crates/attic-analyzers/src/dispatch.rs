@@ -486,6 +486,7 @@ fn preparation_cancelled_output(file_occurrence_id: FileOccurrenceId) -> Analyze
              specialized analyzer was not invoked.",
         )],
         fallback_used: false,
+        structurally_complete: false,
         capability_used: CapabilityKind::Lexical,
     }
 }
@@ -511,6 +512,7 @@ fn preparation_budget_exhausted_output(file_occurrence_id: FileOccurrenceId) -> 
              specialized analyzer was not invoked.",
         )],
         fallback_used: false,
+        structurally_complete: false,
         capability_used: CapabilityKind::Lexical,
     }
 }
@@ -537,6 +539,7 @@ fn preparation_io_failure_output(file_occurrence_id: FileOccurrenceId) -> Analyz
              specialized analyzer was not invoked.",
         )],
         fallback_used: true,
+        structurally_complete: false,
         capability_used: CapabilityKind::Lexical,
     }
 }
@@ -710,6 +713,7 @@ mod tests {
                 retrieval_units: vec![],
                 diagnostics: vec![],
                 fallback_used: false,
+                structurally_complete: true,
                 capability_used: CapabilityKind::Lexical,
             }
         }
@@ -758,6 +762,7 @@ mod tests {
                     "synthetic error from ErrorStub",
                 )],
                 fallback_used: false,
+                structurally_complete: true,
                 capability_used: CapabilityKind::Lexical,
             }
         }
@@ -841,6 +846,7 @@ mod tests {
                 retrieval_units: vec![],
                 diagnostics: vec![],
                 fallback_used: false,
+                structurally_complete: true,
                 capability_used: CapabilityKind::Lexical,
             }
         }

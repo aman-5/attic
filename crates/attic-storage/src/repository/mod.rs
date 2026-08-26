@@ -7,3 +7,4 @@ pub mod publication;
 #[allow(clippy::module_inception)]
 pub mod repository;
 pub mod source_revision;
+pub mod structural;

@@ -28,14 +28,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use attic_analyzers::{
-    AnalyzerContent, AnalyzerInput, AnalyzerRegistry, CancellationToken, GenericAnalyzer,
-    ResourceBudget,
+    AnalyzerContent, AnalyzerInput, AnalyzerRegistry, CancellationToken, ResourceBudget,
 };
 use attic_core::{
     DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
@@ -73,6 +71,7 @@ pub enum IndexError {
 }
 
 pub mod incremental;
+pub(crate) mod structural_pipeline;
 
 pub use incremental::{ScopedChanges, ScopedIndexResult, index_changes};
 
@@ -102,6 +101,10 @@ pub struct IndexOptions {
     pub repository_name: String,
     pub max_units_per_file: usize,
     pub refresh_existing: bool,
+    /// Phase 3 — when `false`, only the GenericAnalyzer runs (Phase 1D
+    /// behaviour; used for honest baselines in benchmarks and as an
+    /// operational kill-switch). Default `true`.
+    pub structural: bool,
 }
 
 impl Default for IndexOptions {
@@ -110,6 +113,7 @@ impl Default for IndexOptions {
             repository_name: "default".to_owned(),
             max_units_per_file: 512,
             refresh_existing: true,
+            structural: true,
         }
     }
 }
@@ -158,6 +162,8 @@ struct PendingUnit {
     start_line: Option<u32>,
     end_line: Option<u32>,
     is_redacted: bool,
+    /// Phase 3 — structural node index this unit is anchored to.
+    structural_node_index: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +235,10 @@ pub fn index_repository(
     let mut sv = SubsystemVersions::new();
     sv.set(subsystem_keys::SCHEMA, CURRENT_SCHEMA_VERSION);
     sv.set(subsystem_keys::INDEXER, env!("CARGO_PKG_VERSION"));
+    sv.set(
+        subsystem_keys::ANALYZER_REGISTRY,
+        attic_core::constants::ANALYZER_REGISTRY_VERSION,
+    );
     sv.set(
         subsystem_keys::SECRET_DETECTOR,
         SECRET_PATTERN_VERSION.to_string(),
@@ -319,18 +329,35 @@ pub fn index_repository(
 
     // 6. Run Phase 1C analysis per file.  Produces pending units only — no
     //    database writes happen during analysis.
-    let registry = AnalyzerRegistry::new(Arc::new(GenericAnalyzer::new()));
+    let registry = if opts.structural {
+        structural_pipeline::default_registry()
+    } else {
+        structural_pipeline::generic_only_registry()
+    };
     let mut pending_units: Vec<PendingUnit> = Vec::new();
     let mut stale_occurrences: Vec<String> = Vec::new();
     let mut indexed_records: Vec<FileRecord> = Vec::new();
+    let mut pipeline = structural_pipeline::StructuralPipeline::new(
+        root,
+        discovery
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.clone())
+            .collect(),
+    );
 
     for rec in file_records {
         match analyze_single_file(&rec, &registry, opts) {
-            Ok(mut units) => {
+            Ok((mut units, captured)) => {
                 if opts.refresh_existing
                     && let Some(old) = rec.old_fo_id.clone()
                 {
                     stale_occurrences.push(old);
+                }
+                pipeline.note_occurrence(&rec.repo_relative, &rec.fo_id.to_string_repr());
+                if let Some(captured) = captured {
+                    pipeline.record(captured);
                 }
                 pending_units.append(&mut units);
                 indexed_records.push(rec);
@@ -372,10 +399,18 @@ pub fn index_repository(
 
     let repo_id_str = repo_id.to_string_repr();
     let gen_id_str = gen_id.to_string_repr();
-    let retrieval_units: Vec<PublicationRetrievalUnit> = pending_units
-        .into_iter()
-        .map(|u| PublicationRetrievalUnit {
-            id: RetrievalUnitId::new_v4().to_string_repr(),
+    let mut retrieval_units: Vec<PublicationRetrievalUnit> = Vec::new();
+    let mut unit_links_by_occ: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for u in pending_units {
+        let unit_id = RetrievalUnitId::new_v4().to_string_repr();
+        if let Some(idx) = u.structural_node_index {
+            unit_links_by_occ
+                .entry(u.file_occurrence_id.clone())
+                .or_default()
+                .push((unit_id.clone(), idx));
+        }
+        retrieval_units.push(PublicationRetrievalUnit {
+            id: unit_id,
             file_occurrence_id: u.file_occurrence_id,
             index_generation_id: gen_id_str.clone(),
             repository_id: repo_id_str.clone(),
@@ -385,8 +420,41 @@ pub fn index_repository(
             start_line: u.start_line,
             end_line: u.end_line,
             is_redacted: u.is_redacted,
-        })
-        .collect();
+        });
+    }
+
+    // Phase 3 — resolve structural edges and assemble payloads.
+    let repo_id_for_deps = repo_id;
+    let deps = structural_pipeline::ResolverDeps {
+        symbol_definition: &|qname, kinds| {
+            store
+                .readers
+                .with_reader(|c| {
+                    attic_storage::lookup_symbol_definition_occurrence(
+                        c,
+                        &repo_id_for_deps.to_string_repr(),
+                        qname,
+                        kinds,
+                    )
+                })
+                .ok()
+                .flatten()
+        },
+        path_occurrence: &|rel_path| {
+            store
+                .readers
+                .with_reader(|c| {
+                    attic_storage::lookup_latest_file_occurrence_for_path(
+                        c,
+                        &repo_id_for_deps,
+                        rel_path,
+                    )
+                })
+                .ok()
+                .flatten()
+        },
+    };
+    let structural_files = pipeline.finish(&deps, &unit_links_by_occ);
 
     let stats: IndexPublicationStats = submit_index_publication(
         store.writer,
@@ -403,8 +471,10 @@ pub fn index_repository(
             subsystem_versions: sv,
             files: publication_files,
             delete_units_for_occurrences: stale_occurrences.clone(),
-            close_audit_for_occurrences: stale_occurrences,
+            close_audit_for_occurrences: stale_occurrences.clone(),
             retrieval_units,
+            structural_files,
+            delete_structural_for_occurrences: stale_occurrences,
         },
     )
     .map_err(IndexError::Storage)?;
@@ -428,13 +498,15 @@ pub fn index_repository(
 // Per-file analysis (pure — no database writes)
 // ---------------------------------------------------------------------------
 
-/// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return the
-/// retrieval units to publish.  Never touches the database.
+/// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return
+/// the retrieval units (with structural anchors) and, when a specialized
+/// structural analyzer produced output, its capturable payload.
+/// Never touches the database.
 fn analyze_single_file(
     rec: &FileRecord,
     registry: &AnalyzerRegistry,
     opts: &IndexOptions,
-) -> Result<Vec<PendingUnit>, IndexError> {
+) -> Result<(Vec<PendingUnit>, Option<structural_pipeline::CapturedFile>), IndexError> {
     // Preprocess through Phase 1B secrets layer.
     // I/O failures MUST be propagated — never swallowed with unwrap_or_default.
     let preprocessed = attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative)
@@ -459,7 +531,7 @@ fn analyze_single_file(
                 decision = ?preprocessed.decision,
                 "skipping file per preprocess decision"
             );
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         SecretScanDecision::Redacted => {
@@ -555,8 +627,11 @@ fn analyze_single_file(
             start_line: Some(unit_spec.span.start_line),
             end_line: Some(unit_spec.span.end_line),
             is_redacted,
+            structural_node_index: unit_spec.structural_node_index,
         })
         .collect();
+
+    let captured = structural_pipeline::capture_structural(&rec.repo_relative, &fo_id_str, &output);
 
     debug!(
         path = %rec.repo_relative,
@@ -565,7 +640,7 @@ fn analyze_single_file(
         is_redacted,
         "file analyzed"
     );
-    Ok(units)
+    Ok((units, captured))
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +666,9 @@ fn infer_file_type(path: &Path) -> FileType {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => FileType::Rust,
         Some("ts") | Some("tsx") => FileType::TypeScript,
-        Some("js") | Some("mjs") | Some("cjs") => FileType::JavaScript,
+        Some("js") | Some("mjs") | Some("cjs") | Some("jsx") => FileType::JavaScript,
+        Some("java") => FileType::Java,
+        Some("go") => FileType::Go,
         Some("py") => FileType::Python,
         Some("md") => FileType::Markdown,
         Some("toml") => FileType::Toml,

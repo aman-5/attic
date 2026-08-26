@@ -17,7 +17,17 @@ serde_json      = { workspace = true }
 uuid            = { workspace = true }
 tracing         = { workspace = true }
 tempfile        = { workspace = true }
+blake3          = { workspace = true }
+tree-sitter            = { workspace = true }
+tree-sitter-language   = { workspace = true }
+tree-sitter-java       = { workspace = true }
+tree-sitter-python     = { workspace = true }
+tree-sitter-go         = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [dev-dependencies]
 attic-test-support = { workspace = true }
 tempfile           = { workspace = true }
+attic-core         = { workspace = true }
+uuid               = { workspace = true }

@@ -145,6 +145,111 @@ pub struct IndexPublication {
     pub close_audit_for_occurrences: Vec<String>,
     /// Retrieval units to insert with FTS synchronisation.
     pub retrieval_units: Vec<PublicationRetrievalUnit>,
+    /// Phase 3 — per-file structural payloads (nodes/symbols/relationships,
+    /// unit↔node links), keyed per file occurrence.
+    pub structural_files: Vec<PublicationStructuralFile>,
+    /// Phase 3 — occurrences whose previous structural rows are deleted first
+    /// (replacement semantics).
+    pub delete_structural_for_occurrences: Vec<String>,
+}
+
+/// One canonical structural node, ready for persistence (Phase 3).
+#[derive(Debug, Clone)]
+pub struct PublicationNode {
+    /// Parent node index within the same file's `nodes` vec.
+    pub parent_index: Option<usize>,
+    /// Analyzer-defined type tag (`CLASS`, `METHOD`, …).
+    pub node_type: String,
+    /// Rename-stable identity hash (BLAKE3 hex).
+    pub structural_identity: String,
+    /// Canonical span string (`"start_line:start_col-end_line:end_col"`).
+    pub span_str: String,
+    /// BLAKE3 hex of the node's delivered content bytes.
+    pub content_hash: String,
+    /// Analyzer-specific structured metadata; never contains secret content.
+    pub metadata_json: Option<String>,
+}
+
+/// One symbol definition occurrence plus its identity tuple (Phase 3).
+#[derive(Debug, Clone)]
+pub struct PublicationSymbolDef {
+    /// Language tag (`java`, `python`, …) for `core_symbol_identities`.
+    pub language: String,
+    /// Fully qualified name (language-specific format).
+    pub qualified_name: String,
+    /// `SymbolKind` DB token.
+    pub kind: String,
+    /// Overload disambiguator when `(repo, language, qualified_name, kind)`
+    /// is ambiguous; `None` otherwise.
+    pub disambiguator: Option<String>,
+    /// Canonical span string of the definition/signature.
+    pub span_str: String,
+    /// Language-specific signature text, when extractable.
+    pub signature: Option<String>,
+    /// Raw visibility modifier, when present.
+    pub visibility: Option<String>,
+    /// `false` for pure API signatures (no body).
+    pub is_definition: bool,
+}
+
+/// One relationship edge (Phase 3). Resolution honesty is preserved verbatim
+/// from the analyzer/resolver — never upgraded silently.
+#[derive(Debug, Clone)]
+pub struct PublicationRelationship {
+    /// `IMPORT | CALL | EXTENDS | IMPLEMENTS | REFERENCES`
+    pub rel_type: String,
+    /// Resolved edges: real file-occurrence UUID. Unresolved edges: the raw
+    /// logical target string (encoded deterministically at insert time).
+    pub target_entity_id: String,
+    /// `true` → `target_entity_id` is a real entity UUID.
+    pub resolved: bool,
+    /// `IMPORT | GO_MODULE | PYTHON_PACKAGE | NPM | MAVEN | HEURISTIC`
+    pub dependency_basis: String,
+    /// `ResolutionLevel` DB token of the FINAL edge after resolution.
+    pub resolution: String,
+    /// Confidence in `[0.0, 1.0]`.
+    pub confidence: f64,
+    /// Index into this file's symbol vec when the edge originates at a
+    /// specific symbol; `None` = file-scoped edge.
+    pub source_symbol_index: Option<usize>,
+    /// Structured provenance (analyzer ids, spans, resolution basis); no
+    /// secret content.
+    pub provenance_json: Option<String>,
+}
+
+/// Links a retrieval unit to one structural node (Phase 3).
+#[derive(Debug, Clone)]
+pub struct PublicationUnitLink {
+    /// Stable UUID string of the already-published retrieval unit.
+    pub retrieval_unit_id: String,
+    /// Node index within this file's structural payload.
+    pub node_index: usize,
+    /// Ordering of nodes within this retrieval unit.
+    pub ordinal: u32,
+}
+
+/// Per-file structural payload for a coordinated publication (Phase 3).
+#[derive(Debug, Clone)]
+pub struct PublicationStructuralFile {
+    /// Target file occurrence (UUID string).
+    pub file_occurrence_id: String,
+    /// `false` when the analyzer reported PARTIAL structural coverage
+    /// (LARGE-file prefix truncation, entity caps, mid-extraction stop).
+    /// Persisted on every node row so partial structure can never be
+    /// presented as complete.
+    pub structurally_complete: bool,
+    /// Analyzer that produced this payload.
+    pub analyzer_id: String,
+    /// Analyzer version.
+    pub analyzer_version: String,
+    /// Structural nodes in discovery order (parents before children).
+    pub nodes: Vec<PublicationNode>,
+    /// Symbol definitions found in this file.
+    pub symbols: Vec<PublicationSymbolDef>,
+    /// Relationship edges originating in this file.
+    pub relationships: Vec<PublicationRelationship>,
+    /// Retrieval-unit ↔ structural-node associations.
+    pub unit_links: Vec<PublicationUnitLink>,
 }
 
 /// Counters returned by a successful coordinated publication.
@@ -156,6 +261,16 @@ pub struct IndexPublicationStats {
     pub units_deleted: usize,
     /// Number of retrieval units inserted.
     pub units_inserted: usize,
+    /// Phase 3 — structural nodes inserted.
+    pub structural_nodes: usize,
+    /// Phase 3 — symbol definition occurrences inserted.
+    pub symbols_inserted: usize,
+    /// Phase 3 — relationships inserted.
+    pub relationships_inserted: usize,
+    /// Phase 3 — unit↔node links inserted.
+    pub unit_node_links: usize,
+    /// Phase 3 — prior structural rows removed (nodes+symbols+rels).
+    pub structural_deleted: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +352,17 @@ fn execute_index_publication(
         ..Default::default()
     };
 
+    // ── Phase 3 FIRST: structural replacement + unit↔node link cleanup.
+    // Dependent state (links → relationships → symbol occurrences → leaf
+    // nodes) is removed before its parents; see
+    // `delete_structural_for_occurrences` for the explicit ordering.
+    let deleted_structural = crate::repository::structural::delete_structural_for_occurrences(
+        conn,
+        &p.delete_structural_for_occurrences,
+    )?;
+    stats.structural_deleted =
+        deleted_structural.0 + deleted_structural.1 + deleted_structural.2 + deleted_structural.3;
+
     for old_occurrence_id in &p.delete_units_for_occurrences {
         stats.units_deleted += delete_retrieval_units_for_file(conn, old_occurrence_id)?;
     }
@@ -258,6 +384,18 @@ fn execute_index_publication(
             },
         )?;
         stats.units_inserted += 1;
+    }
+
+    // ── Phase 3: structural payload insertion (deletion already done above).
+    let repo_str = p.repository_id.to_string_repr();
+    let rev_str = p.source_revision_id.to_string_repr();
+    for sf in &p.structural_files {
+        let counts =
+            crate::repository::structural::insert_structural_file(conn, &repo_str, &rev_str, sf)?;
+        stats.structural_nodes += counts.nodes;
+        stats.symbols_inserted += counts.symbols;
+        stats.relationships_inserted += counts.relationships;
+        stats.unit_node_links += counts.links;
     }
 
     Ok(stats)
@@ -387,6 +525,8 @@ mod tests {
             delete_units_for_occurrences: vec![],
             close_audit_for_occurrences: vec![],
             retrieval_units: units,
+            structural_files: vec![],
+            delete_structural_for_occurrences: vec![],
         }
     }
 
