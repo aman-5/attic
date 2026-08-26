@@ -260,6 +260,13 @@ pub struct StructuralNodeSpec {
     pub span: SourceSpan,
     /// Optional parent node index within this file's output (0-based).
     pub parent_index: Option<usize>,
+    /// Rename-stable identity hash (BLAKE3 of a path-independent basis).
+    /// Persists as `core_structural_nodes.structural_identity`.
+    pub structural_identity: String,
+    /// BLAKE3 hex of the node's source bytes *as delivered* (post-redaction).
+    pub content_hash: String,
+    /// Analyzer-specific structured metadata; never contains secret content.
+    pub metadata_json: Option<String>,
 }
 
 /// A symbol definition found in this file.
@@ -275,6 +282,18 @@ pub struct SymbolSpec {
     pub definition_span: SourceSpan,
     /// Whether the symbol is publicly visible outside its module.
     pub is_public: bool,
+    /// Disambiguator when `(language, qualified_name, kind)` is ambiguous
+    /// (e.g. Java/TypeScript overloads): `"overload:N"` ordered by span.
+    pub disambiguator: Option<String>,
+    /// Language-specific signature text, when extractable.
+    pub signature: Option<String>,
+    /// Raw visibility modifier (`public`/`private`/`package`…), when present.
+    pub visibility: Option<String>,
+    /// `false` for pure signatures (abstract/interface members) that declare
+    /// API surface without a body.
+    pub is_definition: bool,
+    /// Index of the anchoring structural node within this output.
+    pub node_index: Option<usize>,
 }
 
 /// An import or dependency edge found in this file.
@@ -286,6 +305,47 @@ pub struct ImportSpec {
     pub resolved_path: Option<PathBuf>,
     /// Source location of the import statement.
     pub span: SourceSpan,
+    /// Language-specific import form. Well-known values:
+    /// `IMPORT` (Java/Go/plain), `FROM` (Python from-import),
+    /// `REQUIRE` (CommonJS), `DYNAMIC` (`import()`), `EXPORT_FROM`,
+    /// `IMPORT_TYPE` (TypeScript type-only import).
+    pub import_kind: String,
+}
+
+/// How a relationship edge was established (contract: `resolution` column).
+///
+/// This is an *honesty* axis: an edge must never claim a higher level than
+/// the evidence that produced it. A syntactic/name match must stay
+/// [`ResolutionLevel::Syntactic`] even when it looks plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ResolutionLevel {
+    /// Derived purely from source syntax; target not confirmed to exist.
+    Syntactic,
+    /// Target confirmed against package/module layout (file exists in repo).
+    PackageResolved,
+    /// Target confirmed against a known symbol definition in the repo.
+    SymbolResolved,
+    /// Target confirmed through build-system metadata (go.mod, pom.xml, …).
+    BuildResolved,
+    /// Target confirmed through framework-specific knowledge.
+    FrameworkResolved,
+    /// Heuristic inference only; lowest trust.
+    Inferred,
+}
+
+impl ResolutionLevel {
+    /// Canonical DB token (`core_relationships.resolution` enum).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Syntactic => "SYNTACTIC",
+            Self::PackageResolved => "PACKAGE_RESOLVED",
+            Self::SymbolResolved => "SYMBOL_RESOLVED",
+            Self::BuildResolved => "BUILD_RESOLVED",
+            Self::FrameworkResolved => "FRAMEWORK_RESOLVED",
+            Self::Inferred => "INFERRED",
+        }
+    }
 }
 
 /// A cross-file relationship edge (e.g. implementation of a trait/interface).
@@ -297,6 +357,33 @@ pub struct RelationshipSpec {
     pub target_qualified_name: String,
     /// Source location of the relationship.
     pub span: SourceSpan,
+    /// How this edge was established. Never infer beyond actual evidence.
+    pub resolution: ResolutionLevel,
+    /// Confidence in `[0.0, 1.0]`. Syntactic edges typically ≤ 0.6;
+    /// resolved edges carry the resolver's confidence.
+    pub confidence: f64,
+    /// When the edge originates from a specific symbol defined in this same
+    /// output (method call inside a class member, class heritage, …): index
+    /// into this file's `symbols` vec. `None` = file-scoped edge (imports).
+    pub source_symbol_index: Option<usize>,
+}
+
+impl RelationshipSpec {
+    /// Construct a syntax-only edge at the conventional syntactic confidence.
+    pub fn syntactic(
+        relationship_type: impl Into<String>,
+        target_qualified_name: impl Into<String>,
+        span: SourceSpan,
+    ) -> Self {
+        Self {
+            relationship_type: relationship_type.into(),
+            target_qualified_name: target_qualified_name.into(),
+            span,
+            resolution: ResolutionLevel::Syntactic,
+            confidence: 0.5,
+            source_symbol_index: None,
+        }
+    }
 }
 
 /// A single chunk of text that can be stored as an independently retrievable

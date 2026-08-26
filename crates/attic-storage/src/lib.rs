@@ -29,8 +29,9 @@ pub use fts::{
     insert_retrieval_unit_with_fts,
 };
 pub use indexing_publication::{
-    IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
-    PublicationRetrievalUnit, submit_index_publication,
+    IndexPublication, IndexPublicationStats, PublicationFile, PublicationNode,
+    PublicationOccurrence, PublicationRelationship, PublicationRetrievalUnit,
+    PublicationStructuralFile, PublicationSymbolDef, PublicationUnitLink, submit_index_publication,
 };
 pub use invalidation_ops::{
     FreshnessTotals, InvalidationCounts, close_pending_records_for_occurrence,
@@ -64,3 +65,4 @@ pub use repository::repository::{
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
 };
+pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occurrence};

@@ -38,16 +38,18 @@ pub mod cancellation;
 pub mod dispatch;
 pub mod generic;
 pub mod registry;
+pub mod structural;
 
 // ── Flat re-exports ─────────────────────────────────────────────────────────
 
 pub use api::{
     Analyzer, AnalyzerCapabilities, AnalyzerContent, AnalyzerDescriptor, AnalyzerDiagnostic,
     AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, DiagnosticSeverity, ImportSpec,
-    RelationshipSpec, ResourceBudget, RetrievalUnitSpec, StructuralNodeSpec, SymbolSpec,
-    diagnostic_codes,
+    RelationshipSpec, ResolutionLevel, ResourceBudget, RetrievalUnitSpec, StructuralNodeSpec,
+    SymbolSpec, diagnostic_codes,
 };
 pub use cancellation::CancellationToken;
 pub use dispatch::dispatch;
 pub use generic::GenericAnalyzer;
 pub use registry::AnalyzerRegistry;
+pub use structural::default_registry;

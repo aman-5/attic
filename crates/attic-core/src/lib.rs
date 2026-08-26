@@ -8,7 +8,9 @@ pub mod constants;
 pub mod domain;
 pub mod error;
 
-pub use constants::{CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_keys};
+pub use constants::{
+    ANALYZER_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_keys,
+};
 pub use domain::{
     enums::{
         ArtifactType, Authority, CompatibilityClass, DependencyBasis, DiscoveryClass,

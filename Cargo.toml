@@ -38,6 +38,16 @@ tokio              = { version = "1",        features = ["rt-multi-thread", "mac
 # Phase 2: filesystem watching (ADR-008). Stable debouncer 0.7 pulls notify 8.2.x;
 # MSRV 1.88 matches the workspace toolchain.
 notify-debouncer-full = "0.7"
+# Phase 3: structural intelligence (ADR-010). Official tree-sitter runtime +
+# grammar crates. Grammars bundle their C sources (cc build); all MIT licensed.
+# Grammar ABIs (13/14) are within the runtime's MIN_COMPATIBLE_LANGUAGE_VERSION.
+tree-sitter           = "0.26"
+tree-sitter-language  = "0.1"
+tree-sitter-java      = "0.23"
+tree-sitter-python    = "0.25"
+tree-sitter-go        = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
 # Phase 1D: Official Rust MCP SDK (ADR-008)
 # Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }

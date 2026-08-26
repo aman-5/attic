@@ -20,14 +20,12 @@
 //! an identical-content move records an explicit HEURISTIC `CONTENT_MATCH`
 //! link row and never mutates identity rows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 
 use tracing::debug;
 
-use attic_analyzers::{AnalyzerRegistry, GenericAnalyzer};
 use attic_core::{
     DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
     RepositoryId, SecurityState, SourceRevisionId,
@@ -215,9 +213,17 @@ pub fn index_changes(
     }
 
     // ── 5. Analysis (Phase 1B preprocessing → Phase 1C dispatch), scoped ────
-    let registry = AnalyzerRegistry::new(Arc::new(GenericAnalyzer::new()));
+    let registry = if opts.structural {
+        crate::structural_pipeline::default_registry()
+    } else {
+        crate::structural_pipeline::generic_only_registry()
+    };
     let rev_id = SourceRevisionId::new_v4();
     let gen_id = IndexGenerationId::new_v4();
+
+    // Phase 3 — known paths = post-pair manifest baseline ∪ upserts.
+    let known_paths: BTreeSet<String> = pairs.iter().map(|(p, _)| p.clone()).collect();
+    let mut pipeline = crate::structural_pipeline::StructuralPipeline::new(root, known_paths);
 
     let repo_id_str = repo_id.to_string_repr();
     let mut file_records: Vec<FileRecord> = Vec::new();
@@ -251,7 +257,11 @@ pub fn index_changes(
         };
 
         match analyze_single_file(&rec, &registry, opts) {
-            Ok(mut units) => {
+            Ok((mut units, captured)) => {
+                pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
+                if let Some(captured) = captured {
+                    pipeline.record(captured);
+                }
                 pending_units.append(&mut units);
                 file_records.push(rec);
             }
@@ -313,10 +323,18 @@ pub fn index_changes(
     }
 
     let gen_id_str = gen_id.to_string_repr();
-    let retrieval_units: Vec<PublicationRetrievalUnit> = pending_units
-        .into_iter()
-        .map(|u| PublicationRetrievalUnit {
-            id: attic_core::RetrievalUnitId::new_v4().to_string_repr(),
+    let mut retrieval_units: Vec<PublicationRetrievalUnit> = Vec::new();
+    let mut unit_links_by_occ: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for u in pending_units {
+        let unit_id = attic_core::RetrievalUnitId::new_v4().to_string_repr();
+        if let Some(idx) = u.structural_node_index {
+            unit_links_by_occ
+                .entry(u.file_occurrence_id.clone())
+                .or_default()
+                .push((unit_id.clone(), idx));
+        }
+        retrieval_units.push(PublicationRetrievalUnit {
+            id: unit_id,
             file_occurrence_id: u.file_occurrence_id,
             index_generation_id: gen_id_str.clone(),
             repository_id: repo_id_str.clone(),
@@ -326,8 +344,33 @@ pub fn index_changes(
             start_line: u.start_line,
             end_line: u.end_line,
             is_redacted: u.is_redacted,
-        })
-        .collect();
+        });
+    }
+
+    let deps = crate::structural_pipeline::ResolverDeps {
+        symbol_definition: &|qname, kinds| {
+            store
+                .readers
+                .with_reader(|c| {
+                    attic_storage::lookup_symbol_definition_occurrence(
+                        c,
+                        &repo_id_str,
+                        qname,
+                        kinds,
+                    )
+                })
+                .ok()
+                .flatten()
+        },
+        path_occurrence: &|rel_path| {
+            store
+                .readers
+                .with_reader(|c| lookup_latest_file_occurrence_for_path(c, &repo_id, rel_path))
+                .ok()
+                .flatten()
+        },
+    };
+    let structural_files = pipeline.finish(&deps, &unit_links_by_occ);
 
     let mut files = publication_files;
     files.extend(tombstones);
@@ -365,6 +408,10 @@ pub fn index_changes(
                     env!("CARGO_PKG_VERSION"),
                 );
                 sv.set(
+                    attic_core::constants::subsystem_keys::ANALYZER_REGISTRY,
+                    attic_core::constants::ANALYZER_REGISTRY_VERSION,
+                );
+                sv.set(
                     attic_core::constants::subsystem_keys::SECRET_DETECTOR,
                     attic_core::constants::SECRET_PATTERN_VERSION.to_string(),
                 );
@@ -374,6 +421,10 @@ pub fn index_changes(
             delete_units_for_occurrences: old_occurrence_ids.clone(),
             close_audit_for_occurrences: old_occurrence_ids.clone(),
             retrieval_units,
+            structural_files,
+            // Replacement semantics: wipe prior structural artifacts of every
+            // refreshed occurrence (and of tombstoned files) in-txn.
+            delete_structural_for_occurrences: old_occurrence_ids,
         },
     )
     .map_err(IndexError::Storage)?;

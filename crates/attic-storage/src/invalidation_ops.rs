@@ -131,6 +131,15 @@ pub fn close_pending_records_for_occurrence(
                 SELECT id FROM core_structural_nodes    WHERE file_occurrence_id = ?1
                 UNION
                 SELECT id FROM core_symbol_occurrences  WHERE file_occurrence_id = ?1
+                UNION
+                SELECT r.id FROM core_relationships r
+                 WHERE r.source_entity_id IN (
+                       SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1)
+                    OR r.target_entity_id IN (
+                       SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1)
+                    OR r.source_entity_id = ?1
+                    OR (r.target_entity_type = 'FILE_OCCURRENCE'
+                        AND r.target_entity_id = ?1)
             )",
         rusqlite::params![occurrence_id, now_us],
     )?;
@@ -245,13 +254,18 @@ pub fn invalidate_for_occurrences(
     // DAG complete for Phase 3+.
     let mut relationship_ids: Vec<String> = Vec::new();
     {
+        // Edges anchored at symbol occurrences of this file AND edges
+        // anchored at the file occurrence itself (imports, heritage emitted
+        // at file scope by Phase 3 analyzers).
         let mut stmt = conn.prepare(
             "SELECT r.id
                FROM core_relationships r
               WHERE r.source_entity_id IN (
                     SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1)
                  OR r.target_entity_id IN (
-                    SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1)",
+                    SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1)
+                 OR r.source_entity_id = ?1
+                 OR (r.target_entity_type = 'FILE_OCCURRENCE' AND r.target_entity_id = ?1)",
         )?;
         for occ in occurrence_ids {
             let rows = stmt.query_map(rusqlite::params![occ], |r| r.get::<_, String>(0))?;
