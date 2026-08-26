@@ -18,6 +18,7 @@ pub mod invalidation_ops;
 pub mod migration;
 pub mod ops_tasks;
 pub mod repository;
+pub mod retrieval_reads;
 pub mod server_state;
 pub mod writer;
 
@@ -66,3 +67,9 @@ pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
 };
 pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occurrence};
+pub use retrieval_reads::{
+    FileHeader, NewRetrievalPlanRecord, NodeRow, RelationshipEdge, SymbolHit, file_header_by_id,
+    get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
+    lookup_symbol_exact, relationships_for_entity, search_symbols, structural_nodes_by_type,
+    structural_nodes_for_file,
+};
