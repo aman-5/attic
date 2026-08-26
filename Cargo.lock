@@ -83,6 +83,11 @@ dependencies = [
 [[package]]
 name = "attic-evidence"
 version = "0.1.0"
+dependencies = [
+ "attic-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "attic-incremental"
@@ -127,6 +132,22 @@ dependencies = [
 [[package]]
 name = "attic-retrieval"
 version = "0.1.0"
+dependencies = [
+ "attic-analyzers",
+ "attic-core",
+ "attic-discovery",
+ "attic-evidence",
+ "attic-indexing",
+ "attic-storage",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "attic-server"
@@ -135,8 +156,10 @@ dependencies = [
  "anyhow",
  "attic-core",
  "attic-discovery",
+ "attic-evidence",
  "attic-incremental",
  "attic-indexing",
+ "attic-retrieval",
  "attic-storage",
  "rmcp",
  "serde",

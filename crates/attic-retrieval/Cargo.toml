@@ -1,6 +1,6 @@
 [package]
 name        = "attic-retrieval"
-description = "Attic — query classification, RetrievalPlanner, retrievers, candidate fusion, context builder"
+description = "Attic - query classification, RetrievalPlanner, retrievers, candidate fusion, context builder"
 version.workspace     = true
 edition.workspace     = true
 rust-version.workspace = true
@@ -9,5 +9,19 @@ license.workspace     = true
 repository.workspace  = true
 
 [dependencies]
+attic-core.workspace = true
+attic-storage = { path = "../attic-storage" }
+attic-discovery = { path = "../attic-discovery" }
+attic-evidence = { path = "../attic-evidence" }
+blake3.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+attic-analyzers = { path = "../attic-analyzers" }
+attic-indexing = { path = "../attic-indexing" }
+tempfile.workspace = true

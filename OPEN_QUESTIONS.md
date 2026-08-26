@@ -249,3 +249,23 @@ stored older version against the running version to schedule repository-wide
 invalidation. Wiring that diff into server startup is deferred with this
 record; until then an analyzer upgrade should be accompanied by a manual
 re-index.
+
+## OQ-021 - Populate core_knowledge_items at Indexing Time?
+
+**Status:** Open (raised Phase 4)
+**Blocking:** No
+
+Phase 4 retrieval derives KNOWLEDGE/DOCUMENTATION evidence from path
+classification over FTS-retrievable content; `core_knowledge_items` remains
+unwritten. Populating it during indexing (authority, supersedes,
+applicable_versions) would enable richer knowledge-authority semantics but
+has no V1 consumer. Deferred to a later phase.
+
+## OQ-022 - Mode-Scaled Proactive Verification Breadth?
+
+**Status:** Open (raised Phase 4)
+**Blocking:** No
+
+NORMAL/DEEP proactively checksum the top 5 ranked evidence items (ADR-012
+D4). Whether breadth should scale with mode depth or corpus size without
+violating FS budgets is left for measurement on larger corpora.

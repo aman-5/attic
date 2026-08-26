@@ -70,6 +70,8 @@ enum ServerError {
     Json(#[from] serde_json::Error),
     #[error("invalid argument: {0}")]
     InvalidArg(String),
+    #[error("retrieval error: {0}")]
+    Retrieval(String),
 }
 
 #[derive(Clone)]
@@ -709,6 +711,65 @@ fn handle_status(
     )]))
 }
 
+// ─── Phase 4 evidence-driven context tool ─────────────────────────────────────
+
+/// Thin MCP wrapper around the Phase 4 retrieval pipeline. Exposes the
+/// assembled context, verified claims and result/confidence verdicts; raw
+/// RetrievalPlan internals stay in `ops_retrieval_log`, not in the tool
+/// surface.
+fn handle_context(
+    pool: &DbPool,
+    writer: &WriterQueueHandle,
+    args: &HashMap<String, Value>,
+) -> Result<CallToolResult, ServerError> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
+    validate_filter("query", query, 512)?;
+
+    let mode = match args.get("mode").and_then(Value::as_str) {
+        None | Some("NORMAL") => attic_retrieval::AnswerMode::Normal,
+        Some("FAST") => attic_retrieval::AnswerMode::Fast,
+        Some("DEEP") => attic_retrieval::AnswerMode::Deep,
+        Some(other) => {
+            return Err(ServerError::InvalidArg(format!(
+                "mode must be FAST|NORMAL|DEEP, got {other}"
+            )));
+        }
+    };
+
+    let mut request = attic_retrieval::AnswerRequest::new(query, mode);
+    if let Some(id) = args.get("repository_id").and_then(Value::as_str) {
+        validate_repository_id(id)?;
+        request.repository_ids.push(id.to_owned());
+    }
+
+    let service = attic_retrieval::RetrievalService {
+        readers: pool.clone(),
+        writer: writer.clone(),
+    };
+    let outcome = service
+        .answer(&request)
+        .map_err(|e| ServerError::Retrieval(e.to_string()))?;
+
+    let payload = json!({
+        "result": outcome.result.as_str(),
+        "confidence": outcome.confidence.as_str(),
+        "insufficient_reason": outcome.insufficient_reason,
+        "plan_id": outcome.plan.plan_id,
+        "evidence_used": outcome.plan.evidence_used.len(),
+        "claims": outcome.claims.iter().map(|(text, verdict, _)| json!({
+            "text": text,
+            "verdict": verdict,
+        })).collect::<Vec<_>>(),
+        "context": outcome.context_text.unwrap_or_default(),
+    });
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&payload)?,
+    )]))
+}
+
 // ─── schema helper ─────────────────────────────────────────────────────────────
 
 fn json_schema(v: Value) -> std::sync::Arc<serde_json::Map<String, Value>> {
@@ -772,6 +833,26 @@ fn make_tools() -> Vec<Tool> {
             "Return server and database health status.",
             json_schema(json!({"type":"object","properties":{}})),
         ),
+        Tool::new(
+            "context",
+            "Evidence-driven context assembly for a natural-language engineering question. \
+             Classifies the query, applies the Query Evidence Contract for its intent \
+             (definition/navigation/configuration/architecture/debugging/impact/dependency/\
+             test/knowledge), retrieves candidates from lexical+symbol+structural+relationship+\
+             knowledge indexes, validates freshness/provenance/confidence, expands bounded \
+             (graph walk or secure source verification) when requirements are unmet, and \
+             returns a secret-free, provenance-stamped context with verified claims — or an \
+             explicit INSUFFICIENT_EVIDENCE verdict. Modes: FAST (index-only), NORMAL, DEEP.",
+            json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "query":         {"type":"string","description":"Natural-language question (max 512 chars)"},
+                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP"],"description":"Answer-mode policy (default NORMAL)"},
+                    "repository_id": {"type":"string","description":"Optional repository UUID scope"}
+                },
+                "required": ["query"]
+            })),
+        ),
     ]
 }
 
@@ -803,6 +884,7 @@ impl ServerHandler for AtticServer {
         _cx: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send {
         let pool = self.pool.clone();
+        let writer = self.writer.clone();
         let incremental = self.incremental.clone();
         let watch_mode = self.watch_mode;
         let name = request.name.clone();
@@ -815,6 +897,7 @@ impl ServerHandler for AtticServer {
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
                 "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
+                "context" => handle_context(&pool, &writer, &args),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {
@@ -1989,6 +2072,40 @@ mod tests {
                 "expected unknown tool error, got: {text}"
             );
         }
+        child.kill().ok();
+    }
+
+    #[test]
+    fn mcp_context_tool_lists_and_rejects_missing_query() {
+        let bin = require_binary();
+        let tmp = TempDir::new().unwrap();
+        let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
+
+        // The context capability is advertised.
+        let list = send_recv(
+            &mut child,
+            &mut stdin,
+            &mcp_request(2, "tools/list", json!({})),
+        );
+        let names: Vec<String> = list["result"]["tools"]
+            .as_array()
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(names.iter().any(|n| n == "context"), "tools={names:?}");
+        for legacy in ["file", "search", "repo_map", "status"] {
+            assert!(names.iter().any(|n| n == legacy), "{legacy} must remain");
+        }
+
+        // Missing query is a clean argument error (never a panic/SQL leak).
+        let call = mcp_request(3, "tools/call", json!({"name":"context","arguments":{}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("query required"), "got: {text}");
+
         child.kill().ok();
     }
 
