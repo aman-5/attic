@@ -269,3 +269,35 @@ has no V1 consumer. Deferred to a later phase.
 NORMAL/DEEP proactively checksum the top 5 ranked evidence items (ADR-012
 D4). Whether breadth should scale with mode depth or corpus size without
 violating FS budgets is left for measurement on larger corpora.
+
+## OQ-001 - Embedding Provider / Model Choice
+
+**Status:** RESOLVED-DEFERRED (Phase 5, ADR-013 incl. post-review revision)
+**Resolution:** Provider-neutral `SemanticProvider` trait with an enforceable
+query-time deadline contract; the shipped `HashingEmbedder` is honestly
+classified as a deterministic feature-hashing BASELINE/test provider — not a
+neural semantic model. True neural embeddings (fastembed-rs +
+bge-small-en-v1.5 sanctioned first swap-in) are EXPLICITLY DEFERRED until
+benchmark evidence demands them. Production semantic retrieval is therefore
+DISABLED by default and opt-in via `ATTIC_SEMANTIC=1`; when enabled it is
+non-regressing and instantly degradable to the canonical path.
+
+## OQ-002 - Cross-Encoder Reranking
+
+**Status:** RESOLVED-DEFERRED (Phase 5, ADR-014 D7)
+**Resolution:** Sequence embeddings → benchmark → hybrid → benchmark was
+followed; with the similarity noise floor the hybrid tier equals the Phase 4
+baseline on MRR/nDCG (no ordering problem remains), so reranking adds no
+measurable value and is omitted. Revisit requires new benchmark evidence of
+an ordering loss that a bounded reranker demonstrably repairs.
+
+## OQ-023 - Brute-Force kNN Scale Ceiling
+
+**Status:** Open (raised Phase 5)
+**Blocking:** No
+
+Semantic kNN is a bounded scan over the active model's rows inside the
+disposable `semantic.db` (ADR-014 D4). Measured latency at benchmark scale
+is sub-millisecond. Revisit an in-DB vector index or external store only
+when selected-unit counts reach ~10^5 on real workspaces AND query-time kNN
+latency exceeds the NORMAL semantic time budget.

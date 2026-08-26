@@ -36,6 +36,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod query;
 pub mod rank;
+pub mod semantic;
 pub mod validate;
 pub mod verify;
 

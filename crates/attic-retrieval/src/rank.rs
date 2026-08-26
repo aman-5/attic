@@ -24,32 +24,37 @@ mod w {
     pub const RELATIONSHIP: usize = 6;
     pub const KNOWLEDGE: usize = 7;
     pub const TEST: usize = 8;
+    /// Phase 5: semantic similarity — deliberately ZERO for exact/definition/
+    /// configuration lookups so those slices can never regress from vectors.
+    pub const SEMANTIC: usize = 9;
 }
 
-/// Explicit, inspectable weights per query type. Semantic score has no slot
-/// in Phase 4 — its absence is structural, not accidental.
-pub fn intent_weights(qt: QueryType) -> [f64; 9] {
+/// Explicit, inspectable weights per query type (ADR-014). Widened to ten
+/// slots in Phase 5; the first nine rows are byte-for-byte the Phase 4
+/// table with `0.0` appended where semantics must not participate.
+pub fn intent_weights(qt: QueryType) -> [f64; 10] {
     use QueryType as Q;
     match qt {
         // Definitions: exact symbol evidence dominates, freshness matters
         // because CURRENT_ONLY contracts reject stale definitions.
-        Q::ExactLookup | Q::DefinitionLookup => [1.5, 3.0, 2.0, 0.5, 2.0, 0.5, 0.0, 0.0, 0.0],
-        Q::SymbolNavigation => [1.0, 2.5, 2.0, 0.5, 1.0, 0.5, 2.5, 0.0, 0.0],
-        Q::ConfigurationLookup => [1.5, 0.5, 2.0, 0.5, 2.0, 0.0, 0.0, 1.5, 0.0],
-        Q::ArchitectureExplanation => [1.5, 1.0, 2.0, 0.5, 1.0, 1.5, 1.0, 2.0, 1.0],
-        Q::DebuggingRootCause => [1.5, 1.0, 2.0, 0.5, 1.5, 1.0, 1.0, 1.5, 2.0],
-        Q::ImpactAnalysis => [1.0, 2.0, 2.0, 0.5, 1.0, 1.0, 2.5, 0.0, 1.5],
+        Q::ExactLookup | Q::DefinitionLookup => [1.5, 3.0, 2.0, 0.5, 2.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+        Q::SymbolNavigation => [1.0, 2.5, 2.0, 0.5, 1.0, 0.5, 2.5, 0.0, 0.0, 0.0],
+        Q::ConfigurationLookup => [1.5, 0.5, 2.0, 0.5, 2.0, 0.0, 0.0, 1.5, 0.0, 0.0],
+        Q::ArchitectureExplanation => [1.5, 1.0, 2.0, 0.5, 1.0, 1.5, 1.0, 2.0, 1.0, 0.5],
+        Q::DebuggingRootCause => [1.5, 1.0, 2.0, 0.5, 1.5, 1.0, 1.0, 1.5, 2.0, 0.5],
+        Q::ImpactAnalysis => [1.0, 2.0, 2.0, 0.5, 1.0, 1.0, 2.5, 0.0, 1.5, 0.25],
         Q::DependencyQuestion | Q::CrossRepoQuestion => {
-            [1.0, 1.0, 2.0, 1.0, 1.0, 0.5, 3.0, 0.5, 0.0]
+            [1.0, 1.0, 2.0, 1.0, 1.0, 0.5, 3.0, 0.5, 0.0, 0.25]
         }
-        Q::TestBehavior => [1.5, 1.0, 2.0, 0.5, 1.0, 0.5, 0.5, 0.5, 3.0],
-        Q::KnowledgeQuestion => [1.5, 0.5, 2.0, 0.5, 1.0, 0.0, 0.0, 3.0, 0.0],
-        Q::GenericSearch => [2.5, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5],
+        Q::TestBehavior => [1.5, 1.0, 2.0, 0.5, 1.0, 0.5, 0.5, 0.5, 3.0, 0.25],
+        Q::KnowledgeQuestion => [1.5, 0.5, 2.0, 0.5, 1.0, 0.0, 0.0, 3.0, 0.0, 0.75],
+        Q::GenericSearch => [2.5, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5, 1.0],
     }
 }
 
 /// Intent match of a retriever origin for a query type — explicit table,
-/// inspectable in benchmarks and debugging.
+/// inspectable in benchmarks and debugging. The semantic column (last) is
+/// the Phase 5 addition.
 pub fn origin_intent_match(qt: QueryType, kind: RetrieverKind) -> f64 {
     use QueryType as Q;
     let (fts, path, sym, strc, rel, kno) = match qt {
@@ -64,6 +69,13 @@ pub fn origin_intent_match(qt: QueryType, kind: RetrieverKind) -> f64 {
         Q::KnowledgeQuestion => (0.7, 0.4, 0.3, 0.2, 0.2, 1.0),
         Q::GenericSearch => (1.0, 0.8, 0.8, 0.6, 0.5, 0.6),
     };
+    // Semantic-origin intent fit (independent of the other six columns).
+    let sem = match qt {
+        Q::ExactLookup | Q::DefinitionLookup | Q::ConfigurationLookup => 0.2,
+        Q::GenericSearch | Q::KnowledgeQuestion => 0.85,
+        Q::DebuggingRootCause | Q::ArchitectureExplanation => 0.75,
+        _ => 0.55,
+    };
     match kind {
         RetrieverKind::Fts => fts,
         RetrieverKind::Path => path,
@@ -71,6 +83,7 @@ pub fn origin_intent_match(qt: QueryType, kind: RetrieverKind) -> f64 {
         RetrieverKind::Structural => strc,
         RetrieverKind::Relationship => rel,
         RetrieverKind::Knowledge => kno,
+        RetrieverKind::Semantic => sem,
     }
 }
 
@@ -132,6 +145,10 @@ pub fn apply_signals_and_rank(
             .or(ev.relationship.as_ref().map(|r| r.confidence)),
         ev.signals.knowledge_authority,
         ev.signals.test_relevance,
+        // Phase 5: set ONLY by the semantic generator; absence competes as
+        // zero contribution but the weight still enters the denominator for
+        // every item, so hybrid ordering stays explainable.
+        ev.signals.semantic_score,
     ];
     let mut num = 0.0;
     let mut den = 0.0;

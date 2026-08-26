@@ -6,6 +6,7 @@ members = [
     "crates/attic-analyzers",
     "crates/attic-discovery",
     "crates/attic-evidence",
+    "crates/attic-semantic",
     "crates/attic-indexing",
     "crates/attic-incremental",
     "crates/attic-retrieval",
@@ -62,3 +63,4 @@ attic-analyzers    = { path = "crates/attic-analyzers" }
 attic-indexing     = { path = "crates/attic-indexing" }
 attic-incremental  = { path = "crates/attic-incremental" }
 attic-retrieval    = { path = "crates/attic-retrieval" }
+attic-semantic     = { path = "crates/attic-semantic" }

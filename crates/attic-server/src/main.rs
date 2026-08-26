@@ -84,21 +84,54 @@ struct AtticServer {
     /// Which change-detection mechanism is running (`None` = incremental
     /// disabled explicitly).
     watch_mode: Option<attic_incremental::WatchMode>,
+    /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
+    semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
 }
 
 impl AtticServer {
     fn new(db_path: &Path) -> Result<Self, ServerError> {
+        // Single production env read: semantic layer is OPT-IN (ADR-013 rev).
+        let opt_in = std::env::var("ATTIC_SEMANTIC").as_deref() == Ok("1");
+        Self::new_with_semantic_opt(db_path, opt_in)
+    }
+
+    fn new_with_semantic_opt(db_path: &Path, semantic_opt_in: bool) -> Result<Self, ServerError> {
         let (conn, pool) = attic_storage::open_db(db_path).map_err(ServerError::Storage)?;
         run_migrations(&conn).map_err(ServerError::Storage)?;
         let queue = WriterQueue::new(conn).map_err(ServerError::Storage)?;
         let writer = queue.handle();
         let _queue = Arc::new(queue);
+        // Phase 5: semantic layer is OPT-IN and EXPERIMENTAL (ADR-013 rev /
+        // OQ-001): the default embedder is a deterministic hashing baseline,
+        // not a neural model, so Attic ships with production semantic
+        // retrieval DISABLED unless explicitly opted in. Absent/disabled/
+        // degraded semantic layers never affect canonical intelligence
+        // (ADR-014 D1).
+        let semantic_path = db_path.with_file_name("semantic.db");
+        let semantic = if semantic_opt_in {
+            match attic_retrieval::semantic::SemanticStack::open(
+                &semantic_path,
+                Arc::new(attic_semantic::HashingEmbedder::new()),
+            ) {
+                Ok(stack) => {
+                    info!("semantic layer ENABLED (experimental, hashing baseline)");
+                    Some(Arc::new(stack))
+                }
+                Err(e) => {
+                    tracing::warn!("semantic layer unavailable ({e}); running non-semantic");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(AtticServer {
             pool,
             writer,
             _queue,
             incremental: None,
             watch_mode: None,
+            semantic,
         })
     }
 
@@ -718,6 +751,7 @@ fn handle_status(
 /// RetrievalPlan internals stay in `ops_retrieval_log`, not in the tool
 /// surface.
 fn handle_context(
+    semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     pool: &DbPool,
     writer: &WriterQueueHandle,
     args: &HashMap<String, Value>,
@@ -748,6 +782,7 @@ fn handle_context(
     let service = attic_retrieval::RetrievalService {
         readers: pool.clone(),
         writer: writer.clone(),
+        semantic,
     };
     let outcome = service
         .answer(&request)
@@ -886,6 +921,7 @@ impl ServerHandler for AtticServer {
         let pool = self.pool.clone();
         let writer = self.writer.clone();
         let incremental = self.incremental.clone();
+        let semantic = self.semantic.clone();
         let watch_mode = self.watch_mode;
         let name = request.name.clone();
         let args: HashMap<String, Value> =
@@ -897,7 +933,7 @@ impl ServerHandler for AtticServer {
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
                 "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
-                "context" => handle_context(&pool, &writer, &args),
+                "context" => handle_context(semantic, &pool, &writer, &args),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             match result {
@@ -1126,6 +1162,29 @@ mod tests {
 
     fn make_server(tmp: &TempDir) -> AtticServer {
         AtticServer::new(&tmp.path().join("test.db")).expect("AtticServer::new")
+    }
+
+    /// Phase 5 (ADR-013 revision): default startup NEVER enables the
+    /// experimental semantic layer; only an explicit opt-in may turn it on.
+    #[test]
+    fn semantic_layer_is_opt_in_not_default() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("optin.db");
+
+        // Default: no opt-in → no semantic stack, even though the layer is
+        // healthy and could open.
+        let server = AtticServer::new_with_semantic_opt(&db, false).expect("default server");
+        assert!(
+            server.semantic.is_none(),
+            "semantic retrieval must NOT be enabled by default"
+        );
+
+        // Explicit opt-in: layer present.
+        let server = AtticServer::new_with_semantic_opt(&db, true).expect("opted-in server");
+        assert!(
+            server.semantic.is_some(),
+            "explicit ATTIC_SEMANTIC=1 must enable the experimental layer"
+        );
     }
 
     fn text_of(r: &CallToolResult) -> String {

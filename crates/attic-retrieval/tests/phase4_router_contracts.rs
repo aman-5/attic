@@ -163,13 +163,17 @@ fn fast_policy_forbids_filesystem_and_semantics() {
 }
 
 #[test]
-fn deep_policy_expands_bounds_without_semantics() {
+fn deep_policy_expands_bounds_with_bounded_semantics() {
+    let n = AnswerModePolicy::for_mode(AnswerMode::Normal);
     let p = AnswerModePolicy::for_mode(AnswerMode::Deep);
-    assert!(p.max_graph_depth > AnswerModePolicy::for_mode(AnswerMode::Normal).max_graph_depth);
-    assert!(p.max_graph_nodes > AnswerModePolicy::for_mode(AnswerMode::Normal).max_graph_nodes);
+    assert!(p.max_graph_depth > n.max_graph_depth);
+    assert!(p.max_graph_nodes > n.max_graph_nodes);
     assert!(p.repair_attempts >= 1);
-    // Phase 4 has NO embeddings: DEEP still works without Phase 5.
-    assert!(!p.semantic_allowed);
+    // Phase 5 §14: DEEP may use semantics MORE broadly than NORMAL, but
+    // always bounded — never unlimited vector search.
+    assert!(p.semantic_allowed);
+    assert!(p.max_semantic_candidates > n.max_semantic_candidates);
+    assert!(p.semantic_time_budget_ms >= n.semantic_time_budget_ms);
 }
 
 #[test]

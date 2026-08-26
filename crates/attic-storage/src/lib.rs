@@ -19,6 +19,7 @@ pub mod migration;
 pub mod ops_tasks;
 pub mod repository;
 pub mod retrieval_reads;
+pub mod semantic_reads;
 pub mod server_state;
 pub mod writer;
 
@@ -72,4 +73,7 @@ pub use retrieval_reads::{
     get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
     lookup_symbol_exact, relationships_for_entity, search_symbols, structural_nodes_by_type,
     structural_nodes_for_file,
+};
+pub use semantic_reads::{
+    SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, semantic_unit_rows, semantic_units_by_ids,
 };
