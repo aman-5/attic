@@ -13,6 +13,7 @@ attic-core.workspace      = true
 attic-storage.workspace   = true
 attic-indexing.workspace  = true
 attic-discovery.workspace = true
+attic-crossrepo.workspace = true
 notify-debouncer-full.workspace = true
 rusqlite.workspace        = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }

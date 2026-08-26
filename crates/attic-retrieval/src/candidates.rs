@@ -523,8 +523,13 @@ impl KnowledgeGenerator {
     }
 }
 
-/// Cross-repository dependency generator: produces evidence from cross-repo
-/// DEPENDS_ON edges where source and target reside in different repositories.
+/// Cross-repository dependency generator: produces evidence from Phase 6
+/// cross-repository edge and catalog services.
+///
+/// Uses `attic_storage::crossrepo_ops::cross_edges_touching` to fetch
+/// cross-repo DEPENDS_ON edges (the Phase 6 service layer), then filters
+/// to edges touching the seed entity IDs. Each edge carries full Phase 6
+/// provenance: SourceRevision, resolution level, confidence, and freshness.
 pub struct CrossRepoGenerator;
 
 impl CrossRepoGenerator {
@@ -533,16 +538,37 @@ impl CrossRepoGenerator {
         seed_entity_ids: &[String],
     ) -> Result<Vec<Candidate>, RetrievalError> {
         let mut out = Vec::new();
+
+        // Collect unique repository IDs from seed entities.
+        let mut repo_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for entity in seed_entity_ids.iter().take(16) {
+            if let Some(e) = attic_storage::relationships_for_entity(env.conn, entity, 1)?
+                .into_iter()
+                .next()
+            {
+                repo_ids.insert(e.source_repository_id.clone());
+                repo_ids.insert(e.target_repository_id.clone());
+            }
+        }
+
+        // Use Phase 6 cross-repo edge service: fetch all cross-repo
+        // DEPENDS_ON edges touching each repository.
+        let seed_set: std::collections::HashSet<&str> =
+            seed_entity_ids.iter().map(|s| s.as_str()).collect();
+        for repo_id in &repo_ids {
             if !env.budget.candidates_available() {
                 break;
             }
-            for e in attic_storage::relationships_for_entity(env.conn, entity, 24)? {
-                // Only emit cross-repo edges (source != target repository).
-                if e.source_repository_id == e.target_repository_id {
-                    continue;
-                }
-                if e.rel_type != "DEPENDS_ON" {
+            let cross_edges = attic_storage::crossrepo_ops::cross_edges_touching(
+                env.conn,
+                repo_id,
+                64,
+            )?;
+            for e in cross_edges {
+                // Only emit edges touching a seed entity.
+                if !seed_set.contains(e.source_entity_id.as_str())
+                    && !seed_set.contains(e.target_entity_id.as_str())
+                {
                     continue;
                 }
                 if !env.budget.admit_candidate() {
@@ -550,7 +576,10 @@ impl CrossRepoGenerator {
                 }
                 let resolution = ResolutionLevel::from_db_str(&e.resolution)
                     .unwrap_or(ResolutionLevel::Syntactic);
-                let mut ev = Evidence::new(uuid::Uuid::new_v4().to_string(), e.source_repository_id.clone());
+                let mut ev = Evidence::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    e.source_repository_id.clone(),
+                );
                 ev.source_type = EvidenceSourceType::Relationship;
                 ev.source_id = e.id.clone();
                 ev.path = format!(
@@ -565,7 +594,7 @@ impl CrossRepoGenerator {
                 ev.relationship_confidence = Some(e.confidence.clamp(0.0, 0.99));
                 ev.relationship = Some(RelationshipProvenance {
                     edge_id: e.id.clone(),
-                    rel_type: e.rel_type.clone(),
+                    rel_type: "DEPENDS_ON".to_owned(),
                     resolution,
                     confidence: e.confidence,
                     hop_depth: 0,

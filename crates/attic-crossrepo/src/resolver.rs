@@ -112,6 +112,10 @@ impl ResolutionDiagnostics {
 ///
 /// Indexed lookup replaces N×N comparison: each declaration resolves via a
 /// hash-map hit, never by scanning every repository pair.
+///
+/// **Bounded**: per-key candidate list capped at [`limits::MAX_CANDIDATES_PER_KEY`];
+/// total index size bounded by `Σ min(provides_per_repo, MAX_PROVIDES_PER_REPO)`
+/// across repos, itself bounded by `MAX_REPOSITORIES_PER_RUN × MAX_PROVIDES_PER_REPO`.
 struct ProviderIndex {
     map: HashMap<(&'static str, String), Vec<String>>,
     by_root: HashMap<String, String>,

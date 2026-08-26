@@ -228,6 +228,76 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
     });
 }
 
+/// Integrated benchmark: full retrieval pipeline with cross-repo evidence.
+///
+/// Sets up a multi-repo workspace with real manifests, indexes through
+/// Phase 2, runs Phase 6 sync, then benchmarks `RetrievalService::answer()`
+/// which exercises `CrossRepoGenerator` → Evidence Manager → response.
+fn bench_integrated_retrieval_pipeline(c: &mut criterion::Criterion) {
+    use attic_indexing::{IndexOptions, IndexingStore, index_repository};
+    use attic_retrieval::pipeline::{AnswerRequest, RetrievalService};
+    use attic_retrieval::AnswerMode;
+
+    // 1. Create multi-repo fixture.
+    let provider_dir = tempfile::tempdir().unwrap();
+    let consumer_dir = tempfile::tempdir().unwrap();
+    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/bench/lib\n").unwrap();
+    std::fs::write(provider_dir.path().join("lib.go"), "package lib\nfunc Exported() {}\n").unwrap();
+    std::fs::write(
+        consumer_dir.path().join("go.mod"),
+        "module example.com/bench/app\nrequire example.com/bench/lib v1.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_dir.path().join("main.go"),
+        "package main\nimport \"example.com/bench/lib\"\nfunc main() { lib.Exported() }\n",
+    )
+    .unwrap();
+
+    // 2. Set up DB pool + writer queue.
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let (pool_conn, pool) = attic_storage::open_db(db_file.path()).unwrap();
+    attic_storage::connection::configure_connection(&pool_conn).unwrap();
+    attic_storage::migration::run_migrations(&pool_conn).unwrap();
+    drop(pool_conn);
+    let writer_conn = rusqlite::Connection::open(db_file.path()).unwrap();
+    attic_storage::connection::configure_connection(&writer_conn).unwrap();
+    let writer_queue = attic_storage::writer::WriterQueue::new(writer_conn).unwrap();
+    let writer_handle = writer_queue.handle();
+
+    // 3. Phase 2: index both repos.
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
+    let policy = attic_discovery::DiscoveryPolicy::default_git();
+    let opts = IndexOptions::default();
+    index_repository(&store, provider_dir.path(), &policy, &opts).unwrap();
+    index_repository(&store, consumer_dir.path(), &policy, &opts).unwrap();
+
+    // 4. Phase 6: sync workspace.
+    pool.with_reader(|conn| {
+        attic_crossrepo::maintenance::sync_workspace(
+            conn,
+            &writer_handle,
+            &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
+        )
+        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+    })
+    .unwrap();
+
+    // 5. Benchmark retrieval pipeline with cross-repo query.
+    let service = RetrievalService {
+        readers: pool.clone(),
+        writer: writer_handle.clone(),
+        semantic: None,
+    };
+    let req = AnswerRequest::new("What depends on the library?", AnswerMode::Normal);
+    c.bench_function("integrated_retrieval_crossrepo", |b| {
+        b.iter(|| service.answer(&req).unwrap())
+    });
+}
+
 criterion::criterion_group!(
     benches,
     bench_resolver_10_providers,
@@ -235,5 +305,6 @@ criterion::criterion_group!(
     bench_resolver_1000_providers,
     bench_traversal_linear_chain,
     bench_impact_linear_chain,
+    bench_integrated_retrieval_pipeline,
 );
 criterion::criterion_main!(benches);

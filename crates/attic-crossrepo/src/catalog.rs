@@ -274,6 +274,7 @@ fn go_module_prefix(provides: &[ProvidedIdentity]) -> Option<String> {
 }
 
 /// Build a single repository's [`RepoCatalogData`] from a scan.
+#[cfg(test)]
 fn build_repo_catalog_data(
     repository_id: &str,
     root_path: &str,

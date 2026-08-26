@@ -65,10 +65,12 @@ pub struct SyncProgress {
 ///
 /// Must run inside a writer-queue closure (single connection, single atomic
 /// transaction). The caller provides the raw connection.
+///
+/// Looks up the latest source revision from the DB; never accepts an
+/// empty or placeholder source revision.
 pub fn sync_repository(
     conn: &rusqlite::Connection,
     repository_id: &str,
-    source_revision_id: &str,
 ) -> Result<SyncReport, CrossRepoError> {
     let scan = crate::catalog::scan_repository_manifests(conn, repository_id)?;
 
@@ -79,10 +81,13 @@ pub fn sync_repository(
         declarations.extend(m.declarations.clone());
     }
 
+    // Resolve the actual source revision from the authoritative DB state.
+    let source_revision_id = resolve_source_revision(conn, repository_id)?;
+
     crate::catalog::persist_catalog(
         conn,
         repository_id,
-        source_revision_id,
+        &source_revision_id,
         &scan,
         &provides,
         &declarations,
@@ -96,6 +101,25 @@ pub fn sync_repository(
         unreadable: scan.unreadable.len(),
         manifest_hash: scan.manifest_hash,
     })
+}
+
+/// Resolve the latest source revision ID for a repository from the DB.
+///
+/// Returns the `id` column of the most recently captured `core_source_revisions`
+/// row, or a deterministic placeholder if no revision exists yet.
+fn resolve_source_revision(
+    conn: &rusqlite::Connection,
+    repository_id: &str,
+) -> Result<String, CrossRepoError> {
+    let repo_id = repository_id
+        .parse::<attic_core::RepositoryId>()
+        .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
+    if let Some(id) = attic_storage::latest_source_revision_for_repository(conn, &repo_id)? {
+        return Ok(id);
+    }
+    // No source revision exists yet (repository registered but not indexed).
+    // Use a deterministic placeholder so the catalog row is storable.
+    Ok(format!("unindexed-{repository_id}"))
 }
 
 /// Report from a single-repository sync.
@@ -150,9 +174,19 @@ pub struct WorkspaceSyncResult {
 
 /// Perform a full workspace sync: scan all repos, resolve, persist edges.
 ///
-/// Uses two phases:
-/// 1. **Reader phase**: scan all repositories, build resolver input (bounded I/O)
-/// 2. **Writer phase**: persist edges inside a single writer closure
+/// **Two-stage architecture:**
+///
+/// 1. **Reader phase** (read-only): For each repository, scan manifests from
+///    disk via `scan_repository_manifests` (queries DB for indexed paths, reads
+///    files through Phase 1B safe-content boundary). Build in-memory
+///    `RepoCatalogData`. NO persistence occurs in this phase.
+///
+/// 2. **Writer phase** (single atomic closure): Persist all catalogs +
+///    declarations, then resolve cross-repo edges and persist them.
+///
+/// The reader phase MUST NOT call `sync_repository` because that function
+/// persists state. Manifest scanning is done via the read-only
+/// `scan_repository_manifests` path.
 pub fn sync_workspace(
     reader_conn: &rusqlite::Connection,
     writer: &attic_storage::WriterQueueHandle,
@@ -164,54 +198,40 @@ pub fn sync_workspace(
         edges_emitted: 0,
     };
 
-    // Phase 1: scan all repositories (reader-only, bounded I/O).
+    // ── Stage 1: Reader phase (read-only, bounded I/O) ────────────────
     let repo_ids = attic_storage::crossrepo_ops::all_repository_ids(reader_conn)?;
     let total = repo_ids.len();
     let mut all_repo_data: Vec<RepoCatalogData> = Vec::with_capacity(total);
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
+    // Collect scans for later persistence (keyed by repo_id).
+    let mut scans: HashMap<String, (crate::catalog::CatalogScan, Vec<crate::ProvidedIdentity>, Vec<crate::DependencyDeclaration>)> = HashMap::new();
 
     for (idx, repo_id) in repo_ids.iter().enumerate() {
         if opts.cancel.is_cancelled() || opts.deadline.expired() {
             debug!("workspace sync cancelled at repo {idx}/{total}");
             break;
         }
-        let report = sync_repository(reader_conn, repo_id, "")?;
-        // Build resolver input from the persisted catalog state.
-        let catalog =
-            attic_storage::crossrepo_ops::catalog_entry(reader_conn, repo_id)?;
-        let raw_decls =
-            attic_storage::crossrepo_ops::declarations_for_repository(reader_conn, repo_id)?;
 
-        let provides: Vec<crate::ProvidedIdentity> = catalog
-            .as_ref()
-            .and_then(|c| serde_json::from_str(&c.provides_json).ok())
-            .unwrap_or_default();
+        // Scan manifests from disk (read-only — queries DB for paths, reads
+        // files through Phase 1B safe-content boundary).
+        let scan = crate::catalog::scan_repository_manifests(reader_conn, repo_id)?;
 
-        let declarations: Vec<crate::DependencyDeclaration> = raw_decls
-            .into_iter()
-            .map(|d| crate::DependencyDeclaration {
-                path: d.path,
-                ecosystem: crate::Ecosystem::from_db_str(&d.ecosystem)
-                    .unwrap_or(crate::Ecosystem::Maven),
-                name: d.name,
-                version_req: d.version_req,
-                kind: crate::DeclarationKind::from_db_str(&d.declaration_kind)
-                    .unwrap_or(crate::DeclarationKind::External),
-                local_hint: d.local_hint,
-            })
-            .collect();
+        // Extract provides and declarations from the scan.
+        let mut provides = Vec::new();
+        let mut declarations = Vec::new();
+        for m in &scan.manifests {
+            provides.extend(m.provides.clone());
+            declarations.extend(m.declarations.clone());
+        }
 
+        // Resolve source revision from authoritative DB state.
+        let source_revision_id = resolve_source_revision(reader_conn, repo_id)?;
+
+        // Build resolver input from scan results (in-memory, no persistence).
         let repo_id_parsed = repo_id
             .parse::<attic_core::RepositoryId>()
             .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
         let root_path = attic_storage::get_repository_path(reader_conn, &repo_id_parsed)?
-            .unwrap_or_default();
-
-        // Use the real source_revision_id from the catalog (derived from
-        // the persisted DB state, not an empty placeholder).
-        let source_revision_id = catalog
-            .as_ref()
-            .map(|c| c.source_revision_id.clone())
             .unwrap_or_default();
 
         let gmp = provides
@@ -231,30 +251,66 @@ pub fn sync_workspace(
             repository_id: repo_id.clone(),
             root_path,
             source_revision_id,
-            provides,
-            declarations,
+            provides: provides.clone(),
+            declarations: declarations.clone(),
             primary_anchor_occurrence: primary,
             go_module_prefix: gmp,
         });
-        result.repository_reports.push(report);
+
+        // Store scan for later persistence in writer phase.
+        let manifest_hash = scan.manifest_hash.clone();
+        let oversized_count = scan.oversized.len();
+        let unreadable_count = scan.unreadable.len();
+        scans.insert(repo_id.clone(), (scan, provides, declarations));
+
+        result.repository_reports.push(SyncReport {
+            repository_id: repo_id.clone(),
+            provides_count: all_repo_data.last().unwrap().provides.len(),
+            declarations_count: all_repo_data.last().unwrap().declarations.len(),
+            oversized: oversized_count,
+            unreadable: unreadable_count,
+            manifest_hash,
+        });
     }
 
-    // Phase 2: resolve (pure computation, no I/O).
+    // ── Pure computation: resolve cross-repo edges ────────────────────
     let (edges, diagnostics) = resolver::resolve_workspace(&all_repo_data, &proto_index);
     result.diagnostics = diagnostics;
     let edges_len = edges.len();
 
-    // Phase 3: persist edges in a single writer closure.
+    // ── Stage 2: Writer phase (single atomic closure) ─────────────────
     let edges_clone = edges.clone();
-    let repo_ids_for_cleanup: Vec<String> = all_repo_data
+    let repo_ids_for_persistence: Vec<String> = all_repo_data
         .iter()
         .map(|r| r.repository_id.clone())
         .collect();
+    // Move scans into the closure for persistence.
+    let scans_clone = scans;
 
     writer
         .send(move |conn| {
+            // Persist catalog + declarations for each repository.
+            for repo_id in &repo_ids_for_persistence {
+                if let Some((scan, provides, declarations)) = scans_clone.get(repo_id) {
+                    let source_revision_id = all_repo_data
+                        .iter()
+                        .find(|r| &r.repository_id == repo_id)
+                        .map(|r| r.source_revision_id.clone())
+                        .unwrap_or_default();
+                    crate::catalog::persist_catalog(
+                        conn,
+                        repo_id,
+                        &source_revision_id,
+                        scan,
+                        provides,
+                        declarations,
+                    )
+                    .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+                }
+            }
+
             // Delete all existing cross-repo DEPENDS_ON edges (clean replacement).
-            for repo_id in &repo_ids_for_cleanup {
+            for repo_id in &repo_ids_for_persistence {
                 attic_storage::crossrepo_ops::delete_all_xrepo_edges_touching(conn, repo_id)?;
             }
 
@@ -276,7 +332,7 @@ pub fn sync_workspace(
 
             Ok(())
         })
-        .map_err(|e| CrossRepoError::Storage(e))?;
+        .map_err(CrossRepoError::Storage)?;
 
     result.edges_emitted = edges_len;
     Ok(result)
@@ -314,7 +370,6 @@ pub fn repository_removed(
 pub fn incremental_sync(
     conn: &rusqlite::Connection,
     repository_id: &str,
-    source_revision_id: &str,
     changed_paths: &[String],
 ) -> Result<bool, CrossRepoError> {
     let has_manifest_change = changed_paths
@@ -327,7 +382,7 @@ pub fn incremental_sync(
         repo = repository_id,
         "manifest change detected, resyncing"
     );
-    sync_repository(conn, repository_id, source_revision_id)?;
+    sync_repository(conn, repository_id)?;
     Ok(true)
 }
 
@@ -400,7 +455,7 @@ mod tests {
         let _ = insert_rev(&conn, "r1");
 
         let changed = vec!["src/main.rs".to_owned(), "README.md".to_owned()];
-        let resynced = incremental_sync(&conn, &tid("r1"), "rev-1", &changed).unwrap();
+        let resynced = incremental_sync(&conn, &tid("r1"), &changed).unwrap();
         assert!(!resynced, "non-manifest changes should not trigger resync");
     }
 
@@ -411,7 +466,7 @@ mod tests {
         let rev = insert_rev(&conn, "r1");
 
         let changed = vec!["src/main.rs".to_owned(), "go.mod".to_owned()];
-        let resynced = incremental_sync(&conn, &tid("r1"), &rev, &changed).unwrap();
+        let resynced = incremental_sync(&conn, &tid("r1"), &changed).unwrap();
         assert!(resynced, "manifest change should trigger resync");
     }
 
@@ -503,9 +558,9 @@ mod tests {
             "test-repo",
         )
         .unwrap();
-        let rev = insert_rev(&conn, "test-repo");
+        let _rev = insert_rev(&conn, "test-repo");
 
-        let report = sync_repository(&conn, &tid("test-repo"), &rev).unwrap();
+        let report = sync_repository(&conn, &tid("test-repo")).unwrap();
         assert_eq!(report.repository_id, tid("test-repo"));
         assert!(!report.manifest_hash.is_empty(), "manifest_hash should be computed");
 
@@ -530,9 +585,9 @@ mod tests {
             "r1",
         )
         .unwrap();
-        let rev = insert_rev(&conn, "r1");
+        let _rev = insert_rev(&conn, "r1");
 
-        let report = sync_repository(&conn, &tid("r1"), &rev).unwrap();
+        let report = sync_repository(&conn, &tid("r1")).unwrap();
         assert!(report.manifest_hash.len() == 64, "blake3 hex is 64 chars");
         // Without file occurrence indexing, manifest paths are not discovered.
         // The report is valid — provides_count is 0 because no occurrences exist.
@@ -557,7 +612,7 @@ mod tests {
         .unwrap();
         let rev = insert_rev(&conn, "src-rev-test");
 
-        sync_repository(&conn, &tid("src-rev-test"), &rev).unwrap();
+        sync_repository(&conn, &tid("src-rev-test")).unwrap();
 
         let catalog = attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("src-rev-test"))
             .unwrap()
@@ -631,7 +686,6 @@ mod tests {
         let result = incremental_sync(
             &conn,
             &tid("nonexistent"),
-            "rev-1",
             &["go.mod".to_owned()],
         );
         assert!(result.is_err(), "should propagate error for missing repo");

@@ -84,6 +84,8 @@ dependencies = [
  "attic-core",
  "attic-discovery",
  "attic-evidence",
+ "attic-indexing",
+ "attic-retrieval",
  "attic-storage",
  "blake3",
  "criterion",
@@ -125,6 +127,7 @@ name = "attic-incremental"
 version = "0.1.0"
 dependencies = [
  "attic-core",
+ "attic-crossrepo",
  "attic-discovery",
  "attic-indexing",
  "attic-storage",
@@ -166,6 +169,7 @@ version = "0.1.0"
 dependencies = [
  "attic-analyzers",
  "attic-core",
+ "attic-crossrepo",
  "attic-discovery",
  "attic-evidence",
  "attic-indexing",
@@ -202,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "attic-core",
+ "attic-crossrepo",
  "attic-discovery",
  "attic-evidence",
  "attic-incremental",

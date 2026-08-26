@@ -500,6 +500,29 @@ impl IncrementalService {
                 report.queue_saturated = true;
             }
         }
+        // Phase 6 cross-repo incremental recomputation:
+        // If any changed path is a dependency manifest, resync the
+        // repository's catalog/declarations/edges so cross-repo data
+        // stays current without a full workspace rebuild.
+        let touched: Vec<String> = cs.touched_paths().into_iter().collect();
+        let has_manifest = touched
+            .iter()
+            .any(|p| attic_crossrepo::manifest::is_manifest_path(p));
+        if has_manifest {
+            let rid = repo_id.clone();
+            let paths = touched;
+            writer
+                .send(move |conn| {
+                    attic_crossrepo::maintenance::incremental_sync(conn, &rid, &paths)
+                        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+                    Ok(())
+                })
+                .map_err(|e| {
+                    IncrementalError::Storage(attic_storage::StorageError::Worker(
+                        e.to_string(),
+                    ))
+                })?;
+        }
         self.metrics
             .changesets_applied
             .fetch_add(1, Ordering::Relaxed);

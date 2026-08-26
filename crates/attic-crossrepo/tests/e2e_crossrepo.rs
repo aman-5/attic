@@ -5,8 +5,7 @@
 
 use std::collections::HashMap;
 
-use attic_crossrepo::catalog::{CatalogScan, scan_repository_manifests};
-use attic_crossrepo::maintenance::{sync_repository, WorkspaceSyncOptions};
+use attic_crossrepo::maintenance::sync_repository;
 use attic_crossrepo::resolver::{self, RepoCatalogData};
 use attic_crossrepo::traversal::{self, Direction, TraversalBudget};
 use attic_crossrepo::impact;
@@ -94,18 +93,19 @@ fn e2e_multi_repo_sync_and_resolve() {
     insert_repo(&conn, "consumer", &consumer_dir.path().to_string_lossy());
     insert_repo(&conn, "indirect", &indirect_dir.path().to_string_lossy());
 
-    let rev_p = insert_rev(&conn, "provider");
-    let rev_c = insert_rev(&conn, "consumer");
-    let rev_i = insert_rev(&conn, "indirect");
+    // Insert source revisions (required for resolve_source_revision to find them)
+    insert_rev(&conn, "provider");
+    insert_rev(&conn, "consumer");
+    insert_rev(&conn, "indirect");
 
     // Phase 6: sync each repository
-    let report_p = sync_repository(&conn, &tid("provider"), &rev_p).unwrap();
+    let report_p = sync_repository(&conn, &tid("provider")).unwrap();
     assert_eq!(report_p.repository_id, tid("provider"));
 
-    let report_c = sync_repository(&conn, &tid("consumer"), &rev_c).unwrap();
+    let report_c = sync_repository(&conn, &tid("consumer")).unwrap();
     assert_eq!(report_c.repository_id, tid("consumer"));
 
-    let report_i = sync_repository(&conn, &tid("indirect"), &rev_i).unwrap();
+    let report_i = sync_repository(&conn, &tid("indirect")).unwrap();
     assert_eq!(report_i.repository_id, tid("indirect"));
 
     // Build resolver input from DB state
@@ -198,7 +198,7 @@ fn e2e_multi_repo_sync_and_resolve() {
     }
 
     // Phase 4: verify graph expansion finds cross-repo edges
-    let seed_id = &edges[0].source_entity_id;
+    let _seed_id = &edges[0].source_entity_id;
     let budget = TraversalBudget {
         max_depth: 4,
         max_repositories: 64,
@@ -337,4 +337,167 @@ fn e2e_repository_removal_cascade() {
         .unwrap();
     // r1 might still have edges if there were any (there weren't in this test)
     // The important thing is r0's data is gone
+}
+
+/// True end-to-end test through the integrated path:
+///
+/// multi-repo fixture → Phase 2 indexing → Phase 6 sync_workspace →
+/// Phase 6 resolver → edges with SourceRevision → traversal → impact
+///
+/// Verifies real repository provenance, SourceRevision, resolution level,
+/// confidence, and bounded traversal — the full Phase 6 product gate.
+#[test]
+fn e2e_integrated_indexing_to_crossrepo_to_traversal() {
+    use attic_indexing::{IndexOptions, IndexingStore, index_repository};
+    use attic_storage::writer::WriterQueue;
+
+    // 1. Create multi-repo fixture with real manifest files.
+    let provider_dir = tempfile::tempdir().unwrap();
+    let consumer_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/team/srv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.path().join("lib.go"),
+        "package lib\nfunc Exported() {}\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        consumer_dir.path().join("go.mod"),
+        "module example.com/team/app\nrequire example.com/team/srv v1.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_dir.path().join("main.go"),
+        "package main\nimport \"example.com/team/srv\"\nfunc main() { srv.Exported() }\n",
+    )
+    .unwrap();
+
+    // 2. Set up DB pool + writer queue.
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let (pool_conn, pool) = attic_storage::open_db(db_file.path()).unwrap();
+    // Run migrations on the pool connection.
+    attic_storage::connection::configure_connection(&pool_conn).unwrap();
+    attic_storage::migration::run_migrations(&pool_conn).unwrap();
+    drop(pool_conn);
+    // Writer queue uses a separate connection to the same file.
+    let writer_conn = rusqlite::Connection::open(db_file.path()).unwrap();
+    attic_storage::connection::configure_connection(&writer_conn).unwrap();
+    let writer_queue = WriterQueue::new(writer_conn).unwrap();
+    let writer_handle = writer_queue.handle();
+
+    // 3. Phase 2: index both repositories through the real indexing path.
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
+    let policy = attic_discovery::DiscoveryPolicy::default_git();
+    let opts = IndexOptions::default();
+
+    let provider_result = index_repository(&store, provider_dir.path(), &policy, &opts)
+        .expect("provider indexing should succeed");
+    let consumer_result = index_repository(&store, consumer_dir.path(), &policy, &opts)
+        .expect("consumer indexing should succeed");
+
+    let provider_repo_id = provider_result.repository_id.clone();
+    let consumer_repo_id = consumer_result.repository_id.clone();
+    assert_ne!(provider_repo_id, consumer_repo_id, "repo IDs must differ");
+
+    // 4. Phase 6: sync workspace (reader → resolver → writer).
+    pool.with_reader(|conn| {
+        attic_crossrepo::maintenance::sync_workspace(
+            conn,
+            &writer_handle,
+            &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
+        )
+        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+    })
+    .expect("sync_workspace should succeed");
+
+    // 5. Verify cross-repo edges exist with correct provenance.
+    pool.with_reader(|conn| {
+        let edges_consumer =
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_repo_id, 64)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+        let edges_provider =
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &provider_repo_id, 64)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+
+        // Consumer should have an edge TO provider.
+        let consumer_to_provider: Vec<_> = edges_consumer
+            .iter()
+            .filter(|e| e.target_repository_id == provider_repo_id)
+            .collect();
+        assert!(
+            !consumer_to_provider.is_empty(),
+            "consumer must have edge to provider"
+        );
+        let edge = consumer_to_provider[0];
+
+        // Verify SourceRevision is present (not empty).
+        assert!(
+            !edge.source_revision_id.is_empty(),
+            "edge must carry SourceRevision"
+        );
+
+        // Verify resolution level.
+        assert_eq!(edge.resolution, "PACKAGE_RESOLVED");
+
+        // Verify confidence bounds.
+        assert!(
+            edge.confidence > 0.5 && edge.confidence <= 1.0,
+            "confidence must be in (0.5, 1.0], got {}",
+            edge.confidence
+        );
+
+        // Verify freshness.
+        assert_eq!(edge.freshness_state, "CURRENT");
+
+        // Provider should have no outgoing cross-repo edges.
+        assert!(
+            edges_provider.is_empty() || edges_provider.iter().all(|e| e.source_repository_id != provider_repo_id),
+            "provider should have no outgoing cross-repo edges"
+        );
+
+        Ok::<(), attic_storage::StorageError>(())
+    })
+    .expect("edge verification should succeed");
+
+    // 6. Bounded traversal: consumer → dependencies → reaches provider.
+    pool.with_reader(|conn| {
+        let budget = attic_crossrepo::traversal::TraversalBudget {
+            max_depth: 4,
+            max_repositories: 64,
+            max_edges: 2000,
+            max_time_ms: 5000,
+            cancel: attic_crossrepo::CancelToken::never(),
+        };
+        let result = attic_crossrepo::traversal::traverse(
+            conn,
+            &consumer_repo_id,
+            attic_crossrepo::traversal::Direction::Dependencies,
+            &budget,
+        )
+        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+
+        assert!(
+            result.repositories.contains(&provider_repo_id),
+            "traversal from consumer must reach provider"
+        );
+
+        // Impact: provider affects consumer.
+        let impact = attic_crossrepo::impact::analyze_dependents(conn, &provider_repo_id, &budget)
+            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+        assert!(
+            impact.impacted.iter().any(|r| r.repository_id == consumer_repo_id),
+            "provider impact must include consumer"
+        );
+
+        Ok::<(), attic_storage::StorageError>(())
+    })
+    .expect("traversal and impact should succeed");
 }

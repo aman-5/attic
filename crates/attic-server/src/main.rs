@@ -5,6 +5,7 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
+use attic_crossrepo::maintenance as crossrepo_maintenance;
 use attic_discovery::{
     DiscoveryPolicy, SecretScanDecision, canonicalize_within_root, preprocess_file_content,
 };
@@ -1023,6 +1024,36 @@ async fn main() -> anyhow::Result<()> {
             BootstrapAction::FailClosed(why) => {
                 error!("workspace bootstrap FAILED — refusing to serve (fail-closed): {why}");
                 return Err(anyhow::anyhow!("bootstrap failed: {why}"));
+            }
+        }
+
+        // Phase 6 cross-repository workspace sync: after all repos are
+        // indexed, resolve cross-repo dependency edges and persist them.
+        // This runs once at startup before the incremental watcher begins.
+        {
+            let writer = server.writer.clone();
+            let pool = server.pool.clone();
+            match tokio::task::spawn_blocking(move || {
+                pool.with_reader(|conn| {
+                    crossrepo_maintenance::sync_workspace(
+                        conn,
+                        &writer,
+                        &crossrepo_maintenance::WorkspaceSyncOptions::default(),
+                    )
+                    .map_err(|e| StorageError::Worker(e.to_string()))
+                })
+            })
+            .await
+            {
+                Ok(Ok(result)) => {
+                    info!(
+                        repos = result.repository_reports.len(),
+                        edges = result.edges_emitted,
+                        "cross-repo workspace sync complete"
+                    );
+                }
+                Ok(Err(e)) => warn!("cross-repo workspace sync failed: {e}"),
+                Err(e) => warn!("cross-repo workspace sync task failed: {e}"),
             }
         }
 
