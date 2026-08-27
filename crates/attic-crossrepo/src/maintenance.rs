@@ -168,6 +168,8 @@ pub struct WorkspaceSyncResult {
     pub diagnostics: ResolutionDiagnostics,
     /// Number of cross-repo edges emitted.
     pub edges_emitted: usize,
+    /// Workspace snapshot ID that backs this sync result (provenance).
+    pub snapshot_id: Option<String>,
 }
 
 /// Perform a full workspace sync: scan all repos, resolve, persist edges.
@@ -194,6 +196,7 @@ pub fn sync_workspace(
         repository_reports: Vec::new(),
         diagnostics: ResolutionDiagnostics::default(),
         edges_emitted: 0,
+        snapshot_id: None,
     };
 
     // ── Stage 1: Reader phase (read-only, bounded I/O) ────────────────
@@ -294,6 +297,12 @@ pub fn sync_workspace(
     result.diagnostics = diagnostics;
     let edges_len = edges.len();
 
+    // Build (repo_id, source_revision_id) pairs for snapshot provenance.
+    let snapshot_revisions_input: Vec<(String, String)> = all_repo_data
+        .iter()
+        .map(|r| (r.repository_id.clone(), r.source_revision_id.clone()))
+        .collect();
+
     // ── Stage 2: Writer phase (single atomic closure) ─────────────────
     let edges_clone = edges.clone();
     let repo_ids_for_persistence: Vec<String> = all_repo_data
@@ -302,6 +311,10 @@ pub fn sync_workspace(
         .collect();
     // Move scans into the closure for persistence.
     let scans_clone = scans;
+
+    // Channel to receive snapshot_id from writer closure.
+    let snapshot_id_cell = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let snapshot_id_cell_clone = snapshot_id_cell.clone();
 
     writer
         .send(move |conn| {
@@ -325,13 +338,31 @@ pub fn sync_workspace(
                 }
             }
 
+            // Create workspace snapshot (provenance record).
+            let snapshot_id = attic_storage::crossrepo_ops::create_workspace_snapshot(
+                conn,
+                &snapshot_revisions_input,
+                edges_clone.len(),
+            )?;
+            *snapshot_id_cell_clone.lock().unwrap() = Some(snapshot_id.clone());
+
             // Delete all existing cross-repo DEPENDS_ON edges (clean replacement).
             for repo_id in &repo_ids_for_persistence {
                 attic_storage::crossrepo_ops::delete_all_xrepo_edges_touching(conn, repo_id)?;
             }
 
-            // Insert resolved edges.
+            // Insert resolved edges, embedding snapshot_id in provenance_json.
             for e in &edges_clone {
+                // Merge snapshot_id into existing provenance_json.
+                let provenance = if e.provenance_json.trim().starts_with('{') {
+                    let mut p: serde_json::Value =
+                        serde_json::from_str(&e.provenance_json).unwrap_or(serde_json::json!({}));
+                    p["workspace_snapshot_id"] = serde_json::Value::String(snapshot_id.clone());
+                    p.to_string()
+                } else {
+                    serde_json::json!({ "workspace_snapshot_id": snapshot_id }).to_string()
+                };
+
                 attic_storage::crossrepo_ops::insert_xrepo_edge(
                     conn,
                     &e.source_repository_id,
@@ -341,7 +372,7 @@ pub fn sync_workspace(
                     &e.resolution,
                     e.confidence,
                     &e.dependency_basis,
-                    &e.provenance_json,
+                    &provenance,
                     &e.source_revision_id,
                 )?;
             }
@@ -351,6 +382,7 @@ pub fn sync_workspace(
         .map_err(CrossRepoError::Storage)?;
 
     result.edges_emitted = edges_len;
+    result.snapshot_id = snapshot_id_cell.lock().unwrap().clone();
     Ok(result)
 }
 

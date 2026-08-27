@@ -30,7 +30,12 @@ fn within_budget(t0: &Instant) {
 fn single_event_flushes_after_quiet_period_without_second_event() {
     let t0 = Instant::now();
     let fx = Fixture::new(&[("src/solo.rs", "fn solo_before() {}\n")]);
-    let svc = fx.service();
+    // Use a very long quiet period so the "quiet period still open" assertion
+    // is deterministically true immediately after ingest, even on slow CI.
+    let svc = Arc::new(
+        attic_incremental::IncrementalService::new(fx.root(), fx.policy())
+            .with_quiet_period_ms(30_000),
+    );
 
     write_file(fx.root(), "src/solo.rs", "fn solo_after_token() {}\n");
     // ONE event only.

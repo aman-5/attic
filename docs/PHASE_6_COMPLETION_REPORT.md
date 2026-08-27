@@ -135,7 +135,31 @@ edge insert/delete, repository removal, cross-edge enumeration for traversal.
   build/package evidence resolves
 - **Secret material**: parsers never copy raw manifest bytes into outputs
 
-## 11. What was NOT implemented (deferred)
+## 11. Post-integration fixes (applied during final test run)
+
+Three bugs were caught and fixed during full-workspace `cargo test --workspace` validation:
+
+### 11a. Stale DDL in migrations/0001_initial.sql
+`CREATE TABLE IF NOT EXISTS` is idempotent but silently no-ops when the table already
+exists with the wrong schema. `migrations/0001_initial.sql` contained stale DDL for
+`core_workspace_snapshots` (wrong schema: missing `repo_count`, `edges_emitted`) and
+`core_workspace_snapshot_revisions`. Both were removed; the correct schema lives in
+`migrations/0005_workspace_snapshot.sql`.
+
+### 11b. Timing flakiness in phase2_robustness.rs
+`single_event_flushes_after_quiet_period_without_second_event` used `fx.service()`
+which has a 1ms quiet period — on loaded machines the period elapsed before
+`apply_pending(None)` was reached. Fixed by using a dedicated service with a
+30,000ms quiet period for deterministic test behavior.
+
+### 11c. bootstrap_workspace short-circuit in MCP E2E gate 7
+`bootstrap_workspace` returns early without re-indexing if the repository is already
+registered. Gate 7 of `mcp_e2e_crossrepo_multi_repo_fixture` called
+`bootstrap_workspace` after modifying `go.mod`, so the manifest change was never
+picked up. Fixed by replacing with a direct `index_repository` call which always
+performs a full re-index.
+
+## 12. What was NOT implemented (deferred)
 
 - **Network/package manager execution**: all parsing is offline, static analysis only
 - **Build script execution**: never executed for dependency discovery
@@ -145,7 +169,7 @@ edge insert/delete, repository removal, cross-edge enumeration for traversal.
 - **SourceRevision fail-closed**: repos without indexed SourceRevision are skipped
   with `NoSourceRevision` error; the error is caught and logged, not propagated
 
-## 12. Gate status
+## 13. Gate status
 
 | Gate | Status |
 |------|--------|

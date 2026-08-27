@@ -26,6 +26,9 @@ const VERSION_0003: &str = "0003_phase2";
 const MIGRATION_0004: &str = include_str!("../../../migrations/0004_phase6.sql");
 const VERSION_0004: &str = "0004_phase6";
 
+const MIGRATION_0005: &str = include_str!("../../../migrations/0005_workspace_snapshot.sql");
+const VERSION_0005: &str = "0005_workspace_snapshot";
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
@@ -46,6 +49,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     apply_migration(conn, VERSION_0002, MIGRATION_0002)?;
     apply_migration(conn, VERSION_0003, MIGRATION_0003)?;
     apply_migration(conn, VERSION_0004, MIGRATION_0004)?;
+    apply_migration(conn, VERSION_0005, MIGRATION_0005)?;
 
     Ok(())
 }
@@ -116,7 +120,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4, "all migration rows expected after first run");
+        assert_eq!(count, 5, "all migration rows expected after first run");
     }
 
     #[test]
@@ -131,8 +135,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            count, 4,
-            "still exactly four migration rows after second run"
+            count, 5,
+            "still exactly five migration rows after second run"
         );
     }
 

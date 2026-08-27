@@ -498,3 +498,127 @@ fn now_micros() -> i64 {
         .map(|d| d.as_micros() as i64)
         .unwrap_or_default()
 }
+
+// ---------------------------------------------------------------------------
+// WorkspaceSnapshot provenance (Migration 0005)
+// ---------------------------------------------------------------------------
+
+/// One WorkspaceSnapshot header row: identifies the sync_workspace run and
+/// the edges it emitted.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSnapshotRow {
+    /// UUID of this snapshot.
+    pub id: String,
+    /// Unix microseconds.
+    pub created_at: i64,
+    /// Number of repositories contributing revisions.
+    pub repo_count: i64,
+    /// Total edges emitted during this run.
+    pub edges_emitted: i64,
+}
+
+/// One per-repository revision entry in a WorkspaceSnapshot.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSnapshotRevision {
+    /// UUID of this revision entry.
+    pub id: String,
+    /// Owning snapshot.
+    pub snapshot_id: String,
+    /// Repository whose revision is recorded.
+    pub repository_id: String,
+    /// Source revision that contributed to the resolver input.
+    pub source_revision_id: String,
+}
+
+/// Create a new WorkspaceSnapshot row and insert one revision entry for
+/// every (repository_id, source_revision_id) pair.
+///
+/// Returns the snapshot UUID. Must be called inside a writer-queue closure
+/// (single connection, single transaction).
+pub fn create_workspace_snapshot(
+    conn: &Connection,
+    revisions: &[(String, String)], // (repository_id, source_revision_id)
+    edges_emitted: usize,
+) -> Result<String, StorageError> {
+    let now = now_micros();
+    let snapshot_id = uuid::Uuid::new_v4().to_string();
+
+    conn.execute(
+        "INSERT INTO core_workspace_snapshots
+             (id, created_at, repo_count, edges_emitted)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            snapshot_id,
+            now,
+            revisions.len() as i64,
+            edges_emitted as i64,
+        ],
+    )
+    .map_err(StorageError::from)?;
+
+    for (repo_id, rev_id) in revisions {
+        let rev_entry_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO core_workspace_snapshot_revisions
+                 (id, snapshot_id, repository_id, source_revision_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![rev_entry_id, snapshot_id, repo_id, rev_id, now],
+        )
+        .map_err(StorageError::from)?;
+    }
+
+    debug!(
+        snapshot_id = %snapshot_id,
+        repo_count = revisions.len(),
+        edges_emitted,
+        "workspace snapshot created"
+    );
+    Ok(snapshot_id)
+}
+
+/// Retrieve the most recent WorkspaceSnapshot header, if any.
+pub fn latest_workspace_snapshot(
+    conn: &Connection,
+) -> Result<Option<WorkspaceSnapshotRow>, StorageError> {
+    conn.query_row(
+        "SELECT id, created_at, repo_count, edges_emitted
+           FROM core_workspace_snapshots
+          ORDER BY created_at DESC
+          LIMIT 1",
+        [],
+        |r| {
+            Ok(WorkspaceSnapshotRow {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                repo_count: r.get(2)?,
+                edges_emitted: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
+/// Retrieve the revision entries for one snapshot.
+pub fn snapshot_revisions(
+    conn: &Connection,
+    snapshot_id: &str,
+) -> Result<Vec<WorkspaceSnapshotRevision>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, snapshot_id, repository_id, source_revision_id
+           FROM core_workspace_snapshot_revisions
+          WHERE snapshot_id = ?1
+          ORDER BY repository_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![snapshot_id], |r| {
+            Ok(WorkspaceSnapshotRevision {
+                id: r.get(0)?,
+                snapshot_id: r.get(1)?,
+                repository_id: r.get(2)?,
+                source_revision_id: r.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
