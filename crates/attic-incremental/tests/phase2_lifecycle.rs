@@ -298,6 +298,7 @@ fn duplicate_watcher_events_do_not_duplicate_work_or_rows() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}

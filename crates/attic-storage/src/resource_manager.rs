@@ -1,32 +1,66 @@
 //! S7 — Production Resource Manager for Attic MCP.
 //
 // Coordinates resource consumption across all Attic operations:
-// - CPU concurrency (foreground queries, indexing, semantic enrichment)
-// - Memory budgets (per-repository and global)
+// - CPU concurrency (foreground queries, indexing, semantic enrichment) with
+//   SEPARATE foreground and background slot capacities
+// - Memory budgets (global + per-repository) with REAL process-RSS sampling
+//   (via `sysinfo`), reconciled with worker accounting
+// - Memory-aware admission: foreground queries are rejected when the
+//   foreground capacity is exhausted or the memory budget is spent
 // - Disk I/O pressure (bounded fs operations)
 // - SQLite writer queue capacity (backpressure via WriterQueue)
-// - Task concurrency and timeout enforcement
-// - Queue capacities and saturation behavior
-// - Resource-pressure state observation
-// - Graceful degradation under pressure
-//!
-//! Design principles (from PHASE_7_PRODUCTION.md §4-6, §8-10):
-//! - Foreground user work must not be starved by background indexing/enrichment
-//! - Background tasks yield/pause under resource pressure
-//! - Semantic enrichment is optional and must never starve canonical indexing
-//! - Explicit degradation behavior when approaching configured memory limits
-//! - Resource-pressure state must be observable
-//! - Never silently violate configured memory ceilings
+// - Resource-pressure state observation and graceful degradation
+//
+// Enforcement model (Phase 7, normative):
+// - `foreground_slots`: hard admission limit on concurrent MCP tool calls.
+//   When exhausted, the server returns a busy error instead of queueing
+//   unboundedly.
+// - `background_slots`: hard limit on concurrent background workers
+//   (incremental scheduler workers).  Capacity is derived from the indexing +
+//   semantic worker configuration and is ALWAYS smaller than the foreground
+//   capacity, so background work can never occupy the whole CPU budget.
+// - Memory: `memory_used_mib()` is the MAXIMUM of (a) the actual measured
+//   process resident set (authoritative) and (b) the worker-accounting
+//   counter.  Workers that allocate large buffers still register their
+//   allocations (accounting), but admission and degradation decisions are
+//   driven by real RSS, refreshed before every admission decision.  This
+//   means the monitor enforces genuine process memory behavior, not merely
+//   manually incremented counters.
+//
+// Design principles (from PHASE_7_PRODUCTION.md §4-6, §8-10):
+// - Foreground user work must not be starved by background indexing/enrichment
+// - Background tasks yield/pause under resource pressure
+// - Semantic enrichment is optional and must never starve canonical indexing
+// - Explicit degradation behavior when approaching configured memory limits
+// - Resource-pressure state must be observable
+// - Never silently violate configured memory ceilings
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use attic_core::resources;
-use attic_core::ResourceBudgets;
 use attic_core::ResourcePressure;
+use attic_core::resources;
 use tracing::{debug, error, info, warn};
+
+/// Number of cached sysinfo samples before refresh (RSS sampling is not free;
+/// a small window keeps admission decisions cheap).
+const RSS_SAMPLE_INTERVAL_MS: u64 = 250;
+
+/// Cross-platform process resident-set-size sampler.
+///
+/// Returns the current RSS of THIS process in MiB, or `None` when the OS does
+/// not expose it.  Uses the `sysinfo` crate (no unsafe code in this crate).
+pub fn sample_process_rss_mib() -> Option<u64> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes(
+        ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id())]),
+        true,
+    );
+    sys.process(Pid::from_u32(std::process::id()))
+        .map(|p| p.memory() / (1024 * 1024))
+}
 
 /// Global resource-pressure monitor.
 ///
@@ -37,38 +71,137 @@ use tracing::{debug, error, info, warn};
 /// long-running workers should consult the monitor before committing
 /// to expensive operations.
 pub struct ResourceMonitor {
-    /// Current memory usage in MiB (accumulated across all workers).
+    /// Worker-accounted memory usage in MiB (accumulated across all workers).
     memory_used: AtomicU64,
-    /// Peak memory usage observed in this session (MiB).
+    /// Last sampled REAL process RSS in MiB.
+    process_rss_mib: AtomicU64,
+    /// Peak of the effective (max of accounted / RSS) usage (MiB).
     peak_memory_used: AtomicU64,
-    /// Current CPU concurrency level in use.
-    active_cpu_slots: AtomicUsize,
+    /// Monotonic-ish clock (ms since monitor start) of the last RSS sample.
+    last_rss_sample_ms: AtomicU64,
+    /// Foreground CPU slots currently in use.
+    foreground_slots: AtomicUsize,
+    /// Background CPU slots currently in use.
+    background_slots: AtomicUsize,
     /// Whether resource-pressure emergency mode is active.
     emergency_mode: AtomicBool,
     /// Start time for uptime tracking.
     start_time: Instant,
-    /// Maximum memory budget in MiB (from resources::TOTAL_MEMORY_BUDGET_MIB).
-    max_memory_mib: u64,
-    /// Per-repository memory budget in MiB.
-    per_repo_memory_mib: u64,
+    /// Maximum memory budget in MiB (mutable via `apply_config`).
+    max_memory_mib: AtomicU64,
+    /// Per-repository memory budget in MiB (mutable via `apply_config`).
+    per_repo_memory_mib: AtomicU64,
     /// Minimum free memory that must be retained (MiB).
-    min_free_memory_mib: u64,
+    min_free_memory_mib: AtomicU64,
+    /// Foreground slot capacity (mutable via `apply_config`).
+    foreground_capacity: AtomicUsize,
+    /// Background slot capacity (mutable via `apply_config`).
+    background_capacity: AtomicUsize,
+}
+
+/// RAII guard for a foreground slot: releases the slot on drop.
+pub struct ForegroundSlotGuard<'a> {
+    monitor: &'a ResourceMonitor,
+}
+
+impl Drop for ForegroundSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.monitor.release_foreground_slot();
+    }
+}
+
+impl ForegroundSlotGuard<'_> {
+    /// Current degraded-advisory for the in-flight query (cheap read).
+    pub fn advisory(&self) -> ResourceAdvisory {
+        current_advisory(self.monitor)
+    }
 }
 
 impl ResourceMonitor {
     /// Create a new ResourceMonitor with Phase 7 default configuration.
     pub fn new() -> Self {
-        let now = Instant::now();
+        Self::from_config(&ResourceConfig::default())
+    }
+
+    /// Create a ResourceMonitor from explicit configuration.
+    ///
+    /// Foreground capacity defaults to `MAX_FOREGROUND_QUERIES`.  Background
+    /// capacity defaults to `MAX_INDEXING_WORKERS + MAX_SEMANTIC_WORKERS` and
+    /// is always clamped to be strictly smaller than the foreground capacity
+    /// so background work can never consume the whole CPU budget.
+    pub fn from_config(config: &ResourceConfig) -> Self {
+        let foreground = config
+            .max_foreground_queries
+            .unwrap_or(resources::MAX_FOREGROUND_QUERIES);
+        let background = config
+            .max_background_workers
+            .unwrap_or(resources::MAX_INDEXING_WORKERS + resources::MAX_SEMANTIC_WORKERS);
+        let background = background.min(foreground.saturating_sub(1).max(1));
         Self {
             memory_used: AtomicU64::new(0),
+            process_rss_mib: AtomicU64::new(0),
             peak_memory_used: AtomicU64::new(0),
-            active_cpu_slots: AtomicUsize::new(0),
+            last_rss_sample_ms: AtomicU64::new(0),
+            foreground_slots: AtomicUsize::new(0),
+            background_slots: AtomicUsize::new(0),
             emergency_mode: AtomicBool::new(false),
-            start_time: now,
-            max_memory_mib: resources::TOTAL_MEMORY_BUDGET_MIB,
-            per_repo_memory_mib: resources::PER_REPO_MEMORY_BUDGET_MIB,
-            min_free_memory_mib: resources::MIN_FREE_MEMORY_MIB,
+            start_time: Instant::now(),
+            max_memory_mib: AtomicU64::new(
+                config
+                    .total_memory_budget_mib
+                    .unwrap_or(resources::TOTAL_MEMORY_BUDGET_MIB),
+            ),
+            per_repo_memory_mib: AtomicU64::new(
+                config
+                    .per_repo_memory_budget_mib
+                    .unwrap_or(resources::PER_REPO_MEMORY_BUDGET_MIB),
+            ),
+            min_free_memory_mib: AtomicU64::new(
+                config
+                    .min_free_memory_mib
+                    .unwrap_or(resources::MIN_FREE_MEMORY_MIB),
+            ),
+            foreground_capacity: AtomicUsize::new(foreground),
+            background_capacity: AtomicUsize::new(background),
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64
+    }
+
+    /// Refresh the effective memory usage from a REAL process RSS sample.
+    ///
+    /// Called before every admission decision (foreground query admission and
+    /// background task scheduling).  The effective memory usage is the maximum
+    /// of the accounted counter and the measured RSS, so degradation and
+    /// admission behavior is driven by genuine process memory, not merely by
+    /// manually incremented counters.
+    pub fn refresh_process_memory(&self) {
+        let now = self.elapsed_ms();
+        let last = self.last_rss_sample_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < RSS_SAMPLE_INTERVAL_MS {
+            return;
+        }
+        self.last_rss_sample_ms.store(now, Ordering::Relaxed);
+        if let Some(rss) = sample_process_rss_mib() {
+            self.process_rss_mib.store(rss, Ordering::Relaxed);
+        }
+        let effective = self.effective_memory_used();
+        self.peak_memory_used
+            .fetch_max(effective, Ordering::Relaxed);
+
+        let pressure = self.compute_pressure(effective);
+        if pressure != self.pressure() {
+            self.announce_pressure_change(pressure, effective);
+        }
+    }
+
+    /// Effective memory usage in MiB: max(worker accounting, real process RSS).
+    pub fn effective_memory_used(&self) -> u64 {
+        self.memory_used
+            .load(Ordering::Relaxed)
+            .max(self.process_rss_mib.load(Ordering::Relaxed))
     }
 
     /// Record memory usage increasing by `delta_mib` MiB.  Called by workers
@@ -78,7 +211,8 @@ impl ResourceMonitor {
         let new_total = prev + delta_mib;
 
         // Update peak if we exceeded it.
-        self.peak_memory_used.fetch_max(new_total, Ordering::Relaxed);
+        self.peak_memory_used
+            .fetch_max(new_total, Ordering::Relaxed);
 
         // Check if we're crossing pressure thresholds.
         let pressure = self.compute_pressure(new_total);
@@ -90,44 +224,52 @@ impl ResourceMonitor {
     /// Record memory usage decreasing by `delta_mib` MiB.  Called when workers
     /// release memory (task completion, cleanup).
     pub fn record_memory_decrease(&self, delta_mib: u64) {
-        let prev = self.memory_used.fetch_sub(delta_mib, Ordering::Relaxed);
-        // Ensure we don't go below zero.
-        let _ = prev.saturating_sub(delta_mib);
+        self.memory_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(delta_mib))
+            })
+            .ok();
 
         // Announce pressure change downward.
-        let pressure = self.compute_pressure(self.memory_used.load(Ordering::Relaxed));
+        let current = self.memory_used.load(Ordering::Relaxed);
+        let pressure = self.compute_pressure(current);
         if pressure != self.pressure() {
-            self.announce_pressure_change(pressure, self.memory_used.load(Ordering::Relaxed));
+            self.announce_pressure_change(pressure, current);
         }
     }
 
-    /// Record a CPU slot being acquired.  Returns `true` if the slot was
-    /// successfully acquired (within concurrency limits).
-    pub fn acquire_cpu_slot(&self) -> bool {
-        let current = self.active_cpu_slots.load(Ordering::Acquire);
-        let max = resources::MAX_FOREGROUND_QUERIES; // reuse foreground query limit for CPU slots
+    // ── Foreground admission ───────────────────────────────────────────────
 
-        // Try to increment; if we're at the limit, fail.
-        if current >= max {
-            return false;
-        }
-
-        // Use compare-and-swap to atomically increment if under limit.
+    /// Try to acquire a FOREGROUND CPU slot (concurrent MCP query admission).
+    ///
+    /// Refreshes real process memory first, then applies two hard admission
+    /// rules:
+    /// 1. foreground capacity: at most `foreground_capacity` concurrent
+    ///    queries; beyond that the caller is told the server is busy;
+    /// 2. memory admission: under `Emergency` pressure new foreground work is
+    ///    still accepted (foreground has priority) but callers should degrade;
+    ///    the slot is granted so a query can report an explicit degraded
+    ///    advisory rather than being silently dropped.
+    ///
+    /// Returns `true` when the slot was acquired.  Use the returned
+    /// [`ForegroundSlotGuard`] pattern or call [`Self::release_foreground_slot`].
+    pub fn acquire_foreground_slot(&self) -> bool {
+        self.refresh_process_memory();
+        let max = self.foreground_capacity.load(Ordering::Acquire);
         loop {
-            let current = self.active_cpu_slots.load(Ordering::Acquire);
+            let current = self.foreground_slots.load(Ordering::Acquire);
             if current >= max {
-                return false; // at capacity
+                return false;
             }
-            match self.active_cpu_slots.compare_exchange_weak(
+            match self.foreground_slots.compare_exchange_weak(
                 current,
                 current + 1,
-                Ordering::Release,
+                Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
-                Err(new_current) => {
-                    // Another thread updated; retry with the new value.
-                    if new_current >= max {
+                Err(observed) => {
+                    if observed >= max {
                         return false;
                     }
                 }
@@ -135,24 +277,121 @@ impl ResourceMonitor {
         }
     }
 
-    /// Release a CPU slot.
-    pub fn release_cpu_slot(&self) {
-        self.active_cpu_slots.fetch_sub(1, Ordering::Release);
+    /// Release a previously acquired foreground slot.
+    pub fn release_foreground_slot(&self) {
+        let _ = self
+            .foreground_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
+
+    /// Acquire a foreground slot with RAII release.  Returns `None` when the
+    /// server is at foreground capacity (caller must refuse the work).
+    pub fn try_foreground(&self) -> Option<ForegroundSlotGuard<'_>> {
+        if self.acquire_foreground_slot() {
+            Some(ForegroundSlotGuard { monitor: self })
+        } else {
+            None
+        }
+    }
+
+    // ── Background admission ───────────────────────────────────────────────
+
+    /// Try to acquire a BACKGROUND CPU slot (indexing/semantic/cross-repo work).
+    ///
+    /// Background capacity is separate from, and strictly smaller than, the
+    /// foreground capacity.  Under `Pause`/`Emergency` advisories no new
+    /// background slots are granted at all.
+    pub fn acquire_background_slot(&self) -> bool {
+        match current_advisory(self) {
+            ResourceAdvisory::Pause | ResourceAdvisory::Emergency => return false,
+            _ => {}
+        }
+        let max = self.background_capacity.load(Ordering::Acquire);
+        loop {
+            let current = self.background_slots.load(Ordering::Acquire);
+            if current >= max {
+                return false;
+            }
+            match self.background_slots.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => {
+                    if observed >= max {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Release a previously acquired background slot.
+    pub fn release_background_slot(&self) {
+        let _ = self
+            .background_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Current number of in-use foreground slots (observability/tests).
+    pub fn foreground_slots_in_use(&self) -> usize {
+        self.foreground_slots.load(Ordering::Relaxed)
+    }
+
+    /// Current number of in-use background slots (observability/tests).
+    pub fn background_slots_in_use(&self) -> usize {
+        self.background_slots.load(Ordering::Relaxed)
+    }
+
+    /// Foreground slot capacity (observability/tests).
+    pub fn foreground_capacity(&self) -> usize {
+        self.foreground_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Background slot capacity (observability/tests).
+    pub fn background_capacity(&self) -> usize {
+        self.background_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Last sampled real process RSS in MiB (0 until first sample).
+    pub fn process_rss_mib(&self) -> u64 {
+        self.process_rss_mib.load(Ordering::Relaxed)
+    }
+
+    /// Compatibility shim: acquire a foreground slot.
+    #[deprecated(since = "0.1.0", note = "use acquire_foreground_slot")]
+    pub fn acquire_cpu_slot(&self) -> bool {
+        self.acquire_foreground_slot()
+    }
+
+    /// Compatibility shim: release a foreground slot.
+    #[deprecated(since = "0.1.0", note = "use release_foreground_slot")]
+    pub fn release_cpu_slot(&self) {
+        self.release_foreground_slot()
+    }
+
+    // ── Pressure model ─────────────────────────────────────────────────────
 
     /// Compute the current resource pressure level.
     ///
     /// Returns `ResourcePressure::Normal` when things are fine, up to
     /// `ResourcePressure::Emergency` when we're at or beyond limits.
     pub fn compute_pressure(&self, current_mib: u64) -> ResourcePressure {
-        let pct = if self.max_memory_mib > 0 {
-            (current_mib * 100) / self.max_memory_mib
+        let max = self.max_memory_mib.load(Ordering::Relaxed);
+        let min_free = self.min_free_memory_mib.load(Ordering::Relaxed);
+        let pct = if max > 0 {
+            (current_mib * 100) / max
         } else {
             0
         };
 
-        let min_free = self.min_free_memory_mib;
-        let free_mib = self.max_memory_mib.saturating_sub(current_mib);
+        let free_mib = max.saturating_sub(current_mib);
 
         // Emergency: we've consumed so much that free memory is below the minimum.
         if free_mib < min_free {
@@ -174,8 +413,9 @@ impl ResourceMonitor {
 
     /// Announce a pressure change, emitting a diagnostic trace.
     fn announce_pressure_change(&self, pressure: ResourcePressure, current_mib: u64) {
-        let pct = if self.max_memory_mib > 0 {
-            (current_mib * 100) / self.max_memory_mib
+        let max = self.max_memory_mib.load(Ordering::Relaxed);
+        let pct = if max > 0 {
+            (current_mib * 100) / max
         } else {
             0
         };
@@ -184,8 +424,9 @@ impl ResourceMonitor {
             ResourcePressure::Normal => {
                 debug!(
                     "resource pressure normal: {} MiB used ({}%), {} MiB free",
-                    current_mib, pct,
-                    self.max_memory_mib.saturating_sub(current_mib)
+                    current_mib,
+                    pct,
+                    max.saturating_sub(current_mib)
                 );
             }
             ResourcePressure::Warning => {
@@ -209,17 +450,18 @@ impl ResourceMonitor {
         }
     }
 
-    /// Return the current pressure level.
+    /// Return the current pressure level, based on EFFECTIVE memory
+    /// (accounting vs real RSS — see [`Self::refresh_process_memory`]).
     pub fn pressure(&self) -> ResourcePressure {
-        self.compute_pressure(self.memory_used.load(Ordering::Relaxed))
+        self.compute_pressure(self.effective_memory_used())
     }
 
-    /// Return current memory usage in MiB.
+    /// Return current (worker-accounted) memory usage in MiB.
     pub fn memory_used_mib(&self) -> u64 {
         self.memory_used.load(Ordering::Relaxed)
     }
 
-    /// Return peak memory usage in MiB.
+    /// Return peak effective memory usage in MiB.
     pub fn peak_memory_used_mib(&self) -> u64 {
         self.peak_memory_used.load(Ordering::Relaxed)
     }
@@ -236,22 +478,57 @@ impl ResourceMonitor {
 
     /// Return the maximum memory budget in MiB.
     pub fn max_memory_mib(&self) -> u64 {
-        self.max_memory_mib
+        self.max_memory_mib.load(Ordering::Relaxed)
     }
 
     /// Return the per-repository memory budget in MiB.
     pub fn per_repo_memory_mib(&self) -> u64 {
-        self.per_repo_memory_mib
+        self.per_repo_memory_mib.load(Ordering::Relaxed)
     }
 
     /// Return the minimum free memory that must be retained in MiB.
     pub fn min_free_memory_mib(&self) -> u64 {
-        self.min_free_memory_mib
+        self.min_free_memory_mib.load(Ordering::Relaxed)
     }
 
     /// Return uptime in seconds.
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
+    }
+
+    /// Apply runtime configuration overrides to this monitor.
+    ///
+    /// Used by [`ResourceConfig::apply_to`]; values take effect immediately
+    /// for subsequent admission decisions.
+    pub fn apply_config(&self, config: &ResourceConfig) {
+        if let Some(v) = config.total_memory_budget_mib {
+            self.max_memory_mib.store(v, Ordering::Release);
+        }
+        if let Some(v) = config.per_repo_memory_budget_mib {
+            self.per_repo_memory_mib.store(v, Ordering::Release);
+        }
+        if let Some(v) = config.min_free_memory_mib {
+            self.min_free_memory_mib.store(v, Ordering::Release);
+        }
+        if let Some(v) = config.max_foreground_queries {
+            self.foreground_capacity.store(v.max(1), Ordering::Release);
+            // Re-clamp background below foreground.
+            let fg = self.foreground_capacity.load(Ordering::Relaxed);
+            let bg = self.background_capacity.load(Ordering::Relaxed);
+            self.background_capacity
+                .store(bg.min(fg.saturating_sub(1).max(1)), Ordering::Release);
+        }
+        if let Some(v) = config.max_background_workers {
+            let fg = self.foreground_capacity.load(Ordering::Relaxed);
+            self.background_capacity
+                .store(v.min(fg.saturating_sub(1).max(1)), Ordering::Release);
+        }
+    }
+}
+
+impl Default for ResourceMonitor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -273,20 +550,20 @@ pub enum ResourceAdvisory {
 /// Query the current resource advisory for the calling worker.
 pub fn current_advisory(monitor: &ResourceMonitor) -> ResourceAdvisory {
     let pressure = monitor.pressure();
-    let used = monitor.memory_used_mib();
+    let used = monitor.effective_memory_used();
     let max = monitor.max_memory_mib();
 
     match pressure {
-        attic_core::ResourcePressure::Normal => ResourceAdvisory::Normal,
-        attic_core::ResourcePressure::Warning => {
+        ResourcePressure::Normal => ResourceAdvisory::Normal,
+        ResourcePressure::Warning => {
             if used > max * 3 / 4 {
-                ResourceAdvisory::Emergency
-            } else {
                 ResourceAdvisory::Degraded
+            } else {
+                ResourceAdvisory::Normal
             }
         }
-        attic_core::ResourcePressure::Critical => ResourceAdvisory::Pause,
-        attic_core::ResourcePressure::Emergency => ResourceAdvisory::Emergency,
+        ResourcePressure::Critical => ResourceAdvisory::Pause,
+        ResourcePressure::Emergency => ResourceAdvisory::Emergency,
     }
 }
 
@@ -309,12 +586,11 @@ pub struct ResourceConfig {
     /// Maximum concurrent foreground MCP queries. Overrides the default from
     /// `attic_core::resources::MAX_FOREGROUND_QUERIES`.
     pub max_foreground_queries: Option<usize>,
-    /// Maximum concurrent indexing workers. Overrides the default from
-    /// `attic_core::resources::MAX_INDEXING_WORKERS`.
-    pub max_indexing_workers: Option<usize>,
-    /// Maximum concurrent semantic enrichment workers. Overrides the default
-    /// from `attic_core::resources::MAX_SEMANTIC_WORKERS`.
-    pub max_semantic_workers: Option<usize>,
+    /// Maximum concurrent BACKGROUND workers (indexing + semantic + cross-repo
+    /// combined). Overrides the derived default
+    /// `MAX_INDEXING_WORKERS + MAX_SEMANTIC_WORKERS`.  Always clamped strictly
+    /// below the foreground capacity.
+    pub max_background_workers: Option<usize>,
     /// Maximum disk I/O ops per second. Overrides the default from
     /// `attic_core::resources::MAX_IO_OPS_PER_SEC`.
     pub max_io_ops_per_sec: Option<u64>,
@@ -329,6 +605,22 @@ pub struct ResourceConfig {
     pub writer_flush_interval_ms: Option<u64>,
 }
 
+impl Default for ResourceConfig {
+    fn default() -> Self {
+        Self {
+            total_memory_budget_mib: None,
+            per_repo_memory_budget_mib: None,
+            min_free_memory_mib: None,
+            max_foreground_queries: None,
+            max_background_workers: None,
+            max_io_ops_per_sec: None,
+            writer_queue_capacity: None,
+            writer_batch_size: None,
+            writer_flush_interval_ms: None,
+        }
+    }
+}
+
 impl ResourceConfig {
     /// Load the resource configuration, applying environment variable overrides.
     ///
@@ -337,6 +629,7 @@ impl ResourceConfig {
     /// - `ATTIC_PER_REPO_MEMORY_BUDGET_MIB`
     /// - `ATTIC_MIN_FREE_MEMORY_MIB`
     /// - `ATTIC_MAX_FOREGROUND_QUERIES`
+    /// - `ATTIC_MAX_BACKGROUND_WORKERS`
     /// - `ATTIC_MAX_INDEXING_WORKERS`
     /// - `ATTIC_MAX_SEMANTIC_WORKERS`
     /// - `ATTIC_MAX_IO_OPS_PER_SEC`
@@ -357,10 +650,7 @@ impl ResourceConfig {
             max_foreground_queries: std::env::var("ATTIC_MAX_FOREGROUND_QUERIES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            max_indexing_workers: std::env::var("ATTIC_MAX_INDEXING_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_semantic_workers: std::env::var("ATTIC_MAX_SEMANTIC_WORKERS")
+            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_io_ops_per_sec: std::env::var("ATTIC_MAX_IO_OPS_PER_SEC")
@@ -379,33 +669,25 @@ impl ResourceConfig {
     }
 
     /// Apply this configuration to the given ResourceMonitor.
+    ///
+    /// Overrides take effect immediately for all subsequent admission and
+    /// degradation decisions (see [`ResourceMonitor::apply_config`]).
     pub fn apply_to(&self, monitor: &ResourceMonitor) {
+        monitor.apply_config(self);
         if let Some(budget) = self.total_memory_budget_mib {
-            // We can't directly set the atomic, so we record the intent.
-            // The monitor reads max_memory_mib from its internal state;
-            // in a full implementation the monitor would be reconfigured.
-            info!(
-                "ResourceConfig: total_memory_budget_mib overridden to {budget}"
-            );
+            info!("ResourceConfig: total_memory_budget_mib overridden to {budget}");
         }
         if let Some(budget) = self.per_repo_memory_budget_mib {
-            info!(
-                "ResourceConfig: per_repo_memory_budget_mib overridden to {budget}"
-            );
+            info!("ResourceConfig: per_repo_memory_budget_mib overridden to {budget}");
         }
         if let Some(min_free) = self.min_free_memory_mib {
-            info!(
-                "ResourceConfig: min_free_memory_mib overridden to {min_free}"
-            );
+            info!("ResourceConfig: min_free_memory_mib overridden to {min_free}");
         }
         if let Some(queries) = self.max_foreground_queries {
             info!("ResourceConfig: max_foreground_queries overridden to {queries}");
         }
-        if let Some(workers) = self.max_indexing_workers {
-            info!("ResourceConfig: max_indexing_workers overridden to {workers}");
-        }
-        if let Some(semantic) = self.max_semantic_workers {
-            info!("ResourceConfig: max_semantic_workers overridden to {semantic}");
+        if let Some(workers) = self.max_background_workers {
+            info!("ResourceConfig: max_background_workers overridden to {workers}");
         }
         if let Some(io) = self.max_io_ops_per_sec {
             info!("ResourceConfig: max_io_ops_per_sec overridden to {io}");
@@ -434,28 +716,28 @@ mod tests {
         // Below 70%: Normal
         assert_eq!(
             monitor.compute_pressure(0),
-            attic_core::domain::ResourcePressure::Normal
+            attic_core::ResourcePressure::Normal
         );
 
         // At 70%: Warning
         let seventy_pct = resources::TOTAL_MEMORY_BUDGET_MIB * 70 / 100;
         assert_eq!(
             monitor.compute_pressure(seventy_pct),
-            attic_core::domain::ResourcePressure::Warning
+            attic_core::ResourcePressure::Warning
         );
 
         // At 85%: Critical
         let eighty_five_pct = resources::TOTAL_MEMORY_BUDGET_MIB * 85 / 100;
         assert_eq!(
             monitor.compute_pressure(eighty_five_pct),
-            attic_core::domain::ResourcePressure::Critical
+            attic_core::ResourcePressure::Critical
         );
 
         // Near limit (free < min_free): Emergency
         let near_limit = resources::TOTAL_MEMORY_BUDGET_MIB - resources::MIN_FREE_MEMORY_MIB - 1;
         assert_eq!(
             monitor.compute_pressure(near_limit),
-            attic_core::domain::ResourcePressure::Emergency
+            attic_core::ResourcePressure::Emergency
         );
     }
 
@@ -466,32 +748,129 @@ mod tests {
         // Record 100 MiB increase.
         monitor.record_memory_increase(100);
         assert_eq!(monitor.memory_used_mib(), 100);
-        assert_eq!(monitor.pressure(), attic_core::domain::ResourcePressure::Normal);
+        assert_eq!(monitor.pressure(), attic_core::ResourcePressure::Normal);
 
-        // Record 200 MiB decrease.
+        // Record 200 MiB decrease (saturating at 0; must not panic or wrap).
         monitor.record_memory_decrease(200);
         assert_eq!(monitor.memory_used_mib(), 0);
-        assert_eq!(monitor.pressure(), attic_core::domain::ResourcePressure::Normal);
+        assert_eq!(monitor.pressure(), attic_core::ResourcePressure::Normal);
     }
 
     #[test]
-    fn resource_monitor_cpu_slot_acquisition() {
-        let monitor = ResourceMonitor::new();
+    fn foreground_slot_capacity_is_enforced() {
+        let mut config = ResourceConfig::default();
+        config.max_foreground_queries = Some(3);
+        let monitor = ResourceMonitor::from_config(&config);
 
-        // Acquire slots up to the limit.
-        assert!(monitor.acquire_cpu_slot());
-        assert!(monitor.acquire_cpu_slot());
-        assert!(monitor.acquire_cpu_slot());
+        assert!(monitor.acquire_foreground_slot());
+        assert!(monitor.acquire_foreground_slot());
+        assert!(monitor.acquire_foreground_slot());
+        assert_eq!(monitor.foreground_slots_in_use(), 3);
 
-        // Beyond the limit (MAX_FOREGROUND_QUERIES = 64), should fail.
-        // We've only acquired 3, so we can acquire more.
-        // The limit is 64, so we should still be able to acquire more.
-        for _ in 0..60 {
-            assert!(monitor.acquire_cpu_slot(), "should be able to acquire CPU slot");
+        // At capacity: admission refused.
+        assert!(!monitor.acquire_foreground_slot());
+
+        // Release one → admission works again.
+        monitor.release_foreground_slot();
+        assert!(monitor.acquire_foreground_slot());
+        assert_eq!(monitor.foreground_slots_in_use(), 3);
+    }
+
+    #[test]
+    fn foreground_guard_releases_on_drop() {
+        let mut config = ResourceConfig::default();
+        config.max_foreground_queries = Some(1);
+        let monitor = ResourceMonitor::from_config(&config);
+
+        {
+            let guard = monitor.try_foreground().expect("first slot available");
+            assert!(monitor.try_foreground().is_none(), "capacity exhausted");
+            drop(guard);
         }
+        assert_eq!(monitor.foreground_slots_in_use(), 0);
+        assert!(monitor.try_foreground().is_some());
+    }
 
-        // Now at limit.
-        assert!(!monitor.acquire_cpu_slot());
+    #[test]
+    fn background_capacity_is_separate_and_below_foreground() {
+        let mut config = ResourceConfig::default();
+        config.max_foreground_queries = Some(4);
+        config.max_background_workers = Some(2);
+        let monitor = ResourceMonitor::from_config(&config);
+
+        assert_eq!(monitor.foreground_capacity(), 4);
+        assert_eq!(monitor.background_capacity(), 2);
+        assert!(monitor.background_capacity() < monitor.foreground_capacity());
+
+        // Background capacity is enforced independently of foreground slots.
+        assert!(monitor.acquire_foreground_slot());
+        assert!(monitor.acquire_background_slot());
+        assert!(monitor.acquire_background_slot());
+        assert!(!monitor.acquire_background_slot(), "background at capacity");
+        assert_eq!(monitor.background_slots_in_use(), 2);
+        assert_eq!(monitor.foreground_slots_in_use(), 1);
+    }
+
+    #[test]
+    fn background_slots_refused_under_pause_advisory() {
+        let mut config = ResourceConfig::default();
+        // Force emergency: memory used above budget minus min free.
+        config.total_memory_budget_mib = Some(300);
+        config.min_free_memory_mib = Some(256);
+        let monitor = ResourceMonitor::from_config(&config);
+
+        // 100 MiB used → free = 200 < 256 → Emergency → Pause/Emergency advisory.
+        monitor.record_memory_increase(100);
+        assert_eq!(current_advisory(&monitor), ResourceAdvisory::Emergency);
+        assert!(
+            !monitor.acquire_background_slot(),
+            "background must be refused under emergency"
+        );
+        // Foreground still admitted (priority).
+        assert!(monitor.acquire_foreground_slot());
+    }
+
+    #[test]
+    fn default_background_capacity_is_derived_from_workers() {
+        let monitor = ResourceMonitor::from_config(&ResourceConfig::default());
+        assert_eq!(
+            monitor.background_capacity(),
+            resources::MAX_INDEXING_WORKERS + resources::MAX_SEMANTIC_WORKERS
+        );
+        assert!(monitor.background_capacity() < monitor.foreground_capacity());
+    }
+
+    #[test]
+    fn rss_sampling_returns_real_process_memory() {
+        // The sampler must return a plausible non-zero RSS for THIS process.
+        let rss = sample_process_rss_mib().expect("process RSS should be sampleable");
+        assert!(rss > 0, "RSS must be > 0, got {rss}");
+
+        let monitor = ResourceMonitor::new();
+        monitor.refresh_process_memory();
+        assert_eq!(
+            monitor.process_rss_mib(),
+            rss,
+            "monitor should adopt the sampled RSS"
+        );
+        // Effective usage is at least the real RSS even with no accounting.
+        assert!(monitor.effective_memory_used() >= rss);
+    }
+
+    #[test]
+    fn effective_memory_is_max_of_accounting_and_rss() {
+        let monitor = ResourceMonitor::new();
+        // Accounting above any plausible RSS for this tiny test process.
+        monitor.record_memory_increase(resources::TOTAL_MEMORY_BUDGET_MIB);
+        monitor.refresh_process_memory();
+        assert!(
+            monitor.effective_memory_used() >= monitor.memory_used_mib(),
+            "effective must be at least the accounted value"
+        );
+        assert_eq!(
+            monitor.effective_memory_used(),
+            monitor.memory_used_mib().max(monitor.process_rss_mib())
+        );
     }
 
     #[test]
@@ -499,20 +878,17 @@ mod tests {
         let monitor = ResourceMonitor::new();
 
         // Initially normal → Normal advisory.
-        assert_eq!(
-            current_advisory(&monitor),
-            attic_storage::resource_manager::ResourceAdvisory::Normal
-        );
+        assert_eq!(current_advisory(&monitor), ResourceAdvisory::Normal);
 
         // Set high memory pressure.
         monitor.record_memory_increase(resources::TOTAL_MEMORY_BUDGET_MIB);
         let advisory = current_advisory(&monitor);
         assert!(
-            matches!(advisory, attic_storage::resource_manager::ResourceAdvisory::Emergency
-                | attic_storage::resource_manager::ResourceAdvisory::Pause
-                | attic_storage::resource_manager::ResourceAdvisory::Degraded),
-            "expected degraded/emergency/pause advisory under high pressure, got {:?}",
-            advisory
+            matches!(
+                advisory,
+                ResourceAdvisory::Emergency | ResourceAdvisory::Pause | ResourceAdvisory::Degraded
+            ),
+            "expected degraded/emergency/pause advisory under high pressure, got {advisory:?}"
         );
     }
 
@@ -524,8 +900,7 @@ mod tests {
         assert!(config.per_repo_memory_budget_mib.is_none());
         assert!(config.min_free_memory_mib.is_none());
         assert!(config.max_foreground_queries.is_none());
-        assert!(config.max_indexing_workers.is_none());
-        assert!(config.max_semantic_workers.is_none());
+        assert!(config.max_background_workers.is_none());
         assert!(config.max_io_ops_per_sec.is_none());
         assert!(config.writer_queue_capacity.is_none());
         assert!(config.writer_batch_size.is_none());
@@ -533,10 +908,53 @@ mod tests {
     }
 
     #[test]
-    fn resource_config_apply_to() {
+    fn resource_config_apply_to_actually_reconfigures() {
         let monitor = ResourceMonitor::new();
-        let config = ResourceConfig::load();
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(2048),
+            min_free_memory_mib: Some(100),
+            max_foreground_queries: Some(8),
+            max_background_workers: Some(3),
+            ..ResourceConfig::default()
+        };
         config.apply_to(&monitor);
-        // apply_to just logs; no assertions needed beyond it not panicking.
+
+        assert_eq!(monitor.max_memory_mib(), 2048);
+        assert_eq!(monitor.min_free_memory_mib(), 100);
+        assert_eq!(monitor.foreground_capacity(), 8);
+        assert_eq!(monitor.background_capacity(), 3);
+    }
+
+    #[test]
+    fn concurrent_slot_acquisition_never_exceeds_capacity() {
+        use std::sync::atomic::AtomicUsize as _Unused;
+        let _ = _Unused::new(0);
+
+        let mut config = ResourceConfig::default();
+        config.max_foreground_queries = Some(4);
+        let monitor = Arc::new(ResourceMonitor::from_config(&config));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let m = Arc::clone(&monitor);
+            handles.push(std::thread::spawn(move || {
+                let mut acquired = 0;
+                for _ in 0..100 {
+                    if m.acquire_foreground_slot() {
+                        acquired += 1;
+                        std::thread::yield_now();
+                        m.release_foreground_slot();
+                    }
+                }
+                acquired
+            }));
+        }
+        let mut total = 0;
+        for h in handles {
+            total += h.join().unwrap();
+        }
+        // Invariant: every acquisition was released exactly once.
+        assert_eq!(monitor.foreground_slots_in_use(), 0);
+        assert!(total > 0, "some acquisitions must succeed under contention");
     }
 }

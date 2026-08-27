@@ -13,8 +13,9 @@ use attic_indexing::{IndexError, IndexOptions, IndexingStore, index_repository};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
     fts_search, get_db_stats, get_repository_path, get_repository_stats,
-    lookup_repository_by_root_path, run_migrations,
-    resource_manager::{ResourceMonitor, ResourceAdvisory, ResourceConfig},
+    lookup_repository_by_root_path,
+    resource_manager::{ResourceAdvisory, ResourceConfig, ResourceMonitor},
+    run_migrations,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -135,8 +136,12 @@ impl AtticServer {
         } else {
             None
         };
-        // Phase 7: create resource monitor for foreground/background priority
-        let resource_monitor = ResourceMonitor::new();
+        // Phase 7: config-driven resource monitor for foreground/background
+        // priority.  Budgets/capacities come from ATTIC_* env configuration
+        // (ResourceConfig::load) and drive REAL admission enforcement.
+        let config = ResourceConfig::load();
+        let resource_monitor = ResourceMonitor::from_config(&config);
+        config.apply_to(&resource_monitor);
         Ok(AtticServer {
             pool,
             writer,
@@ -791,6 +796,7 @@ fn handle_context(
     writer: &WriterQueueHandle,
     crossrepo_degraded: bool,
     args: &HashMap<String, Value>,
+    resource_advisory: attic_storage::resource_manager::ResourceAdvisory,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
         .get("query")
@@ -798,7 +804,10 @@ fn handle_context(
         .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
     validate_filter("query", query, 512)?;
 
-    let mode = match args.get("mode").and_then(Value::as_str) {
+    // Phase 7 graceful degradation: DEEP expansions are paused under
+    // Pause/Emergency resource advisories; the query still runs at NORMAL
+    // depth so foreground work is never starved by its own expensive mode.
+    let mut mode = match args.get("mode").and_then(Value::as_str) {
         None | Some("NORMAL") => attic_retrieval::AnswerMode::Normal,
         Some("FAST") => attic_retrieval::AnswerMode::Fast,
         Some("DEEP") => attic_retrieval::AnswerMode::Deep,
@@ -808,6 +817,15 @@ fn handle_context(
             )));
         }
     };
+    if mode == attic_retrieval::AnswerMode::Deep
+        && matches!(
+            resource_advisory,
+            attic_storage::resource_manager::ResourceAdvisory::Pause
+                | attic_storage::resource_manager::ResourceAdvisory::Emergency
+        )
+    {
+        mode = attic_retrieval::AnswerMode::Normal;
+    }
 
     let mut request = attic_retrieval::AnswerRequest::new(query, mode);
     if let Some(id) = args.get("repository_id").and_then(Value::as_str) {
@@ -983,14 +1001,48 @@ impl ServerHandler for AtticServer {
             request.arguments.unwrap_or_default().into_iter().collect();
 
         async move {
+            // Phase 7: memory-aware foreground admission.  Each MCP tool call
+            // must acquire a foreground slot (hard capacity from configuration)
+            // before any work happens; when the server is at capacity the
+            // caller receives an explicit busy error instead of unbounded
+            // queueing.  Real process RSS is refreshed by the admission call,
+            // so degradation decisions reflect genuine memory usage.
+            let admission = match self
+                .resource_monitor
+                .as_ref()
+                .and_then(|m| m.try_foreground())
+            {
+                Some(guard) => guard,
+                None => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "server busy: foreground query capacity exhausted ({} concurrent); retry shortly",
+                        self.resource_monitor.as_ref().map(|m| m.foreground_capacity()).unwrap_or(0)
+                    ))])
+                    .into());
+                }
+            };
+            let advisory = admission.advisory();
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
                 "file" => handle_file(&pool, &args),
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(&pool, incremental.as_ref(), watch_mode, self.resource_monitor.as_ref().map(|m| m.as_ref())),
-                "context" => handle_context(semantic, &pool, &writer, crossrepo_degraded, &args),
+                "status" => handle_status(
+                    &pool,
+                    incremental.as_ref(),
+                    watch_mode,
+                    self.resource_monitor.as_ref().map(|m| m.as_ref()),
+                ),
+                "context" => handle_context(
+                    semantic,
+                    &pool,
+                    &writer,
+                    crossrepo_degraded,
+                    &args,
+                    advisory,
+                ),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
+            drop(admission);
             match result {
                 Ok(r) => Ok(r.into()),
                 Err(e) => {
@@ -1010,27 +1062,17 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let db_path = std::env::var("ATTIC_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| {
-                    std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-                })
-                .or_else(|_| {
-                    std::env::var("USERPROFILE")
-                        .map(|h| PathBuf::from(h).join("AppData").join("Local"))
-                })
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("attic")
-                .join("attic.db")
-        });
-
-    if let Some(p) = db_path.parent() {
-        fs::create_dir_all(p)?;
-    }
-    info!("attic starting, db={}", db_path.display());
+    // Phase 7: platform-appropriate data/cache/temp policy (see
+    // attic_core::paths).  The data root is user-global (OS application-data
+    // directory); workspaces are never written to.
+    let paths = attic_core::AtticPaths::resolve();
+    paths.ensure_dirs()?;
+    let db_path = paths.db_path();
+    info!(
+        "attic starting, db={} (data root {})",
+        db_path.display(),
+        paths.data_root.display()
+    );
 
     let mut server = AtticServer::new(&db_path)?;
 
@@ -1058,9 +1100,8 @@ async fn main() -> anyhow::Result<()> {
     // per the crash recovery contract (§3, §5).
     // Open a fresh writer connection just for the verification step; this
     // does not affect the primary writer connection or the connection pool.
-    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path).map_err(|e| {
-        anyhow::anyhow!("failed to open verification connection: {e}")
-    })?;
+    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open verification connection: {e}"))?;
     let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
     drop(verify_conn); // always release the verification connection
     if !integrity_violations.is_empty() {
@@ -1068,7 +1109,9 @@ async fn main() -> anyhow::Result<()> {
             error!("database integrity violation during startup: {v}");
         }
         // Fail-closed: if the database is corrupt, refuse to serve.
-        return Err(anyhow::anyhow!("database integrity check failed during startup"));
+        return Err(anyhow::anyhow!(
+            "database integrity check failed during startup"
+        ));
     }
 
     let mut _watch: Option<attic_incremental::IncrementalWatch> = None;
@@ -1156,14 +1199,14 @@ async fn main() -> anyhow::Result<()> {
                         renames: vec![],
                         from_reconciliation: true,
                     };
-if let Err(e) = attic_incremental::scheduler::schedule_incremental(
-                            &server.writer,
-                            &refresh.repository_id,
-                            &payload,
-                            attic_incremental::scheduler::PRIORITY_RECONCILE,
-                            4096,
-                            None, // no resource monitor in this code path; priority=40 (reconciliation) will be deferred under pressure
-                        ) {
+                    if let Err(e) = attic_incremental::scheduler::schedule_incremental(
+                        &server.writer,
+                        &refresh.repository_id,
+                        &payload,
+                        attic_incremental::scheduler::PRIORITY_RECONCILE,
+                        4096,
+                        server.resource_monitor.as_ref().map(|m| m.as_ref()),
+                    ) {
                         warn!("offline refresh scheduling failed: {e}");
                     }
                 }
@@ -1174,7 +1217,7 @@ if let Err(e) = attic_incremental::scheduler::schedule_incremental(
         // 3. Scheduler — fallible: a scheduler that cannot start its workers
         //    is never silently accepted.
         let policy = DiscoveryPolicy::default_git();
-        let monitor = server.resource_monitor.as_ref().map(|m| m.as_ref());
+        let monitor = server.resource_monitor.clone();
         match attic_incremental::spawn_scheduler(
             attic_incremental::SchedulerConfig::default(),
             server.pool.clone(),
@@ -1243,84 +1286,99 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
     }
 }
 
-/// Serve MCP until the stdio transport closes, then record a clean shutdown
-/// and perform deterministic shutdown ordering per Phase 7 §9.
+/// Serve MCP until the stdio transport closes OR the process receives
+/// SIGINT/Ctrl+C, then record a clean shutdown and perform deterministic
+/// shutdown ordering per Phase 7 §9.
 ///
 /// Ordering:
-///   1. Stop accepting new MCP work (serve returns when transport closes)
-///   2. Cancel/defer background incremental tasks
-///   3. Stop watchers (change detection)
-///   4. Finish/rollback active publications via writer queue drain
-///   5. Checkpoint durable task state
-///   6. Flush required state to SQLite
-///   7. Stop workers (WriterQueue Drop handles this)
-///   8. Close DB resources (pool + writer connection)
-///   9. Exit
+///   1. Stop accepting new MCP work (transport close OR Ctrl+C)
+///   2. Cancel/defer background incremental tasks (scheduler + watcher drop)
+///   3. Record clean-shutdown marker (durable task state)
+///   4. Explicit WAL checkpoint (TRUNCATE) + crash-recovery backup
+///   5. Drain + stop workers (WriterQueue Drop joins the worker thread)
+///   6. Close DB resources (pool + writer connection)
+///   7. Exit
 async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
-    // ─── 1. Stop accepting new MCP work ───────────────────────────────────
-    // Serve returns once the MCP lifecycle handshake has completed.  The
-    // returned RunningService MUST be kept alive for the lifetime of the
-    // server — dropping it cancels the whole service.  `waiting()` consumes
-    // it and blocks until the stdio transport closes.
+    // 1. Stop accepting new MCP work.  Serve returns once the MCP lifecycle
+    //    handshake has completed.  The returned RunningService MUST be kept
+    //    alive for the lifetime of the server.  Ctrl+C (SIGINT / console
+    //    CtrlClose) is handled as an EQUAL first-class trigger: the service
+    //    is cancelled through rmcp and the same deterministic shutdown path
+    //    runs, so the process never dies without recording a clean marker.
     let writer_for_shutdown = server.writer.clone();
+    let db_path_for_shutdown = server.db_path.clone();
     let running = server
         .serve(stdio())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let reason = running
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Capture the cancellation token BEFORE consuming `running` in
+    // `waiting()`; Ctrl+C cancels through this token.
+    let cancel_token = running.cancellation_token();
+    let reason = tokio::select! {
+        r = running.waiting() => {
+            r.map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl_c/SIGINT received - initiating graceful shutdown");
+            cancel_token.cancel();
+            rmcp::service::QuitReason::Cancelled
+        }
+    };
     info!("attic server stopped: {reason:?}");
 
-    // ─── 2. Cancel/defer background incremental tasks ──────────────────────
-    // The scheduler should stop accepting new work and let in-flight tasks
-    // complete.  The WriterQueue Drop will drain and join the worker thread.
+    // 2. Cancel/defer background incremental tasks.  The scheduler handle
+    //    and IncrementalWatch are dropped with `server`; both stop accepting
+    //    new work and let in-flight tasks finish before the writer queue
+    //    drain below.
 
-    // ─── 3. Stop watchers ────────────────────────────────────────────────
-    // This stops the native OS watcher or the periodic reconciliation loop.
-    // Idempotent; safe to call even if no watcher is active.
-    // ─── shut down change detection ──────────────────────────────────────────────
-    // (no-op: WatchMode is just a tag; the actual IncrementalWatch handle
-    // is managed by the server's Drop and incremental field.)
-    // ─── shut down change detection ──────────────────────────────────────────────
-    // (no-op: WatchMode is just a tag; the actual IncrementalWatch handle
-    // is managed by the server's Drop and incremental field.)
-
-    // ─── 4. Finish/rollback active publications ──────────────────────────
-    // Drain the writer queue: all in-flight mutations will be committed
-    // (or rolled back) before the writer thread exits.  The WriterQueue
-    // Drop is intentionally last-resort; we signal shutdown first.
+    // 3. Record clean shutdown marker (durable task state, REC-INV-1).
     let _ = attic_incremental::record_clean_shutdown_marker(&writer_for_shutdown);
 
-    // ─── 5. Checkpoint + backup (Phase 7) ─────────────────────────────────
-    // After a clean shutdown, create a backup copy of the main database file
-    // using the atomic rename pattern.  The WAL checkpoint is handled by
-    // SQLite's internal autocheckpoint mechanism (wal_autocheckpoint = 1000,
-    /// every 1 000 frames or 5 minutes, whichever comes first).  This satisfies
-    // REC-B1 through REC-B4 of the crash recovery contract.
-    // Backup code removed for compilation; can be re-enabled after server clone fix.
+    // 4. Explicit WAL checkpoint + backup (Phase 7).  After a clean shutdown:
+    //    force a TRUNCATE checkpoint so the WAL is emptied into the main
+    //    database, then create a crash-recovery backup using the atomic
+    //    rename pattern (REC-B1 through REC-B4).  Both are best-effort: a
+    //    failure is logged but never prevents clean exit, since the data is
+    //    still recoverable from the WAL on next open.
+    {
+        let db_path = db_path_for_shutdown.clone();
+        let maintenance = tokio::task::spawn_blocking(move || {
+            let (conn, _pool) = match attic_storage::open_db(&db_path) {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!("shutdown maintenance open failed: {e}");
+                    return;
+                }
+            };
+            match attic_storage::connection::checkpoint_wal(&conn) {
+                Ok((busy, log, ckpt)) => {
+                    info!(
+                        "shutdown WAL checkpoint: busy={busy} log_pages={log} checkpointed={ckpt}"
+                    );
+                }
+                Err(e) => warn!("shutdown WAL checkpoint failed: {e}"),
+            }
+            if let Err(e) = attic_storage::connection::backup_database(
+                &db_path,
+                &db_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(attic_core::resources::BACKUP_RELATIVE_DIR),
+            ) {
+                warn!("shutdown backup failed (best-effort): {e}");
+            }
+        })
+        .await;
+        if let Err(e) = maintenance {
+            warn!("shutdown maintenance task failed: {e}");
+        }
+    }
 
-    // ─── 6. Checkpoint durable task state ────────────────────────────────
-    // Record the shutdown epoch so startup recovery can distinguish clean
-    // from crashed shutdowns (REC-INV-1 fail-closed contract).
-    // The writer_queue handle below will trigger the drop that joins the
-    // worker thread; the marker records that we reached this point.
-
-    // ─── 7. Flush required state ─────────────────────────────────────────
-    // Any remaining state is flushed through the writer queue drain that
-    // happens naturally when writer_for_shutdown is dropped.
-
-    // ─── 8. Stop workers / close DB resources ────────────────────────────
-    // Drop the WriterQueue — this signals the worker thread to shut down
-    // and joins it deterministically (no deadlock; the worker checks a
-    // shutdown flag on each loop iteration).
+    // 5. Stop workers.  Drop the WriterQueue - this signals the worker thread
+    //    to shut down and joins it deterministically.
     drop(writer_for_shutdown);
 
-    // The DbPool and writer connection are closed when they are dropped
-    // (they implement Drop that closes the underlying SQLite connection).
-    // The server value is consumed here; its fields are dropped after this
-    // function returns.
+    // 6. Close DB resources (pool + writer connection) via Drop.
 
     info!("attic server shut down cleanly: {reason:?}");
     Ok(())
@@ -2035,7 +2093,7 @@ mod tests {
     #[test]
     fn status_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        let r = handle_status(&make_server(&tmp).pool, None, None).unwrap();
+        let r = handle_status(&make_server(&tmp).pool, None, None, None).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
@@ -2063,7 +2121,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, None, None).unwrap();
+        let r = handle_status(&srv.pool, None, None, None).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -2472,9 +2530,7 @@ mod tests {
                 }),
             );
             let resp = send_recv(&mut child, &mut stdin, &call);
-            let text = resp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
             // With degraded cross-repo, confidence must be LOW or result
             // must be INSUFFICIENT_EVIDENCE — never HIGH cross-repo confidence.
@@ -2498,9 +2554,7 @@ mod tests {
                 }),
             );
             let sresp = send_recv(&mut child, &mut stdin, &search);
-            let stext = sresp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("");
+            let stext = sresp["result"]["content"][0]["text"].as_str().unwrap_or("");
             // Search must succeed and return a JSON results array (even if empty).
             let sv: Value = serde_json::from_str(stext).unwrap_or(json!({}));
             assert!(
@@ -2518,11 +2572,8 @@ mod tests {
         // ─────────────────────────────────────────────────────────────────────
         let (provider_id_str, dependent_id_str, _unrelated_id_str) = {
             // Read back the repository IDs from the pre-seeded DB.
-            let srv =
-                AtticServer::new_with_semantic_opt(&db_path, false).expect("read repo ids");
-            let pid = srv
-                .bootstrap_workspace(&provider_dir)
-                .expect("provider id");
+            let srv = AtticServer::new_with_semantic_opt(&db_path, false).expect("read repo ids");
+            let pid = srv.bootstrap_workspace(&provider_dir).expect("provider id");
             let did = srv
                 .bootstrap_workspace(&dependent_dir)
                 .expect("dependent id");
@@ -2577,9 +2628,7 @@ mod tests {
             }),
         );
         let resp = send_recv(&mut child, &mut stdin, &call);
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
         let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
 
         // Context text and/or claims must mention the provider module.
@@ -2602,8 +2651,7 @@ mod tests {
         // structured claims JSON — not the context prose — for a false dependency
         // claim on example.com/unrelated.
         assert!(
-            !claims_json.contains("example.com/unrelated")
-                || claims_json.contains("not depend"),
+            !claims_json.contains("example.com/unrelated") || claims_json.contains("not depend"),
             "gate 2 FAIL: unrelated repository should not appear as a dependency \
              claim; claims={:.400}",
             &claims_json
@@ -2697,8 +2745,8 @@ mod tests {
         // so use index_repository directly to force a fresh index of the updated
         // manifest.
         {
-            let srv = AtticServer::new_with_semantic_opt(&db_path, false)
-                .expect("server for re-index");
+            let srv =
+                AtticServer::new_with_semantic_opt(&db_path, false).expect("server for re-index");
             let store = IndexingStore {
                 readers: &srv.pool,
                 writer: &srv.writer,
@@ -2752,9 +2800,7 @@ mod tests {
             }),
         );
         let resp2 = send_recv(&mut child2, &mut stdin2, &call2);
-        let text2 = resp2["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap_or("");
         let v2: Value = serde_json::from_str(text2).unwrap_or(json!({}));
         let context2 = v2["context"].as_str().unwrap_or("");
         let claims2 = v2["claims"].to_string();

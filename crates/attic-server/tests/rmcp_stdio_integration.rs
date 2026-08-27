@@ -351,13 +351,9 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         let mut seed = connect(&bin, &db, Some(dir)).await;
         // Wait up to 5 s for the file to be indexed in this repo.
         for _ in 0..10 {
-            let txt = call_tool_text(
-                &mut seed,
-                "search",
-                serde_json::json!({ "query": token }),
-            )
-            .await
-            .unwrap_or_default();
+            let txt = call_tool_text(&mut seed, "search", serde_json::json!({ "query": token }))
+                .await
+                .unwrap_or_default();
             let sv: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
             if sv["results"]
                 .as_array()
@@ -395,7 +391,10 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(watcher_ready, "cross-repo sync did not complete within 10s; watcher never started");
+    assert!(
+        watcher_ready,
+        "cross-repo sync did not complete within 10s; watcher never started"
+    );
 
     // ── Call context tool with cross-repo query ──────────────────────────────
     // Poll until at least one evidence item carries workspace_snapshot_id
@@ -418,11 +417,12 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         .expect("context tool");
         v = serde_json::from_str(&response_text).expect("context payload is JSON");
         // Check if any evidence has workspace_snapshot_id set (cross-repo ready).
-        let has_snapshot = v["evidence"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .any(|e| e["workspace_snapshot_id"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
+        let has_snapshot = v["evidence"].as_array().unwrap_or(&vec![]).iter().any(|e| {
+            e["workspace_snapshot_id"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        });
         if has_snapshot {
             break;
         }
@@ -512,8 +512,12 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     }
 
     // GATE 4c: workspace_snapshot_id must be a valid UUID.
-    let first_ws_snap = snapshot_backed[0]["workspace_snapshot_id"].as_str().unwrap();
-    let uuid_re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
+    let first_ws_snap = snapshot_backed[0]["workspace_snapshot_id"]
+        .as_str()
+        .unwrap();
+    let uuid_re =
+        regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            .unwrap();
     assert!(
         uuid_re.is_match(first_ws_snap),
         "GATE 4c FAIL: workspace_snapshot_id must be valid UUID; got {first_ws_snap}"

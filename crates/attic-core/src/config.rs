@@ -133,36 +133,57 @@ impl ProductionConfig {
             }};
         }
 
-        cfg.max_foreground_queries = env_or!(ATTIC_MAX_FOREGROUND_QUERIES, cfg.max_foreground_queries);
+        cfg.max_foreground_queries =
+            env_or!(ATTIC_MAX_FOREGROUND_QUERIES, cfg.max_foreground_queries);
         cfg.max_indexing_workers = env_or!(ATTIC_MAX_INDEXING_WORKERS, cfg.max_indexing_workers);
-        cfg.total_memory_budget_mib = env_or!(ATTIC_TOTAL_MEMORY_BUDGET_MIB, cfg.total_memory_budget_mib);
-        cfg.per_repo_memory_budget_mib = env_or!(ATTIC_PER_REPO_MEMORY_BUDGET_MIB, cfg.per_repo_memory_budget_mib);
+        cfg.total_memory_budget_mib =
+            env_or!(ATTIC_TOTAL_MEMORY_BUDGET_MIB, cfg.total_memory_budget_mib);
+        cfg.per_repo_memory_budget_mib = env_or!(
+            ATTIC_PER_REPO_MEMORY_BUDGET_MIB,
+            cfg.per_repo_memory_budget_mib
+        );
         cfg.max_io_ops_per_sec = env_or!(ATTIC_MAX_IO_OPS_PER_SEC, cfg.max_io_ops_per_sec);
         cfg.writer_queue_capacity = env_or!(ATTIC_WRITER_QUEUE_CAPACITY, cfg.writer_queue_capacity);
         cfg.writer_batch_size = env_or!(ATTIC_WRITER_BATCH_SIZE, cfg.writer_batch_size);
-        cfg.writer_flush_interval_ms = env_or!(ATTIC_WRITER_FLUSH_INTERVAL_MS, cfg.writer_flush_interval_ms);
-        cfg.incremental_task_queue_capacity = env_or!(ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY, cfg.incremental_task_queue_capacity);
-        cfg.reconciliation_task_queue_capacity = env_or!(ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY, cfg.reconciliation_task_queue_capacity);
+        cfg.writer_flush_interval_ms =
+            env_or!(ATTIC_WRITER_FLUSH_INTERVAL_MS, cfg.writer_flush_interval_ms);
+        cfg.incremental_task_queue_capacity = env_or!(
+            ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY,
+            cfg.incremental_task_queue_capacity
+        );
+        cfg.reconciliation_task_queue_capacity = env_or!(
+            ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY,
+            cfg.reconciliation_task_queue_capacity
+        );
         cfg.max_graph_depth = env_or!(ATTIC_MAX_GRAPH_DEPTH, cfg.max_graph_depth);
         cfg.max_graph_nodes = env_or!(ATTIC_MAX_GRAPH_NODES, cfg.max_graph_nodes);
         cfg.max_context_tokens = env_or!(ATTIC_MAX_CONTEXT_TOKENS, cfg.max_context_tokens);
-        cfg.default_task_timeout_ms = env_or!(ATTIC_DEFAULT_TASK_TIMEOUT_MS, cfg.default_task_timeout_ms);
+        cfg.default_task_timeout_ms =
+            env_or!(ATTIC_DEFAULT_TASK_TIMEOUT_MS, cfg.default_task_timeout_ms);
         cfg.min_free_memory_mib = env_or!(ATTIC_MIN_FREE_MEMORY_MIB, cfg.min_free_memory_mib);
         cfg.backup_relative_dir = env_or!(ATTIC_BACKUP_RELATIVE_DIR, cfg.backup_relative_dir);
         cfg.max_backup_retain = env_or!(ATTIC_MAX_BACKUP_RETAIN, cfg.max_backup_retain);
         cfg.checkpoint_wal_frames = env_or!(ATTIC_CHECKPOINT_WAL_FRAMES, cfg.checkpoint_wal_frames);
         cfg.checkpoint_minutes = env_or!(ATTIC_CHECKPOINT_MINUTES, cfg.checkpoint_minutes);
         cfg.wal_autocpt_enabled = env_or!(ATTIC_WAL_AUTOCKPT_ENABLED, cfg.wal_autocpt_enabled);
-        cfg.graceful_shutdown_timeout_ms = env_or!(ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS, cfg.graceful_shutdown_timeout_ms);
-        cfg.startup_integrity_check = env_or!(ATTIC_STARTUP_INTEGRITY_CHECK, cfg.startup_integrity_check);
-        cfg.startup_foreign_key_check = env_or!(ATTIC_STARTUP_FOREIGN_KEY_CHECK, cfg.startup_foreign_key_check);
+        cfg.graceful_shutdown_timeout_ms = env_or!(
+            ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+            cfg.graceful_shutdown_timeout_ms
+        );
+        cfg.startup_integrity_check =
+            env_or!(ATTIC_STARTUP_INTEGRITY_CHECK, cfg.startup_integrity_check);
+        cfg.startup_foreign_key_check = env_or!(
+            ATTIC_STARTUP_FOREIGN_KEY_CHECK,
+            cfg.startup_foreign_key_check
+        );
 
         cfg
     }
 
     /// Return the backup directory path relative to the database file.
     pub fn backup_dir(&self, db_path: &std::path::Path) -> std::path::PathBuf {
-        db_path.parent()
+        db_path
+            .parent()
             .unwrap_or(std::path::Path::new("."))
             .join(&self.backup_relative_dir)
     }

@@ -231,11 +231,10 @@ pub fn read_bounded(
     let canon = canonicalize_within_root(&joined, &canon_root)?;
 
     // Size bound before read.
-    let meta = std::fs::metadata(&canon)
-        .map_err(|_| DiscoveryError::Canonicalize {
-            path: canon.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
-        })?;
+    let meta = std::fs::metadata(&canon).map_err(|_| DiscoveryError::Canonicalize {
+        path: canon.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+    })?;
     if !meta.is_file() {
         return Ok(None);
     }
@@ -247,8 +246,10 @@ pub fn read_bounded(
     }
 
     // Read and apply secret scan.
-    let raw = std::fs::read(&canon)
-        .map_err(|e| DiscoveryError::Canonicalize { path: canon, source: e })?;
+    let raw = std::fs::read(&canon).map_err(|e| DiscoveryError::Canonicalize {
+        path: canon,
+        source: e,
+    })?;
 
     if let Ok(text) = std::str::from_utf8(&raw) {
         let scan = crate::secrets::scan_and_redact(text);

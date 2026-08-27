@@ -71,13 +71,13 @@ pub mod resources {
     /// Maximum batch size for writer commits (mutations per transaction).
     pub const WRITER_BATCH_SIZE: usize = 256;
 
-/// Flush the writer batch at least this often (ms).
+    /// Flush the writer batch at least this often (ms).
     pub const WRITER_FLUSH_INTERVAL_MS: u64 = 50;
 
     /// Maximum pending incremental tasks in the queue.
     pub const INCREMENTAL_TASK_QUEUE_CAPACITY: usize = 1024;
 
-/// Maximum number of pending reconciliation tasks.
+    /// Maximum number of pending reconciliation tasks.
     pub const RECONCILIATION_TASK_QUEUE_CAPACITY: usize = 256;
 
     /// Maximum depth of graph traversal for evidence expansion.

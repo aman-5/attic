@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature-*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: macos-latest # ARM64 (M-series)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit + integration tests
+        run: cargo test --workspace
+
+  package:
+    name: packaging layout verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify archive layout rules
+        run: |
+          # Stage a synthetic archive dir exercising the verifier's rules.
+          mkdir -p /tmp/fake-archive/docs
+          touch /tmp/fake-archive/attic-server
+          touch /tmp/fake-archive/README.md
+          touch /tmp/fake-archive/docs/x.md
+          bash tools/package.sh --verify /tmp/fake-archive
+          # A dirty archive must FAIL verification.
+          touch /tmp/fake-archive/build_errors.txt
+          if bash tools/package.sh --verify /tmp/fake-archive; then
+            echo "verifier accepted a dirty archive"; exit 1
+          fi

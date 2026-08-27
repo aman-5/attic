@@ -573,8 +573,10 @@ impl CrossRepoGenerator {
                 ev.source_id = e.id.clone();
                 ev.path = format!(
                     "CROSS_REPO {} [{}] → {} [{}]",
-                    e.source_entity_id, e.source_repository_id,
-                    e.target_entity_id, e.target_repository_id
+                    e.source_entity_id,
+                    e.source_repository_id,
+                    e.target_entity_id,
+                    e.target_repository_id
                 );
                 ev.source_revision_id = Some(e.source_revision_id.clone());
                 ev.workspace_snapshot_id = workspace_snapshot_id;
@@ -618,7 +620,10 @@ mod crossrepo_snapshot_tests {
         for name in ["repo-dependent", "repo-provider", "repo-other"] {
             let rid = uuid5(name).parse::<attic_core::RepositoryId>().unwrap();
             attic_storage::repository::repository::upsert_repository(
-                &conn, &rid, &format!("C:/tmp/{}", name), name,
+                &conn,
+                &rid,
+                &format!("C:/tmp/{}", name),
+                name,
             )
             .unwrap();
         }
@@ -675,9 +680,8 @@ mod crossrepo_snapshot_tests {
             budget: &mut budget,
             limit: 16,
         };
-        let candidates =
-            CrossRepoGenerator::run(&mut env, &["file-occ-dependent".to_owned()])
-                .expect("generator");
+        let candidates = CrossRepoGenerator::run(&mut env, &["file-occ-dependent".to_owned()])
+            .expect("generator");
         assert!(candidates.len() >= 2, "edges emitted");
 
         let evs: Vec<&Evidence> = candidates.iter().map(|c| &c.evidence).collect();
@@ -690,7 +694,10 @@ mod crossrepo_snapshot_tests {
             with_snap.workspace_snapshot_id.as_deref(),
             Some("11111111-2222-4333-8444-555555555555")
         );
-        assert_eq!(with_snap.source_revision_id.as_deref(), Some(rev_ids[0].as_str()));
+        assert_eq!(
+            with_snap.source_revision_id.as_deref(),
+            Some(rev_ids[0].as_str())
+        );
         assert!(
             with_snap.path.contains("example.com/provider"),
             "snapshot evidence is the provider edge: {}",

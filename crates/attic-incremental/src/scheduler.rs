@@ -11,9 +11,9 @@ use tracing::{debug, warn};
 
 use attic_indexing::IndexOptions;
 use attic_storage::{
-    ClaimedTask, DbPool, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
-    TASK_RECONCILIATION, TaskCounts, TaskOutcome, WriterQueueHandle, claim_next_pending_task,
-    enqueue_task, finish_task, get_task_counts, set_task_checkpoint, ResourceMonitor,
+    ClaimedTask, DbPool, EnqueueOutcome, IncrementalTaskPayload, ResourceMonitor,
+    TASK_INCREMENTAL_INDEX, TASK_RECONCILIATION, TaskCounts, TaskOutcome, WriterQueueHandle,
+    claim_next_pending_task, enqueue_task, finish_task, get_task_counts, set_task_checkpoint,
 };
 
 use crate::changeset::VerifiedChangeSet;
@@ -231,7 +231,7 @@ pub fn spawn_scheduler(
     writer: WriterQueueHandle,
     root: std::path::PathBuf,
     policy: attic_discovery::DiscoveryPolicy,
-    monitor: Option<&ResourceMonitor>,
+    monitor: Option<Arc<ResourceMonitor>>,
 ) -> Result<SchedulerHandle, IncrementalError> {
     config.validate()?;
 
@@ -247,10 +247,20 @@ pub fn spawn_scheduler(
         let policy = policy.clone();
         let worker_shutdown = Arc::clone(&shutdown);
         let st = Arc::clone(&state);
+        let monitor_captured = monitor.clone();
         match std::thread::Builder::new()
             .name(format!("attic-sched-{worker_idx}"))
             .spawn(move || {
-                worker_loop(cfg, pool, writer, root, policy, worker_shutdown, st, None);
+                worker_loop(
+                    cfg,
+                    pool,
+                    writer,
+                    root,
+                    policy,
+                    worker_shutdown,
+                    st,
+                    monitor_captured,
+                );
             }) {
             Ok(h) => workers.push(h),
             Err(e) => {
@@ -287,6 +297,7 @@ fn wait_for_wake_or_timeout(state: &ShutdownState, timeout: Duration) {
     let _ = state.cv.wait_timeout_while(g, timeout, |stopped| !*stopped);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     config: SchedulerConfig,
     pool: DbPool,
@@ -295,12 +306,26 @@ fn worker_loop(
     policy: attic_discovery::DiscoveryPolicy,
     shutdown: Arc<AtomicBool>,
     state: Arc<ShutdownState>,
-    monitor: Option<&ResourceMonitor>,
+    monitor: Option<Arc<ResourceMonitor>>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             debug!("scheduler worker exiting (graceful)");
             return;
+        }
+
+        // Refresh real process memory before admission decisions so the
+        // pressure gate and background slot limits reflect genuine RSS.
+        if let Some(m) = monitor.as_ref() {
+            m.refresh_process_memory();
+            // Phase 7: background slot admission — a worker may not claim a
+            // task without a background CPU slot.  Under Pause/Emergency
+            // advisories the slot is refused, so the worker idles instead of
+            // starved-by-design foreground queries.
+            if !m.acquire_background_slot() {
+                wait_for_wake_or_timeout(&state, config.poll_interval);
+                continue;
+            }
         }
 
         // Claim atomically through the coordinated writer queue.
@@ -310,7 +335,15 @@ fn worker_loop(
         match claimed {
             Ok(Some(task)) => {
                 debug!(task = %task.id, kind = %task.task_type, "executing task");
-                let outcome = execute_task(&pool, &writer, &root, &policy, &config, &task, monitor);
+                let outcome = execute_task(
+                    &pool,
+                    &writer,
+                    &root,
+                    &policy,
+                    &config,
+                    &task,
+                    monitor.as_deref(),
+                );
                 let task_id = task.id.clone();
                 let finished: Result<(), IncrementalError> = run_on_writer(&writer, move |conn| {
                     finish_task(conn, &task_id, &outcome, crate::now_micros())
@@ -318,14 +351,25 @@ fn worker_loop(
                 if let Err(e) = finished {
                     warn!(task = %task.id, error = %e, "finish_task failed");
                 }
+                // Release the background slot only after the task fully finished.
+                if let Some(m) = monitor.as_ref() {
+                    m.release_background_slot();
+                }
             }
             Ok(None) => {
+                // No work claimed: return the background slot for this poll.
+                if let Some(m) = monitor.as_ref() {
+                    m.release_background_slot();
+                }
                 if shutdown.load(Ordering::SeqCst) {
                     continue;
                 }
                 wait_for_wake_or_timeout(&state, config.poll_interval);
             }
             Err(e) => {
+                if let Some(m) = monitor.as_ref() {
+                    m.release_background_slot();
+                }
                 warn!(error = %e, "task claim failed");
                 std::thread::sleep(config.poll_interval);
             }
@@ -399,7 +443,7 @@ fn execute_task(
                 },
             }
         }
-TASK_RECONCILIATION => {
+        TASK_RECONCILIATION => {
             // Authoritative diff — then take it through the SAME pipeline as
             // every other change: invalidation (cheap, sync) → schedule
             // INCREMENTAL_INDEX recomputation (separate task).  A converged
@@ -410,7 +454,13 @@ TASK_RECONCILIATION => {
             // starved.  The diff itself is still performed (it's cheap and
             // non-blocking), but scheduling is deferred.
             let should_defer_scheduling = monitor
-                .map(|m| matches!(m.pressure(), attic_core::domain::enums::ResourcePressure::Emergency | attic_core::domain::enums::ResourcePressure::Critical))
+                .map(|m| {
+                    matches!(
+                        m.pressure(),
+                        attic_core::domain::enums::ResourcePressure::Emergency
+                            | attic_core::domain::enums::ResourcePressure::Critical
+                    )
+                })
                 .unwrap_or(false);
 
             match crate::recovery::reconcile_repository(pool, writer, root, policy) {

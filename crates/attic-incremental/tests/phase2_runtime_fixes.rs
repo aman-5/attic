@@ -86,6 +86,7 @@ fn native_pump_has_no_production_lifetime_and_stays_live() {
         writer.clone(),
         repo.clone(),
         policy.clone(),
+        None,
     )
     .expect("scheduler start");
     // Allow the backend to arm before producing events.
@@ -194,7 +195,7 @@ fn git_ignored_events_never_become_indexed() {
         kind: FsEventKind::Created,
     }]);
     svc.apply_pending(&pool, &writer, Some(FAR_FUTURE)).unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy)
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
         .unwrap()
     {}
 
@@ -286,7 +287,7 @@ fn nested_gitignore_and_negation_match_discovery_exactly() {
         }]);
     }
     svc.apply_pending(&pool, &writer, Some(FAR_FUTURE)).unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy)
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
         .unwrap()
     {}
 
@@ -351,6 +352,7 @@ fn explicit_reincluded_vendor_path_receives_updates() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -447,6 +449,7 @@ fn reconciliation_origin_gets_reconciliation_priority() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap();
     assert!(ran);
@@ -482,6 +485,7 @@ fn reconciliation_origin_gets_reconciliation_priority() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}

@@ -41,8 +41,7 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 
     // Integrity check — code 100 means "run full check (include index
     // and foreign tables)" per the Phase 7 recovery contract.
-    let integrity: String = conn
-        .query_row("PRAGMA integrity_check(100)", [], |r| r.get(0))?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check(100)", [], |r| r.get(0))?;
     if integrity != "ok" {
         violations.push(StorageError::CorruptDatabase {
             reason: format!("integrity_check returned: {integrity}"),
@@ -81,10 +80,7 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 ///   recoverable from the WAL on next open).
 /// * If the backup directory cannot be created, the error is returned but
 ///   execution continues.
-pub fn backup_database(
-    db_path: &Path,
-    backup_dir: &Path,
-) -> Result<(), StorageError> {
+pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageError> {
     // Ensure the backup directory exists.
     fs::create_dir_all(backup_dir).map_err(|e| {
         StorageError::Io(std::io::Error::new(
@@ -133,12 +129,59 @@ pub fn backup_database(
         Ok(read_dir) => read_dir
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.file_name().unwrap_or_default().to_string_lossy().starts_with("attic.db.backup."))
+            .filter(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with("attic.db.backup.")
+            })
             .collect(),
         Err(_) => Vec::new(),
     };
 
     Ok(())
+}
+
+/// Force a WAL checkpoint.
+///
+/// Runs `PRAGMA wal_checkpoint(TRUNCATE)`: checkpoints all WAL content into
+/// the main database and truncates the WAL file to zero length.  Returns the
+/// `(busy, log_pages, checkpointed_pages)` triple reported by SQLite.  This is
+/// the Phase 7 explicit maintenance step the startup/shutdown contracts
+/// require, complementing the passive `wal_autocheckpoint` used at runtime.
+pub fn checkpoint_wal(conn: &Connection) -> Result<(i64, i64, i64), StorageError> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+    .map_err(StorageError::from)
+}
+
+/// Run SQLite production maintenance.
+///
+/// * `integrity_check` — full `PRAGMA integrity_check` (returns violations).
+/// * `wal_checkpoint` — explicit TRUNCATE checkpoint (see [`checkpoint_wal`]).
+/// * `vacuum` — rebuild the database to reclaim space and defragment.
+///   VACUUM must NOT run while a transaction is open on the connection; it
+///   is intended for shutdown/idle maintenance windows only.
+pub fn run_maintenance(
+    conn: &Connection,
+    wal_checkpoint: bool,
+    vacuum: bool,
+) -> Result<Vec<StorageError>, StorageError> {
+    let mut violations = Vec::new();
+    if wal_checkpoint {
+        let (busy, _log, _ckpt) = checkpoint_wal(conn)?;
+        if busy != 0 {
+            violations.push(StorageError::Worker(format!(
+                "wal_checkpoint(TRUNCATE) reported busy={busy}; checkpoint incomplete"
+            )));
+        }
+    }
+    if vacuum {
+        conn.execute_batch("VACUUM")?;
+    }
+    violations.extend(verify_connection(conn)?);
+    Ok(violations)
 }
 
 // ---------------------------------------------------------------------------
@@ -567,5 +610,91 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn checkpoint_wal_truncates_and_maintenance_passes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_maint_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let (writer, pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+            // Generate WAL frames.
+            pool.with_reader(|c| {
+                c.query_row("SELECT COUNT(*) FROM core_repositories", [], |r| {
+                    r.get::<_, i64>(0)
+                })?;
+                Ok(())
+            })
+            .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO core_repositories (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) VALUES ('m1','/m','m',1,1,0,0)",
+                    [],
+                )
+                .unwrap();
+
+            let (busy, _log, _ckpt) = checkpoint_wal(&writer).expect("checkpoint");
+            assert_eq!(busy, 0, "checkpoint on idle writer must not be busy");
+            let wal_size = std::fs::metadata(path.with_extension("db-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert_eq!(wal_size, 0, "TRUNCATE checkpoint must empty the WAL file");
+
+            let violations = run_maintenance(&writer, false, true).expect("maintenance");
+            assert!(
+                violations.is_empty(),
+                "no violations on healthy db: {violations:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn corruption_is_detected_by_verify_connection() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_corrupt_{}.db", uuid::Uuid::new_v4()));
+
+        // Write a valid SQLite-looking but truncated/garbage database.
+        std::fs::write(&path, b"SQLite format 3 this is not a real database").unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        configure_connection(&conn).unwrap();
+        let violations = verify_connection(&conn).expect("verify should run");
+        assert!(
+            !violations.is_empty(),
+            "garbage database must be reported as corrupt"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn backups_created_and_retained() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_bk_{}.db", uuid::Uuid::new_v4()));
+        let backup_dir = dir.join(format!("attic_bk_dir_{}", uuid::Uuid::new_v4()));
+
+        {
+            let (writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+        }
+        for _ in 0..5 {
+            backup_database(&path, &backup_dir).unwrap();
+        }
+        let backups: Vec<_> = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!backups.is_empty(), "backups must be created");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&backup_dir);
     }
 }

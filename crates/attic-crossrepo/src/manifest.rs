@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::{DependencyDeclaration, DeclarationKind, Ecosystem, ProvidedIdentity, limits};
+use crate::{DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity, limits};
 
 /// Result of parsing one manifest file.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -236,18 +236,17 @@ fn parse_package_json(text: &str) -> ManifestParse {
         if let Some(map) = v.get(section).and_then(|m| m.as_object()) {
             for (dep_name, spec) in map.iter().take(limits::MAX_DECLARATIONS_PER_REPO) {
                 let version = spec.as_str().map(str::to_string);
-                let (kind, hint): (DeclarationKind, Option<String>) =
-                    match version.as_deref() {
-                        Some(s) if is_npm_local_spec(s) => {
-                            // Strip "file:" or "link:" prefix before normalizing
-                            let path = s
-                                .strip_prefix("file:")
-                                .or_else(|| s.strip_prefix("link:"))
-                                .unwrap_or(s);
-                            (DeclarationKind::LocalPath, Some(normalize_relative(path)))
-                        }
-                        _ => (DeclarationKind::External, None),
-                    };
+                let (kind, hint): (DeclarationKind, Option<String>) = match version.as_deref() {
+                    Some(s) if is_npm_local_spec(s) => {
+                        // Strip "file:" or "link:" prefix before normalizing
+                        let path = s
+                            .strip_prefix("file:")
+                            .or_else(|| s.strip_prefix("link:"))
+                            .unwrap_or(s);
+                        (DeclarationKind::LocalPath, Some(normalize_relative(path)))
+                    }
+                    _ => (DeclarationKind::External, None),
+                };
                 if kind == DeclarationKind::LocalPath && hint.as_deref() == Some("") {
                     continue;
                 }
@@ -346,7 +345,8 @@ fn parse_pom_xml(text: &str) -> ManifestParse {
                 );
                 if starts_with(bytes, i, b"</") {
                     let Some(gt) = find_byte(bytes, i, b'>') else {
-                        out.diagnostics.push("pom_unterminated_close_tag".to_string());
+                        out.diagnostics
+                            .push("pom_unterminated_close_tag".to_string());
                         break;
                     };
                     let name = text_slice_trimmed(bytes, i + 2, gt);
@@ -413,7 +413,8 @@ fn parse_pom_xml(text: &str) -> ManifestParse {
             }
         }
         if out.declarations.len() >= limits::MAX_DECLARATIONS_PER_REPO {
-            out.diagnostics.push("pom_declaration_cap_reached".to_string());
+            out.diagnostics
+                .push("pom_declaration_cap_reached".to_string());
             break;
         }
     }
@@ -487,12 +488,14 @@ fn emit_dependency(
     version: Option<String>,
 ) {
     let (Some(g), Some(a)) = (group, artifact) else {
-        out.diagnostics.push("pom_dependency_missing_coords".to_string());
+        out.diagnostics
+            .push("pom_dependency_missing_coords".to_string());
         return;
     };
     if g.contains('$') || a.contains('$') {
         // property placeholders cannot be resolved without executing Maven
-        out.diagnostics.push("pom_dependency_property_placeholder".to_string());
+        out.diagnostics
+            .push("pom_dependency_property_placeholder".to_string());
         return;
     }
     out.declarations.push(DependencyDeclaration {
@@ -546,11 +549,15 @@ fn find_sub<'a>(bytes: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
     if pat.is_empty() || hay.len() < pat.len() {
         return None;
     }
-    hay.windows(pat.len()).position(|w| w == pat).map(|p| p + from)
+    hay.windows(pat.len())
+        .position(|w| w == pat)
+        .map(|p| p + from)
 }
 
 fn text_slice_trimmed(bytes: &[u8], from: usize, to: usize) -> String {
-    String::from_utf8_lossy(&bytes[from..to.min(bytes.len())]).trim().to_string()
+    String::from_utf8_lossy(&bytes[from..to.min(bytes.len())])
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +648,9 @@ fn gradle_dependency_line(path: &str, line: &str) -> Vec<DependencyDeclaration> 
         if parts.len() >= 2
             && !parts[0].is_empty()
             && !parts[1].is_empty()
-            && token.chars().all(|c| c.is_ascii_alphanumeric() || ":.-_+".contains(c))
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ":.-_+".contains(c))
         {
             out.push(DependencyDeclaration {
                 path: path.to_string(),
@@ -819,7 +828,9 @@ fn python_req_decl(path: &str, req: &str) -> Option<DependencyDeclaration> {
     if name.is_empty() {
         return None;
     }
-    let version = req[name.len()..].trim().trim_start_matches(['=', '<', '>', '~', '!', ';']);
+    let version = req[name.len()..]
+        .trim()
+        .trim_start_matches(['=', '<', '>', '~', '!', ';']);
     Some(DependencyDeclaration {
         path: path.to_string(),
         ecosystem: Ecosystem::Python,
@@ -872,9 +883,7 @@ fn parse_gitmodules(text: &str) -> ManifestParse {
     let mut out = ManifestParse::default();
     let mut current_name: Option<String> = None;
     let mut current_path: Option<String> = None;
-    let flush = |out: &mut ManifestParse,
-                 name: &Option<String>,
-                 path: &Option<String>| {
+    let flush = |out: &mut ManifestParse, name: &Option<String>, path: &Option<String>| {
         if let (Some(n), Some(p)) = (name, path) {
             out.declarations.push(DependencyDeclaration {
                 path: ".gitmodules".to_string(),
@@ -895,7 +904,10 @@ fn parse_gitmodules(text: &str) -> ManifestParse {
             continue;
         }
         if let Some(rest) = line.strip_prefix("path") {
-            current_path = rest.trim_start().strip_prefix('=').map(|v| v.trim().to_string());
+            current_path = rest
+                .trim_start()
+                .strip_prefix('=')
+                .map(|v| v.trim().to_string());
             continue;
         }
         let _ = line.strip_prefix("url"); // url recorded but not used for resolution
@@ -964,15 +976,18 @@ mod tests {
         );
         assert_eq!(p.provides.len(), 1);
         assert_eq!(p.provides[0].name, "example.com/team/api");
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "example.com/team/lib" && d.kind == DeclarationKind::LocalPath
-                && d.local_hint.as_deref() == Some("../lib")));
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "github.com/x/y" && d.kind == DeclarationKind::External));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "example.com/team/lib"
+                    && d.kind == DeclarationKind::LocalPath
+                    && d.local_hint.as_deref() == Some("../lib"))
+        );
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "github.com/x/y" && d.kind == DeclarationKind::External)
+        );
     }
 
     #[test]
@@ -981,12 +996,17 @@ mod tests {
         let p = parse_manifest("package.json", body);
         assert_eq!(p.provides[0].name, "@team/svc");
         assert!(p.declarations.iter().any(|d| d.name == "lodash"));
-        assert!(p.declarations.iter().any(|d| d.kind == DeclarationKind::LocalPath
-            && d.local_hint.as_deref() == Some("packages/inner")));
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.kind == DeclarationKind::WorkspaceMember));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.kind == DeclarationKind::LocalPath
+                    && d.local_hint.as_deref() == Some("packages/inner"))
+        );
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.kind == DeclarationKind::WorkspaceMember)
+        );
     }
 
     #[test]
@@ -997,10 +1017,11 @@ mod tests {
             p.provides.first().map(|x| x.name.as_str()),
             Some("com.team:api")
         );
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "com.team:lib" && d.version_req.as_deref() == Some("1.0")));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "com.team:lib" && d.version_req.as_deref() == Some("1.0"))
+        );
         assert!(p.declarations.iter().any(|d| d.name == "junit:junit"));
     }
 
@@ -1011,10 +1032,11 @@ mod tests {
         assert!(p.declarations.iter().any(|d| d.name == "project::core"
             || d.name == "project:::core"
             || d.local_hint.as_deref() == Some("core")));
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "commons-io:commons-io"));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "commons-io:commons-io")
+        );
     }
 
     #[test]
@@ -1023,10 +1045,11 @@ mod tests {
         let p = parse_manifest("settings.gradle", body);
         assert_eq!(p.provides.first().map(|x| x.name.as_str()), Some("mono"));
         assert_eq!(p.declarations.len(), 2);
-        assert!(p
-            .declarations
-            .iter()
-            .all(|d| d.kind == DeclarationKind::WorkspaceMember));
+        assert!(
+            p.declarations
+                .iter()
+                .all(|d| d.kind == DeclarationKind::WorkspaceMember)
+        );
     }
 
     #[test]
@@ -1039,12 +1062,15 @@ mod tests {
         assert!(py.declarations.iter().any(|d| d.name == "requests"));
         assert!(py.declarations.iter().any(|d| d.name == "team-lib"));
 
-        let reqs =
-            parse_manifest("requirements.txt", b"-e ./shared\nflask~=3.0\n# comment\n\nnumpy\n");
-        assert!(reqs
-            .declarations
-            .iter()
-            .any(|d| d.kind == DeclarationKind::LocalPath));
+        let reqs = parse_manifest(
+            "requirements.txt",
+            b"-e ./shared\nflask~=3.0\n# comment\n\nnumpy\n",
+        );
+        assert!(
+            reqs.declarations
+                .iter()
+                .any(|d| d.kind == DeclarationKind::LocalPath)
+        );
         assert!(reqs.declarations.iter().any(|d| d.name == "flask"));
         assert!(reqs.declarations.iter().any(|d| d.name == "numpy"));
     }
@@ -1054,10 +1080,11 @@ mod tests {
         let body = b"[submodule \"libs/shared\"]\n\tpath = libs/shared\n\turl = https://example.test/shared.git\n[submodule \"tools/gen\"]\n\tpath = tools/gen\n\turl = https://example.test/gen.git\n";
         let p = parse_manifest(".gitmodules", body);
         assert_eq!(p.declarations.len(), 2);
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "libs/shared" && d.local_hint.as_deref() == Some("libs/shared")));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "libs/shared" && d.local_hint.as_deref() == Some("libs/shared"))
+        );
     }
 
     #[test]
@@ -1067,10 +1094,11 @@ mod tests {
             b"syntax = \"proto3\";\nimport public \"common/types.proto\";\nimport \"local.proto\";\n",
         );
         assert_eq!(p.declarations.len(), 2);
-        assert!(p
-            .declarations
-            .iter()
-            .any(|d| d.name == "common/types.proto"));
+        assert!(
+            p.declarations
+                .iter()
+                .any(|d| d.name == "common/types.proto")
+        );
     }
 
     #[test]
@@ -1078,10 +1106,11 @@ mod tests {
         let big = vec![b'a'; (limits::MAX_MANIFEST_BYTES as usize) + 1];
         let p = parse_manifest("go.mod", &big);
         assert!(p.provides.is_empty());
-        assert!(p
-            .diagnostics
-            .iter()
-            .any(|d| d.starts_with("manifest_too_large")));
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.starts_with("manifest_too_large"))
+        );
     }
 
     #[test]

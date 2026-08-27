@@ -302,7 +302,10 @@ mod tests {
         let out = traverse(&conn, &tid("r1"), Direction::Dependencies, &budget).unwrap();
         // r1 → r2 only (depth 1)
         assert!(out.repositories.contains(&tid("r2")));
-        assert!(!out.repositories.contains(&tid("r3")), "r3 should not be reached at depth 1");
+        assert!(
+            !out.repositories.contains(&tid("r3")),
+            "r3 should not be reached at depth 1"
+        );
     }
 
     #[test]
@@ -488,6 +491,9 @@ mod tests {
             cancel: CancelToken::never(),
         };
         let out = traverse(&conn, &tid("r0"), Direction::Dependencies, &budget).unwrap();
-        assert!(out.repositories.is_empty(), "INVALID edges must be excluded");
+        assert!(
+            out.repositories.is_empty(),
+            "INVALID edges must be excluded"
+        );
     }
 }

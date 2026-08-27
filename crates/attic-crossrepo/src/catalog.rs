@@ -199,14 +199,15 @@ pub fn scan_proto_imports(
 /// Find the primary anchor occurrence id for a repository.
 ///
 /// Tries the repo-root manifest files in priority order.
-pub fn primary_anchor_for_repo(
-    conn: &Connection,
-    repository_id: &str,
-) -> Option<String> {
-    let repo_id = repository_id
-        .parse::<attic_core::RepositoryId>()
-        .ok()?;
-    for name in &["go.mod", "package.json", "pom.xml", "pyproject.toml", "build.gradle"] {
+pub fn primary_anchor_for_repo(conn: &Connection, repository_id: &str) -> Option<String> {
+    let repo_id = repository_id.parse::<attic_core::RepositoryId>().ok()?;
+    for name in &[
+        "go.mod",
+        "package.json",
+        "pom.xml",
+        "pyproject.toml",
+        "build.gradle",
+    ] {
         if let Ok(Some(id)) =
             attic_storage::lookup_latest_file_occurrence_for_path(conn, &repo_id, name)
         {
@@ -317,9 +318,7 @@ pub fn persist_catalog(
 /// Build [`RepoCatalogData`] for every registered repository from DB state.
 ///
 /// Used by the resolver to build the provider index — pure read, no disk I/O.
-pub fn build_resolver_input(
-    conn: &Connection,
-) -> Result<Vec<RepoCatalogData>, CrossRepoError> {
+pub fn build_resolver_input(conn: &Connection) -> Result<Vec<RepoCatalogData>, CrossRepoError> {
     let repos = attic_storage::crossrepo_ops::all_repository_ids(conn)?;
     let mut out = Vec::with_capacity(repos.len());
     for repo_id in &repos {
@@ -336,8 +335,7 @@ pub fn build_resolver_input(
             .into_iter()
             .map(|d| DependencyDeclaration {
                 path: d.path,
-                ecosystem: Ecosystem::from_db_str(&d.ecosystem)
-                    .unwrap_or(Ecosystem::Maven),
+                ecosystem: Ecosystem::from_db_str(&d.ecosystem).unwrap_or(Ecosystem::Maven),
                 name: d.name,
                 version_req: d.version_req,
                 kind: DeclarationKind::from_db_str(&d.declaration_kind)
@@ -350,8 +348,8 @@ pub fn build_resolver_input(
         let repo_id_parsed = repo_id
             .parse::<attic_core::RepositoryId>()
             .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
-        let root_path = attic_storage::get_repository_path(conn, &repo_id_parsed)?
-            .unwrap_or_default();
+        let root_path =
+            attic_storage::get_repository_path(conn, &repo_id_parsed)?.unwrap_or_default();
 
         // Source revision.
         let source_revision_id = catalog
@@ -471,7 +469,10 @@ mod tests {
         };
 
         let data = build_repo_catalog_data("repo-1", "/ws/svc", "rev-1", &scan);
-        assert_eq!(data.go_module_prefix.as_deref(), Some("example.com/team/svc"));
+        assert_eq!(
+            data.go_module_prefix.as_deref(),
+            Some("example.com/team/svc")
+        );
         assert_eq!(data.provides.len(), 1);
         assert_eq!(data.repository_id, "repo-1");
     }

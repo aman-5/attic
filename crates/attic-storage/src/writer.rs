@@ -61,7 +61,7 @@
 //! - [`FLUSH_INTERVAL`]: flush at least every 50 ms
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};

@@ -12,7 +12,6 @@
 //! - S7: production resource manager (Phase 7 hardening)
 
 pub mod connection;
-pub mod resource_manager;
 pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
@@ -21,6 +20,7 @@ pub mod invalidation_ops;
 pub mod migration;
 pub mod ops_tasks;
 pub mod repository;
+pub mod resource_manager;
 pub mod retrieval_reads;
 pub mod semantic_reads;
 pub mod server_state;
@@ -30,9 +30,10 @@ pub use connection::{DbPool, open_db};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
     all_catalog_entries, all_repository_ids, catalog_entry, create_workspace_snapshot,
-    cross_edges_all, cross_edges_between, cross_edges_for_entities, cross_edges_touching, delete_all_xrepo_edges_touching,
-    delete_xrepo_edges_between, declarations_for_repository, delete_declarations_for_repository,
-    insert_declaration, insert_xrepo_edge, latest_workspace_snapshot, providers_of_identity,
+    cross_edges_all, cross_edges_between, cross_edges_for_entities, cross_edges_touching,
+    declarations_for_repository, delete_all_xrepo_edges_touching,
+    delete_declarations_for_repository, delete_xrepo_edges_between, insert_declaration,
+    insert_xrepo_edge, latest_workspace_snapshot, providers_of_identity,
     remove_repository_crossrepo_data, snapshot_revisions, upsert_catalog_row,
 };
 pub use error::StorageError;
@@ -56,9 +57,9 @@ pub use ops_tasks::{
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
     enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
 };
+pub use resource_manager::{ResourceAdvisory, ResourceConfig, ResourceMonitor};
 pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
 pub use writer::{WriterQueue, WriterQueueHandle};
-pub use resource_manager::{ResourceMonitor, ResourceAdvisory, ResourceConfig};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{

@@ -533,9 +533,7 @@ impl IncrementalService {
                     Ok(())
                 })
                 .map_err(|e| {
-                    IncrementalError::Storage(attic_storage::StorageError::Worker(
-                        e.to_string(),
-                    ))
+                    IncrementalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
                 })?;
         }
         self.metrics
@@ -832,7 +830,14 @@ pub(crate) fn invalidate_and_schedule(
         renames: cs.renames.clone(),
         from_reconciliation: origin.from_reconciliation(),
     };
-    scheduler::schedule_incremental(writer, repo_id, &payload, origin.priority(), max_pending, monitor)
+    scheduler::schedule_incremental(
+        writer,
+        repo_id,
+        &payload,
+        origin.priority(),
+        max_pending,
+        monitor,
+    )
 }
 
 /// Verified restoration: disk hash matched the stored hash, so trust is

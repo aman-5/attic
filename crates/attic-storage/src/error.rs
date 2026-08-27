@@ -70,13 +70,15 @@ pub enum StorageError {
 
     /// The database failed an integrity check — the file may be corrupt.
     #[error("database integrity check failed: {reason}")]
-    CorruptDatabase { /// reason description of corruption
+    CorruptDatabase {
+        /// reason description of corruption
         reason: String,
     },
 
     /// A foreign-key constraint was violated in the database.
     #[error("foreign-key violation: {reason}")]
-    ForeignKeyViolation { /// reason description of the violation
+    ForeignKeyViolation {
+        /// reason description of the violation
         reason: String,
     },
 }

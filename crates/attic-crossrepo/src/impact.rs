@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
-use crate::traversal::TraversalBudget;
 use crate::limits;
+use crate::traversal::TraversalBudget;
 
 /// Impact classification for one affected repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,11 +394,29 @@ mod tests {
 
         // r2 depends on r1, r1 depends on r0
         attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r2"), "s2", &tid("r1"), "t1", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r2"),
+            "s2",
+            &tid("r1"),
+            "t1",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
         attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r1"), "s1", &tid("r0"), "t0", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r1"),
+            "s1",
+            &tid("r0"),
+            "t0",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
 
@@ -417,14 +435,28 @@ mod tests {
             .iter()
             .map(|r| r.repository_id.as_str())
             .collect();
-        assert!(ids.contains(&tid("r1").as_str()), "r1 should be impacted (direct)");
-        assert!(ids.contains(&tid("r2").as_str()), "r2 should be impacted (indirect)");
+        assert!(
+            ids.contains(&tid("r1").as_str()),
+            "r1 should be impacted (direct)"
+        );
+        assert!(
+            ids.contains(&tid("r2").as_str()),
+            "r2 should be impacted (indirect)"
+        );
 
         // r1 should be DIRECT, r2 should be INDIRECT
-        let r1_impact = report.impacted.iter().find(|r| r.repository_id == tid("r1")).unwrap();
+        let r1_impact = report
+            .impacted
+            .iter()
+            .find(|r| r.repository_id == tid("r1"))
+            .unwrap();
         assert_eq!(r1_impact.level, ImpactLevel::DirectResolved);
 
-        let r2_impact = report.impacted.iter().find(|r| r.repository_id == tid("r2")).unwrap();
+        let r2_impact = report
+            .impacted
+            .iter()
+            .find(|r| r.repository_id == tid("r2"))
+            .unwrap();
         assert_eq!(r2_impact.level, ImpactLevel::IndirectResolved);
     }
 
@@ -437,7 +469,16 @@ mod tests {
         let _ = insert_rev(&conn, "r1");
 
         let edge_id = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r1"), "s1", &tid("r0"), "t0", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r1"),
+            "s1",
+            &tid("r0"),
+            "t0",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
         conn.execute(
@@ -450,7 +491,11 @@ mod tests {
         let report = analyze_dependents(&conn, &tid("r0"), &budget).unwrap();
 
         // r1 should still appear but with Unknown level due to STALE
-        if let Some(r1) = report.impacted.iter().find(|r| r.repository_id == tid("r1")) {
+        if let Some(r1) = report
+            .impacted
+            .iter()
+            .find(|r| r.repository_id == tid("r1"))
+        {
             assert_eq!(r1.level, ImpactLevel::Unknown);
         }
     }
