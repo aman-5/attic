@@ -33,3 +33,92 @@ pub mod subsystem_keys {
     /// General configuration version.
     pub const CONFIGURATION: &str = "configuration";
 }
+
+/// Resource management constants for Phase 7 production hardening.
+///
+/// These are compile-time defaults that the server may override from
+/// configuration at startup.  They must not be changed between restarts
+/// without a migration.
+pub mod resources {
+    /// Maximum concurrent foreground MCP queries.  Prevents query flooding.
+    pub const MAX_FOREGROUND_QUERIES: usize = 64;
+
+    /// Maximum concurrent indexing workers.  Prevents indexing from starving
+    /// foreground queries (see foreground_priority.md §2).
+    pub const MAX_INDEXING_WORKERS: usize = 8;
+
+    /// Maximum concurrent semantic enrichment workers.  Only active when
+    /// ATTIC_SEMANTIC=1; baseline hashing embedder is single-threaded.
+    pub const MAX_SEMANTIC_WORKERS: usize = 4;
+
+    /// Total memory budget for all in-index operations (MiB).  When approached,
+    /// the system degrades by pausing semantic enrichment, reducing indexing
+    /// concurrency, and rejecting expensive tasks.
+    pub const TOTAL_MEMORY_BUDGET_MIB: u64 = 1024;
+
+    /// Per-repository memory budget ceiling (MiB).  No single repository may
+    /// consume more than this during indexing.
+    pub const PER_REPO_MEMORY_BUDGET_MIB: u64 = 128;
+
+    /// Maximum disk I/O operations per second across all workers.  When
+    /// exceeded, the system backs off expensive fs operations.
+    pub const MAX_IO_OPS_PER_SEC: u64 = 200;
+
+    /// Maximum queue depth for the writer queue (pending mutations).  Beyond
+    /// this, `WriterQueueHandle::send` returns `QueueFull`.
+    pub const WRITER_QUEUE_CAPACITY: usize = 512;
+
+    /// Maximum batch size for writer commits (mutations per transaction).
+    pub const WRITER_BATCH_SIZE: usize = 256;
+
+    /// Flush the writer batch at least this often (ms).
+    pub const WRITER_FLUSH_INTERVAL_MS: u64 = 50;
+
+    /// Maximum number of pending incremental tasks in the task queue.
+    pub INCREMENTAL_TASK_QUEUE_CAPACITY: usize = 1024;
+
+    /// Maximum number of pending reconciliation tasks.
+    pub RECONCILIATION_TASK_QUEUE_CAPACITY: usize = 256;
+
+    /// Maximum depth of graph traversal for evidence expansion.
+    pub MAX_GRAPH_DEPTH: usize = 5;
+
+    /// Maximum nodes traversed in a single graph walk.
+    pub MAX_GRAPH_NODES: usize = 500;
+
+    /// Maximum tokens consumed by context building for a single query.
+    pub MAX_CONTEXT_TOKENS: usize = 8192;
+
+    /// Default timeout for background tasks (ms).  Tasks exceeding this are
+    /// cancelled and rescheduled.
+    pub const DEFAULT_TASK_TIMEOUT_MS: u64 = 300_000;
+
+    /// Minimum free memory (MiB) that must be retained after foreground work.
+    /// Background indexing pauses if falling below this threshold.
+    pub MIN_FREE_MEMORY_MIB: u64 = 256;
+
+    /// Backup directory relative to database path (for crash recovery backups).
+    pub BACKUP_RELATIVE_DIR: &str = "backups";
+
+    /// Maximum number of backup checkpoints to retain (REC-B2).
+    pub MAX_BACKUP_RETAIN: usize = 3;
+
+    /// Checkpoint interval: every N WAL frames OR every M minutes, whichever comes first.
+    pub CHECKPOINT_WAL_FRAMES: u64 = 1000;
+
+    /// Checkpoint interval: every N minutes (alternative to WAL frames threshold).
+    pub CHECKPOINT_MINUTES: u64 = 5;
+
+    /// Whether WAL auto-checkpoint is enabled.
+    pub WAL_AUTOCKPT_ENABLED: bool = true;
+
+    /// Graceful shutdown timeout (ms).  Server waits this long for in-flight
+    /// tasks to complete before force-exiting.
+    pub GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+
+    /// Whether integrity check is performed at startup.
+    pub STARTUP_INTEGRITY_CHECK: bool = true;
+
+    /// Whether foreign key check is performed at startup.
+    pub STARTUP_FOREIGN_KEY_CHECK: bool = true;
+}

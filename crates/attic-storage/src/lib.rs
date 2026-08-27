@@ -9,8 +9,10 @@
 //! - S4: publication batch
 //! - S5: FTS helpers (external-content tables)
 //! - S6: bounded writer queue
+//! - S7: production resource manager (Phase 7 hardening)
 
 pub mod connection;
+pub mod resource_manager;
 pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
@@ -56,6 +58,7 @@ pub use ops_tasks::{
 };
 pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
 pub use writer::{WriterQueue, WriterQueueHandle};
+pub use resource_manager::{ResourceMonitor, ResourceAdvisory, ResourceConfig};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{

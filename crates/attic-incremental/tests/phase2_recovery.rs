@@ -25,14 +25,14 @@ fn restart_with_interrupted_task_reschedules_it() {
     let fx = Fixture::new(&[("src/wip.rs", "fn wip_token() {}\n")]);
 
     // Simulate a crash between claim and completion: RUNNING row left behind.
-    let payload = attic_storage::IncrementalTaskPayload {
-        dedup_key: "interrupted".into(),
-        upserts: vec!["src/wip.rs".into()],
+let payload = attic_storage::IncrementalTaskPayload {
+        dedup_key: "startup-recovery-task".into(),
+        upserts: vec!["src/startup.rs".into()],
         deletes: vec![],
         renames: vec![],
         from_reconciliation: false,
     };
-    attic_incremental::scheduler::schedule_incremental(&fx.writer, &fx.repo_id, &payload, 80, 4096)
+    attic_incremental::scheduler::schedule_incremental(&fx.writer, &fx.repo_id, &payload, 80, 4096, None)
         .unwrap();
     let claimed: Option<attic_storage::ClaimedTask> =
         attic_incremental::run_on_writer(&fx.writer, |conn| {

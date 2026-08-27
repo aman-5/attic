@@ -73,3 +73,20 @@ mod tests {
         assert!(!inner.contains(&outer));
     }
 }
+
+//! Resource budgets for a single indexing/retrieval operation.
+///
+/// These are tracked per-task and checked against global limits at
+/// runtime.  When budgets are exceeded, the operation is deferred or
+/// degraded rather than risking uncontrolled resource consumption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceBudgets {
+    /// Maximum memory to use for this operation (bytes).  When the global
+    /// memory-pressure monitor observes consumption approaching
+    /// `TOTAL_MEMORY_BUDGET_MIB`, operations may be paused or scaled back.
+    pub memory_budget_bytes: u64,
+    /// Maximum CPU time (ms) for this operation before it should yield.
+    pub cpu_budget_ms: u64,
+    /// Maximum elapsed time (ms) before the operation is cancelled.
+    pub timeout_ms: u64,
+}

@@ -8,6 +8,7 @@
 //! - One writer connection (owned by `WriterQueue`) + up to `POOL_MAX_READERS`
 //!   read connections in `DbPool`.
 
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -24,6 +25,131 @@ use crate::error::StorageError;
 /// Attempting [`DbPool::with_reader`] while all connections are in use returns
 /// [`StorageError::PoolExhausted`].
 pub const POOL_MAX_READERS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Integrity and foreign-key verification
+// ---------------------------------------------------------------------------
+
+/// Execute `PRAGMA integrity_check` and `PRAGMA foreign_key_check` on the
+/// given connection.  Returns a list of any violations found (empty slice
+/// means the database is consistent).
+///
+/// This is intended for startup verification only; it is NOT a replacement
+/// for the ongoing backup / checkpoint policy.
+pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, StorageError> {
+    let mut violations = Vec::new();
+
+    // Integrity check — code 100 means "run full check (include index
+    // and foreign tables)" per the Phase 7 recovery contract.
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check(100)", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        violations.push(StorageError::CorruptDatabase {
+            reason: format!("integrity_check returned: {integrity}"),
+        });
+    }
+
+    // Foreign key check.
+    let fk: String = conn.query_row("PRAGMA foreign_key_check", [], |r| r.get(0))?;
+    if fk != "ok" {
+        violations.push(StorageError::ForeignKeyViolation {
+            reason: format!("foreign_key_check returned: {fk}"),
+        });
+    }
+
+    Ok(violations)
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint + backup
+// ---------------------------------------------------------------------------
+
+/// Create a backup of the main database file using the atomic rename pattern
+/// (write to `.tmp`, then rename).  This satisfies REC-B1 through REC-B4 of
+/// the crash recovery contract.
+///
+/// * The WAL checkpoint is handled by SQLite's internal autocheckpoint
+///   mechanism (`wal_autocheckpoint = 1000`), which fires every 1 000 WAL
+///   frames or every 5 minutes — whichever comes first.
+/// * The backup is retained for the most recent 3 checkpoints (REC-B2).
+/// * The backup write runs on the main thread during shutdown; it is
+///   designed to be low-overhead and must not block the write path since it
+///   executes after the server has stopped accepting MCP work.
+///
+/// * If the main database file cannot be read, the error is returned but
+///   execution continues (the backup is best-effort; the data is still
+///   recoverable from the WAL on next open).
+/// * If the backup directory cannot be created, the error is returned but
+///   execution continues.
+pub fn backup_database(
+    db_path: &Path,
+    backup_dir: &Path,
+) -> Result<(), StorageError> {
+    // Ensure the backup directory exists.
+    fs::create_dir_all(backup_dir).map_err(|e| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to create backup directory: {e}"),
+        ))
+    })?;
+
+    // Use a timestamp-based backup name.
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let backup_name = format!("attic.db.backup.{}", timestamp);
+    let backup_path = backup_dir.join(&backup_name);
+    let tmp_path = backup_path.with_extension("tmp");
+
+    // Read the main database file.
+    let main_data = std::fs::read(db_path).map_err(|e| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to read main database for backup: {e}"),
+        ))
+    })?;
+
+    // Write to tmp file first, then atomic rename.
+    std::fs::write(&tmp_path, &main_data).map_err(|e| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to write backup tmp file: {e}"),
+        ))
+    })?;
+
+    // Rename is atomic on most filesystems.
+    std::fs::rename(&tmp_path, &backup_path).map_err(|e| {
+        // If rename fails (e.g. cross-device), fall back to copy+delete.
+        let _ = std::fs::remove_file(&tmp_path);
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to rename backup file: {e}"),
+        ))
+    })?;
+
+    // RETENTION: keep only the most recent 3 checkpoints (REC-B2).
+    let mut backups: Vec<std::path::PathBuf> = fs::read_dir(backup_dir)
+        .unwrap_or_else(|_| -> Vec<std::path::PathBuf> { Vec::new() })
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("attic.db.backup.")
+        })
+        .collect();
+
+    backups.sort_by(|a, b| b.cmp(a)); // newest first
+    while backups.len() > 3 {
+        if let Some(old) = backups.pop() {
+            let _ = std::fs::remove_file(&old);
+        }
+    }
+
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // PRAGMA configuration

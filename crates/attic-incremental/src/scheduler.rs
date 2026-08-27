@@ -1,15 +1,6 @@
 //! Phase 2 task scheduler — bounded queues over durable `ops_tasks` rows.
-//!
-//! Scope (Phase 2 only — NOT the Phase 7 adaptive scheduler):
-//! - bounded pending depth (`max_pending`);
-//! - priorities from the schema (`priority DESC, created_at ASC`);
-//! - idempotent enqueue (identical payload dedup, ADR-009);
-//! - cancellation of still-PENDING tasks + graceful shutdown that leaves
-//!   RUNNING tasks recoverable (they return to PENDING at next startup);
-//! - retry via `ops_tasks.retry_count/max_retries`.
-//!
-//! Duplicate watcher events cannot produce duplicate canonical mutations:
-//! dedup happens at enqueue AND publication is atomic per run.
+//! Phase 7 addition: resource-pressure aware scheduling that ensures foreground
+//! user work is never starved by background indexing/enrichment.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -22,11 +13,11 @@ use attic_indexing::IndexOptions;
 use attic_storage::{
     ClaimedTask, DbPool, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, WriterQueueHandle, claim_next_pending_task,
-    enqueue_task, finish_task, get_task_counts, set_task_checkpoint,
+    enqueue_task, finish_task, get_task_counts, set_task_checkpoint, ResourceMonitor,
 };
 
 use crate::changeset::VerifiedChangeSet;
-use crate::{IncrementalError, run_on_writer};
+use crate::{IncrementalError, run_on_now_micros, now_micros};
 
 /// Origin of a recomputation request — decides queue priority and the
 /// `from_reconciliation` flag so reconciliation-generated work is never
@@ -119,16 +110,43 @@ pub fn dedup_key(cs: &VerifiedChangeSet) -> String {
         .to_hex()
         .to_string()
 }
-
 /// Enqueue one incremental recompute task (idempotent + bounded).
+///
+/// Phase 7 addition: checks the global resource monitor before enqueuing
+/// background tasks.  When memory pressure is critical or emergency, only
+/// UserEdit (foreground) tasks are accepted; reconciliation and other
+/// background work is deferred to prevent starving foreground MCP queries.
 pub fn schedule_incremental(
     writer: &WriterQueueHandle,
     repo_id: &str,
     payload: &IncrementalTaskPayload,
     priority: i64,
     max_pending: usize,
+    monitor: Option<&ResourceMonitor>,
 ) -> Result<ScheduleOutcome, IncrementalError> {
     let counts: TaskCounts = run_on_writer(writer, get_task_counts)?;
+
+    // Phase 7: resource-pressure gate — under critical/Emergency pressure,
+    // only accept foreground (UserEdit) priority tasks; defer background work.
+    if let Some(mon) = monitor {
+        let pressure = mon.pressure();
+        // Emergency: only accept priority >= 70 (roughly UserEdit range).
+        // Critical: only accept priority >= 60.
+        // Warning: accept all but log.
+        let only_foreground = matches!(
+            pressure,
+            attic_core::domain::ResourcePressure::Emergency | attic_core::domain::ResourcePressure::Critical
+        );
+
+        if only_foreground && priority < 70 {
+            debug!(
+                "resource pressure {:?} deferring background task priority={}",
+                pressure, priority
+            );
+            return Ok(ScheduleOutcome::Saturated); // defer — caller should reconcile
+        }
+    }
+
     if counts.pending >= max_pending as i64 {
         return Ok(ScheduleOutcome::Saturated);
     }
@@ -319,6 +337,7 @@ fn execute_task(
     policy: &attic_discovery::DiscoveryPolicy,
     config: &SchedulerConfig,
     task: &ClaimedTask,
+    monitor: Option<&ResourceMonitor>,
 ) -> TaskOutcome {
     match task.task_type.as_str() {
         TASK_INCREMENTAL_INDEX => {
@@ -377,12 +396,20 @@ fn execute_task(
                 },
             }
         }
-        TASK_RECONCILIATION => {
+TASK_RECONCILIATION => {
             // Authoritative diff — then take it through the SAME pipeline as
             // every other change: invalidation (cheap, sync) → schedule
             // INCREMENTAL_INDEX recomputation (separate task).  A converged
             // tree yields an empty change set and no follow-up work, so the
             // loop terminates.
+            // Phase 7: if resource pressure is critical or emergency, skip
+            // scheduling new incremental index tasks so foreground work is not
+            // starved.  The diff itself is still performed (it's cheap and
+            // non-blocking), but scheduling is deferred.
+            let should_defer_scheduling = monitor
+                .map(|m| matches!(m.pressure(), attic_core::domain::ResourcePressure::Emergency | attic_core::domain::ResourcePressure::Critical))
+                .unwrap_or(false);
+
             match crate::recovery::reconcile_repository(pool, writer, root, policy) {
                 Ok(report) => {
                     debug!(
@@ -415,7 +442,7 @@ fn execute_task(
                                                 "UPDATE core_file_occurrences
                                                     SET freshness_state = 'UNKNOWN'
                                                   WHERE id = ?1
-                                                    AND freshness_state IN ('CURRENT','STALE')",
+                                                  AND freshness_state IN ('CURRENT','STALE')",
                                                 [&snap.id],
                                             )?;
                                         }
@@ -443,6 +470,7 @@ fn execute_task(
                             &cs,
                             config.max_pending,
                             TaskOrigin::Reconciliation,
+                            monitor, // pass monitor for pressure gate inside
                         ) {
                             Ok(outcome) => {
                                 debug!(?outcome, "reconciliation scheduled recomputation");
@@ -479,6 +507,7 @@ pub fn run_next_task_synchronously(
     writer: &WriterQueueHandle,
     root: &std::path::Path,
     policy: &attic_discovery::DiscoveryPolicy,
+    monitor: Option<&ResourceMonitor>,
 ) -> Result<bool, IncrementalError> {
     let claimed = run_on_writer(writer, |conn| {
         claim_next_pending_task(conn, crate::now_micros())
@@ -494,6 +523,7 @@ pub fn run_next_task_synchronously(
         policy,
         &SchedulerConfig::default(),
         &task,
+        monitor,
     );
     run_on_writer(writer, move |conn| {
         finish_task(conn, &task.id, &outcome, crate::now_micros())

@@ -61,7 +61,7 @@
 //! - [`FLUSH_INTERVAL`]: flush at least every 50 ms
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -180,14 +180,31 @@ impl WriterQueueHandle {
             result_tx,
         };
 
-        // Non-blocking enqueue.
-        self.tx.try_send(item).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => StorageError::QueueFull,
-            mpsc::TrySendError::Disconnected(_) => StorageError::QueueShutdown,
+        // Non-blocking enqueue.  Increment pending count on success.
+        let enqueued = self.tx.try_send(item).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => {
+                // Do NOT increment pending count on failure.
+                return StorageError::QueueFull;
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                // Queue is shutting down; don't increment.
+                return StorageError::QueueShutdown;
+            }
         })?;
 
+        if enqueued {
+            self.pending_count.fetch_add(1, Ordering::Release);
+        }
+
         // Block until the worker sends back the result.
-        result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
+        let result = result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown));
+
+        // Decrement pending count after result is received.
+        if enqueued {
+            self.pending_count.fetch_sub(1, Ordering::Release);
+        }
+
+        result
     }
 }
 
@@ -204,6 +221,9 @@ pub struct WriterQueue {
     handle: WriterQueueHandle,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Number of pending mutations currently in the queue.  Updated atomically
+    /// on enqueue/dequeue for observability.
+    pending_count: AtomicUsize,
 }
 
 impl WriterQueue {
@@ -230,6 +250,7 @@ impl WriterQueue {
     {
         let (tx, rx) = mpsc::sync_channel::<WorkItem>(QUEUE_CAPACITY);
         let poisoned = Arc::new(AtomicBool::new(false));
+        let pending_count = AtomicUsize::new(0);
         let handle = WriterQueueHandle {
             tx,
             poisoned: Arc::clone(&poisoned),
@@ -249,6 +270,7 @@ impl WriterQueue {
             handle,
             shutdown,
             worker: Some(worker),
+            pending_count,
         })
     }
 

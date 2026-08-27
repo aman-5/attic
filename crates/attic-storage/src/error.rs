@@ -63,6 +63,14 @@ pub enum StorageError {
         "writer connection poisoned (unrecoverable transaction finalization failure; restart required)"
     )]
     WriterPoisoned,
+
+    /// The database failed an integrity check — the file may be corrupt.
+    #[error("database integrity check failed: {reason}")]
+    CorruptDatabase { reason: String },
+
+    /// A foreign-key constraint was violated in the database.
+    #[error("foreign-key violation: {reason}")]
+    ForeignKeyViolation { reason: String },
 }
 
 impl From<serde_json::Error> for StorageError {
