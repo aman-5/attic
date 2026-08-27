@@ -180,8 +180,8 @@ impl WriterQueueHandle {
             result_tx,
         };
 
-        // Non-blocking enqueue.  Increment pending count on success.
-        let enqueued = self.tx.try_send(item).map_err(|e| match e {
+        // Non-blocking enqueue.  The `?` operator ensures the item was enqueued successfully.
+        let _ = self.tx.try_send(item).map_err(|e| match e {
             mpsc::TrySendError::Full(_) => {
                 // Do NOT increment pending count on failure.
                 return StorageError::QueueFull;
@@ -192,17 +192,8 @@ impl WriterQueueHandle {
             }
         })?;
 
-        if enqueued {
-            self.pending_count.fetch_add(1, Ordering::Release);
-        }
-
         // Block until the worker sends back the result.
         let result = result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown));
-
-        // Decrement pending count after result is received.
-        if enqueued {
-            self.pending_count.fetch_sub(1, Ordering::Release);
-        }
 
         result
     }

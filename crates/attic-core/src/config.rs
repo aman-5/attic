@@ -1,29 +1,29 @@
-//! Production configuration model for Attic MCP server.
-//!
-//! Reads defaults from `crates/attic-core/src/constants.rs::resources` and
-//! allows override via environment variables.  All values are compile-time
-//! constants by default; only the override mechanism is runtime.
-//!
-//! Environment variables (all prefix attic_):
-//!   ATTIC_MAX_FOREGROUND_QUERIES
-//!   ATTIC_MAX_INDEXING_WORKERS
-//!   ATTIC_TOTAL_MEMORY_BUDGET_MIB
-//!   ATTIC_PER_REPO_MEMORY_BUDGET_MIB
-//!   ATTIC_MAX_IO_OPS_PER_SEC
-//!   ATTIC_WRITER_QUEUE_CAPACITY
-//!   ATTIC_WRITER_BATCH_SIZE
-//!   ATTIC_WRITER_FLUSH_INTERVAL_MS
-//!   ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY
-//!   ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY
-//!   ATTIC_MIN_FREE_MEMORY_MIB
-//!   ATTIC_BACKUP_RELATIVE_DIR
-//!   ATTIC_MAX_BACKUP_RETAIN
-//!   ATTIC_CHECKPOINT_WAL_FRAMES
-//!   ATTIC_CHECKPOINT_MINUTES
-//!   ATTIC_WAL_AUTOCKPT_ENABLED
-//!   ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS
-//!   ATTIC_STARTUP_INTEGRITY_CHECK
-//!   ATTIC_STARTUP_FOREIGN_KEY_CHECK
+#! Production configuration model for Attic MCP server.
+//
+// Reads defaults from `crates/attic-core/src/constants.rs::resources` and
+// allows override via environment variables.  All values are compile-time
+// constants by default; only the override mechanism is runtime.
+//
+// Environment variables (all prefix attic_):
+//   ATTIC_MAX_FOREGROUND_QUERIES
+//   ATTIC_MAX_INDEXING_WORKERS
+//   ATTIC_TOTAL_MEMORY_BUDGET_MIB
+//   ATTIC_PER_REPO_MEMORY_BUDGET_MIB
+//   ATTIC_MAX_IO_OPS_PER_SEC
+//   ATTIC_WRITER_QUEUE_CAPACITY
+//   ATTIC_WRITER_BATCH_SIZE
+//   ATTIC_WRITER_FLUSH_INTERVAL_MS
+//   ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY
+//   ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY
+//   ATTIC_MIN_FREE_MEMORY_MIB
+//   ATTIC_BACKUP_RELATIVE_DIR
+//   ATTIC_MAX_BACKUP_RETAIN
+//   ATTIC_CHECKPOINT_WAL_FRAMES
+//   ATTIC_CHECKPOINT_MINUTES
+//   ATTIC_WAL_AUTOCKPT_ENABLED
+//   ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS
+//   ATTIC_STARTUP_INTEGRITY_CHECK
+//   ATTIC_STARTUP_FOREIGN_KEY_CHECK
 
 use crate::constants::resources;
 
@@ -152,10 +152,10 @@ impl ProductionConfig {
         cfg.max_backup_retain = env_or!(ATTIC_MAX_BACKUP_RETAIN, cfg.max_backup_retain);
         cfg.checkpoint_wal_frames = env_or!(ATTIC_CHECKPOINT_WAL_FRAMES, cfg.checkpoint_wal_frames);
         cfg.checkpoint_minutes = env_or!(ATTIC_CHECKPOINT_MINUTES, cfg.checkpoint_minutes);
-        cfg.wal_autocpt_enabled = env_or!(ATTIC_WAL_AUTOCKPT_ENABLED, cfg.wal_autocpt_enabled).unwrap_or(cfg.wal_autocpt_enabled);
+        cfg.wal_autocpt_enabled = env_or!(ATTIC_WAL_AUTOCKPT_ENABLED, cfg.wal_autocpt_enabled);
         cfg.graceful_shutdown_timeout_ms = env_or!(ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS, cfg.graceful_shutdown_timeout_ms);
-        cfg.startup_integrity_check = env_or!(ATTIC_STARTUP_INTEGRITY_CHECK, cfg.startup_integrity_check).unwrap_or(cfg.startup_integrity_check);
-        cfg.startup_foreign_key_check = env_or!(ATTIC_STARTUP_FOREIGN_KEY_CHECK, cfg.startup_foreign_key_check).unwrap_or(cfg.startup_foreign_key_check);
+        cfg.startup_integrity_check = env_or!(ATTIC_STARTUP_INTEGRITY_CHECK, cfg.startup_integrity_check);
+        cfg.startup_foreign_key_check = env_or!(ATTIC_STARTUP_FOREIGN_KEY_CHECK, cfg.startup_foreign_key_check);
 
         cfg
     }
@@ -226,9 +226,3 @@ impl ProductionConfig {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Export production config from attic-core lib for use by attic-server.
-// ---------------------------------------------------------------------------
-
-pub use ProductionConfig;

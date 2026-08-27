@@ -28,7 +28,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use attic_discovery::DiscoveryPolicy;
-use attic_storage::{DbPool, IncrementalTaskPayload, WriterQueueHandle};
+use attic_storage::{DbPool, IncrementalTaskPayload, ResourceMonitor, WriterQueueHandle};
 
 use crate::changeset::{self, DbSnapshotSource, VerifiedChangeSet};
 use crate::coalesce::{CoalescedChange, EventCoalescer};

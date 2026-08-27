@@ -6,6 +6,10 @@
 
 pub mod constants;
 pub mod domain;
+/// Configuration model for the Attic MCP server, reading defaults from
+/// `crates/attic-core/src/constants.rs::resources` and allowing override via
+/// environment variables.
+pub mod config;
 pub mod error;
 
 pub use constants::{

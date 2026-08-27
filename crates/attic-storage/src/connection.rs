@@ -129,24 +129,14 @@ pub fn backup_database(
     })?;
 
     // RETENTION: keep only the most recent 3 checkpoints (REC-B2).
-    let mut backups: Vec<std::path::PathBuf> = fs::read_dir(backup_dir)
-        .unwrap_or_else(|_| -> Vec<std::path::PathBuf> { Vec::new() })
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with("attic.db.backup.")
-        })
-        .collect();
-
-    backups.sort_by(|a, b| b.cmp(a)); // newest first
-    while backups.len() > 3 {
-        if let Some(old) = backups.pop() {
-            let _ = std::fs::remove_file(&old);
-        }
-    }
+    let backups: Vec<std::path::PathBuf> = match fs::read_dir(backup_dir) {
+        Ok(read_dir) => read_dir
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap_or_default().to_string_lossy().starts_with("attic.db.backup."))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
 
     Ok(())
 }

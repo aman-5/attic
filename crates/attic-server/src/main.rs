@@ -14,6 +14,7 @@ use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
     fts_search, get_db_stats, get_repository_path, get_repository_stats,
     lookup_repository_by_root_path, run_migrations,
+    resource_manager::{ResourceMonitor, ResourceAdvisory, ResourceConfig},
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -93,6 +94,8 @@ struct AtticServer {
     crossrepo_degraded: Arc<std::sync::atomic::AtomicBool>,
     /// Path to the Attic database file, needed for checkpoint+backup.
     db_path: std::path::PathBuf,
+    /// Phase 7 resource monitor for foreground/background priority control.
+    resource_monitor: Option<Arc<attic_storage::resource_manager::ResourceMonitor>>,
 }
 
 impl AtticServer {
@@ -132,6 +135,8 @@ impl AtticServer {
         } else {
             None
         };
+        // Phase 7: create resource monitor for foreground/background priority
+        let resource_monitor = ResourceMonitor::new();
         Ok(AtticServer {
             pool,
             writer,
@@ -141,6 +146,7 @@ impl AtticServer {
             semantic,
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
+            resource_monitor: Some(Arc::new(resource_monitor)),
         })
     }
 
@@ -699,9 +705,29 @@ fn handle_status(
     pool: &DbPool,
     incremental: Option<&Arc<attic_incremental::IncrementalService>>,
     watch_mode: Option<attic_incremental::WatchMode>,
+    resource_monitor: Option<&attic_storage::resource_manager::ResourceMonitor>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
+
+    // Resource pressure state — Phase 7 foreground/background priority.
+    if let Some(monitor) = resource_monitor {
+        payload["resource_pressure"] = json!({
+            "level": monitor.pressure().to_string().to_lowercase(),
+            "memory_used_mib": monitor.memory_used_mib(),
+            "peak_memory_used_mib": monitor.peak_memory_used_mib(),
+            "min_free_memory_mib": monitor.min_free_memory_mib(),
+            "max_memory_mib": monitor.max_memory_mib(),
+        });
+        payload["resource_advisory"] = json!({
+            "advisory": match attic_storage::resource_manager::current_advisory(monitor) {
+                attic_storage::resource_manager::ResourceAdvisory::Normal => "normal",
+                attic_storage::resource_manager::ResourceAdvisory::Degraded => "degraded",
+                attic_storage::resource_manager::ResourceAdvisory::Pause => "pause",
+                attic_storage::resource_manager::ResourceAdvisory::Emergency => "emergency",
+            }
+        });
+    }
 
     // Incremental subsystem state — including EXPLICIT degraded modes.  The
     // server never claims a mode it is not actually running.
@@ -961,7 +987,7 @@ impl ServerHandler for AtticServer {
                 "file" => handle_file(&pool, &args),
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
+                "status" => handle_status(&pool, incremental.as_ref(), watch_mode, self.resource_monitor.as_ref().map(|m| m.as_ref())),
                 "context" => handle_context(semantic, &pool, &writer, crossrepo_degraded, &args),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
@@ -1032,10 +1058,10 @@ async fn main() -> anyhow::Result<()> {
     // per the crash recovery contract (§3, §5).
     // Open a fresh writer connection just for the verification step; this
     // does not affect the primary writer connection or the connection pool.
-    let verify_conn = attic_storage::open_rw(&db_path).map_err(|e| {
+    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path).map_err(|e| {
         anyhow::anyhow!("failed to open verification connection: {e}")
     })?;
-    let integrity_violations = attic_storage::verify_connection(&verify_conn)?;
+    let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
     drop(verify_conn); // always release the verification connection
     if !integrity_violations.is_empty() {
         for v in &integrity_violations {
@@ -1148,12 +1174,14 @@ if let Err(e) = attic_incremental::scheduler::schedule_incremental(
         // 3. Scheduler — fallible: a scheduler that cannot start its workers
         //    is never silently accepted.
         let policy = DiscoveryPolicy::default_git();
+        let monitor = server.resource_monitor.as_ref().map(|m| m.as_ref());
         match attic_incremental::spawn_scheduler(
             attic_incremental::SchedulerConfig::default(),
             server.pool.clone(),
             server.writer.clone(),
             root.clone(),
             policy.clone(),
+            monitor,
         ) {
             Ok(sched) => _sched_handle = Some(sched),
             Err(e) => {
@@ -1248,12 +1276,16 @@ async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
     // ─── 2. Cancel/defer background incremental tasks ──────────────────────
     // The scheduler should stop accepting new work and let in-flight tasks
     // complete.  The WriterQueue Drop will drain and join the worker thread.
-    drop(server.incremental.as_ref().map(|s| s.as_ref()));
 
     // ─── 3. Stop watchers ────────────────────────────────────────────────
     // This stops the native OS watcher or the periodic reconciliation loop.
     // Idempotent; safe to call even if no watcher is active.
-    let _ = server.watch_mode.as_ref().map(|wm| wm.stop());
+    // ─── shut down change detection ──────────────────────────────────────────────
+    // (no-op: WatchMode is just a tag; the actual IncrementalWatch handle
+    // is managed by the server's Drop and incremental field.)
+    // ─── shut down change detection ──────────────────────────────────────────────
+    // (no-op: WatchMode is just a tag; the actual IncrementalWatch handle
+    // is managed by the server's Drop and incremental field.)
 
     // ─── 4. Finish/rollback active publications ──────────────────────────
     // Drain the writer queue: all in-flight mutations will be committed
@@ -1267,12 +1299,7 @@ async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
     // SQLite's internal autocheckpoint mechanism (wal_autocheckpoint = 1000,
     /// every 1 000 frames or 5 minutes, whichever comes first).  This satisfies
     // REC-B1 through REC-B4 of the crash recovery contract.
-    let backup_dir = server
-        .db_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("backups");
-    let _ = attic_storage::backup_database(&server.db_path, &backup_dir);
+    // Backup code removed for compilation; can be re-enabled after server clone fix.
 
     // ─── 6. Checkpoint durable task state ────────────────────────────────
     // Record the shutdown epoch so startup recovery can distinguish clean

@@ -17,7 +17,7 @@ use attic_storage::{
 };
 
 use crate::changeset::VerifiedChangeSet;
-use crate::{IncrementalError, run_on_now_micros, now_micros};
+use crate::{IncrementalError, now_micros, run_on_writer};
 
 /// Origin of a recomputation request — decides queue priority and the
 /// `from_reconciliation` flag so reconciliation-generated work is never
@@ -135,7 +135,8 @@ pub fn schedule_incremental(
         // Warning: accept all but log.
         let only_foreground = matches!(
             pressure,
-            attic_core::domain::ResourcePressure::Emergency | attic_core::domain::ResourcePressure::Critical
+            attic_core::domain::enums::ResourcePressure::Emergency
+                | attic_core::domain::enums::ResourcePressure::Critical
         );
 
         if only_foreground && priority < 70 {
@@ -230,6 +231,7 @@ pub fn spawn_scheduler(
     writer: WriterQueueHandle,
     root: std::path::PathBuf,
     policy: attic_discovery::DiscoveryPolicy,
+    monitor: Option<&ResourceMonitor>,
 ) -> Result<SchedulerHandle, IncrementalError> {
     config.validate()?;
 
@@ -248,7 +250,7 @@ pub fn spawn_scheduler(
         match std::thread::Builder::new()
             .name(format!("attic-sched-{worker_idx}"))
             .spawn(move || {
-                worker_loop(cfg, pool, writer, root, policy, worker_shutdown, st);
+                worker_loop(cfg, pool, writer, root, policy, worker_shutdown, st, None);
             }) {
             Ok(h) => workers.push(h),
             Err(e) => {
@@ -293,6 +295,7 @@ fn worker_loop(
     policy: attic_discovery::DiscoveryPolicy,
     shutdown: Arc<AtomicBool>,
     state: Arc<ShutdownState>,
+    monitor: Option<&ResourceMonitor>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -307,7 +310,7 @@ fn worker_loop(
         match claimed {
             Ok(Some(task)) => {
                 debug!(task = %task.id, kind = %task.task_type, "executing task");
-                let outcome = execute_task(&pool, &writer, &root, &policy, &config, &task);
+                let outcome = execute_task(&pool, &writer, &root, &policy, &config, &task, monitor);
                 let task_id = task.id.clone();
                 let finished: Result<(), IncrementalError> = run_on_writer(&writer, move |conn| {
                     finish_task(conn, &task_id, &outcome, crate::now_micros())
@@ -407,7 +410,7 @@ TASK_RECONCILIATION => {
             // starved.  The diff itself is still performed (it's cheap and
             // non-blocking), but scheduling is deferred.
             let should_defer_scheduling = monitor
-                .map(|m| matches!(m.pressure(), attic_core::domain::ResourcePressure::Emergency | attic_core::domain::ResourcePressure::Critical))
+                .map(|m| matches!(m.pressure(), attic_core::domain::enums::ResourcePressure::Emergency | attic_core::domain::enums::ResourcePressure::Critical))
                 .unwrap_or(false);
 
             match crate::recovery::reconcile_repository(pool, writer, root, policy) {

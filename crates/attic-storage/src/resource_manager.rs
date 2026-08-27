@@ -20,11 +20,12 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use attic_core::resources;
-use attic_core::domain::ResourceBudgets;
-use attic_storage::error::StorageError;
+use attic_core::ResourceBudgets;
+use attic_core::ResourcePressure;
 use tracing::{debug, error, info, warn};
 
 /// Global resource-pressure monitor.
@@ -276,16 +277,16 @@ pub fn current_advisory(monitor: &ResourceMonitor) -> ResourceAdvisory {
     let max = monitor.max_memory_mib();
 
     match pressure {
-        attic_core::domain::ResourcePressure::Normal => ResourceAdvisory::Normal,
-        attic_core::domain::ResourcePressure::Warning => {
+        attic_core::ResourcePressure::Normal => ResourceAdvisory::Normal,
+        attic_core::ResourcePressure::Warning => {
             if used > max * 3 / 4 {
                 ResourceAdvisory::Emergency
             } else {
                 ResourceAdvisory::Degraded
             }
         }
-        attic_core::domain::ResourcePressure::Critical => ResourceAdvisory::Pause,
-        attic_core::domain::ResourcePressure::Emergency => ResourceAdvisory::Emergency,
+        attic_core::ResourcePressure::Critical => ResourceAdvisory::Pause,
+        attic_core::ResourcePressure::Emergency => ResourceAdvisory::Emergency,
     }
 }
 

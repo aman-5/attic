@@ -74,7 +74,7 @@ mod tests {
     }
 }
 
-//! Resource budgets for a single indexing/retrieval operation.
+// Resource budgets for a single indexing/retrieval operation.
 ///
 /// These are tracked per-task and checked against global limits at
 /// runtime.  When budgets are exceeded, the operation is deferred or

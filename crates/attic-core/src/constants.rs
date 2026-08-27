@@ -71,23 +71,23 @@ pub mod resources {
     /// Maximum batch size for writer commits (mutations per transaction).
     pub const WRITER_BATCH_SIZE: usize = 256;
 
-    /// Flush the writer batch at least this often (ms).
+/// Flush the writer batch at least this often (ms).
     pub const WRITER_FLUSH_INTERVAL_MS: u64 = 50;
 
-    /// Maximum number of pending incremental tasks in the task queue.
-    pub INCREMENTAL_TASK_QUEUE_CAPACITY: usize = 1024;
+    /// Maximum pending incremental tasks in the queue.
+    pub const INCREMENTAL_TASK_QUEUE_CAPACITY: usize = 1024;
 
-    /// Maximum number of pending reconciliation tasks.
-    pub RECONCILIATION_TASK_QUEUE_CAPACITY: usize = 256;
+/// Maximum number of pending reconciliation tasks.
+    pub const RECONCILIATION_TASK_QUEUE_CAPACITY: usize = 256;
 
     /// Maximum depth of graph traversal for evidence expansion.
-    pub MAX_GRAPH_DEPTH: usize = 5;
+    pub const MAX_GRAPH_DEPTH: usize = 5;
 
     /// Maximum nodes traversed in a single graph walk.
-    pub MAX_GRAPH_NODES: usize = 500;
+    pub const MAX_GRAPH_NODES: usize = 500;
 
     /// Maximum tokens consumed by context building for a single query.
-    pub MAX_CONTEXT_TOKENS: usize = 8192;
+    pub const MAX_CONTEXT_TOKENS: usize = 8192;
 
     /// Default timeout for background tasks (ms).  Tasks exceeding this are
     /// cancelled and rescheduled.
@@ -95,30 +95,30 @@ pub mod resources {
 
     /// Minimum free memory (MiB) that must be retained after foreground work.
     /// Background indexing pauses if falling below this threshold.
-    pub MIN_FREE_MEMORY_MIB: u64 = 256;
+    pub const MIN_FREE_MEMORY_MIB: u64 = 256;
 
     /// Backup directory relative to database path (for crash recovery backups).
-    pub BACKUP_RELATIVE_DIR: &str = "backups";
+    pub const BACKUP_RELATIVE_DIR: &str = "backups";
 
     /// Maximum number of backup checkpoints to retain (REC-B2).
-    pub MAX_BACKUP_RETAIN: usize = 3;
+    pub const MAX_BACKUP_RETAIN: usize = 3;
 
     /// Checkpoint interval: every N WAL frames OR every M minutes, whichever comes first.
-    pub CHECKPOINT_WAL_FRAMES: u64 = 1000;
+    pub const CHECKPOINT_WAL_FRAMES: u64 = 1000;
 
     /// Checkpoint interval: every N minutes (alternative to WAL frames threshold).
-    pub CHECKPOINT_MINUTES: u64 = 5;
+    pub const CHECKPOINT_MINUTES: u64 = 5;
 
     /// Whether WAL auto-checkpoint is enabled.
-    pub WAL_AUTOCKPT_ENABLED: bool = true;
+    pub const WAL_AUTOCKPT_ENABLED: bool = true;
 
     /// Graceful shutdown timeout (ms).  Server waits this long for in-flight
     /// tasks to complete before force-exiting.
-    pub GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+    pub const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 
     /// Whether integrity check is performed at startup.
-    pub STARTUP_INTEGRITY_CHECK: bool = true;
+    pub const STARTUP_INTEGRITY_CHECK: bool = true;
 
     /// Whether foreign key check is performed at startup.
-    pub STARTUP_FOREIGN_KEY_CHECK: bool = true;
+    pub const STARTUP_FOREIGN_KEY_CHECK: bool = true;
 }
