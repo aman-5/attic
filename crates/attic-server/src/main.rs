@@ -13,7 +13,9 @@ use attic_indexing::{IndexError, IndexOptions, IndexingStore, index_repository};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
     fts_search, get_db_stats, get_repository_path, get_repository_stats,
-    lookup_repository_by_root_path, run_migrations,
+    lookup_repository_by_root_path,
+    resource_manager::{ResourceConfig, ResourceMonitor},
+    run_migrations,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -28,9 +30,10 @@ use serde_json::{Value, json};
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -91,6 +94,10 @@ struct AtticServer {
     /// failed or has not yet completed.  Cross-repo-dependent answers are
     /// prevented until this clears.
     crossrepo_degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// Path to the Attic database file, needed for checkpoint+backup.
+    db_path: std::path::PathBuf,
+    /// Phase 7 resource monitor for foreground/background priority control.
+    resource_monitor: Option<Arc<attic_storage::resource_manager::ResourceMonitor>>,
 }
 
 impl AtticServer {
@@ -130,6 +137,22 @@ impl AtticServer {
         } else {
             None
         };
+        // Phase 7: config-driven resource monitor for foreground/background
+        // priority.  Budgets/capacities come from ATTIC_* env configuration
+        // (ResourceConfig::load) and drive REAL admission enforcement.
+        //
+        // Invalid configuration fails closed here rather than silently
+        // running with an internally-inconsistent resource-pressure model
+        // (e.g. a min-free-memory override that would make the Critical
+        // tier unreachable).
+        let config = ResourceConfig::load();
+        if let Err(e) = config.validate() {
+            return Err(ServerError::InvalidArg(format!(
+                "invalid resource configuration: {e}"
+            )));
+        }
+        let resource_monitor = ResourceMonitor::from_config(&config);
+        config.apply_to(&resource_monitor);
         Ok(AtticServer {
             pool,
             writer,
@@ -138,6 +161,8 @@ impl AtticServer {
             watch_mode: None,
             semantic,
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            db_path: db_path.to_path_buf(),
+            resource_monitor: Some(Arc::new(resource_monitor)),
         })
     }
 
@@ -696,9 +721,29 @@ fn handle_status(
     pool: &DbPool,
     incremental: Option<&Arc<attic_incremental::IncrementalService>>,
     watch_mode: Option<attic_incremental::WatchMode>,
+    resource_monitor: Option<&attic_storage::resource_manager::ResourceMonitor>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
+
+    // Resource pressure state — Phase 7 foreground/background priority.
+    if let Some(monitor) = resource_monitor {
+        payload["resource_pressure"] = json!({
+            "level": monitor.pressure().to_string().to_lowercase(),
+            "memory_used_mib": monitor.memory_used_mib(),
+            "peak_memory_used_mib": monitor.peak_memory_used_mib(),
+            "min_free_memory_mib": monitor.min_free_memory_mib(),
+            "max_memory_mib": monitor.max_memory_mib(),
+        });
+        payload["resource_advisory"] = json!({
+            "advisory": match attic_storage::resource_manager::current_advisory(monitor) {
+                attic_storage::resource_manager::ResourceAdvisory::Normal => "normal",
+                attic_storage::resource_manager::ResourceAdvisory::Degraded => "degraded",
+                attic_storage::resource_manager::ResourceAdvisory::Pause => "pause",
+                attic_storage::resource_manager::ResourceAdvisory::Emergency => "emergency",
+            }
+        });
+    }
 
     // Incremental subsystem state — including EXPLICIT degraded modes.  The
     // server never claims a mode it is not actually running.
@@ -762,6 +807,7 @@ fn handle_context(
     writer: &WriterQueueHandle,
     crossrepo_degraded: bool,
     args: &HashMap<String, Value>,
+    resource_advisory: attic_storage::resource_manager::ResourceAdvisory,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
         .get("query")
@@ -769,7 +815,10 @@ fn handle_context(
         .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
     validate_filter("query", query, 512)?;
 
-    let mode = match args.get("mode").and_then(Value::as_str) {
+    // Phase 7 graceful degradation: DEEP expansions are paused under
+    // Pause/Emergency resource advisories; the query still runs at NORMAL
+    // depth so foreground work is never starved by its own expensive mode.
+    let mut mode = match args.get("mode").and_then(Value::as_str) {
         None | Some("NORMAL") => attic_retrieval::AnswerMode::Normal,
         Some("FAST") => attic_retrieval::AnswerMode::Fast,
         Some("DEEP") => attic_retrieval::AnswerMode::Deep,
@@ -779,6 +828,15 @@ fn handle_context(
             )));
         }
     };
+    if mode == attic_retrieval::AnswerMode::Deep
+        && matches!(
+            resource_advisory,
+            attic_storage::resource_manager::ResourceAdvisory::Pause
+                | attic_storage::resource_manager::ResourceAdvisory::Emergency
+        )
+    {
+        mode = attic_retrieval::AnswerMode::Normal;
+    }
 
     let mut request = attic_retrieval::AnswerRequest::new(query, mode);
     if let Some(id) = args.get("repository_id").and_then(Value::as_str) {
@@ -954,14 +1012,48 @@ impl ServerHandler for AtticServer {
             request.arguments.unwrap_or_default().into_iter().collect();
 
         async move {
+            // Phase 7: memory-aware foreground admission.  Each MCP tool call
+            // must acquire a foreground slot (hard capacity from configuration)
+            // before any work happens; when the server is at capacity the
+            // caller receives an explicit busy error instead of unbounded
+            // queueing.  Real process RSS is refreshed by the admission call,
+            // so degradation decisions reflect genuine memory usage.
+            let admission = match self
+                .resource_monitor
+                .as_ref()
+                .and_then(|m| m.try_foreground())
+            {
+                Some(guard) => guard,
+                None => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "server busy: foreground query capacity exhausted ({} concurrent); retry shortly",
+                        self.resource_monitor.as_ref().map(|m| m.foreground_capacity()).unwrap_or(0)
+                    ))])
+                    .into());
+                }
+            };
+            let advisory = admission.advisory();
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
                 "file" => handle_file(&pool, &args),
                 "search" => handle_search(&pool, &args),
                 "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(&pool, incremental.as_ref(), watch_mode),
-                "context" => handle_context(semantic, &pool, &writer, crossrepo_degraded, &args),
+                "status" => handle_status(
+                    &pool,
+                    incremental.as_ref(),
+                    watch_mode,
+                    self.resource_monitor.as_ref().map(|m| m.as_ref()),
+                ),
+                "context" => handle_context(
+                    semantic,
+                    &pool,
+                    &writer,
+                    crossrepo_degraded,
+                    &args,
+                    advisory,
+                ),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
+            drop(admission);
             match result {
                 Ok(r) => Ok(r.into()),
                 Err(e) => {
@@ -977,33 +1069,50 @@ impl ServerHandler for AtticServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Configuration: ATTIC_LOG / RUST_LOG controls verbosity (tracing_subscriber's
+    // EnvFilter reads both, RUST_LOG taking precedence when both are set); the
+    // dependency's `env-filter` feature was enabled but never wired to the
+    // subscriber, so this previously had no effect at all. Default to `info`
+    // when neither is set, matching production-safe verbosity.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_env("ATTIC_LOG")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
         .init();
 
-    let db_path = std::env::var("ATTIC_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| {
-                    std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-                })
-                .or_else(|_| {
-                    std::env::var("USERPROFILE")
-                        .map(|h| PathBuf::from(h).join("AppData").join("Local"))
-                })
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("attic")
-                .join("attic.db")
-        });
-
-    if let Some(p) = db_path.parent() {
-        fs::create_dir_all(p)?;
-    }
-    info!("attic starting, db={}", db_path.display());
+    // Phase 7: platform-appropriate data/cache/temp policy (see
+    // attic_core::paths).  The data root is user-global (OS application-data
+    // directory); workspaces are never written to.
+    let paths = attic_core::AtticPaths::resolve();
+    paths.ensure_dirs()?;
+    let db_path = paths.db_path();
+    info!(
+        "attic starting, db={} (data root {})",
+        db_path.display(),
+        paths.data_root.display()
+    );
 
     let mut server = AtticServer::new(&db_path)?;
+
+    // Phase 5/7: when the semantic layer is opt-in and opened successfully,
+    // it needs a background worker to actually drain the enrichment queue —
+    // without this, embeddings are never produced and the opt-in layer is a
+    // no-op that permanently falls back to non-semantic retrieval. Lowest
+    // priority background subsystem (ADR-014 D1): bounded batches, never
+    // blocks foreground queries (they only read the store).
+    let mut semantic_enricher: Option<attic_semantic::BackgroundEnricher> = None;
+    if let Some(stack) = server.semantic.clone() {
+        semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
+            db_path.clone(),
+            stack.store.clone(),
+            stack.provider.clone(),
+            attic_semantic::EnrichmentConfig::default(),
+            server.resource_monitor.clone(),
+        ));
+        info!("semantic background enrichment worker started");
+    }
 
     // ─── Startup recovery — ALWAYS before serving (recovery contract §3) ────
     //
@@ -1025,8 +1134,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut _watch: Option<attic_incremental::IncrementalWatch> = None;
-    let mut _sched_handle: Option<attic_incremental::SchedulerHandle> = None;
+    // Phase 7: verify database integrity and foreign key consistency
+    // per the crash recovery contract (§3, §5).
+    // Open a fresh writer connection just for the verification step; this
+    // does not affect the primary writer connection or the connection pool.
+    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open verification connection: {e}"))?;
+    let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
+    drop(verify_conn); // always release the verification connection
+    if !integrity_violations.is_empty() {
+        for v in &integrity_violations {
+            error!("database integrity violation during startup: {v}");
+        }
+        // Fail-closed: if the database is corrupt, refuse to serve.
+        return Err(anyhow::anyhow!(
+            "database integrity check failed during startup"
+        ));
+    }
+
+    let mut watch_handle: Option<attic_incremental::IncrementalWatch> = None;
+    let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
     // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
     if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
@@ -1116,6 +1243,7 @@ async fn main() -> anyhow::Result<()> {
                         &payload,
                         attic_incremental::scheduler::PRIORITY_RECONCILE,
                         4096,
+                        server.resource_monitor.as_ref().map(|m| m.as_ref()),
                     ) {
                         warn!("offline refresh scheduling failed: {e}");
                     }
@@ -1127,21 +1255,24 @@ async fn main() -> anyhow::Result<()> {
         // 3. Scheduler — fallible: a scheduler that cannot start its workers
         //    is never silently accepted.
         let policy = DiscoveryPolicy::default_git();
+        let monitor = server.resource_monitor.clone();
         match attic_incremental::spawn_scheduler(
             attic_incremental::SchedulerConfig::default(),
             server.pool.clone(),
             server.writer.clone(),
             root.clone(),
             policy.clone(),
+            monitor,
         ) {
-            Ok(sched) => _sched_handle = Some(sched),
+            Ok(sched) => sched_handle = Some(sched),
             Err(e) => {
                 error!("scheduler startup failed — incremental mode DISABLED: {e}");
                 server.watch_mode = None;
                 server.incremental = None;
                 // Continue serving WITHOUT incremental claims; status reports
                 // watcher.mode = "disabled".
-                return serve_until_closed(server).await;
+                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
+                    .await;
             }
         }
 
@@ -1159,19 +1290,20 @@ async fn main() -> anyhow::Result<()> {
                     "incremental change detection started"
                 );
                 server.watch_mode = Some(watch.mode());
-                _watch = Some(watch);
+                watch_handle = Some(watch);
             }
             Err(e) => {
                 error!("change detection failed to start ({e}) — incremental DISABLED");
                 server.watch_mode = None;
                 server.incremental = None;
-                return serve_until_closed(server).await;
+                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
+                    .await;
             }
         }
         server.incremental = Some(service);
     }
 
-    serve_until_closed(server).await
+    serve_until_closed(server, sched_handle, watch_handle, semantic_enricher).await
 }
 
 /// Outcome of the initial workspace indexing decision.
@@ -1194,27 +1326,143 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
     }
 }
 
-/// Serve MCP until the stdio transport closes, then record a clean shutdown.
-async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
-    // Keep a writer handle for the clean-shutdown marker; `serve` consumes
-    // the server value.
+/// Serve MCP until the stdio transport closes OR the process receives
+/// SIGINT/Ctrl+C, then perform deterministic shutdown ordering per Phase 7
+/// §6.
+///
+/// Ordering:
+///   1. Stop accepting new MCP work (transport close OR Ctrl+C), fully
+///      awaited — never a bare drop of the running service.
+///   2. Watcher shutdown, then scheduler shutdown (bounded joins).
+///   3. Semantic background worker shutdown (bounded join with timeout).
+///   4. Record clean-shutdown marker (durable task state).
+///   5. Explicit WAL checkpoint (TRUNCATE) + crash-recovery backup.
+///   6. Drain + stop the writer (WriterQueue Drop joins the worker thread).
+///   7. Close DB resources (pool + writer connection).
+///   8. Exit.
+///
+/// `sched_handle`/`watch`/`semantic_enricher` are owned by this function
+/// (not left to an implicit drop in `main`) specifically so each can be
+/// stopped, in order, deterministically and with a bounded join — a
+/// production worker whose shutdown is left to "whatever `main` does last"
+/// is not controlled.
+async fn serve_until_closed(
+    server: AtticServer,
+    sched_handle: Option<attic_incremental::SchedulerHandle>,
+    mut watch: Option<attic_incremental::IncrementalWatch>,
+    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
+) -> anyhow::Result<()> {
+    // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
+    //    handle to the spawned service task (which itself holds `server`'s
+    //    pool/writer/semantic references).  It is always fully awaited to
+    //    completion below — on the natural-close path directly, and on the
+    //    Ctrl+C path by cancelling through `cancel_token` and then still
+    //    awaiting the same `waiting()` future — so the service task is
+    //    never left running detached while later steps close its
+    //    resources out from under it.
     let writer_for_shutdown = server.writer.clone();
-    // Serve returns once the MCP lifecycle handshake has completed.  The
-    // returned RunningService MUST be kept alive for the lifetime of the
-    // server — dropping it cancels the whole service.  `waiting()` consumes
-    // it and blocks until the stdio transport closes.
+    let db_path_for_shutdown = server.db_path.clone();
     let running = server
         .serve(stdio())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cancel_token = running.cancellation_token();
+    let ctrl_c_watcher = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("ctrl_c/SIGINT received - initiating graceful shutdown");
+            cancel_token.cancel();
+        }
+    });
     let reason = running
         .waiting()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The service already stopped; if Ctrl+C never fired, stop listening
+    // for it rather than leaving the signal handler task running.
+    ctrl_c_watcher.abort();
     info!("attic server stopped: {reason:?}");
 
-    // Clean-shutdown marker for crash detection on next start.
+    // 2. Watcher shutdown, then scheduler shutdown.  The watcher only
+    //    detects changes; the scheduler drains work derived from those
+    //    changes, so stopping detection first bounds how much new work the
+    //    scheduler can still be asked to do. Both joins are bounded (worker
+    //    threads poll a stop flag / condvar, not indefinite blocking I/O).
+    if let Some(w) = watch.as_mut() {
+        w.stop();
+    }
+    if let Some(sched) = sched_handle {
+        sched.shutdown();
+    }
+
+    // 3. Semantic background worker: lowest-priority subsystem (ADR-014
+    //    D1), stopped with a bounded join before canonical DB maintenance.
+    //    A timeout is observable, not silently ignored: it means a worker
+    //    thread is still finishing an in-flight embed call, which is safe
+    //    to abandon (the OS reclaims the thread at process exit) but must
+    //    be logged rather than reported as clean.
+    if let Some(enricher) = semantic_enricher {
+        let stopped = enricher.shutdown(Duration::from_millis(
+            attic_core::resources::GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+        ));
+        if !stopped {
+            warn!("semantic background enricher did not stop within the shutdown timeout");
+        }
+    }
+
+    // 4. Record clean shutdown marker (durable task state, REC-INV-1).
     let _ = attic_incremental::record_clean_shutdown_marker(&writer_for_shutdown);
+
+    // 5. Explicit WAL checkpoint + backup (Phase 7).  After a clean shutdown:
+    //    force a TRUNCATE checkpoint so the WAL is emptied into the main
+    //    database, then create a crash-recovery backup using the atomic
+    //    rename pattern (REC-B1 through REC-B4).  Both are best-effort: a
+    //    failure is logged but never prevents clean exit, since the data is
+    //    still recoverable from the WAL on next open.
+    {
+        let db_path = db_path_for_shutdown.clone();
+        let maintenance = tokio::task::spawn_blocking(move || {
+            let (conn, _pool) = match attic_storage::open_db(&db_path) {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!("shutdown maintenance open failed: {e}");
+                    return;
+                }
+            };
+            match attic_storage::connection::checkpoint_wal(&conn) {
+                Ok((busy, log, ckpt)) => {
+                    info!(
+                        "shutdown WAL checkpoint: busy={busy} log_pages={log} checkpointed={ckpt}"
+                    );
+                }
+                Err(e) => warn!("shutdown WAL checkpoint failed: {e}"),
+            }
+            if let Err(e) = attic_storage::connection::backup_database(
+                &db_path,
+                &db_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(attic_core::resources::BACKUP_RELATIVE_DIR),
+            ) {
+                warn!("shutdown backup failed (best-effort): {e}");
+            }
+        })
+        .await;
+        if let Err(e) = maintenance {
+            warn!("shutdown maintenance task failed: {e}");
+        }
+    }
+
+    // 6. Stop workers.  Drop the WriterQueue - this signals the worker thread
+    //    to shut down and joins it deterministically. By this point `server`
+    //    (and its `Arc<WriterQueue>`) has already been fully dropped inside
+    //    `running.waiting()` above, so this drops the last outstanding
+    //    handle clone.
+    drop(writer_for_shutdown);
+
+    // 7. Close DB resources (pool + writer connection) via Drop.
+    // 8. Exit (return to `main`, which returns `Ok(())` to the runtime).
+
+    info!("attic server shut down cleanly: {reason:?}");
     Ok(())
 }
 
@@ -1223,6 +1471,7 @@ async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
@@ -1927,7 +2176,7 @@ mod tests {
     #[test]
     fn status_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        let r = handle_status(&make_server(&tmp).pool, None, None).unwrap();
+        let r = handle_status(&make_server(&tmp).pool, None, None, None).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
@@ -1955,7 +2204,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, None, None).unwrap();
+        let r = handle_status(&srv.pool, None, None, None).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -2364,9 +2613,7 @@ mod tests {
                 }),
             );
             let resp = send_recv(&mut child, &mut stdin, &call);
-            let text = resp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
             // With degraded cross-repo, confidence must be LOW or result
             // must be INSUFFICIENT_EVIDENCE — never HIGH cross-repo confidence.
@@ -2390,9 +2637,7 @@ mod tests {
                 }),
             );
             let sresp = send_recv(&mut child, &mut stdin, &search);
-            let stext = sresp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("");
+            let stext = sresp["result"]["content"][0]["text"].as_str().unwrap_or("");
             // Search must succeed and return a JSON results array (even if empty).
             let sv: Value = serde_json::from_str(stext).unwrap_or(json!({}));
             assert!(
@@ -2410,11 +2655,8 @@ mod tests {
         // ─────────────────────────────────────────────────────────────────────
         let (provider_id_str, dependent_id_str, _unrelated_id_str) = {
             // Read back the repository IDs from the pre-seeded DB.
-            let srv =
-                AtticServer::new_with_semantic_opt(&db_path, false).expect("read repo ids");
-            let pid = srv
-                .bootstrap_workspace(&provider_dir)
-                .expect("provider id");
+            let srv = AtticServer::new_with_semantic_opt(&db_path, false).expect("read repo ids");
+            let pid = srv.bootstrap_workspace(&provider_dir).expect("provider id");
             let did = srv
                 .bootstrap_workspace(&dependent_dir)
                 .expect("dependent id");
@@ -2469,9 +2711,7 @@ mod tests {
             }),
         );
         let resp = send_recv(&mut child, &mut stdin, &call);
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
         let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
 
         // Context text and/or claims must mention the provider module.
@@ -2485,7 +2725,7 @@ mod tests {
                 || full_response.contains(&provider_id_str),
             "gate 1 FAIL: provider repository not identified in cross-repo response; \
              response={:.400}",
-            &full_response
+            full_response
         );
 
         // Gate 2: unrelated repository is not falsely claimed as a dependency.
@@ -2494,11 +2734,10 @@ mod tests {
         // structured claims JSON — not the context prose — for a false dependency
         // claim on example.com/unrelated.
         assert!(
-            !claims_json.contains("example.com/unrelated")
-                || claims_json.contains("not depend"),
+            !claims_json.contains("example.com/unrelated") || claims_json.contains("not depend"),
             "gate 2 FAIL: unrelated repository should not appear as a dependency \
              claim; claims={:.400}",
-            &claims_json
+            claims_json
         );
 
         // Gate 3: confidence field is present and non-empty (preserved).
@@ -2589,8 +2828,8 @@ mod tests {
         // so use index_repository directly to force a fresh index of the updated
         // manifest.
         {
-            let srv = AtticServer::new_with_semantic_opt(&db_path, false)
-                .expect("server for re-index");
+            let srv =
+                AtticServer::new_with_semantic_opt(&db_path, false).expect("server for re-index");
             let store = IndexingStore {
                 readers: &srv.pool,
                 writer: &srv.writer,
@@ -2644,9 +2883,7 @@ mod tests {
             }),
         );
         let resp2 = send_recv(&mut child2, &mut stdin2, &call2);
-        let text2 = resp2["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap_or("");
         let v2: Value = serde_json::from_str(text2).unwrap_or(json!({}));
         let context2 = v2["context"].as_str().unwrap_or("");
         let claims2 = v2["claims"].to_string();
@@ -2667,7 +2904,7 @@ mod tests {
             "gate 7 FAIL: manifest change must change cross-repo result; \
              provider still claimed after removing require; \
              result={result2}, response={:.400}",
-            &full2
+            full2
         );
 
         child2.kill().ok();

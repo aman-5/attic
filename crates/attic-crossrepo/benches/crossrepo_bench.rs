@@ -7,10 +7,12 @@
 
 use std::collections::HashMap;
 
+use attic_crossrepo::impact;
 use attic_crossrepo::resolver::{self, RepoCatalogData};
 use attic_crossrepo::traversal::{self, Direction, TraversalBudget};
-use attic_crossrepo::impact;
-use attic_crossrepo::{CancelToken, DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity};
+use attic_crossrepo::{
+    CancelToken, DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity,
+};
 
 fn make_provider(id: usize, provides_name: &str) -> RepoCatalogData {
     RepoCatalogData {
@@ -54,13 +56,16 @@ fn bench_resolver_10_providers(c: &mut criterion::Criterion) {
     let mut repos: Vec<RepoCatalogData> = (0..10)
         .map(|i| make_provider(i, &format!("example.com/lib{i}")))
         .collect();
-    repos.push(make_consumer(0, vec![
-        "example.com/lib0",
-        "example.com/lib1",
-        "example.com/lib2",
-        "example.com/lib3",
-        "example.com/lib4",
-    ]));
+    repos.push(make_consumer(
+        0,
+        vec![
+            "example.com/lib0",
+            "example.com/lib1",
+            "example.com/lib2",
+            "example.com/lib3",
+            "example.com/lib4",
+        ],
+    ));
     c.bench_function("resolver_10_providers", |b| {
         b.iter(|| resolver::resolve_workspace(&repos, &HashMap::new()))
     });
@@ -70,11 +75,10 @@ fn bench_resolver_100_providers(c: &mut criterion::Criterion) {
     let mut repos: Vec<RepoCatalogData> = (0..100)
         .map(|i| make_provider(i, &format!("example.com/lib{i}")))
         .collect();
-    repos.push(make_consumer(0, vec![
-        "example.com/lib0",
-        "example.com/lib50",
-        "example.com/lib99",
-    ]));
+    repos.push(make_consumer(
+        0,
+        vec!["example.com/lib0", "example.com/lib50", "example.com/lib99"],
+    ));
     c.bench_function("resolver_100_providers", |b| {
         b.iter(|| resolver::resolve_workspace(&repos, &HashMap::new()))
     });
@@ -84,11 +88,14 @@ fn bench_resolver_1000_providers(c: &mut criterion::Criterion) {
     let mut repos: Vec<RepoCatalogData> = (0..1000)
         .map(|i| make_provider(i, &format!("example.com/lib{i}")))
         .collect();
-    repos.push(make_consumer(0, vec![
-        "example.com/lib0",
-        "example.com/lib500",
-        "example.com/lib999",
-    ]));
+    repos.push(make_consumer(
+        0,
+        vec![
+            "example.com/lib0",
+            "example.com/lib500",
+            "example.com/lib999",
+        ],
+    ));
     c.bench_function("resolver_1000_providers", |b| {
         b.iter(|| resolver::resolve_workspace(&repos, &HashMap::new()))
     });
@@ -104,13 +111,11 @@ fn bench_traversal_linear_chain(c: &mut criterion::Criterion) {
 
     let mut rev_ids = Vec::new();
     for i in 0..10 {
-        let rid: attic_core::RepositoryId = uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_DNS,
-            format!("bench-r{i}").as_bytes(),
-        )
-        .to_string()
-        .parse()
-        .unwrap();
+        let rid: attic_core::RepositoryId =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("bench-r{i}").as_bytes())
+                .to_string()
+                .parse()
+                .unwrap();
         attic_storage::repository::repository::upsert_repository(
             &conn,
             &rid,
@@ -131,8 +136,14 @@ fn bench_traversal_linear_chain(c: &mut criterion::Criterion) {
         rev_ids.push(srid.to_string_repr().to_string());
     }
     for i in 0..9 {
-        let src_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("bench-r{i}").as_bytes()).to_string();
-        let tgt_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("bench-r{}", i + 1).as_bytes()).to_string();
+        let src_id =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("bench-r{i}").as_bytes())
+                .to_string();
+        let tgt_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            format!("bench-r{}", i + 1).as_bytes(),
+        )
+        .to_string();
         attic_storage::crossrepo_ops::insert_xrepo_edge(
             &conn,
             &src_id,
@@ -171,13 +182,11 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
 
     let mut rev_ids = Vec::new();
     for i in 0..10 {
-        let rid: attic_core::RepositoryId = uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_DNS,
-            format!("imp-r{i}").as_bytes(),
-        )
-        .to_string()
-        .parse()
-        .unwrap();
+        let rid: attic_core::RepositoryId =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("imp-r{i}").as_bytes())
+                .to_string()
+                .parse()
+                .unwrap();
         attic_storage::repository::repository::upsert_repository(
             &conn,
             &rid,
@@ -198,8 +207,13 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
         rev_ids.push(srid.to_string_repr().to_string());
     }
     for i in 0..9 {
-        let src_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("imp-r{i}").as_bytes()).to_string();
-        let tgt_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("imp-r{}", i + 1).as_bytes()).to_string();
+        let src_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("imp-r{i}").as_bytes())
+            .to_string();
+        let tgt_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            format!("imp-r{}", i + 1).as_bytes(),
+        )
+        .to_string();
         attic_storage::crossrepo_ops::insert_xrepo_edge(
             &conn,
             &src_id,
@@ -235,14 +249,22 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
 /// which exercises `CrossRepoGenerator` → Evidence Manager → response.
 fn bench_integrated_retrieval_pipeline(c: &mut criterion::Criterion) {
     use attic_indexing::{IndexOptions, IndexingStore, index_repository};
-    use attic_retrieval::pipeline::{AnswerRequest, RetrievalService};
     use attic_retrieval::AnswerMode;
+    use attic_retrieval::pipeline::{AnswerRequest, RetrievalService};
 
     // 1. Create multi-repo fixture.
     let provider_dir = tempfile::tempdir().unwrap();
     let consumer_dir = tempfile::tempdir().unwrap();
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/bench/lib\n").unwrap();
-    std::fs::write(provider_dir.path().join("lib.go"), "package lib\nfunc Exported() {}\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/bench/lib\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.path().join("lib.go"),
+        "package lib\nfunc Exported() {}\n",
+    )
+    .unwrap();
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/bench/app\nrequire example.com/bench/lib v1.0.0\n",

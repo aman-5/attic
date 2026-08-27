@@ -412,6 +412,21 @@ str_enum! {
 }
 
 str_enum! {
+    /// Resource pressure level indicating how the system is responding to
+    /// approaching memory or I/O limits.
+    ResourcePressure {
+        /// Normal operation; no pressure.
+        Normal      => "normal",
+        /// Approaching memory limit; reducing non-essential work.
+        Warning     => "warning",
+        /// Near limit; pausing semantic enrichment and background work.
+        Critical    => "critical",
+        /// At or above limit; foreground retrieval only, all background paused.
+        Emergency   => "emergency",
+    }
+}
+
+str_enum! {
     /// Execution state of a background task.
     TaskState {
         /// Waiting to be picked up.

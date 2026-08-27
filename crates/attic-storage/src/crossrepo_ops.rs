@@ -363,10 +363,7 @@ pub fn delete_declarations_for_repository(
 }
 
 /// Insert one declaration row (id assigned here).
-pub fn insert_declaration(
-    conn: &Connection,
-    d: &DeclarationRow,
-) -> Result<(), StorageError> {
+pub fn insert_declaration(conn: &Connection, d: &DeclarationRow) -> Result<(), StorageError> {
     conn.execute(
         "INSERT INTO core_dependency_declarations
             (id, repository_id, file_occurrence_id, path, ecosystem, name,
@@ -436,10 +433,7 @@ pub fn delete_all_xrepo_edges_touching(
 /// require Phase 3 structural relationship edges to exist and works for
 /// every indexing profile (Go, Python, JS, etc.). The caller's budget
 /// enforces the real bound; `limit` is the SQL ceiling.
-pub fn cross_edges_all(
-    conn: &Connection,
-    limit: usize,
-) -> Result<Vec<XrepoEdge>, StorageError> {
+pub fn cross_edges_all(conn: &Connection, limit: usize) -> Result<Vec<XrepoEdge>, StorageError> {
     let sql = "
         SELECT r.id, r.source_repository_id, r.target_repository_id,
                r.source_entity_id, r.target_entity_id, r.resolution,
@@ -518,9 +512,7 @@ pub fn cross_edges_for_entities(
                 .iter()
                 .map(|s| -> Box<dyn ToSql> { Box::new(s.to_string()) }),
         )
-        .chain(std::iter::once(
-            Box::new(limit as i64) as Box<dyn ToSql>
-        ))
+        .chain(std::iter::once(Box::new(limit as i64) as Box<dyn ToSql>))
         .collect();
     let refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt
@@ -548,6 +540,10 @@ pub fn cross_edges_for_entities(
 /// `target_entity_id` anchors at the target repository's primary manifest
 /// occurrence, or a deterministic `logical:` placeholder when that
 /// repository has none (ADR-011 convention).
+// One row-insert function mapping directly onto the `core_xrepo_edges`
+// schema; a parameter-object refactor is out of scope for this pass and
+// would ripple across every call site for no behavioral change.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_xrepo_edge(
     conn: &Connection,
     source_repo: &str,
@@ -594,8 +590,7 @@ pub fn remove_repository_crossrepo_data(
     conn: &Connection,
     repository_id: &str,
 ) -> Result<(usize, usize), StorageError> {
-    let edges =
-        delete_all_xrepo_edges_touching(conn, repository_id)?;
+    let edges = delete_all_xrepo_edges_touching(conn, repository_id)?;
     conn.execute(
         "DELETE FROM core_workspace_catalog WHERE repository_id = ?1",
         rusqlite::params![repository_id],
@@ -755,8 +750,7 @@ mod snapshot_tests {
             ("repo-provider".to_owned(), "rev-provider-1".to_owned()),
             ("repo-dependent".to_owned(), "rev-dependent-7".to_owned()),
         ];
-        let snapshot_id =
-            create_workspace_snapshot(&conn, &input, 4).expect("create snapshot");
+        let snapshot_id = create_workspace_snapshot(&conn, &input, 4).expect("create snapshot");
 
         let latest = latest_workspace_snapshot(&conn)
             .unwrap()
@@ -769,16 +763,26 @@ mod snapshot_tests {
         revisions.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
         assert_eq!(revisions.len(), 2);
         assert_eq!(
-            (revisions[0].repository_id.as_str(), revisions[0].source_revision_id.as_str()),
+            (
+                revisions[0].repository_id.as_str(),
+                revisions[0].source_revision_id.as_str()
+            ),
             ("repo-dependent", "rev-dependent-7")
         );
         assert_eq!(
-            (revisions[1].repository_id.as_str(), revisions[1].source_revision_id.as_str()),
+            (
+                revisions[1].repository_id.as_str(),
+                revisions[1].source_revision_id.as_str()
+            ),
             ("repo-provider", "rev-provider-1")
         );
 
         // No fabricated entries: an unrelated repository/revision is absent.
-        assert!(!revisions.iter().any(|r| r.repository_id.contains("unrelated")));
+        assert!(
+            !revisions
+                .iter()
+                .any(|r| r.repository_id.contains("unrelated"))
+        );
     }
 
     #[test]

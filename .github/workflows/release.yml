@@ -1,0 +1,50 @@
+name: Release
+
+# Builds release binaries for ALL supported platforms.  Local verification is
+# only possible for the host platform; the remaining platform gates are
+# verified HERE, by CI.  A release may only be cut when this workflow is
+# green on every matrix entry.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test
+        # Every matrix entry runs on a NATIVE runner for its target
+        # (windows-latest=MSVC host, ubuntu-latest=x86_64 host,
+        # macos-13=Intel host, macos-latest=Apple Silicon host) — none of
+        # these are cross-compiled, so there is no platform here that can't
+        # actually run its own test suite. Skipping any of them would be a
+        # silent NOT VERIFIED masquerading as a passing release gate.
+        run: cargo test --workspace
+      - name: Package release archive
+        shell: bash
+        run: bash tools/package.sh --target ${{ matrix.target }} --out dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attic-${{ matrix.target }}
+          path: dist/attic-*

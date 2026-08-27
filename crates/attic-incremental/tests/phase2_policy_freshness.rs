@@ -104,8 +104,14 @@ fn gitignore_modification_removes_newly_ignored_file_from_fts() {
     let svc = attic_incremental::IncrementalService::new(&repo_dir, git_policy.clone());
     svc.apply_verified_change_set(&pool, &writer, &report.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &git_policy)
-        .unwrap()
+    while attic_incremental::run_next_task_synchronously(
+        &pool,
+        &writer,
+        &repo_dir,
+        &git_policy,
+        None,
+    )
+    .unwrap()
     {}
 
     let ghosts: Vec<_> = pool
@@ -156,6 +162,7 @@ fn discovery_policy_exclusion_removes_file_from_fts() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -282,9 +289,9 @@ fn unaffected_repository_is_completely_untouched() {
     svc_a
         .apply_pending(&pool, &writer, Some(u64::MAX / 2))
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_a, &policy).unwrap()
-    {
-    }
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_a, &policy, None)
+        .unwrap()
+    {}
 
     // B's committed state must be byte-identical to before.
     let b_revs: i64 = pool
@@ -467,6 +474,7 @@ fn queue_saturation_marks_unknown_and_requires_reconciliation() {
         &payload,
         80,
         0, // zero capacity → immediate saturation signal
+        None,
     )
     .unwrap();
     assert_eq!(

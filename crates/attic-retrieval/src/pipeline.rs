@@ -326,20 +326,23 @@ impl RetrievalService {
         let (result, confidence, insufficient_reason) =
             compute_result(&report, validated.len(), hard_cancelled);
 
-        let (context_text, claims_out, served_evidence): (Option<String>, ServedClaims, Vec<Evidence>) =
-            if validated.is_empty() || hard_cancelled {
-                (None, Vec::new(), Vec::new())
-            } else {
-                build_context_and_claims(
-                    self,
-                    &mut plan,
-                    &contract,
-                    &classification,
-                    &policy,
-                    &validated,
-                    &contradictions,
-                )
-            };
+        let (context_text, claims_out, served_evidence): (
+            Option<String>,
+            ServedClaims,
+            Vec<Evidence>,
+        ) = if validated.is_empty() || hard_cancelled {
+            (None, Vec::new(), Vec::new())
+        } else {
+            build_context_and_claims(
+                self,
+                &mut plan,
+                &contract,
+                &classification,
+                &policy,
+                &validated,
+                &contradictions,
+            )
+        };
 
         // ── Trace + finalize + persist ──────────────────────────────────────
         plan.policy_trace.time_elapsed_ms = budget.elapsed_ms();
@@ -655,7 +658,6 @@ impl RetrievalService {
             validated.len() as u32,
             now_us(),
         );
-
         // ── Proactive CHECKSUM/FULL verification of top evidence ───────────
         // answer_modes.md: NORMAL=CHECKSUM, DEEP=FULL. This is what makes a
         // DIRTY WORKING TREE detectable: an indexed row can still be flagged
@@ -1211,7 +1213,11 @@ fn build_context_and_claims(
     let served_evidence = doc
         .refs
         .iter()
-        .filter_map(|r| served_by_id.get(r.evidence_id.as_str()).map(|e| (*e).clone()))
+        .filter_map(|r| {
+            served_by_id
+                .get(r.evidence_id.as_str())
+                .map(|e| (*e).clone())
+        })
         .collect();
     (Some(doc.text), claims, served_evidence)
 }

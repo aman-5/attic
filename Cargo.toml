@@ -15,6 +15,16 @@ members = [
     "crates/attic-test-support",
 ]
 
+# Phase 7: production release profile.  Conservative, well-supported options
+# only: thin LTO + a single codegen unit for size/speed, symbol stripping for
+# smaller release archives.  No exotic linker or unsafe codegen options;
+# panics remain unwinding so cancellation and panic-safety tests stay valid.
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
@@ -36,7 +46,7 @@ ignore             = "0.4.33"
 # Phase 1B: BLAKE3 hashing required by source_revision contract
 blake3             = "1.8.7"
 # Phase 1D: Async runtime (rmcp requires tokio)
-tokio              = { version = "1",        features = ["rt-multi-thread", "macros", "sync", "io-std", "fs", "time"] }
+tokio              = { version = "1",        features = ["rt-multi-thread", "macros", "sync", "io-std", "fs", "time", "signal"] }
 # Phase 2: filesystem watching (ADR-008). Stable debouncer 0.7 pulls notify 8.2.x;
 # MSRV 1.88 matches the workspace toolchain.
 notify-debouncer-full = "0.7"
@@ -54,6 +64,9 @@ tree-sitter-typescript = "0.23"
 # Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
 anyhow             = "1"
+# Phase 7: cross-platform process memory measurement (real RSS, not counters).
+# default-features = false avoids gui/web deps; only the `system` feature is needed.
+sysinfo            = { version = "0.33", default-features = false, features = ["system"] }
 # Test utilities
 tempfile           = "3"
 attic-core         = { path = "crates/attic-core" }

@@ -29,6 +29,17 @@ const VERSION_0004: &str = "0004_phase6";
 const MIGRATION_0005: &str = include_str!("../../../migrations/0005_workspace_snapshot.sql");
 const VERSION_0005: &str = "0005_workspace_snapshot";
 
+/// Every migration version this binary knows how to apply/reason about, in
+/// order. Used to detect a downgrade (an older binary opening a database a
+/// newer binary already migrated further) — see `run_migrations`.
+const KNOWN_VERSIONS: &[&str] = &[
+    VERSION_0001,
+    VERSION_0002,
+    VERSION_0003,
+    VERSION_0004,
+    VERSION_0005,
+];
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
@@ -44,6 +55,27 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
             applied_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000000)
         );",
     )?;
+
+    // Fail closed on downgrade: if the database already records a migration
+    // this binary doesn't recognize, a newer binary has already advanced the
+    // schema past what this build understands. Silently proceeding would
+    // "successfully" run zero migrations and then serve against a schema
+    // this code cannot reason about — refuse instead.
+    let mut stmt = conn.prepare("SELECT id FROM core_schema_migrations")?;
+    let applied_ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &applied_ids {
+        if !KNOWN_VERSIONS.contains(&id.as_str()) {
+            return Err(StorageError::Migration {
+                message: format!(
+                    "database has migration '{id}' applied, which this binary does not \
+                     recognize (known: {KNOWN_VERSIONS:?}) — this binary is older than \
+                     the database schema; refusing to serve a schema state it cannot verify"
+                ),
+            });
+        }
+    }
 
     apply_migration(conn, VERSION_0001, MIGRATION_0001)?;
     apply_migration(conn, VERSION_0002, MIGRATION_0002)?;
@@ -137,6 +169,25 @@ mod tests {
         assert_eq!(
             count, 5,
             "still exactly five migration rows after second run"
+        );
+    }
+
+    #[test]
+    fn unrecognized_future_migration_is_rejected() {
+        // Simulate a newer binary having already migrated this database
+        // further than the current binary knows how to.
+        let conn = in_memory_conn();
+        run_migrations(&conn).expect("first run");
+        conn.execute(
+            "INSERT INTO core_schema_migrations (id) VALUES (?1)",
+            rusqlite::params!["0099_future_migration"],
+        )
+        .unwrap();
+
+        let err = run_migrations(&conn).expect_err("downgrade must be rejected");
+        assert!(
+            matches!(err, StorageError::Migration { .. }),
+            "expected a Migration error, got {err:?}"
         );
     }
 

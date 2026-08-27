@@ -351,13 +351,9 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         let mut seed = connect(&bin, &db, Some(dir)).await;
         // Wait up to 5 s for the file to be indexed in this repo.
         for _ in 0..10 {
-            let txt = call_tool_text(
-                &mut seed,
-                "search",
-                serde_json::json!({ "query": token }),
-            )
-            .await
-            .unwrap_or_default();
+            let txt = call_tool_text(&mut seed, "search", serde_json::json!({ "query": token }))
+                .await
+                .unwrap_or_default();
             let sv: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
             if sv["results"]
                 .as_array()
@@ -395,7 +391,10 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(watcher_ready, "cross-repo sync did not complete within 10s; watcher never started");
+    assert!(
+        watcher_ready,
+        "cross-repo sync did not complete within 10s; watcher never started"
+    );
 
     // ── Call context tool with cross-repo query ──────────────────────────────
     // Poll until at least one evidence item carries workspace_snapshot_id
@@ -418,11 +417,12 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         .expect("context tool");
         v = serde_json::from_str(&response_text).expect("context payload is JSON");
         // Check if any evidence has workspace_snapshot_id set (cross-repo ready).
-        let has_snapshot = v["evidence"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .any(|e| e["workspace_snapshot_id"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
+        let has_snapshot = v["evidence"].as_array().unwrap_or(&vec![]).iter().any(|e| {
+            e["workspace_snapshot_id"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        });
         if has_snapshot {
             break;
         }
@@ -440,7 +440,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     assert!(
         full_response.contains("example.com/rmcp/provider"),
         "GATE 1 FAIL: provider module must be identified in cross-repo response; response={:.500}",
-        &full_response
+        full_response
     );
 
     // GATE 2: Unrelated repository is NOT falsely claimed as a dependency.
@@ -450,7 +450,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     assert!(
         !claims_json.contains("example.com/rmcp/unrelated"),
         "GATE 2 FAIL: unrelated module must NOT appear as dependency claim; claims={:.500}",
-        &claims_json
+        claims_json
     );
 
     // GATE 3: Confidence field is present and non-empty.
@@ -496,7 +496,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         !snapshot_backed.is_empty(),
         "GATE 4b FAIL: must have at least one evidence item with workspace_snapshot_id \
          (cross-repo provenance); evidence={:.500}",
-        &evidence_json
+        evidence_json
     );
     for ev in &snapshot_backed {
         let ws_snap_id = ev["workspace_snapshot_id"].as_str().unwrap_or("");
@@ -512,8 +512,12 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     }
 
     // GATE 4c: workspace_snapshot_id must be a valid UUID.
-    let first_ws_snap = snapshot_backed[0]["workspace_snapshot_id"].as_str().unwrap();
-    let uuid_re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
+    let first_ws_snap = snapshot_backed[0]["workspace_snapshot_id"]
+        .as_str()
+        .unwrap();
+    let uuid_re =
+        regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            .unwrap();
     assert!(
         uuid_re.is_match(first_ws_snap),
         "GATE 4c FAIL: workspace_snapshot_id must be valid UUID; got {first_ws_snap}"

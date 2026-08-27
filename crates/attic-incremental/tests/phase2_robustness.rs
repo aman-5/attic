@@ -64,6 +64,7 @@ fn single_event_flushes_after_quiet_period_without_second_event() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -157,6 +158,7 @@ fn reconciliation_task_updates_fts_and_canonical_state() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap();
     assert!(ran, "RECONCILIATION task claimed");
@@ -167,6 +169,7 @@ fn reconciliation_task_updates_fts_and_canonical_state() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -221,6 +224,7 @@ fn watcher_overflow_then_reconciliation_converges() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -302,7 +306,7 @@ fn gitignore_change_updates_inclusion_and_exclusion_end_to_end() {
         svc.apply_verified_change_set(&pool, &writer, &rep.change_set)
             .unwrap();
     }
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy)
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
         .unwrap()
     {}
     assert!(
@@ -323,7 +327,7 @@ fn gitignore_change_updates_inclusion_and_exclusion_end_to_end() {
         svc.apply_verified_change_set(&pool, &writer, &rep.change_set)
             .unwrap();
     }
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy)
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
         .unwrap()
     {}
 
@@ -397,6 +401,7 @@ fn unreadable_hash_failure_degrades_to_unknown_never_deleted() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -412,6 +417,7 @@ fn unreadable_hash_failure_degrades_to_unknown_never_deleted() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -541,6 +547,7 @@ fn scheduler_zero_worker_config_is_rejected() {
         fx.writer.clone(),
         fx.root().to_path_buf(),
         fx.policy(),
+        None,
     )
     .unwrap_err();
     let _ = &err;
@@ -558,6 +565,7 @@ fn scheduler_zero_worker_config_is_rejected() {
         fx.writer.clone(),
         fx.root().to_path_buf(),
         fx.policy(),
+        None,
     )
     .unwrap_err();
     assert!(err.to_string().contains("max_pending"));
@@ -627,7 +635,7 @@ fn watcher_start_failure_falls_back_to_periodic_reconciliation() {
     );
     svc.apply_verified_change_set(&pool, &writer, &report.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo, svc.policy())
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo, svc.policy(), None)
         .unwrap()
     {}
     let hits = pool

@@ -32,6 +32,10 @@ pub enum StorageError {
     #[error("JSON error: {0}")]
     Json(String),
 
+    /// An I/O error encountered during filesystem operations.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// A background OS thread could not be spawned.
     #[error("thread spawn failed: {0}")]
     ThreadSpawn(String),
@@ -63,6 +67,20 @@ pub enum StorageError {
         "writer connection poisoned (unrecoverable transaction finalization failure; restart required)"
     )]
     WriterPoisoned,
+
+    /// The database failed an integrity check — the file may be corrupt.
+    #[error("database integrity check failed: {reason}")]
+    CorruptDatabase {
+        /// reason description of corruption
+        reason: String,
+    },
+
+    /// A foreign-key constraint was violated in the database.
+    #[error("foreign-key violation: {reason}")]
+    ForeignKeyViolation {
+        /// reason description of the violation
+        reason: String,
+    },
 }
 
 impl From<serde_json::Error> for StorageError {

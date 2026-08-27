@@ -275,6 +275,7 @@ fn duplicate_watcher_events_do_not_duplicate_work_or_rows() {
         &payload,
         80,
         4096,
+        None,
     )
     .unwrap();
     let o2 = attic_incremental::scheduler::schedule_incremental(
@@ -283,6 +284,7 @@ fn duplicate_watcher_events_do_not_duplicate_work_or_rows() {
         &payload,
         80,
         4096,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -296,6 +298,7 @@ fn duplicate_watcher_events_do_not_duplicate_work_or_rows() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}

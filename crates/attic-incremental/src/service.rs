@@ -28,7 +28,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use attic_discovery::DiscoveryPolicy;
-use attic_storage::{DbPool, IncrementalTaskPayload, WriterQueueHandle};
+use attic_storage::{DbPool, IncrementalTaskPayload, ResourceMonitor, WriterQueueHandle};
 
 use crate::changeset::{self, DbSnapshotSource, VerifiedChangeSet};
 use crate::coalesce::{CoalescedChange, EventCoalescer};
@@ -81,12 +81,26 @@ pub struct ServiceMetrics {
     pub hints_dropped: AtomicU64,
     /// Watcher error batches received (event-loss signal).
     pub watcher_errors: AtomicU64,
-    /// Batches dropped by the raw watcher channel (saturation).
+    /// Batches dropped by the bounded raw channel (saturation).
     pub raw_batches_dropped: AtomicU64,
     /// Verified change sets applied.
     pub changesets_applied: AtomicU64,
     /// Whether event loss requires authoritative reconciliation.
     pub reconciliation_required: AtomicBool,
+    /// Phase 7: current resource pressure level.
+    pub resource_pressure: AtomicU64,
+    /// Phase 7: current foreground query count.
+    pub foreground_queries: AtomicU64,
+    /// Phase 7: writer queue pending count (observability).
+    pub writer_pending_count: AtomicU64,
+    /// Phase 7: number of backup checkpoints retained.
+    pub backup_checkpoints_retained: AtomicU64,
+    /// Phase 7: last backup timestamp (unix micros).
+    pub last_backup_timestamp: AtomicU64,
+    /// Phase 7: whether integrity check passed at last startup.
+    pub startup_integrity_ok: AtomicBool,
+    /// Phase 7: whether foreign key check passed at last startup.
+    pub startup_fk_ok: AtomicBool,
 }
 
 /// Wall-clock milliseconds for the event timeline (coalescer unit = ms).
@@ -483,6 +497,7 @@ impl IncrementalService {
             cs,
             DEFAULT_TASK_MAX_PENDING,
             scheduler::TaskOrigin::UserEdit,
+            None, // foreground UserEdit work always allowed; pressure gate in schedule_incremental permits priority >= 70
         )?;
         match outcome {
             ScheduleOutcome::Queued => report.task_queued = true,
@@ -518,9 +533,7 @@ impl IncrementalService {
                     Ok(())
                 })
                 .map_err(|e| {
-                    IncrementalError::Storage(attic_storage::StorageError::Worker(
-                        e.to_string(),
-                    ))
+                    IncrementalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
                 })?;
         }
         self.metrics
@@ -787,12 +800,15 @@ pub(crate) fn pair_content_renames(
 /// scheduler's RECONCILIATION arm.  Invalidation stays synchronous/cheap;
 /// recomputation is only SCHEDULED here (never executed inline), preserving
 /// `invalidation != recomputation`.
+/// Phase 7: accepts an optional ResourceMonitor so the scheduling gate can
+/// defer background work under memory pressure.
 pub(crate) fn invalidate_and_schedule(
     writer: &WriterQueueHandle,
     repo_id: &str,
     cs: &VerifiedChangeSet,
     max_pending: usize,
     origin: scheduler::TaskOrigin,
+    monitor: Option<&ResourceMonitor>,
 ) -> Result<ScheduleOutcome, IncrementalError> {
     let counts = invalidation::apply_invalidation(
         writer,
@@ -814,7 +830,14 @@ pub(crate) fn invalidate_and_schedule(
         renames: cs.renames.clone(),
         from_reconciliation: origin.from_reconciliation(),
     };
-    scheduler::schedule_incremental(writer, repo_id, &payload, origin.priority(), max_pending)
+    scheduler::schedule_incremental(
+        writer,
+        repo_id,
+        &payload,
+        origin.priority(),
+        max_pending,
+        monitor,
+    )
 }
 
 /// Verified restoration: disk hash matched the stored hash, so trust is

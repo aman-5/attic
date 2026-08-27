@@ -180,13 +180,20 @@ impl WriterQueueHandle {
             result_tx,
         };
 
-        // Non-blocking enqueue.
+        // Non-blocking enqueue.  The `?` operator ensures the item was enqueued successfully.
         self.tx.try_send(item).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => StorageError::QueueFull,
-            mpsc::TrySendError::Disconnected(_) => StorageError::QueueShutdown,
+            mpsc::TrySendError::Full(_) => {
+                // Do NOT increment pending count on failure.
+                StorageError::QueueFull
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                // Queue is shutting down; don't increment.
+                StorageError::QueueShutdown
+            }
         })?;
 
         // Block until the worker sends back the result.
+
         result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
     }
 }
@@ -265,9 +272,13 @@ impl Drop for WriterQueue {
         self.shutdown.store(true, Ordering::Release);
 
         if let Some(jh) = self.worker.take() {
-            // If the thread panicked we discard the panic value; the DB is
-            // safely closed when `conn` is dropped inside the worker.
-            let _ = jh.join();
+            // The DB is safely closed when `conn` is dropped inside the
+            // worker regardless of outcome, but a panic here means the
+            // writer thread died mid-work — that's not "clean shutdown"
+            // and must be observable, not silently discarded.
+            if let Err(panic) = jh.join() {
+                error!("writer thread panicked during shutdown: {panic:?}");
+            }
         }
     }
 }

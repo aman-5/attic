@@ -150,9 +150,7 @@ impl ProviderIndex {
 }
 
 fn normalize_path(p: &str) -> String {
-    p.replace('\\', "/")
-        .trim_end_matches('/')
-        .to_lowercase()
+    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
 }
 
 /// Basis token stored in `core_relationships.dependency_basis` for an
@@ -289,7 +287,10 @@ fn resolve_external(
 ) {
     // Generated API imports resolve against the exact proto path index.
     if d.ecosystem == Ecosystem::GeneratedApi {
-        let providers = proto_index.get(d.name.as_str()).cloned().unwrap_or_default();
+        let providers = proto_index
+            .get(d.name.as_str())
+            .cloned()
+            .unwrap_or_default();
         let others: Vec<String> = providers
             .iter()
             .map(|s| (*s).to_string())
@@ -327,8 +328,10 @@ fn resolve_external(
     }
 
     let providers = index.providers_of(d.ecosystem, &d.name);
-    let others: Vec<&String> =
-        providers.iter().filter(|p| **p != r.repository_id).collect();
+    let others: Vec<&String> = providers
+        .iter()
+        .filter(|p| **p != r.repository_id)
+        .collect();
     match others.len() {
         0 => {
             // No workspace provider — external-world dependency; nothing to
@@ -439,7 +442,10 @@ mod tests {
         assert_eq!(edges[0].source_repository_id, "repo-api");
         assert_eq!(edges[0].target_repository_id, "repo-lib");
         assert_eq!(edges[0].resolution, "PACKAGE_RESOLVED");
-        assert!(diag.is_empty(), "no diagnostics expected for clean resolution");
+        assert!(
+            diag.is_empty(),
+            "no diagnostics expected for clean resolution"
+        );
     }
 
     #[test]
@@ -477,7 +483,10 @@ mod tests {
         );
 
         let (edges, diag) = resolve_workspace(&[p1, p2, consumer], &HashMap::new());
-        assert!(edges.is_empty(), "ambiguous target must NOT produce an edge");
+        assert!(
+            edges.is_empty(),
+            "ambiguous target must NOT produce an edge"
+        );
         assert_eq!(diag.ambiguous_targets.len(), 1);
         assert_eq!(diag.ambiguous_targets[0].1, "shared-util");
     }
@@ -690,9 +699,15 @@ mod tests {
         assert_eq!(edges.len(), 2, "app→lib and lib→core edges");
         assert!(diag.is_empty());
         // Verify direction
-        let app_to_lib = edges.iter().find(|e| e.source_repository_id == "app").unwrap();
+        let app_to_lib = edges
+            .iter()
+            .find(|e| e.source_repository_id == "app")
+            .unwrap();
         assert_eq!(app_to_lib.target_repository_id, "lib");
-        let lib_to_core = edges.iter().find(|e| e.source_repository_id == "lib").unwrap();
+        let lib_to_core = edges
+            .iter()
+            .find(|e| e.source_repository_id == "lib")
+            .unwrap();
         assert_eq!(lib_to_core.target_repository_id, "core");
     }
 

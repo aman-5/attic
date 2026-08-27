@@ -664,6 +664,7 @@ fn foreground_queries_answer_during_background_enrichment() {
             batch_size: 4,
             max_attempts: 3,
         },
+        None,
     );
     for _ in 0..3 {
         let out = fx

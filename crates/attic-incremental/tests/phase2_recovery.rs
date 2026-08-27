@@ -26,14 +26,21 @@ fn restart_with_interrupted_task_reschedules_it() {
 
     // Simulate a crash between claim and completion: RUNNING row left behind.
     let payload = attic_storage::IncrementalTaskPayload {
-        dedup_key: "interrupted".into(),
-        upserts: vec!["src/wip.rs".into()],
+        dedup_key: "startup-recovery-task".into(),
+        upserts: vec!["src/startup.rs".into()],
         deletes: vec![],
         renames: vec![],
         from_reconciliation: false,
     };
-    attic_incremental::scheduler::schedule_incremental(&fx.writer, &fx.repo_id, &payload, 80, 4096)
-        .unwrap();
+    attic_incremental::scheduler::schedule_incremental(
+        &fx.writer,
+        &fx.repo_id,
+        &payload,
+        80,
+        4096,
+        None,
+    )
+    .unwrap();
     let claimed: Option<attic_storage::ClaimedTask> =
         attic_incremental::run_on_writer(&fx.writer, |conn| {
             attic_storage::claim_next_pending_task(conn, 1_000)
@@ -103,6 +110,7 @@ fn crash_between_invalidation_and_recomputation_never_serves_current() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap()
     {}
@@ -246,8 +254,15 @@ fn recovery_is_idempotent_across_repeated_restarts() {
         renames: vec![],
         from_reconciliation: false,
     };
-    attic_incremental::scheduler::schedule_incremental(&fx.writer, &fx.repo_id, &payload, 80, 4096)
-        .unwrap();
+    attic_incremental::scheduler::schedule_incremental(
+        &fx.writer,
+        &fx.repo_id,
+        &payload,
+        80,
+        4096,
+        None,
+    )
+    .unwrap();
 
     let r1 = attic_incremental::run_startup_recovery(&fx.pool, &fx.writer).unwrap();
     let r2 = attic_incremental::run_startup_recovery(&fx.pool, &fx.writer).unwrap();
@@ -277,8 +292,15 @@ fn cancellation_removes_pending_task_before_execution() {
         renames: vec![],
         from_reconciliation: false,
     };
-    attic_incremental::scheduler::schedule_incremental(&fx.writer, &fx.repo_id, &payload, 50, 4096)
-        .unwrap();
+    attic_incremental::scheduler::schedule_incremental(
+        &fx.writer,
+        &fx.repo_id,
+        &payload,
+        50,
+        4096,
+        None,
+    )
+    .unwrap();
 
     let cancelled = attic_incremental::run_on_writer(&fx.writer, |conn| {
         let id: String = conn.query_row(
@@ -296,6 +318,7 @@ fn cancellation_removes_pending_task_before_execution() {
         &fx.writer,
         fx.root(),
         &fx.policy(),
+        None,
     )
     .unwrap();
     assert!(!executed, "cancelled task must not execute");
@@ -328,6 +351,7 @@ fn graceful_shutdown_with_pending_work_preserves_queue() {
         fx.writer.clone(),
         fx.root().to_path_buf(),
         fx.policy(),
+        None,
     )
     .expect("scheduler must start");
 
@@ -346,6 +370,7 @@ fn graceful_shutdown_with_pending_work_preserves_queue() {
             &payload,
             80,
             4096,
+            None,
         )
         .unwrap();
     }

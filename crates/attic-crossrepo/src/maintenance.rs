@@ -114,10 +114,11 @@ fn resolve_source_revision(
     let repo_id = repository_id
         .parse::<attic_core::RepositoryId>()
         .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
-    attic_storage::latest_source_revision_for_repository(conn, &repo_id)?
-        .ok_or_else(|| CrossRepoError::NoSourceRevision {
+    attic_storage::latest_source_revision_for_repository(conn, &repo_id)?.ok_or_else(|| {
+        CrossRepoError::NoSourceRevision {
             repository_id: repository_id.to_owned(),
-        })
+        }
+    })
 }
 
 /// Report from a single-repository sync.
@@ -205,7 +206,14 @@ pub fn sync_workspace(
     let mut all_repo_data: Vec<RepoCatalogData> = Vec::with_capacity(total);
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
     // Collect scans for later persistence (keyed by repo_id).
-    let mut scans: HashMap<String, (crate::catalog::CatalogScan, Vec<crate::ProvidedIdentity>, Vec<crate::DependencyDeclaration>)> = HashMap::new();
+    let mut scans: HashMap<
+        String,
+        (
+            crate::catalog::CatalogScan,
+            Vec<crate::ProvidedIdentity>,
+            Vec<crate::DependencyDeclaration>,
+        ),
+    > = HashMap::new();
 
     for (idx, repo_id) in repo_ids.iter().enumerate() {
         if opts.cancel.is_cancelled() || opts.deadline.expired() {
@@ -236,11 +244,14 @@ pub fn sync_workspace(
         let source_revision_id = match resolve_source_revision(reader_conn, repo_id) {
             Ok(id) => id,
             Err(CrossRepoError::NoSourceRevision { repository_id }) => {
-                debug!("skipping repo {} — no source revision (not indexed)", repository_id);
-                result.diagnostics.missing_targets.push((
-                    repository_id.clone(),
-                    "no_source_revision".to_owned(),
-                ));
+                debug!(
+                    "skipping repo {} — no source revision (not indexed)",
+                    repository_id
+                );
+                result
+                    .diagnostics
+                    .missing_targets
+                    .push((repository_id.clone(), "no_source_revision".to_owned()));
                 continue;
             }
             Err(e) => return Err(e),
@@ -250,8 +261,8 @@ pub fn sync_workspace(
         let repo_id_parsed = repo_id
             .parse::<attic_core::RepositoryId>()
             .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
-        let root_path = attic_storage::get_repository_path(reader_conn, &repo_id_parsed)?
-            .unwrap_or_default();
+        let root_path =
+            attic_storage::get_repository_path(reader_conn, &repo_id_parsed)?.unwrap_or_default();
 
         let gmp = provides
             .iter()
@@ -444,16 +455,22 @@ pub fn incremental_sync(
             AND freshness_state = 'CURRENT'",
         rusqlite::params![repository_id],
     )?;
-    debug!(repo = repository_id, out_stale = out_stale, "invalidated outgoing edges");
+    debug!(
+        repo = repository_id,
+        out_stale = out_stale,
+        "invalidated outgoing edges"
+    );
 
     // 2. Check if this repo provides any packages. If so, invalidate INCOMING edges
     // (its provides changed, consumers' resolution may need update).
-    let provides_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM core_dependency_declarations
+    let provides_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM core_dependency_declarations
            WHERE repository_id = ?1 AND json_type(provides_json) = 'array'",
-        rusqlite::params![repository_id],
-        |r| r.get(0),
-    ).unwrap_or(0);
+            rusqlite::params![repository_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     let in_stale = if provides_count > 0 {
         conn.execute(
@@ -466,7 +483,11 @@ pub fn incremental_sync(
     } else {
         0
     };
-    debug!(repo = repository_id, in_stale = in_stale, "invalidated incoming edges");
+    debug!(
+        repo = repository_id,
+        in_stale = in_stale,
+        "invalidated incoming edges"
+    );
 
     // 3. Re-sync this repository's catalog with fresh SourceRevision.
     sync_repository(conn, repository_id)?;
@@ -475,7 +496,8 @@ pub fn incremental_sync(
     // Build resolver input for the whole workspace (bounded) and persist new edges.
     // This is a targeted recomputation, not a full workspace rebuild.
     let repo_ids = attic_storage::crossrepo_ops::all_repository_ids(conn)?;
-    let mut all_repo_data: Vec<crate::resolver::RepoCatalogData> = Vec::with_capacity(repo_ids.len());
+    let mut all_repo_data: Vec<crate::resolver::RepoCatalogData> =
+        Vec::with_capacity(repo_ids.len());
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
 
     for rid in &repo_ids {
@@ -494,8 +516,8 @@ pub fn incremental_sync(
         let repo_id_parsed = rid
             .parse::<attic_core::RepositoryId>()
             .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
-        let root_path = attic_storage::get_repository_path(conn, &repo_id_parsed)?
-            .unwrap_or_default();
+        let root_path =
+            attic_storage::get_repository_path(conn, &repo_id_parsed)?.unwrap_or_default();
         let gmp = provides
             .iter()
             .find(|p| p.ecosystem == crate::Ecosystem::Go)
@@ -640,18 +662,39 @@ mod tests {
         let rev = insert_rev(&conn, "r0");
 
         let edge_id = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r0"), "s0", &tid("r1"), "t1", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r0"),
+            "s0",
+            &tid("r1"),
+            "t1",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
 
         // Also insert an edge NOT targeting r1
         let _edge_id2 = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r0"), "s0", &tid("r0"), "t0", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r0"),
+            "s0",
+            &tid("r0"),
+            "t0",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
 
         let count = invalidate_edges_targeting(&conn, &tid("r1")).unwrap();
-        assert_eq!(count, 1, "only the edge targeting r1 should be marked STALE");
+        assert_eq!(
+            count, 1,
+            "only the edge targeting r1 should be marked STALE"
+        );
 
         // Verify the edge is actually STALE
         let state: String = conn
@@ -686,7 +729,16 @@ mod tests {
 
         // Insert edge
         let _ = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r0"), "s0", &tid("r1"), "t1", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
+            &conn,
+            &tid("r0"),
+            "s0",
+            &tid("r1"),
+            "t1",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev,
         )
         .unwrap();
 
@@ -724,10 +776,14 @@ mod tests {
 
         let report = sync_repository(&conn, &tid("test-repo")).unwrap();
         assert_eq!(report.repository_id, tid("test-repo"));
-        assert!(!report.manifest_hash.is_empty(), "manifest_hash should be computed");
+        assert!(
+            !report.manifest_hash.is_empty(),
+            "manifest_hash should be computed"
+        );
 
         // Verify catalog row exists
-        let catalog = attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("test-repo")).unwrap();
+        let catalog =
+            attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("test-repo")).unwrap();
         assert!(catalog.is_some(), "catalog row should exist after sync");
     }
 
@@ -802,7 +858,8 @@ mod tests {
             entry_count: 0,
             freshness_state: "CURRENT".to_owned(),
         };
-        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat0, &cat0.provides_json).unwrap();
+        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat0, &cat0.provides_json)
+            .unwrap();
 
         let cat1 = attic_storage::crossrepo_ops::CatalogRow {
             repository_id: tid("r1"),
@@ -812,15 +869,36 @@ mod tests {
             entry_count: 0,
             freshness_state: "CURRENT".to_owned(),
         };
-        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat1, &cat1.provides_json).unwrap();
+        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &cat1, &cat1.provides_json)
+            .unwrap();
 
         // Insert edges r0→r1 and r1→r0
         let _e1 = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r0"), "s0", &tid("r1"), "t1", "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev0,
-        ).unwrap();
+            &conn,
+            &tid("r0"),
+            "s0",
+            &tid("r1"),
+            "t1",
+            "PACKAGE_RESOLVED",
+            0.9,
+            "GO_MODULE",
+            "{}",
+            &rev0,
+        )
+        .unwrap();
         let _e2 = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn, &tid("r1"), "s1", &tid("r0"), "t0", "PACKAGE_RESOLVED", 0.8, "GO_MODULE", "{}", &rev1,
-        ).unwrap();
+            &conn,
+            &tid("r1"),
+            "s1",
+            &tid("r0"),
+            "t0",
+            "PACKAGE_RESOLVED",
+            0.8,
+            "GO_MODULE",
+            "{}",
+            &rev1,
+        )
+        .unwrap();
 
         let (edges_deleted, decls_deleted) = repository_removed(&conn, &tid("r0")).unwrap();
         assert!(edges_deleted >= 2, "should delete both edges touching r0");
@@ -845,11 +923,7 @@ mod tests {
     fn incremental_sync_propagates_error_on_db_failure() {
         let conn = seeded_conn();
         // Try to sync a repository that doesn't exist — should propagate error
-        let result = incremental_sync(
-            &conn,
-            &tid("nonexistent"),
-            &["go.mod".to_owned()],
-        );
+        let result = incremental_sync(&conn, &tid("nonexistent"), &["go.mod".to_owned()]);
         assert!(result.is_err(), "should propagate error for missing repo");
     }
 }

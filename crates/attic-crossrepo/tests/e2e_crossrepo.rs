@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 
+use attic_crossrepo::impact;
 use attic_crossrepo::maintenance::sync_repository;
 use attic_crossrepo::resolver::{self, RepoCatalogData};
 use attic_crossrepo::traversal::{self, Direction, TraversalBudget};
-use attic_crossrepo::impact;
-use attic_crossrepo::{CancelToken, DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity};
+use attic_crossrepo::{
+    CancelToken, DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity,
+};
 use attic_storage::connection::configure_connection;
 use attic_storage::migration::run_migrations;
 
@@ -140,7 +142,10 @@ fn e2e_multi_repo_sync_and_resolve() {
         RepoCatalogData {
             repository_id: tid("provider"),
             root_path: provider_dir.path().to_string_lossy().to_string(),
-            source_revision_id: catalog_p.as_ref().map(|c| c.source_revision_id.clone()).unwrap_or_default(),
+            source_revision_id: catalog_p
+                .as_ref()
+                .map(|c| c.source_revision_id.clone())
+                .unwrap_or_default(),
             provides,
             declarations: vec![],
             primary_anchor_occurrence: None,
@@ -149,7 +154,10 @@ fn e2e_multi_repo_sync_and_resolve() {
         RepoCatalogData {
             repository_id: tid("consumer"),
             root_path: consumer_dir.path().to_string_lossy().to_string(),
-            source_revision_id: catalog_c.as_ref().map(|c| c.source_revision_id.clone()).unwrap_or_default(),
+            source_revision_id: catalog_c
+                .as_ref()
+                .map(|c| c.source_revision_id.clone())
+                .unwrap_or_default(),
             provides: vec![],
             declarations: decl_consumer,
             primary_anchor_occurrence: None,
@@ -158,7 +166,10 @@ fn e2e_multi_repo_sync_and_resolve() {
         RepoCatalogData {
             repository_id: tid("indirect"),
             root_path: indirect_dir.path().to_string_lossy().to_string(),
-            source_revision_id: catalog_i.as_ref().map(|c| c.source_revision_id.clone()).unwrap_or_default(),
+            source_revision_id: catalog_i
+                .as_ref()
+                .map(|c| c.source_revision_id.clone())
+                .unwrap_or_default(),
             provides: vec![],
             declarations: decl_indirect,
             primary_anchor_occurrence: None,
@@ -172,12 +183,18 @@ fn e2e_multi_repo_sync_and_resolve() {
     assert!(diagnostics.is_empty(), "no resolution diagnostics expected");
 
     // Verify edge directions
-    let consumer_edge = edges.iter().find(|e| e.source_repository_id == tid("consumer")).unwrap();
+    let consumer_edge = edges
+        .iter()
+        .find(|e| e.source_repository_id == tid("consumer"))
+        .unwrap();
     assert_eq!(consumer_edge.target_repository_id, tid("provider"));
     assert_eq!(consumer_edge.resolution, "PACKAGE_RESOLVED");
     assert_eq!(consumer_edge.dependency_basis, "GO_MODULE");
 
-    let indirect_edge = edges.iter().find(|e| e.source_repository_id == tid("indirect")).unwrap();
+    let indirect_edge = edges
+        .iter()
+        .find(|e| e.source_repository_id == tid("indirect"))
+        .unwrap();
     assert_eq!(indirect_edge.target_repository_id, tid("provider"));
 
     // Persist edges
@@ -206,7 +223,8 @@ fn e2e_multi_repo_sync_and_resolve() {
         max_time_ms: 5000,
         cancel: CancelToken::never(),
     };
-    let traversal_result = traversal::traverse(&conn, &tid("consumer"), Direction::Dependencies, &budget).unwrap();
+    let traversal_result =
+        traversal::traverse(&conn, &tid("consumer"), Direction::Dependencies, &budget).unwrap();
     assert!(
         traversal_result.repositories.contains(&tid("provider")),
         "graph traversal must reach provider from consumer"
@@ -214,13 +232,22 @@ fn e2e_multi_repo_sync_and_resolve() {
 
     // Impact analysis: provider affects consumer and indirect
     let impact_report = impact::analyze_dependents(&conn, &tid("provider"), &budget).unwrap();
-    assert!(!impact_report.impacted.is_empty(), "provider should have dependents");
     assert!(
-        impact_report.impacted.iter().any(|r| r.repository_id == tid("consumer")),
+        !impact_report.impacted.is_empty(),
+        "provider should have dependents"
+    );
+    assert!(
+        impact_report
+            .impacted
+            .iter()
+            .any(|r| r.repository_id == tid("consumer")),
         "consumer must be in impacted repos"
     );
     assert!(
-        impact_report.impacted.iter().any(|r| r.repository_id == tid("indirect")),
+        impact_report
+            .impacted
+            .iter()
+            .any(|r| r.repository_id == tid("indirect")),
         "indirect must be in impacted repos"
     );
 }
@@ -237,29 +264,58 @@ fn e2e_stale_vs_invalid_edge_handling() {
 
     // CURRENT edge: r0 → r1
     let _edge_current = attic_storage::crossrepo_ops::insert_xrepo_edge(
-        &conn, &tid("r0"), "occ-0", &tid("r1"), "occ-1",
-        "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev,
-    ).unwrap();
+        &conn,
+        &tid("r0"),
+        "occ-0",
+        &tid("r1"),
+        "occ-1",
+        "PACKAGE_RESOLVED",
+        0.9,
+        "GO_MODULE",
+        "{}",
+        &rev,
+    )
+    .unwrap();
 
     // STALE edge: r0 → r2
     let edge_stale = attic_storage::crossrepo_ops::insert_xrepo_edge(
-        &conn, &tid("r0"), "occ-0", &tid("r2"), "occ-2",
-        "PACKAGE_RESOLVED", 0.7, "GO_MODULE", "{}", &rev,
-    ).unwrap();
+        &conn,
+        &tid("r0"),
+        "occ-0",
+        &tid("r2"),
+        "occ-2",
+        "PACKAGE_RESOLVED",
+        0.7,
+        "GO_MODULE",
+        "{}",
+        &rev,
+    )
+    .unwrap();
     conn.execute(
         "UPDATE core_relationships SET freshness_state = 'STALE' WHERE id = ?1",
         rusqlite::params![edge_stale],
-    ).unwrap();
+    )
+    .unwrap();
 
     // INVALID edge: r1 → r2 (should be excluded)
     let edge_invalid = attic_storage::crossrepo_ops::insert_xrepo_edge(
-        &conn, &tid("r1"), "occ-1", &tid("r2"), "occ-2",
-        "PACKAGE_RESOLVED", 0.8, "GO_MODULE", "{}", &rev,
-    ).unwrap();
+        &conn,
+        &tid("r1"),
+        "occ-1",
+        &tid("r2"),
+        "occ-2",
+        "PACKAGE_RESOLVED",
+        0.8,
+        "GO_MODULE",
+        "{}",
+        &rev,
+    )
+    .unwrap();
     conn.execute(
         "UPDATE core_relationships SET freshness_state = 'INVALID' WHERE id = ?1",
         rusqlite::params![edge_invalid],
-    ).unwrap();
+    )
+    .unwrap();
 
     let budget = TraversalBudget {
         max_depth: 4,
@@ -271,12 +327,21 @@ fn e2e_stale_vs_invalid_edge_handling() {
 
     // Traversal from r0: should reach r1 (CURRENT) and r2 (STALE)
     let result = traversal::traverse(&conn, &tid("r0"), Direction::Dependencies, &budget).unwrap();
-    assert!(result.repositories.contains(&tid("r1")), "r1 via CURRENT edge");
-    assert!(result.repositories.contains(&tid("r2")), "r2 via STALE edge");
+    assert!(
+        result.repositories.contains(&tid("r1")),
+        "r1 via CURRENT edge"
+    );
+    assert!(
+        result.repositories.contains(&tid("r2")),
+        "r2 via STALE edge"
+    );
 
     // Traversal from r1: should NOT reach r2 (INVALID edge excluded)
     let result2 = traversal::traverse(&conn, &tid("r1"), Direction::Dependencies, &budget).unwrap();
-    assert!(!result2.repositories.contains(&tid("r2")), "r2 must be excluded via INVALID edge");
+    assert!(
+        !result2.repositories.contains(&tid("r2")),
+        "r2 must be excluded via INVALID edge"
+    );
 }
 
 /// Verify that repository removal cleans up all cross-repo state.
@@ -298,20 +363,40 @@ fn e2e_repository_removal_cascade() {
         entry_count: 1,
         freshness_state: "CURRENT".to_owned(),
     };
-    attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &catalog, &catalog.provides_json).unwrap();
+    attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &catalog, &catalog.provides_json)
+        .unwrap();
 
     // Insert edges: r0→r1 and r0→r2
     let _ = attic_storage::crossrepo_ops::insert_xrepo_edge(
-        &conn, &tid("r0"), "occ-0", &tid("r1"), "occ-1",
-        "PACKAGE_RESOLVED", 0.9, "GO_MODULE", "{}", &rev0,
-    ).unwrap();
+        &conn,
+        &tid("r0"),
+        "occ-0",
+        &tid("r1"),
+        "occ-1",
+        "PACKAGE_RESOLVED",
+        0.9,
+        "GO_MODULE",
+        "{}",
+        &rev0,
+    )
+    .unwrap();
     let _ = attic_storage::crossrepo_ops::insert_xrepo_edge(
-        &conn, &tid("r0"), "occ-0", &tid("r2"), "occ-2",
-        "PACKAGE_RESOLVED", 0.8, "GO_MODULE", "{}", &rev0,
-    ).unwrap();
+        &conn,
+        &tid("r0"),
+        "occ-0",
+        &tid("r2"),
+        "occ-2",
+        "PACKAGE_RESOLVED",
+        0.8,
+        "GO_MODULE",
+        "{}",
+        &rev0,
+    )
+    .unwrap();
 
     // Remove r0
-    let (edges_deleted, _decls_deleted) = attic_crossrepo::maintenance::repository_removed(&conn, &tid("r0")).unwrap();
+    let (edges_deleted, _decls_deleted) =
+        attic_crossrepo::maintenance::repository_removed(&conn, &tid("r0")).unwrap();
     assert!(edges_deleted >= 2, "both edges should be deleted");
 
     // Verify: no catalog, no edges
@@ -459,7 +544,10 @@ fn e2e_integrated_indexing_to_crossrepo_to_traversal() {
 
         // Provider should have no outgoing cross-repo edges.
         assert!(
-            edges_provider.is_empty() || edges_provider.iter().all(|e| e.source_repository_id != provider_repo_id),
+            edges_provider.is_empty()
+                || edges_provider
+                    .iter()
+                    .all(|e| e.source_repository_id != provider_repo_id),
             "provider should have no outgoing cross-repo edges"
         );
 
@@ -493,7 +581,10 @@ fn e2e_integrated_indexing_to_crossrepo_to_traversal() {
         let impact = attic_crossrepo::impact::analyze_dependents(conn, &provider_repo_id, &budget)
             .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
         assert!(
-            impact.impacted.iter().any(|r| r.repository_id == consumer_repo_id),
+            impact
+                .impacted
+                .iter()
+                .any(|r| r.repository_id == consumer_repo_id),
             "provider impact must include consumer"
         );
 
@@ -518,8 +609,16 @@ fn e2e_phase6_quality_metrics() {
     let consumer_dir = tempfile::tempdir().unwrap();
     let unrelated_dir = tempfile::tempdir().unwrap();
 
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/metrics/lib\n").unwrap();
-    std::fs::write(provider_dir.path().join("lib.go"), "package lib\nfunc Exported() {}\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/metrics/lib\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.path().join("lib.go"),
+        "package lib\nfunc Exported() {}\n",
+    )
+    .unwrap();
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/metrics/app\nrequire example.com/metrics/lib v1.0.0\n",
@@ -531,8 +630,16 @@ fn e2e_phase6_quality_metrics() {
     )
     .unwrap();
     // Unrelated repo: no cross-deps.
-    std::fs::write(unrelated_dir.path().join("go.mod"), "module example.com/metrics/standalone\n").unwrap();
-    std::fs::write(unrelated_dir.path().join("lib.go"), "package standalone\nfunc Hello() {}\n").unwrap();
+    std::fs::write(
+        unrelated_dir.path().join("go.mod"),
+        "module example.com/metrics/standalone\n",
+    )
+    .unwrap();
+    std::fs::write(
+        unrelated_dir.path().join("lib.go"),
+        "package standalone\nfunc Hello() {}\n",
+    )
+    .unwrap();
 
     // 2. Set up DB + writer.
     let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -546,7 +653,10 @@ fn e2e_phase6_quality_metrics() {
     let writer_handle = writer_queue.handle();
 
     // 3. Phase 2: index all three repos.
-    let store = IndexingStore { readers: &pool, writer: &writer_handle };
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
     let policy = attic_discovery::DiscoveryPolicy::default_git();
     let opts = IndexOptions::default();
     let provider_result = index_repository(&store, provider_dir.path(), &policy, &opts).unwrap();
@@ -559,11 +669,13 @@ fn e2e_phase6_quality_metrics() {
     // 4. Phase 6: sync workspace.
     pool.with_reader(|conn| {
         attic_crossrepo::maintenance::sync_workspace(
-            conn, &writer_handle,
+            conn,
+            &writer_handle,
             &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
         )
         .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
+    })
+    .unwrap();
 
     // ── Metrics collection ──────────────────────────────────────────────
 
@@ -702,8 +814,16 @@ fn e2e_manifest_change_triggers_crossrepo_recomputation() {
     let provider_dir = tempfile::tempdir().unwrap();
     let consumer_dir = tempfile::tempdir().unwrap();
 
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/recomp/lib\n").unwrap();
-    std::fs::write(provider_dir.path().join("lib.go"), "package lib\nfunc V1() {}\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/recomp/lib\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.path().join("lib.go"),
+        "package lib\nfunc V1() {}\n",
+    )
+    .unwrap();
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/recomp/app\nrequire example.com/recomp/lib v1.0.0\n",
@@ -727,7 +847,10 @@ fn e2e_manifest_change_triggers_crossrepo_recomputation() {
     let writer_handle = writer_queue.handle();
 
     // 3. Phase 2: index both repos.
-    let store = IndexingStore { readers: &pool, writer: &writer_handle };
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
     let policy = attic_discovery::DiscoveryPolicy::default_git();
     let opts = IndexOptions::default();
     let provider_result = index_repository(&store, provider_dir.path(), &policy, &opts).unwrap();
@@ -736,23 +859,34 @@ fn e2e_manifest_change_triggers_crossrepo_recomputation() {
     let consumer_id = consumer_result.repository_id.clone();
 
     // 4. Phase 6: initial sync.
-    let sync_result = pool.with_reader(|conn| {
-        attic_crossrepo::maintenance::sync_workspace(
-            conn, &writer_handle,
-            &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
-        )
-        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
-    eprintln!("sync result: repos={} edges={}", sync_result.repository_reports.len(), sync_result.edges_emitted);
+    let sync_result = pool
+        .with_reader(|conn| {
+            attic_crossrepo::maintenance::sync_workspace(
+                conn,
+                &writer_handle,
+                &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
+            )
+            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+        })
+        .unwrap();
+    eprintln!(
+        "sync result: repos={} edges={}",
+        sync_result.repository_reports.len(),
+        sync_result.edges_emitted
+    );
 
     // Verify initial edges exist.
-    let initial_edge_count = pool.with_reader(|conn| {
-        let edges = attic_storage::crossrepo_ops::cross_edges_touching(
-            conn, &consumer_id, 64,
-        ).map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
-        Ok::<_, attic_storage::StorageError>(edges.len())
-    }).unwrap();
-    assert!(initial_edge_count > 0, "should have cross-repo edges after initial sync");
+    let initial_edge_count = pool
+        .with_reader(|conn| {
+            let edges = attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 64)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+            Ok::<_, attic_storage::StorageError>(edges.len())
+        })
+        .unwrap();
+    assert!(
+        initial_edge_count > 0,
+        "should have cross-repo edges after initial sync"
+    );
 
     // 5. Modify consumer's manifest (add a new dependency).
     std::fs::write(
@@ -764,24 +898,40 @@ fn e2e_manifest_change_triggers_crossrepo_recomputation() {
     // 6. Run incremental sync through the writer queue (sync_repository writes).
     let changed_paths = vec!["go.mod".to_owned()];
     let consumer_id_for_sync = consumer_id.clone();
-    writer_handle.send(move |conn| {
-        attic_crossrepo::maintenance::incremental_sync(conn, &consumer_id_for_sync, &changed_paths)
+    writer_handle
+        .send(move |conn| {
+            attic_crossrepo::maintenance::incremental_sync(
+                conn,
+                &consumer_id_for_sync,
+                &changed_paths,
+            )
             .map(|_| ())
             .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
+        })
+        .unwrap();
 
     // 7. Verify edges were recomputed (freshness should still be CURRENT
     //    because sync_repository re-creates them).
-    let post_sync_edges = pool.with_reader(|conn| {
-        let edges = attic_storage::crossrepo_ops::cross_edges_touching(
-            conn, &consumer_id, 64,
-        ).map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
-        Ok::<_, attic_storage::StorageError>(edges)
-    }).unwrap();
-    assert!(!post_sync_edges.is_empty(), "edges should exist after manifest change + resync");
+    let post_sync_edges = pool
+        .with_reader(|conn| {
+            let edges = attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 64)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+            Ok::<_, attic_storage::StorageError>(edges)
+        })
+        .unwrap();
+    assert!(
+        !post_sync_edges.is_empty(),
+        "edges should exist after manifest change + resync"
+    );
     for e in &post_sync_edges {
-        assert_eq!(e.freshness_state, "CURRENT", "recomputed edges must be CURRENT");
-        assert!(!e.source_revision_id.is_empty(), "recomputed edges must carry SourceRevision");
+        assert_eq!(
+            e.freshness_state, "CURRENT",
+            "recomputed edges must be CURRENT"
+        );
+        assert!(
+            !e.source_revision_id.is_empty(),
+            "recomputed edges must carry SourceRevision"
+        );
     }
 }
 
@@ -794,7 +944,11 @@ fn e2e_missing_source_revision_fail_closed() {
 
     // Create a provider repo and index it.
     let provider_dir = tempfile::tempdir().unwrap();
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/fail/lib\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/fail/lib\n",
+    )
+    .unwrap();
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let (pool_conn, pool) = attic_storage::open_db(db_file.path()).unwrap();
@@ -807,7 +961,10 @@ fn e2e_missing_source_revision_fail_closed() {
     let writer_handle = writer_queue.handle();
 
     // Index provider only.
-    let store = IndexingStore { readers: &pool, writer: &writer_handle };
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
     let policy = attic_discovery::DiscoveryPolicy::default_git();
     let opts = IndexOptions::default();
     let provider_result = index_repository(&store, provider_dir.path(), &policy, &opts).unwrap();
@@ -817,21 +974,30 @@ fn e2e_missing_source_revision_fail_closed() {
     // (no source revision exists).
     let repo_id = attic_core::RepositoryId::new_v4();
     let _repo_id_str = repo_id.to_string_repr();
-    writer_handle.send(move |conn| {
-        attic_storage::repository::repository::upsert_repository(
-            conn, &repo_id, "/fake/path", "unindexed-repo",
-        ).unwrap();
-        Ok::<(), attic_storage::StorageError>(())
-    }).unwrap();
+    writer_handle
+        .send(move |conn| {
+            attic_storage::repository::repository::upsert_repository(
+                conn,
+                &repo_id,
+                "/fake/path",
+                "unindexed-repo",
+            )
+            .unwrap();
+            Ok::<(), attic_storage::StorageError>(())
+        })
+        .unwrap();
 
     // Sync workspace — should skip the unindexed repo gracefully.
-    let result = pool.with_reader(|conn| {
-        attic_crossrepo::maintenance::sync_workspace(
-            conn, &writer_handle,
-            &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
-        )
-        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
+    let result = pool
+        .with_reader(|conn| {
+            attic_crossrepo::maintenance::sync_workspace(
+                conn,
+                &writer_handle,
+                &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
+            )
+            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+        })
+        .unwrap();
 
     // Only provider should be synced; unindexed repo skipped gracefully.
     assert_eq!(result.repository_reports.len(), 1);
@@ -844,25 +1010,35 @@ fn e2e_missing_source_revision_fail_closed() {
 #[test]
 fn e2e_manifest_change_edge_visible_via_mcp() {
     use attic_indexing::{IndexOptions, IndexingStore, index_repository};
-    use attic_retrieval::pipeline::{AnswerRequest, RetrievalService};
     use attic_retrieval::AnswerMode;
+    use attic_retrieval::pipeline::{AnswerRequest, RetrievalService};
     use attic_storage::writer::WriterQueue;
 
     // Create provider + consumer.
     let provider_dir = tempfile::tempdir().unwrap();
     let consumer_dir = tempfile::tempdir().unwrap();
 
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/mcp/lib\n").unwrap();
-    std::fs::write(provider_dir.path().join("lib.go"), "package lib\nfunc V1() {}\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/mcp/lib\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.path().join("lib.go"),
+        "package lib\nfunc V1() {}\n",
+    )
+    .unwrap();
 
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/mcp/app\nrequire example.com/mcp/lib v1.0.0\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         consumer_dir.path().join("main.go"),
         "package main\nimport \"example.com/mcp/lib\"\nfunc main() { lib.V1() }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // DB + writer.
     let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -876,7 +1052,10 @@ fn e2e_manifest_change_edge_visible_via_mcp() {
     let writer_handle = writer_queue.handle();
 
     // Phase 2: index both.
-    let store = IndexingStore { readers: &pool, writer: &writer_handle };
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &writer_handle,
+    };
     let policy = attic_discovery::DiscoveryPolicy::default_git();
     let opts = IndexOptions::default();
     let _provider_result = index_repository(&store, provider_dir.path(), &policy, &opts).unwrap();
@@ -886,18 +1065,22 @@ fn e2e_manifest_change_edge_visible_via_mcp() {
     // Phase 6: sync — should resolve cross-repo edge consumer→provider.
     pool.with_reader(|conn| {
         attic_crossrepo::maintenance::sync_workspace(
-            conn, &writer_handle,
+            conn,
+            &writer_handle,
             &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
         )
         .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
+    })
+    .unwrap();
 
     // Verify edge exists in DB.
     pool.with_reader(|conn| {
-        let edges = attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 100).unwrap();
+        let edges =
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 100).unwrap();
         assert!(!edges.is_empty(), "cross-repo edge must exist after sync");
         Ok::<(), attic_storage::StorageError>(())
-    }).unwrap();
+    })
+    .unwrap();
 
     // Full retrieval pipeline must not crash with cross-repo edges present.
     let service = RetrievalService {
@@ -913,23 +1096,31 @@ fn e2e_manifest_change_edge_visible_via_mcp() {
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/mcp/app\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Trigger incremental sync (manifest changed) — edge should be removed.
     let changed = vec!["go.mod".to_owned()];
     let consumer_id_clone = consumer_id.clone();
-    writer_handle.send(move |conn| {
-        attic_crossrepo::maintenance::incremental_sync(conn, &consumer_id_clone, &changed)
-            .map(|_| ())
-            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    }).unwrap();
+    writer_handle
+        .send(move |conn| {
+            attic_crossrepo::maintenance::incremental_sync(conn, &consumer_id_clone, &changed)
+                .map(|_| ())
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+        })
+        .unwrap();
 
     // Verify edge is gone.
     pool.with_reader(|conn| {
-        let edges = attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 100).unwrap();
-        assert!(edges.is_empty(), "cross-repo edge must be removed after incremental_sync");
+        let edges =
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 100).unwrap();
+        assert!(
+            edges.is_empty(),
+            "cross-repo edge must be removed after incremental_sync"
+        );
         Ok::<(), attic_storage::StorageError>(())
-    }).unwrap();
+    })
+    .unwrap();
 
     // Full retrieval pipeline must still work without cross-repo edges.
     let req2 = AnswerRequest::new("lib", AnswerMode::Fast);
@@ -1059,12 +1250,9 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
         .with_reader(|conn| {
             let rows = attic_storage::crossrepo_ops::snapshot_revisions(conn, &real_snapshot_id)
                 .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
-            let header =
-                attic_storage::crossrepo_ops::latest_workspace_snapshot(conn)
-                    .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?
-                    .ok_or_else(|| {
-                        attic_storage::StorageError::Worker("no snapshot".to_owned())
-                    })?;
+            let header = attic_storage::crossrepo_ops::latest_workspace_snapshot(conn)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?
+                .ok_or_else(|| attic_storage::StorageError::Worker("no snapshot".to_owned()))?;
             Ok::<_, attic_storage::StorageError>((rows, header))
         })
         .expect("snapshot lookup");
@@ -1072,9 +1260,14 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
         snap_meta.id, real_snapshot_id,
         "snapshot header must match the one sync_workspace created"
     );
-    let mut snap_repo_ids: Vec<String> = snap_revs.iter().map(|r| r.repository_id.clone()).collect();
+    let mut snap_repo_ids: Vec<String> =
+        snap_revs.iter().map(|r| r.repository_id.clone()).collect();
     snap_repo_ids.sort();
-    let mut expected_repo_ids = vec![provider_id.clone(), consumer_id.clone(), indirect_id.clone()];
+    let mut expected_repo_ids = vec![
+        provider_id.clone(),
+        consumer_id.clone(),
+        indirect_id.clone(),
+    ];
     expected_repo_ids.sort();
     assert_eq!(
         snap_repo_ids, expected_repo_ids,
@@ -1107,12 +1300,8 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     //    pipeline uses to surface cross-repository conclusions.
     let cross_edges = pool
         .with_reader(|conn| {
-            attic_storage::crossrepo_ops::cross_edges_touching(
-                conn,
-                &consumer_id,
-                64,
-            )
-            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 64)
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
         })
         .expect("cross edges");
     assert!(
@@ -1132,7 +1321,7 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     let cross_evidence = pool
         .with_reader(|conn| {
             let mut env = attic_retrieval::candidates::GeneratorEnv {
-                conn: &conn,
+                conn: conn,
                 repository_id: None,
                 budget: &mut budget,
                 limit: 64,
@@ -1161,10 +1350,9 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     for cand in &cross_evidence {
         let ev = &cand.evidence;
         // 7a: snapshot id must be present on cross-repo evidence.
-        let snap_id = ev
-            .workspace_snapshot_id
-            .as_deref()
-            .unwrap_or_else(|| panic!("cross-repo Evidence must carry a workspace_snapshot_id: {ev:?}"));
+        let snap_id = ev.workspace_snapshot_id.as_deref().unwrap_or_else(|| {
+            panic!("cross-repo Evidence must carry a workspace_snapshot_id: {ev:?}")
+        });
 
         // 7b: snapshot id must be one we actually created (no fabrication).
         assert_eq!(
@@ -1247,7 +1435,7 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     let synthetic_evidence = pool
         .with_reader(|conn| {
             let mut env = attic_retrieval::candidates::GeneratorEnv {
-                conn: &conn,
+                conn: conn,
                 repository_id: None,
                 budget: &mut budget2,
                 limit: 64,
@@ -1290,13 +1478,21 @@ fn e2e_workspace_snapshot_revision_set_is_exact_no_fabrication() {
     let other_dir = tempfile::tempdir().unwrap();
     let standalone_dir = tempfile::tempdir().unwrap();
 
-    std::fs::write(provider_dir.path().join("go.mod"), "module example.com/exact/lib\n").unwrap();
+    std::fs::write(
+        provider_dir.path().join("go.mod"),
+        "module example.com/exact/lib\n",
+    )
+    .unwrap();
     std::fs::write(
         consumer_dir.path().join("go.mod"),
         "module example.com/exact/app\nrequire example.com/exact/lib v1.0.0\n",
     )
     .unwrap();
-    std::fs::write(other_dir.path().join("go.mod"), "module example.com/exact/other\n").unwrap();
+    std::fs::write(
+        other_dir.path().join("go.mod"),
+        "module example.com/exact/other\n",
+    )
+    .unwrap();
     std::fs::write(
         standalone_dir.path().join("go.mod"),
         "module example.com/exact/standalone\n",
