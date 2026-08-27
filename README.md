@@ -47,10 +47,19 @@ files change. If `ATTIC_WORKSPACE_ROOT` is unset, Attic still starts and
 serves whatever repositories are already in its database (useful for
 inspecting a previously-indexed workspace, or for pure MCP tool testing).
 
-For multi-repository / cross-repo dependency resolution, point additional
-Attic instances at each repository sharing the same `ATTIC_DB_PATH` (or
-default data directory) — see `docs/contracts/query_evidence.md` and the
-cross-repo workspace sync behavior in `crates/attic-crossrepo`.
+For multi-repository / cross-repo dependency resolution, point
+`ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are linked as
+Git submodules (each submodule becomes its own `core_repositories` entry —
+see ADR-006). A **single** `attic-server` process owns the workspace: one
+watcher, one MCP transport, one SQLite writer. Cross-repo dependency
+resolution runs automatically at startup within that one process — see
+`crates/attic-crossrepo` and `docs/contracts/query_evidence.md`.
+
+Attic does **not** support multiple `attic-server` processes writing to the
+same database concurrently — the writer, watcher, and startup-recovery logic
+all assume single-process ownership of a given `attic.db`. Point every
+workspace's `ATTIC_DATA_DIR` (or `ATTIC_DB_PATH`) at its own, distinct
+location if you run more than one Attic instance on a machine.
 
 ## Configure your MCP client
 
