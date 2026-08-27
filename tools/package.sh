@@ -49,10 +49,14 @@ if [[ "$MODE" == verify ]]; then
   echo "== verifying release archive layout: $NAME"
   # Layout invariants
   test -d "$DIR" || { echo "FAIL: $DIR missing"; exit 1; }
-  BIN_COUNT=0
-  if [[ -f "$DIR/attic-server" ]]; then BIN_COUNT=$((BIN_COUNT+1)); fi
-  if [[ -f "$DIR/attic-server.exe" ]]; then BIN_COUNT=$((BIN_COUNT+1)); fi
-  test "$BIN_COUNT" -eq 1 || { echo "FAIL: exactly one attic-server binary expected"; exit 1; }
+  # NOTE: `[[ -f "$DIR/attic-server" ]]` is NOT safe here — on Windows/MSYS
+  # bash (exactly what GitHub's windows-latest runner uses for `run: bash
+  # ...` steps), that stat call resolves through PATHEXT-style suffix
+  # matching and reports true even when only `attic-server.exe` exists,
+  # double-counting a single binary. `find` lists real directory entries
+  # and isn't subject to that resolution.
+  BIN_COUNT=$(find "$DIR" -maxdepth 1 -type f \( -name 'attic-server' -o -name 'attic-server.exe' \) | wc -l)
+  test "$BIN_COUNT" -eq 1 || { echo "FAIL: exactly one attic-server binary expected (found $BIN_COUNT)"; exit 1; }
   test -f "$DIR/README.md" || { echo "FAIL: README.md missing"; exit 1; }
   test -d "$DIR/docs" || { echo "FAIL: docs/ missing"; exit 1; }
   # Exclusion invariants: no developer artifacts, no logs, no DBs, no target/.
