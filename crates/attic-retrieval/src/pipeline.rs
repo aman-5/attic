@@ -92,6 +92,11 @@ pub struct AnswerOutcome {
     pub context_text: Option<String>,
     /// (claim text, verdict tag, evidence ids) for served claims.
     pub claims: Vec<(String, String, Vec<String>)>,
+    /// The canonical Evidence items actually served into the assembled
+    /// context (bounded by context-assembly caps). Lets the MCP surface
+    /// report REAL provenance — source revision, workspace snapshot — rather
+    /// than asking callers to trust a verdict token.
+    pub served_evidence: Vec<Evidence>,
     /// Unsatisfied requirement labels on PARTIAL/INSUFFICIENT results.
     pub insufficient_reason: Option<String>,
 }
@@ -321,9 +326,9 @@ impl RetrievalService {
         let (result, confidence, insufficient_reason) =
             compute_result(&report, validated.len(), hard_cancelled);
 
-        let (context_text, claims_out): (Option<String>, ServedClaims) =
+        let (context_text, claims_out, served_evidence): (Option<String>, ServedClaims, Vec<Evidence>) =
             if validated.is_empty() || hard_cancelled {
-                (None, Vec::new())
+                (None, Vec::new(), Vec::new())
             } else {
                 build_context_and_claims(
                     self,
@@ -366,6 +371,7 @@ impl RetrievalService {
             confidence,
             context_text,
             claims: claims_out,
+            served_evidence,
             insufficient_reason,
         })
     }
@@ -1047,7 +1053,7 @@ fn build_context_and_claims(
     policy: &AnswerModePolicy,
     validated: &[Evidence],
     contradictions: &[Contradiction],
-) -> (Option<String>, ServedClaims) {
+) -> (Option<String>, ServedClaims, Vec<Evidence>) {
     // ── §15 priority floor: context serves the strongest evidence, not a
     // dump of everything validated. Two tiers keep contract-PREFERRED
     // supporting slices (tests/config/knowledge/docs) while cutting noise:
@@ -1198,7 +1204,16 @@ fn build_context_and_claims(
             )
         })
         .collect();
-    (Some(doc.text), claims)
+    // Served provenance: the canonical Evidence behind the context refs, so
+    // the MCP surface can assert REAL source-revision / snapshot lineage.
+    let served_by_id: std::collections::HashMap<&str, &Evidence> =
+        keep.iter().map(|e| (e.id.as_str(), e)).collect();
+    let served_evidence = doc
+        .refs
+        .iter()
+        .filter_map(|r| served_by_id.get(r.evidence_id.as_str()).map(|e| (*e).clone()))
+        .collect();
+    (Some(doc.text), claims, served_evidence)
 }
 
 /// Persist the finalized plan through the coordinated writer queue.

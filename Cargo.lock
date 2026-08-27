@@ -214,6 +214,7 @@ dependencies = [
  "attic-retrieval",
  "attic-semantic",
  "attic-storage",
+ "regex",
  "rmcp",
  "serde",
  "serde_json",

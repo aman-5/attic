@@ -535,47 +535,36 @@ pub struct CrossRepoGenerator;
 impl CrossRepoGenerator {
     pub fn run(
         env: &mut GeneratorEnv<'_>,
-        seed_entity_ids: &[String],
+        _seed_entity_ids: &[String],
     ) -> Result<Vec<Candidate>, RetrievalError> {
         let mut out = Vec::new();
 
-        // Collect unique repository IDs from seed entities.
-        let mut repo_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entity in seed_entity_ids.iter().take(16) {
-            if let Some(e) = attic_storage::relationships_for_entity(env.conn, entity, 1)?
-                .into_iter()
-                .next()
-            {
-                repo_ids.insert(e.source_repository_id.clone());
-                repo_ids.insert(e.target_repository_id.clone());
-            }
-        }
-
-        // Use Phase 6 cross-repo edge service: fetch all cross-repo
-        // DEPENDS_ON edges touching each repository.
-        let seed_set: std::collections::HashSet<&str> =
-            seed_entity_ids.iter().map(|s| s.as_str()).collect();
-        for repo_id in &repo_ids {
-            if !env.budget.candidates_available() {
+        // Fetch ALL cross-repo DEPENDS_ON edges unconditionally (bounded at
+        // 64). Filtering by seed entity_ids is incorrect here: FTS seeds
+        // from a provider repo's go.mod use different IDs than the cross-repo
+        // edge source_entity_ids (dependent repo's go.mod). Using cross_edges_all
+        // ensures every workspace-level cross-repo edge is evaluated; the
+        // BudgetAccountant provides the real candidate ceiling.
+        let cross_edges = attic_storage::cross_edges_all(env.conn, 64)?;
+        for e in cross_edges {
+            if !env.budget.admit_candidate() {
                 break;
             }
-            let cross_edges = attic_storage::crossrepo_ops::cross_edges_touching(
-                env.conn,
-                repo_id,
-                64,
-            )?;
-            for e in cross_edges {
-                // Only emit edges touching a seed entity.
-                if !seed_set.contains(e.source_entity_id.as_str())
-                    && !seed_set.contains(e.target_entity_id.as_str())
-                {
-                    continue;
-                }
-                if !env.budget.admit_candidate() {
-                    break;
-                }
+            {
                 let resolution = ResolutionLevel::from_db_str(&e.resolution)
                     .unwrap_or(ResolutionLevel::Syntactic);
+                // WorkspaceSnapshot provenance is carried by the edge's
+                // provenance_json (written by sync_workspace). Parsed, never
+                // fabricated; edges without the key stay None.
+                let workspace_snapshot_id: Option<String> = e
+                    .provenance_json
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                    .and_then(|p| {
+                        p.get("workspace_snapshot_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    });
                 let mut ev = Evidence::new(
                     uuid::Uuid::new_v4().to_string(),
                     e.source_repository_id.clone(),
@@ -588,6 +577,7 @@ impl CrossRepoGenerator {
                     e.target_entity_id, e.target_repository_id
                 );
                 ev.source_revision_id = Some(e.source_revision_id.clone());
+                ev.workspace_snapshot_id = workspace_snapshot_id;
                 ev.freshness_state = freshness_of(&e.freshness_state);
                 ev.authority = AuthorityLevel::Derived;
                 ev.confidence = e.confidence.clamp(0.0, 0.99);
@@ -605,5 +595,113 @@ impl CrossRepoGenerator {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod crossrepo_snapshot_tests {
+    use super::*;
+    use crate::mode::{AnswerMode, AnswerModePolicy};
+    use attic_storage::run_migrations;
+    use rusqlite::Connection;
+
+    fn uuid5(name: &str) -> String {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, name.as_bytes()).to_string()
+    }
+
+    #[test]
+    fn cross_repo_generator_preserves_workspace_snapshot_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Seed repositories and revisions (core_relationships carries FKs).
+        for name in ["repo-dependent", "repo-provider", "repo-other"] {
+            let rid = uuid5(name).parse::<attic_core::RepositoryId>().unwrap();
+            attic_storage::repository::repository::upsert_repository(
+                &conn, &rid, &format!("C:/tmp/{}", name), name,
+            )
+            .unwrap();
+        }
+        let mut rev_ids = Vec::new();
+        for name in ["repo-dependent", "repo-provider", "repo-other"] {
+            let rid = uuid5(name).parse::<attic_core::RepositoryId>().unwrap();
+            let srid = attic_core::SourceRevisionId::new_v4();
+            attic_storage::repository::source_revision::insert_source_revision(
+                &conn,
+                &srid,
+                &rid,
+                "test-sha",
+                "2024-01-01",
+                attic_core::SourceType::Git,
+            )
+            .unwrap();
+            rev_ids.push(srid.to_string_repr().to_string());
+        }
+
+        // Edge WITH snapshot provenance (as written by sync_workspace).
+        attic_storage::crossrepo_ops::insert_xrepo_edge(
+            &conn,
+            &uuid5("repo-dependent"),
+            "file-occ-dependent",
+            &uuid5("repo-provider"),
+            "logical:example.com/provider",
+            "BUILD_RESOLVED",
+            0.9,
+            "MANIFEST",
+            r#"{"ecosystem":"go","workspace_snapshot_id":"11111111-2222-4333-8444-555555555555"}"#,
+            &rev_ids[0],
+        )
+        .unwrap();
+        // Edge WITHOUT a snapshot key: must stay None — never fabricated.
+        attic_storage::crossrepo_ops::insert_xrepo_edge(
+            &conn,
+            &uuid5("repo-dependent"),
+            "file-occ-dependent",
+            &uuid5("repo-other"),
+            "logical:example.com/other",
+            "SYNTACTIC",
+            0.7,
+            "MANIFEST",
+            "{}",
+            &rev_ids[0],
+        )
+        .unwrap();
+
+        let policy = AnswerModePolicy::for_mode(AnswerMode::Normal);
+        let mut budget = BudgetAccountant::new(&policy);
+        let mut env = GeneratorEnv {
+            conn: &conn,
+            repository_id: None,
+            budget: &mut budget,
+            limit: 16,
+        };
+        let candidates =
+            CrossRepoGenerator::run(&mut env, &["file-occ-dependent".to_owned()])
+                .expect("generator");
+        assert!(candidates.len() >= 2, "edges emitted");
+
+        let evs: Vec<&Evidence> = candidates.iter().map(|c| &c.evidence).collect();
+        let with_snap = evs
+            .iter()
+            .find(|e| e.workspace_snapshot_id.is_some())
+            .copied()
+            .expect("snapshot-backed evidence present");
+        assert_eq!(
+            with_snap.workspace_snapshot_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(with_snap.source_revision_id.as_deref(), Some(rev_ids[0].as_str()));
+        assert!(
+            with_snap.path.contains("example.com/provider"),
+            "snapshot evidence is the provider edge: {}",
+            with_snap.path
+        );
+
+        let without = evs
+            .iter()
+            .find(|e| e.workspace_snapshot_id.is_none())
+            .copied()
+            .expect("legacy edge keeps None");
+        assert!(without.workspace_snapshot_id.is_none());
     }
 }

@@ -183,6 +183,15 @@ pub struct Evidence {
     /// never allowed here (defense-in-depth scan runs before serving).
     #[serde(default)]
     pub snippet: Option<String>,
+
+    /// `core_workspace_snapshots.id` for cross-repository evidence only.
+    ///
+    /// Set ONLY when this evidence was derived from a cross-repo edge whose
+    /// provenance embeds a real WorkspaceSnapshot ID recorded by
+    /// `sync_workspace`; it is never fabricated. Repository-local evidence
+    /// legitimately has no workspace snapshot and keeps `None`.
+    #[serde(default)]
+    pub workspace_snapshot_id: Option<String>,
 }
 
 impl Evidence {
@@ -208,6 +217,7 @@ impl Evidence {
             verification_state: VerificationStatus::Unverified,
             live_source_verified: false,
             snippet: None,
+            workspace_snapshot_id: None,
         }
     }
 

@@ -28,7 +28,7 @@ pub use connection::{DbPool, open_db};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
     all_catalog_entries, all_repository_ids, catalog_entry, create_workspace_snapshot,
-    cross_edges_between, cross_edges_touching, delete_all_xrepo_edges_touching,
+    cross_edges_all, cross_edges_between, cross_edges_for_entities, cross_edges_touching, delete_all_xrepo_edges_touching,
     delete_xrepo_edges_between, declarations_for_repository, delete_declarations_for_repository,
     insert_declaration, insert_xrepo_edge, latest_workspace_snapshot, providers_of_identity,
     remove_repository_crossrepo_data, snapshot_revisions, upsert_catalog_row,

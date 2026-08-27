@@ -270,3 +270,256 @@ async fn rmcp_client_workspace_index_search_and_file_e2e() {
         .await
         .expect("graceful shutdown timed out");
 }
+
+/// Phase 6 cross-repo MCP E2E gate using the official rmcp client.
+///
+/// This test exercises the complete Phase 6 → Phase 4 evidence path through
+/// the real MCP server binary:
+///
+/// 1. Creates a multi-repo fixture (provider + consumer + unrelated)
+/// 2. Spawns the Attic server with ATTIC_WORKSPACE_ROOT → triggers
+///    sync_workspace → creates WorkspaceSnapshot
+/// 3. Calls the `context` tool with a cross-repo query
+/// 4. Verifies:
+///    - Provider repository is identified in the response
+///    - Unrelated repository is NOT falsely claimed
+///    - Evidence carries workspace_snapshot_id (provenance chain)
+///    - Evidence carries source_revision_id (provenance chain)
+///    - Result/plan_id is present (evidence path ran)
+///    - Confidence is preserved
+///
+/// This is the REQUIRED product gate for Phase 6 cross-repo intelligence.
+#[tokio::test]
+async fn rmcp_client_crossrepo_multi_repo_fixture() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db = tmp.path().join("rmcp_crossrepo.db");
+
+    // ── Build three-repo fixture ──────────────────────────────────────────────
+    // provider: declares module "example.com/rmcp/provider"
+    let provider_dir = tmp.path().join("provider");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    std::fs::write(
+        provider_dir.join("go.mod"),
+        "module example.com/rmcp/provider\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        provider_dir.join("lib.go"),
+        "package provider\n\nfunc Hello() string { return \"hello\" }\n",
+    )
+    .unwrap();
+
+    // dependent: requires "example.com/rmcp/provider"
+    let dependent_dir = tmp.path().join("dependent");
+    std::fs::create_dir_all(&dependent_dir).unwrap();
+    std::fs::write(
+        dependent_dir.join("go.mod"),
+        "module example.com/rmcp/dependent\n\ngo 1.21\n\nrequire example.com/rmcp/provider v0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependent_dir.join("main.go"),
+        "package main\n\nimport \"example.com/rmcp/provider\"\n\nfunc main() { _ = provider.Hello() }\n",
+    )
+    .unwrap();
+
+    // unrelated repo: no dependency on provider
+    let unrelated_dir = tmp.path().join("unrelated");
+    std::fs::create_dir_all(&unrelated_dir).unwrap();
+    std::fs::write(
+        unrelated_dir.join("go.mod"),
+        "module example.com/rmcp/unrelated\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        unrelated_dir.join("util.go"),
+        "package unrelated\n\nfunc Util() {}\n",
+    )
+    .unwrap();
+
+    // ── Pre-seed all three repos into the shared DB ───────────────────────────
+    // We connect once per repo directory (each as its own ATTIC_WORKSPACE_ROOT)
+    // so all three repos are indexed before we run sync_workspace.
+    // We wait for each workspace to appear in the search index before closing,
+    // to avoid a race between the startup indexing task and server shutdown.
+    for (dir, token) in [
+        (&provider_dir, "Hello"),
+        (&dependent_dir, "provider"),
+        (&unrelated_dir, "Util"),
+    ] {
+        let mut seed = connect(&bin, &db, Some(dir)).await;
+        // Wait up to 5 s for the file to be indexed in this repo.
+        for _ in 0..10 {
+            let txt = call_tool_text(
+                &mut seed,
+                "search",
+                serde_json::json!({ "query": token }),
+            )
+            .await
+            .unwrap_or_default();
+            let sv: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
+            if sv["results"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = tokio::time::timeout(IO_TIMEOUT, seed.service.close()).await;
+        // seed is dropped here, killing the child.
+    }
+
+    // ── Spawn server WITH ATTIC_WORKSPACE_ROOT → sync_workspace runs ──────────
+    // All three repos are now in the DB; pointing ATTIC_WORKSPACE_ROOT at
+    // provider_dir causes the server to run sync_workspace over all DB repos.
+    let mut srv = connect(&bin, &db, Some(&provider_dir)).await;
+
+    // Poll status until the watcher is running (cross-repo sync completed).
+    // Accept either native-watcher or periodic-reconciliation as "ready".
+    // Bounded poll: 10s total, 500ms intervals.
+    let mut watcher_ready = false;
+    for _ in 0..20 {
+        let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+            .await
+            .expect("status tool");
+        let v: Value = serde_json::from_str(&status_text).expect("status payload is JSON");
+        if let Some(watcher) = v.get("watcher") {
+            let mode = watcher.get("mode").and_then(|m| m.as_str()).unwrap_or("");
+            if mode == "native-watcher" || mode == "periodic-reconciliation" {
+                watcher_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(watcher_ready, "cross-repo sync did not complete within 10s; watcher never started");
+
+    // ── Call context tool with cross-repo query ──────────────────────────────
+    // Poll until at least one evidence item carries workspace_snapshot_id
+    // (proves sync_workspace completed cross-repo edge resolution).  The watcher
+    // being "ready" only means the watcher task started; sync_workspace may still
+    // be computing cross-repo edges and creating the WorkspaceSnapshot.
+    // Bounded: 20 attempts × 500 ms = 10 s.
+    let mut response_text = String::new();
+    let mut v = Value::Null;
+    for _ in 0..20 {
+        response_text = call_tool_text(
+            &mut srv,
+            "context",
+            serde_json::json!({
+                "query": "What Go modules does the dependent repository depend on?",
+                "mode": "NORMAL"
+            }),
+        )
+        .await
+        .expect("context tool");
+        v = serde_json::from_str(&response_text).expect("context payload is JSON");
+        // Check if any evidence has workspace_snapshot_id set (cross-repo ready).
+        let has_snapshot = v["evidence"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|e| e["workspace_snapshot_id"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
+        if has_snapshot {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Extract key fields from response.
+    let context_body = v["context"].as_str().unwrap_or("");
+    let claims_json = v["claims"].to_string();
+    let evidence_json = v["evidence"].to_string();
+    let full_response = format!("{context_body} {claims_json} {evidence_json} {response_text}");
+
+    // GATE 1: Provider repository IS identified in the cross-repo response.
+    // Check full_response — provider must appear somewhere (context or claims).
+    assert!(
+        full_response.contains("example.com/rmcp/provider"),
+        "GATE 1 FAIL: provider module must be identified in cross-repo response; response={:.500}",
+        &full_response
+    );
+
+    // GATE 2: Unrelated repository is NOT falsely claimed as a dependency.
+    // Only check claims_json — the prose context_body legitimately includes all
+    // indexed go.mod files as CONFIGURATION evidence (that is correct behaviour);
+    // the structured claims must not list the unrelated module as a dependency.
+    assert!(
+        !claims_json.contains("example.com/rmcp/unrelated"),
+        "GATE 2 FAIL: unrelated module must NOT appear as dependency claim; claims={:.500}",
+        &claims_json
+    );
+
+    // GATE 3: Confidence field is present and non-empty.
+    let confidence = v["confidence"].as_str().unwrap_or("");
+    assert!(
+        !confidence.is_empty(),
+        "GATE 3 FAIL: confidence must be present; got: {v}"
+    );
+
+    // GATE 4 (STRENGTHENED): Real provenance must be present.
+    // - result verdict must be present (not empty)
+    let result = v["result"].as_str().unwrap_or("");
+    assert!(
+        !result.is_empty(),
+        "GATE 4 FAIL: result verdict must be present; got: {v}"
+    );
+    // - plan_id must be set (evidence path ran)
+    let plan_id = v["plan_id"].as_str().unwrap_or("");
+    assert!(
+        !plan_id.is_empty(),
+        "GATE 4 FAIL: plan_id must be set (evidence path ran); got: {v}"
+    );
+
+    // GATE 4b: WorkspaceSnapshot provenance — any evidence item carrying a
+    // non-null `workspace_snapshot_id` is definitionally a cross-repo evidence
+    // item (only CrossRepoGenerator sets this field).  We assert:
+    //   a) At least one such item exists (proves sync_workspace ran and produced
+    //      a real WorkspaceSnapshot-backed edge).
+    //   b) Every snapshot-backed item also carries `source_revision_id`
+    //      (proves the full provenance chain is intact).
+    let empty_vec: Vec<Value> = vec![];
+    let evidence_arr = v["evidence"].as_array().unwrap_or(&empty_vec);
+    let snapshot_backed: Vec<_> = evidence_arr
+        .iter()
+        .filter(|e| {
+            e["workspace_snapshot_id"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !snapshot_backed.is_empty(),
+        "GATE 4b FAIL: must have at least one evidence item with workspace_snapshot_id \
+         (cross-repo provenance); evidence={:.500}",
+        &evidence_json
+    );
+    for ev in &snapshot_backed {
+        let ws_snap_id = ev["workspace_snapshot_id"].as_str().unwrap_or("");
+        assert!(
+            !ws_snap_id.is_empty(),
+            "GATE 4b FAIL: snapshot-backed evidence must carry workspace_snapshot_id; evidence={ev}"
+        );
+        let src_rev = ev["source_revision_id"].as_str().unwrap_or("");
+        assert!(
+            !src_rev.is_empty(),
+            "GATE 4b FAIL: snapshot-backed evidence must carry source_revision_id; evidence={ev}"
+        );
+    }
+
+    // GATE 4c: workspace_snapshot_id must be a valid UUID.
+    let first_ws_snap = snapshot_backed[0]["workspace_snapshot_id"].as_str().unwrap();
+    let uuid_re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
+    assert!(
+        uuid_re.is_match(first_ws_snap),
+        "GATE 4c FAIL: workspace_snapshot_id must be valid UUID; got {first_ws_snap}"
+    );
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close())
+        .await
+        .expect("graceful shutdown timed out");
+}

@@ -159,17 +159,58 @@ registered. Gate 7 of `mcp_e2e_crossrepo_multi_repo_fixture` called
 picked up. Fixed by replacing with a direct `index_repository` call which always
 performs a full re-index.
 
-## 12. What was NOT implemented (deferred)
+## 12. WorkspaceSnapshot Provenance (fully implemented)
+
+WorkspaceSnapshot provenance is **fully implemented** end-to-end:
+
+### Storage (migration 0005)
+- `core_workspace_snapshots(id, created_at, repo_count, edges_emitted)` — one row per `sync_workspace` run
+- `core_workspace_snapshot_revisions(id, snapshot_id, repository_id, source_revision_id, created_at)` — exact per-repository SourceRevision set at sync time
+
+### Data flow
+1. `sync_workspace` calls `create_workspace_snapshot(conn, revisions, edges_count)` → returns `snapshot_id`
+2. `snapshot_id` is embedded in every cross-repo edge's `provenance_json` as `"workspace_snapshot_id"`
+3. `CrossRepoGenerator::run()` parses `provenance_json` and sets `ev.workspace_snapshot_id` on each `Evidence` item
+4. `handle_context` serializes `workspace_snapshot_id` (alongside `source_revision_id`) in the MCP tool response
+
+### Evidence struct (backward-compatible)
+`Evidence.workspace_snapshot_id: Option<String>` with `#[serde(default)]` — repo-local evidence keeps `None`; only cross-repo evidence carries the snapshot id.
+
+### Provenance traceability chain
+```
+MCP response evidence[].workspace_snapshot_id
+  → core_workspace_snapshot_revisions (snapshot_id = that id)
+  → (repository_id, source_revision_id) rows
+  → exact SourceRevision set that was in scope at sync time
+```
+
+### Tests
+- `e2e_workspace_snapshot_provenance_traces_to_source_revisions` — proves `sync_workspace` snapshot links back to correct revisions via `snapshot_revisions()`
+- `e2e_workspace_snapshot_revision_set_is_exact_no_fabrication` — proves the revision set is exact (no fabricated entries)
+- `crossrepo_snapshot_tests::cross_repo_generator_preserves_workspace_snapshot_provenance` (in `attic-retrieval`) — proves `CrossRepoGenerator` preserves the field through the evidence pipeline
+- Gate 4b in `mcp_e2e_crossrepo_multi_repo_fixture` — end-to-end: any evidence item with `workspace_snapshot_id` must also carry `source_revision_id` (provenance chain unbroken)
+- Gate 4b/4c in `rmcp_stdio_integration.rs::rmcp_client_crossrepo_multi_repo_fixture` — official rmcp client gate: verifies UUID format of `workspace_snapshot_id` and non-empty `source_revision_id` on RELATIONSHIP evidence
+
+## 13. What was NOT implemented (deferred)
 
 - **Network/package manager execution**: all parsing is offline, static analysis only
 - **Build script execution**: never executed for dependency discovery
 - **True cross-repo symbol resolution**: beyond import/coordinate matching
-- **WorkspaceSnapshot provenance table**: deferred (can be added later)
 - **Resolution run audit trail**: deferred (can be added later)
-- **SourceRevision fail-closed**: repos without indexed SourceRevision are skipped
-  with `NoSourceRevision` error; the error is caught and logged, not propagated
 
-## 13. Gate status
+### Note on WorkspaceSnapshot provenance
+WorkspaceSnapshot provenance is now fully implemented end-to-end via migration 0005:
+- `core_workspace_snapshots` and `core_workspace_snapshot_revisions` tables created
+- `sync_workspace` embeds `workspace_snapshot_id` in cross-repo edge `provenance_json`
+- `CrossRepoGenerator` parses and preserves `workspace_snapshot_id` in canonical Evidence
+- `handle_context` serializes `workspace_snapshot_id` in MCP tool responses
+- Gate 4b/4c explicitly assert real SourceRevision and WorkspaceSnapshot provenance
+
+### SourceRevision fail-closed
+repos without indexed SourceRevision are skipped with `NoSourceRevision` error;
+the error is caught and logged, not propagated
+
+## 14. Gate status
 
 | Gate | Status |
 |------|--------|

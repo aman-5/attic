@@ -429,6 +429,119 @@ pub fn delete_all_xrepo_edges_touching(
     .map_err(StorageError::from)
 }
 
+/// Fetch all cross-repo DEPENDS_ON edges in the workspace (bounded by
+/// `limit`), excluding INVALID.
+///
+/// This is the primary lookup used by `CrossRepoGenerator`: it does NOT
+/// require Phase 3 structural relationship edges to exist and works for
+/// every indexing profile (Go, Python, JS, etc.). The caller's budget
+/// enforces the real bound; `limit` is the SQL ceiling.
+pub fn cross_edges_all(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<XrepoEdge>, StorageError> {
+    let sql = "
+        SELECT r.id, r.source_repository_id, r.target_repository_id,
+               r.source_entity_id, r.target_entity_id, r.resolution,
+               r.confidence, r.provenance_json, r.freshness_state,
+               r.source_revision_id
+          FROM core_relationships r
+         WHERE r.rel_type = 'DEPENDS_ON'
+           AND r.source_repository_id != r.target_repository_id
+           AND r.freshness_state != 'INVALID'
+         ORDER BY r.confidence DESC, r.id ASC
+         LIMIT ?1";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit as i64], |r| {
+            Ok(XrepoEdge {
+                id: r.get(0)?,
+                source_repository_id: r.get(1)?,
+                target_repository_id: r.get(2)?,
+                source_entity_id: r.get(3)?,
+                target_entity_id: r.get(4)?,
+                resolution: r.get(5)?,
+                confidence: r.get(6)?,
+                provenance_json: r.get(7)?,
+                freshness_state: r.get(8)?,
+                source_revision_id: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fetch all cross-repo DEPENDS_ON edges where `source_entity_id` OR
+/// `target_entity_id` is one of the provided entity IDs.
+///
+/// Used for targeted lookups when caller has exact entity anchors.
+pub fn cross_edges_for_entities(
+    conn: &Connection,
+    entity_ids: &[&str],
+    limit: usize,
+) -> Result<Vec<XrepoEdge>, StorageError> {
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build a parameterised IN clause at runtime (bounded — callers pass ≤ 16
+    // IDs, so this never escapes the intended scale).
+    let placeholders = entity_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT r.id, r.source_repository_id, r.target_repository_id,
+                r.source_entity_id, r.target_entity_id, r.resolution,
+                r.confidence, r.provenance_json, r.freshness_state,
+                r.source_revision_id
+           FROM core_relationships r
+          WHERE r.rel_type = 'DEPENDS_ON'
+            AND r.source_repository_id != r.target_repository_id
+            AND r.freshness_state != 'INVALID'
+            AND (r.source_entity_id IN ({placeholders})
+              OR r.target_entity_id IN ({placeholders}))
+          ORDER BY r.id ASC
+          LIMIT ?{limit_param}",
+        placeholders = placeholders,
+        limit_param = entity_ids.len() * 2 + 1,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // Bind entity IDs twice (once for source IN, once for target IN).
+    use rusqlite::types::ToSql;
+    let params: Vec<Box<dyn ToSql>> = entity_ids
+        .iter()
+        .map(|s| -> Box<dyn ToSql> { Box::new(s.to_string()) })
+        .chain(
+            entity_ids
+                .iter()
+                .map(|s| -> Box<dyn ToSql> { Box::new(s.to_string()) }),
+        )
+        .chain(std::iter::once(
+            Box::new(limit as i64) as Box<dyn ToSql>
+        ))
+        .collect();
+    let refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs.as_slice(), |r| {
+            Ok(XrepoEdge {
+                id: r.get(0)?,
+                source_repository_id: r.get(1)?,
+                target_repository_id: r.get(2)?,
+                source_entity_id: r.get(3)?,
+                target_entity_id: r.get(4)?,
+                resolution: r.get(5)?,
+                confidence: r.get(6)?,
+                provenance_json: r.get(7)?,
+                freshness_state: r.get(8)?,
+                source_revision_id: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Insert one cross-repo DEPENDS_ON edge.
 ///
 /// `source_entity_id` anchors at the declaring FILE_OCCURRENCE;
@@ -621,4 +734,58 @@ pub fn snapshot_revisions(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::run_migrations;
+    use rusqlite::Connection;
+
+    #[test]
+    fn workspace_snapshot_round_trip_preserves_exact_revision_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let input = vec![
+            ("repo-provider".to_owned(), "rev-provider-1".to_owned()),
+            ("repo-dependent".to_owned(), "rev-dependent-7".to_owned()),
+        ];
+        let snapshot_id =
+            create_workspace_snapshot(&conn, &input, 4).expect("create snapshot");
+
+        let latest = latest_workspace_snapshot(&conn)
+            .unwrap()
+            .expect("snapshot exists");
+        assert_eq!(latest.id, snapshot_id);
+        assert_eq!(latest.repo_count, 2, "one entry per participating repo");
+        assert_eq!(latest.edges_emitted, 4);
+
+        let mut revisions = snapshot_revisions(&conn, &snapshot_id).unwrap();
+        revisions.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(
+            (revisions[0].repository_id.as_str(), revisions[0].source_revision_id.as_str()),
+            ("repo-dependent", "rev-dependent-7")
+        );
+        assert_eq!(
+            (revisions[1].repository_id.as_str(), revisions[1].source_revision_id.as_str()),
+            ("repo-provider", "rev-provider-1")
+        );
+
+        // No fabricated entries: an unrelated repository/revision is absent.
+        assert!(!revisions.iter().any(|r| r.repository_id.contains("unrelated")));
+    }
+
+    #[test]
+    fn snapshot_revisions_for_unknown_snapshot_are_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let rows = snapshot_revisions(&conn, "no-such-snapshot").unwrap();
+        assert!(rows.is_empty());
+    }
 }
