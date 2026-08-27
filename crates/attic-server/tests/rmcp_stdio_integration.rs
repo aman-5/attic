@@ -440,7 +440,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     assert!(
         full_response.contains("example.com/rmcp/provider"),
         "GATE 1 FAIL: provider module must be identified in cross-repo response; response={:.500}",
-        &full_response
+        full_response
     );
 
     // GATE 2: Unrelated repository is NOT falsely claimed as a dependency.
@@ -450,7 +450,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     assert!(
         !claims_json.contains("example.com/rmcp/unrelated"),
         "GATE 2 FAIL: unrelated module must NOT appear as dependency claim; claims={:.500}",
-        &claims_json
+        claims_json
     );
 
     // GATE 3: Confidence field is present and non-empty.
@@ -496,7 +496,7 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
         !snapshot_backed.is_empty(),
         "GATE 4b FAIL: must have at least one evidence item with workspace_snapshot_id \
          (cross-repo provenance); evidence={:.500}",
-        &evidence_json
+        evidence_json
     );
     for ev in &snapshot_backed {
         let ws_snap_id = ev["workspace_snapshot_id"].as_str().unwrap_or("");

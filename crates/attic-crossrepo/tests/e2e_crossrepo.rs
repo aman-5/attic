@@ -1321,7 +1321,7 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     let cross_evidence = pool
         .with_reader(|conn| {
             let mut env = attic_retrieval::candidates::GeneratorEnv {
-                conn: &conn,
+                conn: conn,
                 repository_id: None,
                 budget: &mut budget,
                 limit: 64,
@@ -1435,7 +1435,7 @@ fn e2e_workspace_snapshot_provenance_traces_to_source_revisions() {
     let synthetic_evidence = pool
         .with_reader(|conn| {
             let mut env = attic_retrieval::candidates::GeneratorEnv {
-                conn: &conn,
+                conn: conn,
                 repository_id: None,
                 budget: &mut budget2,
                 limit: 64,

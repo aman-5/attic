@@ -48,11 +48,17 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
         });
     }
 
-    // Foreign key check.
-    let fk: String = conn.query_row("PRAGMA foreign_key_check", [], |r| r.get(0))?;
-    if fk != "ok" {
+    // Foreign key check. `PRAGMA foreign_key_check` returns one row per
+    // violation and ZERO rows when the database is clean — the normal case —
+    // so it must be queried as a table-valued function, never with
+    // `query_row` (which errors on zero rows).
+    let fk_violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check()", [], |r| {
+            r.get(0)
+        })?;
+    if fk_violations > 0 {
         violations.push(StorageError::ForeignKeyViolation {
-            reason: format!("foreign_key_check returned: {fk}"),
+            reason: format!("foreign_key_check found {fk_violations} violation(s)"),
         });
     }
 
@@ -83,8 +89,7 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageError> {
     // Ensure the backup directory exists.
     fs::create_dir_all(backup_dir).map_err(|e| {
-        StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        StorageError::Io(std::io::Error::other(
             format!("failed to create backup directory: {e}"),
         ))
     })?;
@@ -100,16 +105,14 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
 
     // Read the main database file.
     let main_data = std::fs::read(db_path).map_err(|e| {
-        StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        StorageError::Io(std::io::Error::other(
             format!("failed to read main database for backup: {e}"),
         ))
     })?;
 
     // Write to tmp file first, then atomic rename.
     std::fs::write(&tmp_path, &main_data).map_err(|e| {
-        StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        StorageError::Io(std::io::Error::other(
             format!("failed to write backup tmp file: {e}"),
         ))
     })?;
@@ -118,14 +121,15 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
     std::fs::rename(&tmp_path, &backup_path).map_err(|e| {
         // If rename fails (e.g. cross-device), fall back to copy+delete.
         let _ = std::fs::remove_file(&tmp_path);
-        StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        StorageError::Io(std::io::Error::other(
             format!("failed to rename backup file: {e}"),
         ))
     })?;
 
     // RETENTION: keep only the most recent 3 checkpoints (REC-B2).
-    let backups: Vec<std::path::PathBuf> = match fs::read_dir(backup_dir) {
+    // The backup filename embeds a microsecond timestamp, so lexical sort
+    // order matches chronological order.
+    let mut backups: Vec<std::path::PathBuf> = match fs::read_dir(backup_dir) {
         Ok(read_dir) => read_dir
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -138,6 +142,12 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
             .collect(),
         Err(_) => Vec::new(),
     };
+    backups.sort();
+    if backups.len() > 3 {
+        for stale in &backups[..backups.len() - 3] {
+            let _ = std::fs::remove_file(stale);
+        }
+    }
 
     Ok(())
 }
@@ -659,16 +669,73 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("attic_corrupt_{}.db", uuid::Uuid::new_v4()));
 
-        // Write a valid SQLite-looking but truncated/garbage database.
-        std::fs::write(&path, b"SQLite format 3 this is not a real database").unwrap();
+        // Build a REAL database with real page content first. A hand-crafted
+        // byte buffer can't reliably model corruption: get the header fields
+        // (page size, format version, payload fractions) even slightly wrong
+        // and SQLite refuses the file outright as NotADatabase before
+        // integrity_check ever runs. Flipping bytes deep inside a real,
+        // populated file (well past the header) corrupts actual page/b-tree
+        // content instead, which SQLite opens fine but integrity_check
+        // legitimately flags — the realistic on-disk corruption scenario
+        // (partial write, disk error) this check exists to catch.
+        {
+            let (writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+            for i in 0..50 {
+                writer
+                    .execute(
+                        "INSERT INTO core_repositories \
+                             (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, 1, 1, 0, 0)",
+                        rusqlite::params![
+                            uuid::Uuid::new_v4().to_string(),
+                            format!("/tmp/corrupt-fixture-{i}"),
+                            format!("repo-{i}")
+                        ],
+                    )
+                    .unwrap();
+            }
+            checkpoint_wal(&writer).unwrap();
+        }
 
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 8192, "fixture must span multiple pages");
+        // Stomp every byte from the second page onward: page 1 (the schema
+        // header + sqlite_master) stays intact so the file still opens, but
+        // every data page holding our inserted rows is destroyed.
+        for b in &mut bytes[4096..] {
+            *b = 0xAA;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Deliberately skip configure_connection: switching journal_mode to
+        // WAL itself touches the file in ways that can trip a HARD SQLite
+        // error on a corrupted file before integrity_check even runs.
+        // verify_connection only needs a plain connection to run its PRAGMAs.
+        //
+        // Corruption this severe can surface either as Ok(non-empty
+        // violations) from a completed integrity_check, or as a hard
+        // Err (e.g. DatabaseCorrupt) when the pager can't even read the
+        // pages integrity_check needs. Both are a genuine "this database is
+        // unusable" signal, and callers (main.rs startup) fail closed on
+        // either via `?` — so either outcome satisfies this test.
         let conn = Connection::open(&path).unwrap();
-        configure_connection(&conn).unwrap();
-        let violations = verify_connection(&conn).expect("verify should run");
-        assert!(
-            !violations.is_empty(),
-            "garbage database must be reported as corrupt"
-        );
+        match verify_connection(&conn) {
+            Ok(violations) => assert!(
+                !violations.is_empty(),
+                "corrupted data pages must be reported as corrupt"
+            ),
+            Err(e) => {
+                // A hard SQLite error IS the corruption signal here.
+                let msg = e.to_string();
+                assert!(
+                    msg.to_lowercase().contains("corrupt")
+                        || msg.to_lowercase().contains("malformed")
+                        || msg.to_lowercase().contains("not a database"),
+                    "expected a corruption-shaped error, got: {msg}"
+                );
+            }
+        }
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

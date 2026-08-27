@@ -477,6 +477,10 @@ impl RelationshipGenerator {
                     hop_depth: 0,
                 });
                 ev.signals.relationship_confidence = Some(e.confidence);
+                // See CrossRepoGenerator: relationship evidence has no
+                // source-file snippet, so the edge label must fill that
+                // field or context::build drops the item as empty content.
+                ev.snippet = Some(ev.path.clone());
                 out.push(Candidate::new(RetrieverKind::Relationship, ev));
             }
         }
@@ -593,6 +597,11 @@ impl CrossRepoGenerator {
                 });
                 ev.signals.relationship_confidence = Some(e.confidence);
                 ev.signals.structural_proximity = Some(0.5);
+                // Relationship evidence carries no source-file snippet; the
+                // edge description itself is the renderable content. Without
+                // this, context::build's empty-snippet check silently drops
+                // every relationship item before it reaches served evidence.
+                ev.snippet = Some(ev.path.clone());
                 out.push(Candidate::new(RetrieverKind::CrossRepo, ev));
             }
         }

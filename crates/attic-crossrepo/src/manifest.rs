@@ -219,14 +219,13 @@ fn parse_package_json(text: &str) -> ManifestParse {
         out.diagnostics.push("package_json_unparseable".to_string());
         return out;
     };
-    if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-        if !name.trim().is_empty() {
+    if let Some(name) = v.get("name").and_then(|n| n.as_str())
+        && !name.trim().is_empty() {
             out.provides.push(ProvidedIdentity {
                 ecosystem: Ecosystem::Npm,
                 name: name.trim().to_string(),
             });
         }
-    }
     for section in [
         "dependencies",
         "devDependencies",
@@ -622,8 +621,8 @@ fn parse_build_gradle(text: &str) -> ManifestParse {
 fn gradle_dependency_line(path: &str, line: &str) -> Vec<DependencyDeclaration> {
     let mut out = Vec::new();
     // project(...) references
-    if let Some(open) = line.find("project(") {
-        if let Some(token) = first_quoted(&line[open..]) {
+    if let Some(open) = line.find("project(")
+        && let Some(token) = first_quoted(&line[open..]) {
             let hint = token.trim_start_matches(':').replace(':', "/");
             if !hint.is_empty() {
                 out.push(DependencyDeclaration {
@@ -641,7 +640,6 @@ fn gradle_dependency_line(path: &str, line: &str) -> Vec<DependencyDeclaration> 
                 return out;
             }
         }
-    }
     // single-quoted G:A:V notation
     for token in gradle_tokens(line) {
         let parts: Vec<&str> = token.split(':').collect();
@@ -708,14 +706,13 @@ fn gradle_tokens(line: &str) -> Vec<String> {
 
 fn first_quoted(s: &str) -> Option<String> {
     for q in ['\'', '"'] {
-        if let Some(start) = s.find(q) {
-            if let Some(end) = s[start + 1..].find(q) {
+        if let Some(start) = s.find(q)
+            && let Some(end) = s[start + 1..].find(q) {
                 let v = s[start + 1..start + 1 + end].trim().to_string();
                 if !v.is_empty() {
                     return Some(v);
                 }
             }
-        }
     }
     None
 }
@@ -746,11 +743,10 @@ fn parse_pyproject_toml(text: &str) -> ManifestParse {
             let entry_part = trimmed.trim_end_matches(',').trim();
             let done = entry_part.contains(']');
             let entry = entry_part.trim_end_matches(']').trim().trim_matches(',');
-            if !entry.is_empty() {
-                if let Some(d) = python_req_decl("pyproject.toml", entry) {
+            if !entry.is_empty()
+                && let Some(d) = python_req_decl("pyproject.toml", entry) {
                     out.declarations.push(d);
                 }
-            }
             if done {
                 in_dependencies_array = false;
             }
@@ -772,11 +768,10 @@ fn parse_pyproject_toml(text: &str) -> ManifestParse {
                     let inner = after.trim_start_matches('[').trim();
                     if inner.contains(']') {
                         let entry = inner.split(']').next().unwrap_or("").trim();
-                        if !entry.is_empty() {
-                            if let Some(d) = python_req_decl("pyproject.toml", entry) {
+                        if !entry.is_empty()
+                            && let Some(d) = python_req_decl("pyproject.toml", entry) {
                                 out.declarations.push(d);
                             }
-                        }
                     } else if !inner.trim_end_matches(',').trim().is_empty() {
                         if let Some(d) =
                             python_req_decl("pyproject.toml", inner.trim_end_matches(','))

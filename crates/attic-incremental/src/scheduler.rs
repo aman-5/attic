@@ -17,7 +17,7 @@ use attic_storage::{
 };
 
 use crate::changeset::VerifiedChangeSet;
-use crate::{IncrementalError, now_micros, run_on_writer};
+use crate::{IncrementalError, run_on_writer};
 
 /// Origin of a recomputation request — decides queue priority and the
 /// `from_reconciliation` flag so reconciliation-generated work is never
@@ -453,7 +453,7 @@ fn execute_task(
             // scheduling new incremental index tasks so foreground work is not
             // starved.  The diff itself is still performed (it's cheap and
             // non-blocking), but scheduling is deferred.
-            let should_defer_scheduling = monitor
+            let _should_defer_scheduling = monitor
                 .map(|m| {
                     matches!(
                         m.pressure(),

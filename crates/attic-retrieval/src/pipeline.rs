@@ -658,7 +658,6 @@ impl RetrievalService {
             validated.len() as u32,
             now_us(),
         );
-
         // ── Proactive CHECKSUM/FULL verification of top evidence ───────────
         // answer_modes.md: NORMAL=CHECKSUM, DEEP=FULL. This is what makes a
         // DIRTY WORKING TREE detectable: an indexed row can still be flagged

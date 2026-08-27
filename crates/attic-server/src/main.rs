@@ -14,7 +14,7 @@ use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
     fts_search, get_db_stats, get_repository_path, get_repository_stats,
     lookup_repository_by_root_path,
-    resource_manager::{ResourceAdvisory, ResourceConfig, ResourceMonitor},
+    resource_manager::{ResourceConfig, ResourceMonitor},
     run_migrations,
 };
 use rmcp::{
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -1389,6 +1389,7 @@ async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
@@ -2642,7 +2643,7 @@ mod tests {
                 || full_response.contains(&provider_id_str),
             "gate 1 FAIL: provider repository not identified in cross-repo response; \
              response={:.400}",
-            &full_response
+            full_response
         );
 
         // Gate 2: unrelated repository is not falsely claimed as a dependency.
@@ -2654,7 +2655,7 @@ mod tests {
             !claims_json.contains("example.com/unrelated") || claims_json.contains("not depend"),
             "gate 2 FAIL: unrelated repository should not appear as a dependency \
              claim; claims={:.400}",
-            &claims_json
+            claims_json
         );
 
         // Gate 3: confidence field is present and non-empty (preserved).
@@ -2821,7 +2822,7 @@ mod tests {
             "gate 7 FAIL: manifest change must change cross-repo result; \
              provider still claimed after removing require; \
              result={result2}, response={:.400}",
-            &full2
+            full2
         );
 
         child2.kill().ok();

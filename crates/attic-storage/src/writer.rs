@@ -181,21 +181,21 @@ impl WriterQueueHandle {
         };
 
         // Non-blocking enqueue.  The `?` operator ensures the item was enqueued successfully.
-        let _ = self.tx.try_send(item).map_err(|e| match e {
+        self.tx.try_send(item).map_err(|e| match e {
             mpsc::TrySendError::Full(_) => {
                 // Do NOT increment pending count on failure.
-                return StorageError::QueueFull;
+                StorageError::QueueFull
             }
             mpsc::TrySendError::Disconnected(_) => {
                 // Queue is shutting down; don't increment.
-                return StorageError::QueueShutdown;
+                StorageError::QueueShutdown
             }
         })?;
 
         // Block until the worker sends back the result.
-        let result = result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown));
+        
 
-        result
+        result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
     }
 }
 

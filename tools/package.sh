@@ -81,9 +81,15 @@ cd "$REPO_ROOT"
 echo "== building attic-server for $TARGET"
 cargo build --release --package attic-server --target "$TARGET"
 
-EXE="attic-server"
-[[ "$TARGET" == *windows* ]] && EXE="attic-server.exe"
-BIN="target/$TARGET/release/$EXE"
+# The Cargo package is named `attic-server` but its `[[bin]]` target is
+# named `attic` (see crates/attic-server/Cargo.toml) — cargo therefore
+# produces `target/$TARGET/release/attic[.exe]`, NOT `attic-server[.exe]`.
+# The release archive renames it to `attic-server` for a clearer end-user
+# binary name; this staging copy is the only place that rename happens.
+CARGO_EXE="attic"
+STAGED_EXE="attic-server"
+[[ "$TARGET" == *windows* ]] && CARGO_EXE="attic.exe" && STAGED_EXE="attic-server.exe"
+BIN="target/$TARGET/release/$CARGO_EXE"
 test -f "$BIN" || { echo "FAIL: binary not found at $BIN" >&2; exit 1; }
 
 NAME="attic-v${VERSION}-${TARGET}"
@@ -91,7 +97,7 @@ STAGE="$OUT/$NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/docs"
 
-cp "$BIN" "$STAGE/"
+cp "$BIN" "$STAGE/$STAGED_EXE"
 cp "$REPO_ROOT/README.md" "$STAGE/"
 for lic in LICENSE-MIT LICENSE-APACHE; do
   [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"
