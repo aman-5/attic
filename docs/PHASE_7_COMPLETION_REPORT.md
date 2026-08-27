@@ -243,6 +243,139 @@ but not a substitute for the dedicated large-scale runs above):
   results exist. This is the single largest gap before a production
   readiness claim can be made.
 
+## 9a. Functional-hardening follow-up pass (2026-08-28)
+
+A second pass focused exclusively on genuine functional/architectural
+defects (no benchmarks, no soak/stress). Deferred validation work is now
+tracked in `docs/FINAL_VALIDATION_TODO.md`.
+
+**Fixed:**
+
+1. **Resource Manager pressure tiers** (§3 above, now resolved):
+   `MIN_FREE_MEMORY_MIB` default lowered 256→100 MiB so the Emergency
+   floor sits above the Critical threshold; added
+   `resource_manager::safe_min_free_mib` (defensive clamp) and
+   `ResourceConfig::validate()` (fail-closed rejection of inconsistent
+   `ATTIC_*` overrides), wired into server startup. Regression-tested.
+2. **Shutdown ordering — real bug, not cosmetic.** `SchedulerHandle::shutdown()`
+   and `IncrementalWatch::stop()` existed but were never called anywhere;
+   the watcher/scheduler locals lived in `main()`, separate from the
+   `AtticServer` moved into `serve_until_closed`, so they were only
+   dropped (a no-op — neither type has a `Drop` impl) after shutdown
+   maintenance (WAL checkpoint/backup/writer close) had already run. Fixed
+   by threading both handles into `serve_until_closed` and stopping them,
+   in order, before DB maintenance.
+3. **Ctrl+C shutdown race.** The old `tokio::select!` between
+   `running.waiting()` (consumes `self`) and `ctrl_c()` dropped the
+   in-flight `waiting()` future — and the `RunningService` it owned —
+   without awaiting it whenever Ctrl+C won the race, detaching the actual
+   service task while shutdown proceeded to checkpoint/close the DB
+   concurrently. Fixed by spawning a small Ctrl+C watcher task that only
+   cancels the token, then always fully awaiting `running.waiting()`.
+4. **Semantic background enrichment was never wired into the server.**
+   `BackgroundEnricher`/`enrich_to_completion` existed and were fully
+   tested, but neither was ever invoked outside tests — when
+   `ATTIC_SEMANTIC=1`, the enrichment queue was never drained in
+   production, so semantic search would always fall back to
+   `NoEmbeddings`. Fixed: `main()` now spawns `BackgroundEnricher` when
+   the semantic layer opens, and `serve_until_closed` stops it (bounded
+   timeout) before DB maintenance.
+5. **CI silently skipped Intel macOS tests.** `release.yml` ran
+   `cargo test --workspace` for every matrix target except
+   `x86_64-apple-darwin`, despite `macos-13` being a native (not
+   cross-compiled) runner for that target — an unexplained skip that
+   would have let a real regression on Intel Mac ship unnoticed. Removed
+   the exclusion.
+6. **Dead-code / lint gate cleanup:** removed a genuinely-unused
+   `pending_count` field from `WriterQueue`, added
+   `#[allow(clippy::too_many_arguments)]` with rationale to a schema-shaped
+   insert function, replaced two manual percentage divisions with
+   `checked_div`, and fixed a handful of pre-existing `-D warnings`
+   violations (unused lifetime, manual `strip_prefix`, `field_reassign_with_default`)
+   encountered in files touched this pass.
+7. **Debris:** removed tracked `_test.log`; `.gitignore` now covers
+   `*.log`, `build_errors*.txt`, and stray `*.db*` files.
+
+**Reviewed, no defect found (light-touch, not exhaustive):** SQLite
+connection/writer/backup code, migration ordering, `.cargo/config.toml`
+(confirmed no machine-specific/target-forcing config is tracked), release
+profile, README platform claims, and a repo-wide `unwrap`/`expect`/`panic!`
+grep (every hit outside test-support/bench code fell inside `#[cfg(test)]`
+modules).
+
+**Explicitly not re-audited this pass** (time-boxed): the full
+resource/backpressure integration matrix (§5 of the task spec — indexing,
+structural analysis, graph traversal, cross-repo resolution admission
+paths were not individually traced this session beyond the semantic-worker
+fix above); `ProductionConfig` in `attic-core` remains constructed nowhere
+in the real binary (dead scaffolding — its 20-odd `ATTIC_*` env vars are
+documented but inert; distinct from the live `ResourceConfig`/`ResourceMonitor`
+path that IS wired in and was fixed above). Both are recorded as open items
+for a follow-up pass rather than silently left unmentioned.
+
+**Verification run this pass:** `cargo fmt --all` (clean), `cargo build
+--workspace --all-targets` (clean), `cargo test --workspace` (100% pass,
+every crate, 0 failures), `cargo clippy --workspace --all-targets`
+(6 pre-existing style warnings remain, all in test/bench files, unrelated
+to this pass's changes — `-D warnings` was not driven fully clean across
+the whole workspace; the ones surfaced in files touched this pass were
+fixed). No benchmark, soak, stress, or fault-injection work was performed,
+per the pass's explicit scope — see `docs/FINAL_VALIDATION_TODO.md`.
+
+## 9b. Second follow-up pass — remaining checklist items (2026-08-28)
+
+8. **Migration downgrade was unguarded.** `run_migrations` only checked
+   whether *its own* known versions were already applied — a database
+   already advanced by a newer binary (unrecognized migration ids present)
+   would silently run zero migrations and proceed to serve, rather than
+   failing closed on a schema state this build can't reason about. Added an
+   explicit check that rejects any unrecognized `core_schema_migrations`
+   entry before applying anything. Regression-tested
+   (`unrecognized_future_migration_is_rejected`).
+9. **`RUST_LOG`/`ATTIC_LOG` had zero effect.** `tracing_subscriber`'s
+   `env-filter` feature was enabled in `Cargo.toml` but never wired to the
+   subscriber in `main()` — log verbosity was hardcoded regardless of
+   environment. Fixed: `ATTIC_LOG` (checked first) or `RUST_LOG`, default
+   `info`.
+10. **Semantic background enrichment ignored resource pressure.** The
+    `BackgroundEnricher` wired in during the first pass ran on a fixed
+    cadence with no awareness of `ResourceMonitor` — it did not pause under
+    `Pause`/`Emergency` advisories the way the incremental scheduler does,
+    contradicting ADR-014's "semantic is the lowest-priority background
+    subsystem" and this task's explicit backpressure-integration
+    requirement. Fixed: the worker now checks `current_advisory()` before
+    each drive cycle and backs off under pressure, mirroring the
+    scheduler's policy. No second scheduler introduced.
+11. **Silently swallowed worker-thread panics on shutdown.** Both
+    `WriterQueue::drop` and `SchedulerHandle::shutdown` discarded
+    `JoinHandle::join()`'s `Err` (thread panicked) with `let _ = ...`,
+    meaning a worker crash during shutdown left no trace anywhere. Both now
+    log an `error!`/`warn!` with the panic payload instead of discarding it.
+12. **Reviewed and found no defects:** SQL string construction (the
+    `format!("UPDATE {table} ...")` pattern in
+    `attic-storage/src/invalidation_ops.rs` only ever receives compile-time
+    string literals, never external input — not an injection vector despite
+    the pattern looking risky at a glance); all `Command::new` call sites
+    (git subprocess calls use argv arrays, no shell; the only other call
+    sites are `#[cfg(test)]` helpers spawning the built test binary); path
+    traversal / symlink escape guards (already tested:
+    `path_escape_should_return_none`, `file_traversal_rejected`); graph
+    traversal bounds (`MAX_GRAPH_DEPTH`/`MAX_GRAPH_NODES` enforced in
+    `graph.rs`); the four production (non-test) `let _ = x;` sites in the
+    JS/TS structural analyzers are unused-parameter suppressions, not
+    swallowed `Result`s; README/`paths.rs` runtime-data-layout docs are
+    already internally consistent.
+13. **Known gap, not fixed (out of code-hardening scope):** no
+    `LICENSE-MIT`/`LICENSE-APACHE` files exist in the repo root, so every
+    release archive `tools/package.sh` produces ships with zero license
+    text (the copy step is a silent no-op when the files are absent).
+    Choosing/drafting a license is a legal/business decision, not a code
+    defect — flagged here rather than fixed.
+
+All 15 tracked functional-hardening tasks are now complete. Full workspace
+verification after this pass: `cargo fmt --all` (clean), `cargo test
+--workspace` (0 failures, every crate).
+
 ## 10. Production-readiness verdict
 
 **NOT production-ready.** Phase 7 development is functionally complete and,

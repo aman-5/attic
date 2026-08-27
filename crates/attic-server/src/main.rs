@@ -33,6 +33,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -139,7 +140,17 @@ impl AtticServer {
         // Phase 7: config-driven resource monitor for foreground/background
         // priority.  Budgets/capacities come from ATTIC_* env configuration
         // (ResourceConfig::load) and drive REAL admission enforcement.
+        //
+        // Invalid configuration fails closed here rather than silently
+        // running with an internally-inconsistent resource-pressure model
+        // (e.g. a min-free-memory override that would make the Critical
+        // tier unreachable).
         let config = ResourceConfig::load();
+        if let Err(e) = config.validate() {
+            return Err(ServerError::InvalidArg(format!(
+                "invalid resource configuration: {e}"
+            )));
+        }
         let resource_monitor = ResourceMonitor::from_config(&config);
         config.apply_to(&resource_monitor);
         Ok(AtticServer {
@@ -1058,8 +1069,17 @@ impl ServerHandler for AtticServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Configuration: ATTIC_LOG / RUST_LOG controls verbosity (tracing_subscriber's
+    // EnvFilter reads both, RUST_LOG taking precedence when both are set); the
+    // dependency's `env-filter` feature was enabled but never wired to the
+    // subscriber, so this previously had no effect at all. Default to `info`
+    // when neither is set, matching production-safe verbosity.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_env("ATTIC_LOG")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
         .init();
 
     // Phase 7: platform-appropriate data/cache/temp policy (see
@@ -1075,6 +1095,24 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut server = AtticServer::new(&db_path)?;
+
+    // Phase 5/7: when the semantic layer is opt-in and opened successfully,
+    // it needs a background worker to actually drain the enrichment queue —
+    // without this, embeddings are never produced and the opt-in layer is a
+    // no-op that permanently falls back to non-semantic retrieval. Lowest
+    // priority background subsystem (ADR-014 D1): bounded batches, never
+    // blocks foreground queries (they only read the store).
+    let mut semantic_enricher: Option<attic_semantic::BackgroundEnricher> = None;
+    if let Some(stack) = server.semantic.clone() {
+        semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
+            db_path.clone(),
+            stack.store.clone(),
+            stack.provider.clone(),
+            attic_semantic::EnrichmentConfig::default(),
+            server.resource_monitor.clone(),
+        ));
+        info!("semantic background enrichment worker started");
+    }
 
     // ─── Startup recovery — ALWAYS before serving (recovery contract §3) ────
     //
@@ -1114,8 +1152,8 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut _watch: Option<attic_incremental::IncrementalWatch> = None;
-    let mut _sched_handle: Option<attic_incremental::SchedulerHandle> = None;
+    let mut watch_handle: Option<attic_incremental::IncrementalWatch> = None;
+    let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
     // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
     if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
@@ -1226,14 +1264,15 @@ async fn main() -> anyhow::Result<()> {
             policy.clone(),
             monitor,
         ) {
-            Ok(sched) => _sched_handle = Some(sched),
+            Ok(sched) => sched_handle = Some(sched),
             Err(e) => {
                 error!("scheduler startup failed — incremental mode DISABLED: {e}");
                 server.watch_mode = None;
                 server.incremental = None;
                 // Continue serving WITHOUT incremental claims; status reports
                 // watcher.mode = "disabled".
-                return serve_until_closed(server).await;
+                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
+                    .await;
             }
         }
 
@@ -1251,19 +1290,20 @@ async fn main() -> anyhow::Result<()> {
                     "incremental change detection started"
                 );
                 server.watch_mode = Some(watch.mode());
-                _watch = Some(watch);
+                watch_handle = Some(watch);
             }
             Err(e) => {
                 error!("change detection failed to start ({e}) — incremental DISABLED");
                 server.watch_mode = None;
                 server.incremental = None;
-                return serve_until_closed(server).await;
+                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
+                    .await;
             }
         }
         server.incremental = Some(service);
     }
 
-    serve_until_closed(server).await
+    serve_until_closed(server, sched_handle, watch_handle, semantic_enricher).await
 }
 
 /// Outcome of the initial workspace indexing decision.
@@ -1287,54 +1327,92 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
 }
 
 /// Serve MCP until the stdio transport closes OR the process receives
-/// SIGINT/Ctrl+C, then record a clean shutdown and perform deterministic
-/// shutdown ordering per Phase 7 §9.
+/// SIGINT/Ctrl+C, then perform deterministic shutdown ordering per Phase 7
+/// §6.
 ///
 /// Ordering:
-///   1. Stop accepting new MCP work (transport close OR Ctrl+C)
-///   2. Cancel/defer background incremental tasks (scheduler + watcher drop)
-///   3. Record clean-shutdown marker (durable task state)
-///   4. Explicit WAL checkpoint (TRUNCATE) + crash-recovery backup
-///   5. Drain + stop workers (WriterQueue Drop joins the worker thread)
-///   6. Close DB resources (pool + writer connection)
-///   7. Exit
-async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
-    // 1. Stop accepting new MCP work.  Serve returns once the MCP lifecycle
-    //    handshake has completed.  The returned RunningService MUST be kept
-    //    alive for the lifetime of the server.  Ctrl+C (SIGINT / console
-    //    CtrlClose) is handled as an EQUAL first-class trigger: the service
-    //    is cancelled through rmcp and the same deterministic shutdown path
-    //    runs, so the process never dies without recording a clean marker.
+///   1. Stop accepting new MCP work (transport close OR Ctrl+C), fully
+///      awaited — never a bare drop of the running service.
+///   2. Watcher shutdown, then scheduler shutdown (bounded joins).
+///   3. Semantic background worker shutdown (bounded join with timeout).
+///   4. Record clean-shutdown marker (durable task state).
+///   5. Explicit WAL checkpoint (TRUNCATE) + crash-recovery backup.
+///   6. Drain + stop the writer (WriterQueue Drop joins the worker thread).
+///   7. Close DB resources (pool + writer connection).
+///   8. Exit.
+///
+/// `sched_handle`/`watch`/`semantic_enricher` are owned by this function
+/// (not left to an implicit drop in `main`) specifically so each can be
+/// stopped, in order, deterministically and with a bounded join — a
+/// production worker whose shutdown is left to "whatever `main` does last"
+/// is not controlled.
+async fn serve_until_closed(
+    server: AtticServer,
+    sched_handle: Option<attic_incremental::SchedulerHandle>,
+    mut watch: Option<attic_incremental::IncrementalWatch>,
+    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
+) -> anyhow::Result<()> {
+    // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
+    //    handle to the spawned service task (which itself holds `server`'s
+    //    pool/writer/semantic references).  It is always fully awaited to
+    //    completion below — on the natural-close path directly, and on the
+    //    Ctrl+C path by cancelling through `cancel_token` and then still
+    //    awaiting the same `waiting()` future — so the service task is
+    //    never left running detached while later steps close its
+    //    resources out from under it.
     let writer_for_shutdown = server.writer.clone();
     let db_path_for_shutdown = server.db_path.clone();
     let running = server
         .serve(stdio())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Capture the cancellation token BEFORE consuming `running` in
-    // `waiting()`; Ctrl+C cancels through this token.
     let cancel_token = running.cancellation_token();
-    let reason = tokio::select! {
-        r = running.waiting() => {
-            r.map_err(|e| anyhow::anyhow!("{e}"))?
-        }
-        _ = tokio::signal::ctrl_c() => {
+    let ctrl_c_watcher = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
             info!("ctrl_c/SIGINT received - initiating graceful shutdown");
             cancel_token.cancel();
-            rmcp::service::QuitReason::Cancelled
         }
-    };
+    });
+    let reason = running
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The service already stopped; if Ctrl+C never fired, stop listening
+    // for it rather than leaving the signal handler task running.
+    ctrl_c_watcher.abort();
     info!("attic server stopped: {reason:?}");
 
-    // 2. Cancel/defer background incremental tasks.  The scheduler handle
-    //    and IncrementalWatch are dropped with `server`; both stop accepting
-    //    new work and let in-flight tasks finish before the writer queue
-    //    drain below.
+    // 2. Watcher shutdown, then scheduler shutdown.  The watcher only
+    //    detects changes; the scheduler drains work derived from those
+    //    changes, so stopping detection first bounds how much new work the
+    //    scheduler can still be asked to do. Both joins are bounded (worker
+    //    threads poll a stop flag / condvar, not indefinite blocking I/O).
+    if let Some(w) = watch.as_mut() {
+        w.stop();
+    }
+    if let Some(sched) = sched_handle {
+        sched.shutdown();
+    }
 
-    // 3. Record clean shutdown marker (durable task state, REC-INV-1).
+    // 3. Semantic background worker: lowest-priority subsystem (ADR-014
+    //    D1), stopped with a bounded join before canonical DB maintenance.
+    //    A timeout is observable, not silently ignored: it means a worker
+    //    thread is still finishing an in-flight embed call, which is safe
+    //    to abandon (the OS reclaims the thread at process exit) but must
+    //    be logged rather than reported as clean.
+    if let Some(enricher) = semantic_enricher {
+        let stopped = enricher.shutdown(Duration::from_millis(
+            attic_core::resources::GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+        ));
+        if !stopped {
+            warn!("semantic background enricher did not stop within the shutdown timeout");
+        }
+    }
+
+    // 4. Record clean shutdown marker (durable task state, REC-INV-1).
     let _ = attic_incremental::record_clean_shutdown_marker(&writer_for_shutdown);
 
-    // 4. Explicit WAL checkpoint + backup (Phase 7).  After a clean shutdown:
+    // 5. Explicit WAL checkpoint + backup (Phase 7).  After a clean shutdown:
     //    force a TRUNCATE checkpoint so the WAL is emptied into the main
     //    database, then create a crash-recovery backup using the atomic
     //    rename pattern (REC-B1 through REC-B4).  Both are best-effort: a
@@ -1374,11 +1452,15 @@ async fn serve_until_closed(server: AtticServer) -> anyhow::Result<()> {
         }
     }
 
-    // 5. Stop workers.  Drop the WriterQueue - this signals the worker thread
-    //    to shut down and joins it deterministically.
+    // 6. Stop workers.  Drop the WriterQueue - this signals the worker thread
+    //    to shut down and joins it deterministically. By this point `server`
+    //    (and its `Arc<WriterQueue>`) has already been fully dropped inside
+    //    `running.waiting()` above, so this drops the last outstanding
+    //    handle clone.
     drop(writer_for_shutdown);
 
-    // 6. Close DB resources (pool + writer connection) via Drop.
+    // 7. Close DB resources (pool + writer connection) via Drop.
+    // 8. Exit (return to `main`, which returns `Ok(())` to the runtime).
 
     info!("attic server shut down cleanly: {reason:?}");
     Ok(())

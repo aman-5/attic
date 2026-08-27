@@ -8,6 +8,15 @@ Cargo.lock.bak
 .vscode/settings.json
 *.pdb
 
+# development debris (test logs, ad-hoc build-error dumps, scratch DBs)
+*.log
+build_errors*.txt
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+!fixtures/**/*.db
+
 # Attic runtime data
 .mcp/
 

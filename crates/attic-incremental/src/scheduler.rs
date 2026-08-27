@@ -202,7 +202,9 @@ impl SchedulerHandle {
         }
         self.state.cv.notify_all();
         for h in self.workers {
-            let _ = h.join();
+            if let Err(panic) = h.join() {
+                warn!("scheduler worker thread panicked during shutdown: {panic:?}");
+            }
         }
     }
 

@@ -89,9 +89,9 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageError> {
     // Ensure the backup directory exists.
     fs::create_dir_all(backup_dir).map_err(|e| {
-        StorageError::Io(std::io::Error::other(
-            format!("failed to create backup directory: {e}"),
-        ))
+        StorageError::Io(std::io::Error::other(format!(
+            "failed to create backup directory: {e}"
+        )))
     })?;
 
     // Use a timestamp-based backup name.
@@ -105,25 +105,25 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
 
     // Read the main database file.
     let main_data = std::fs::read(db_path).map_err(|e| {
-        StorageError::Io(std::io::Error::other(
-            format!("failed to read main database for backup: {e}"),
-        ))
+        StorageError::Io(std::io::Error::other(format!(
+            "failed to read main database for backup: {e}"
+        )))
     })?;
 
     // Write to tmp file first, then atomic rename.
     std::fs::write(&tmp_path, &main_data).map_err(|e| {
-        StorageError::Io(std::io::Error::other(
-            format!("failed to write backup tmp file: {e}"),
-        ))
+        StorageError::Io(std::io::Error::other(format!(
+            "failed to write backup tmp file: {e}"
+        )))
     })?;
 
     // Rename is atomic on most filesystems.
     std::fs::rename(&tmp_path, &backup_path).map_err(|e| {
         // If rename fails (e.g. cross-device), fall back to copy+delete.
         let _ = std::fs::remove_file(&tmp_path);
-        StorageError::Io(std::io::Error::other(
-            format!("failed to rename backup file: {e}"),
-        ))
+        StorageError::Io(std::io::Error::other(format!(
+            "failed to rename backup file: {e}"
+        )))
     })?;
 
     // RETENTION: keep only the most recent 3 checkpoints (REC-B2).

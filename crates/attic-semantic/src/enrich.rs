@@ -183,11 +183,18 @@ impl BackgroundEnricher {
     /// Spawn a worker driving the queue with the given cadence. The worker
     /// opens its OWN canonical read connection (rusqlite connections are not
     /// `Sync`, so the pool is never shared across the boundary).
+    ///
+    /// `resource_monitor`, when present, gates each drive cycle on the same
+    /// resource-pressure advisory the incremental scheduler consults (§4/§5:
+    /// semantic enrichment is the lowest-priority background subsystem and
+    /// must pause under `Pause`/`Emergency` pressure rather than compete with
+    /// foreground queries or canonical indexing for memory/CPU).
     pub fn spawn(
         canonical_db_path: std::path::PathBuf,
         store: std::sync::Arc<SemanticStore>,
         provider: std::sync::Arc<dyn SemanticProvider>,
         cfg: EnrichmentConfig,
+        resource_monitor: Option<std::sync::Arc<attic_storage::resource_manager::ResourceMonitor>>,
     ) -> Self {
         let stop = std::sync::Arc::new(CancelFlag::new());
         let stop2 = stop.clone();
@@ -200,6 +207,16 @@ impl BackgroundEnricher {
                 }
             };
             while !stop2.is_cancelled() {
+                if let Some(monitor) = resource_monitor.as_ref() {
+                    use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
+                    if matches!(
+                        current_advisory(monitor),
+                        ResourceAdvisory::Pause | ResourceAdvisory::Emergency
+                    ) {
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                }
                 match drive(&conn, &store, provider.as_ref(), &cfg, &stop2) {
                     Ok(s) if s.embedded == 0 && !s.cancelled => {
                         // Queue drained; idle-poll so we stay responsive to

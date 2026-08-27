@@ -95,7 +95,15 @@ pub mod resources {
 
     /// Minimum free memory (MiB) that must be retained after foreground work.
     /// Background indexing pauses if falling below this threshold.
-    pub const MIN_FREE_MEMORY_MIB: u64 = 256;
+    ///
+    /// MUST stay below 15% of `TOTAL_MEMORY_BUDGET_MIB` (i.e. below
+    /// `100 - resource_manager::PRESSURE_CRITICAL_PCT`). The Emergency tier
+    /// triggers when free memory drops below this value; if it implies an
+    /// Emergency floor at or below the Critical percentage (85%), Critical
+    /// becomes unreachable (Emergency always preempts it first). See
+    /// `ResourceConfig::validate` / `resource_manager::safe_min_free_mib`,
+    /// which reject or clamp configurations that violate this invariant.
+    pub const MIN_FREE_MEMORY_MIB: u64 = 100;
 
     /// Backup directory relative to database path (for crash recovery backups).
     pub const BACKUP_RELATIVE_DIR: &str = "backups";

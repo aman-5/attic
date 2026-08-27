@@ -540,6 +540,10 @@ pub fn cross_edges_for_entities(
 /// `target_entity_id` anchors at the target repository's primary manifest
 /// occurrence, or a deterministic `logical:` placeholder when that
 /// repository has none (ADR-011 convention).
+// One row-insert function mapping directly onto the `core_xrepo_edges`
+// schema; a parameter-object refactor is out of scope for this pass and
+// would ripple across every call site for no behavioral change.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_xrepo_edge(
     conn: &Connection,
     source_repo: &str,

@@ -46,6 +46,49 @@ use tracing::{debug, error, info, warn};
 /// a small window keeps admission decisions cheap).
 const RSS_SAMPLE_INTERVAL_MS: u64 = 250;
 
+/// Percentage of the memory budget at which `ResourcePressure::Warning` is
+/// reached (§4 pressure-tier ordering: Normal < Warning < Critical <
+/// Emergency).
+pub const PRESSURE_WARNING_PCT: u64 = 70;
+
+/// Percentage of the memory budget at which `ResourcePressure::Critical` is
+/// reached.  `min_free_memory_mib` MUST leave this tier reachable: its
+/// implied "Emergency floor" percentage (`100 - min_free_pct`) must be
+/// strictly greater than this value, otherwise Emergency would preempt
+/// Critical and the tier could never be observed. See [`safe_min_free_mib`].
+pub const PRESSURE_CRITICAL_PCT: u64 = 85;
+
+/// Return a `min_free_memory_mib` value that keeps all four pressure tiers
+/// (Normal/Warning/Critical/Emergency) reachable against `max_memory_mib`.
+///
+/// The Emergency tier triggers when `free_mib < min_free_mib`, i.e. at usage
+/// percentage `100 - (min_free_mib * 100 / max_memory_mib)`. For Critical
+/// (§`PRESSURE_CRITICAL_PCT`) to be reachable, that implied floor must sit
+/// strictly above `PRESSURE_CRITICAL_PCT`. When the input violates this,
+/// the value is clamped down and the caller is expected to have already
+/// rejected the configuration via [`ResourceConfig::validate`] if it came
+/// from user-facing configuration — this clamp is the defensive fallback so
+/// the monitor itself is never internally inconsistent.
+pub fn safe_min_free_mib(max_memory_mib: u64, min_free_mib: u64) -> u64 {
+    if max_memory_mib == 0 {
+        return min_free_mib;
+    }
+    // Largest min_free (in MiB) that still leaves the Emergency floor above
+    // PRESSURE_CRITICAL_PCT, i.e. min_free_pct < 100 - PRESSURE_CRITICAL_PCT.
+    let ceiling_pct = 100 - PRESSURE_CRITICAL_PCT;
+    let ceiling_mib = max_memory_mib.saturating_mul(ceiling_pct) / 100;
+    if min_free_mib < ceiling_mib {
+        return min_free_mib;
+    }
+    let clamped = ceiling_mib.saturating_sub(1).max(1).min(max_memory_mib);
+    warn!(
+        "min_free_memory_mib={min_free_mib} against total_memory_budget_mib={max_memory_mib} \
+         would make ResourcePressure::Critical unreachable (Emergency preempts it first); \
+         clamping min_free_memory_mib to {clamped}"
+    );
+    clamped
+}
+
 /// Cross-platform process resident-set-size sampler.
 ///
 /// Returns the current RSS of THIS process in MiB, or `None` when the OS does
@@ -131,11 +174,22 @@ impl ResourceMonitor {
     pub fn from_config(config: &ResourceConfig) -> Self {
         let foreground = config
             .max_foreground_queries
-            .unwrap_or(resources::MAX_FOREGROUND_QUERIES);
+            .unwrap_or(resources::MAX_FOREGROUND_QUERIES)
+            .max(1);
         let background = config
             .max_background_workers
             .unwrap_or(resources::MAX_INDEXING_WORKERS + resources::MAX_SEMANTIC_WORKERS);
         let background = background.min(foreground.saturating_sub(1).max(1));
+        let max_memory_mib = config
+            .total_memory_budget_mib
+            .unwrap_or(resources::TOTAL_MEMORY_BUDGET_MIB)
+            .max(1);
+        let min_free_memory_mib = safe_min_free_mib(
+            max_memory_mib,
+            config
+                .min_free_memory_mib
+                .unwrap_or(resources::MIN_FREE_MEMORY_MIB),
+        );
         Self {
             memory_used: AtomicU64::new(0),
             process_rss_mib: AtomicU64::new(0),
@@ -145,21 +199,13 @@ impl ResourceMonitor {
             background_slots: AtomicUsize::new(0),
             emergency_mode: AtomicBool::new(false),
             start_time: Instant::now(),
-            max_memory_mib: AtomicU64::new(
-                config
-                    .total_memory_budget_mib
-                    .unwrap_or(resources::TOTAL_MEMORY_BUDGET_MIB),
-            ),
+            max_memory_mib: AtomicU64::new(max_memory_mib),
             per_repo_memory_mib: AtomicU64::new(
                 config
                     .per_repo_memory_budget_mib
                     .unwrap_or(resources::PER_REPO_MEMORY_BUDGET_MIB),
             ),
-            min_free_memory_mib: AtomicU64::new(
-                config
-                    .min_free_memory_mib
-                    .unwrap_or(resources::MIN_FREE_MEMORY_MIB),
-            ),
+            min_free_memory_mib: AtomicU64::new(min_free_memory_mib),
             foreground_capacity: AtomicUsize::new(foreground),
             background_capacity: AtomicUsize::new(background),
         }
@@ -390,11 +436,10 @@ impl ResourceMonitor {
     pub fn compute_pressure(&self, current_mib: u64) -> ResourcePressure {
         let max = self.max_memory_mib.load(Ordering::Relaxed);
         let min_free = self.min_free_memory_mib.load(Ordering::Relaxed);
-        let pct = if max > 0 {
-            (current_mib * 100) / max
-        } else {
-            0
-        };
+        let pct = current_mib
+            .saturating_mul(100)
+            .checked_div(max)
+            .unwrap_or(0);
 
         let free_mib = max.saturating_sub(current_mib);
 
@@ -403,13 +448,13 @@ impl ResourceMonitor {
             return ResourcePressure::Emergency;
         }
 
-        // Critical: we're above 85% of the budget.
-        if pct >= 85 {
+        // Critical: we're above the critical percentage of the budget.
+        if pct >= PRESSURE_CRITICAL_PCT {
             return ResourcePressure::Critical;
         }
 
-        // Warning: we're above 70% of the budget.
-        if pct >= 70 {
+        // Warning: we're above the warning percentage of the budget.
+        if pct >= PRESSURE_WARNING_PCT {
             return ResourcePressure::Warning;
         }
 
@@ -419,11 +464,10 @@ impl ResourceMonitor {
     /// Announce a pressure change, emitting a diagnostic trace.
     fn announce_pressure_change(&self, pressure: ResourcePressure, current_mib: u64) {
         let max = self.max_memory_mib.load(Ordering::Relaxed);
-        let pct = if max > 0 {
-            (current_mib * 100) / max
-        } else {
-            0
-        };
+        let pct = current_mib
+            .saturating_mul(100)
+            .checked_div(max)
+            .unwrap_or(0);
 
         match pressure {
             ResourcePressure::Normal => {
@@ -507,13 +551,22 @@ impl ResourceMonitor {
     /// for subsequent admission decisions.
     pub fn apply_config(&self, config: &ResourceConfig) {
         if let Some(v) = config.total_memory_budget_mib {
-            self.max_memory_mib.store(v, Ordering::Release);
+            self.max_memory_mib.store(v.max(1), Ordering::Release);
         }
         if let Some(v) = config.per_repo_memory_budget_mib {
             self.per_repo_memory_mib.store(v, Ordering::Release);
         }
-        if let Some(v) = config.min_free_memory_mib {
-            self.min_free_memory_mib.store(v, Ordering::Release);
+        if config.total_memory_budget_mib.is_some() || config.min_free_memory_mib.is_some() {
+            // Re-derive min_free against the (possibly just-updated) max
+            // budget so the two settings can never drift into an
+            // inconsistent state where Critical is unreachable, regardless
+            // of which of the two fields this call actually overrides.
+            let max = self.max_memory_mib.load(Ordering::Acquire);
+            let requested = config
+                .min_free_memory_mib
+                .unwrap_or_else(|| self.min_free_memory_mib.load(Ordering::Acquire));
+            self.min_free_memory_mib
+                .store(safe_min_free_mib(max, requested), Ordering::Release);
         }
         if let Some(v) = config.max_foreground_queries {
             self.foreground_capacity.store(v.max(1), Ordering::Release);
@@ -577,8 +630,7 @@ pub fn current_advisory(monitor: &ResourceMonitor) -> ResourceAdvisory {
 /// These values may be overridden by environment variables or a config file
 /// at server startup.  The defaults in `attic_core::resources` are the
 /// production-hardening baselines.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceConfig {
     /// Global memory budget in MiB. Overrides the default from
     /// `attic_core::resources::TOTAL_MEMORY_BUDGET_MIB`.
@@ -610,7 +662,6 @@ pub struct ResourceConfig {
     /// `attic_core::resources::WRITER_FLUSH_INTERVAL_MS`.
     pub writer_flush_interval_ms: Option<u64>,
 }
-
 
 impl ResourceConfig {
     /// Load the resource configuration, applying environment variable overrides.
@@ -659,6 +710,82 @@ impl ResourceConfig {
         }
     }
 
+    /// Validate this configuration before it is applied.
+    ///
+    /// Rejects invalid or internally-inconsistent overrides so the server
+    /// fails clearly at startup instead of silently running with
+    /// nonsensical or unreachable resource-pressure behavior. Fields left as
+    /// `None` fall back to `attic_core::resources` defaults, which are
+    /// themselves guaranteed consistent, so only explicit overrides are
+    /// checked here.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(v) = self.total_memory_budget_mib
+            && v == 0
+        {
+            return Err("ATTIC_TOTAL_MEMORY_BUDGET_MIB must be > 0".into());
+        }
+        if let Some(v) = self.per_repo_memory_budget_mib
+            && v == 0
+        {
+            return Err("ATTIC_PER_REPO_MEMORY_BUDGET_MIB must be > 0".into());
+        }
+        if let Some(v) = self.min_free_memory_mib
+            && v == 0
+        {
+            return Err("ATTIC_MIN_FREE_MEMORY_MIB must be > 0".into());
+        }
+        if let Some(v) = self.max_foreground_queries
+            && v == 0
+        {
+            return Err("ATTIC_MAX_FOREGROUND_QUERIES must be > 0".into());
+        }
+        if let Some(v) = self.max_io_ops_per_sec
+            && v == 0
+        {
+            return Err("ATTIC_MAX_IO_OPS_PER_SEC must be > 0".into());
+        }
+        if let Some(v) = self.writer_queue_capacity
+            && v == 0
+        {
+            return Err("ATTIC_WRITER_QUEUE_CAPACITY must be > 0".into());
+        }
+        if let Some(v) = self.writer_batch_size
+            && v == 0
+        {
+            return Err("ATTIC_WRITER_BATCH_SIZE must be > 0".into());
+        }
+        if let Some(v) = self.writer_flush_interval_ms
+            && v == 0
+        {
+            return Err("ATTIC_WRITER_FLUSH_INTERVAL_MS must be > 0".into());
+        }
+
+        let max = self
+            .total_memory_budget_mib
+            .unwrap_or(resources::TOTAL_MEMORY_BUDGET_MIB);
+        let min_free = self
+            .min_free_memory_mib
+            .unwrap_or(resources::MIN_FREE_MEMORY_MIB);
+        if min_free >= max {
+            return Err(format!(
+                "ATTIC_MIN_FREE_MEMORY_MIB ({min_free}) must be less than \
+                 ATTIC_TOTAL_MEMORY_BUDGET_MIB ({max})"
+            ));
+        }
+        let ceiling_pct = 100 - PRESSURE_CRITICAL_PCT;
+        let ceiling_mib = max.saturating_mul(ceiling_pct) / 100;
+        if min_free >= ceiling_mib {
+            return Err(format!(
+                "ATTIC_MIN_FREE_MEMORY_MIB ({min_free}) is too large relative to \
+                 ATTIC_TOTAL_MEMORY_BUDGET_MIB ({max}): the implied Emergency floor \
+                 would be at or below the Critical threshold ({PRESSURE_CRITICAL_PCT}%), \
+                 making ResourcePressure::Critical unreachable. Use a value below \
+                 {ceiling_mib} MiB."
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply this configuration to the given ResourceMonitor.
     ///
     /// Overrides take effect immediately for all subsequent admission and
@@ -702,14 +829,6 @@ mod tests {
 
     #[test]
     fn resource_monitor_pressure_levels() {
-        // A custom config with a large budget and proportionally tiny
-        // min_free keeps the four pressure tiers cleanly separable. The
-        // production defaults (1024 MiB budget, 256 MiB min_free = 25%)
-        // don't work for this: the Emergency floor (free < min_free, i.e.
-        // used > 75%) falls BELOW the Critical floor (used >= 85%), so
-        // Critical would be unreachable — any 85%-used value is already
-        // Emergency. This test exists to exercise the tier boundaries in
-        // isolation, so it picks constants where all four are reachable.
         let config = ResourceConfig {
             total_memory_budget_mib: Some(10_000),
             min_free_memory_mib: Some(100),
@@ -743,6 +862,84 @@ mod tests {
     }
 
     #[test]
+    fn default_configuration_keeps_all_four_tiers_reachable() {
+        // Regression test for the Phase 7 finding: production defaults
+        // (1024 MiB budget, formerly 256 MiB min_free = 25%) made the
+        // Emergency floor (free < min_free, i.e. used > 75%) fall BELOW the
+        // Critical floor (used >= 85%), so Critical was unreachable — any
+        // 85%-used value was already Emergency. The fixed defaults must
+        // leave Critical reachable: some usage level must read Critical
+        // without also reading Emergency.
+        let monitor = ResourceMonitor::from_config(&ResourceConfig::default());
+        let max = monitor.max_memory_mib();
+        let min_free = monitor.min_free_memory_mib();
+        let emergency_floor_pct = 100 - (min_free * 100 / max);
+        assert!(
+            emergency_floor_pct > PRESSURE_CRITICAL_PCT,
+            "Emergency floor ({emergency_floor_pct}%) must be strictly above \
+             Critical ({PRESSURE_CRITICAL_PCT}%) for Critical to be reachable"
+        );
+        // 85% used with the default budget must read Critical, not Emergency.
+        // Ceiling-divide so integer truncation in `compute_pressure`'s own
+        // `(current * 100) / max` can't round the percentage back under 85.
+        let at_critical = (max * PRESSURE_CRITICAL_PCT).div_ceil(100);
+        assert_eq!(
+            monitor.compute_pressure(at_critical),
+            attic_core::ResourcePressure::Critical
+        );
+    }
+
+    #[test]
+    fn safe_min_free_clamps_inconsistent_input() {
+        // 250 MiB min_free against a 1000 MiB budget (25%) is above the 15%
+        // ceiling implied by PRESSURE_CRITICAL_PCT=85 and must be clamped
+        // down so Critical stays reachable.
+        let clamped = safe_min_free_mib(1000, 250);
+        assert!(
+            clamped < 150,
+            "clamped min_free must sit below the 15% ceiling"
+        );
+        let emergency_floor_pct = 100 - (clamped * 100 / 1000);
+        assert!(emergency_floor_pct > PRESSURE_CRITICAL_PCT);
+
+        // A value already within bounds must pass through unchanged.
+        assert_eq!(safe_min_free_mib(1000, 50), 50);
+    }
+
+    #[test]
+    fn resource_config_validate_rejects_unreachable_critical_tier() {
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(1000),
+            min_free_memory_mib: Some(250),
+            ..ResourceConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "config making Critical unreachable must be rejected"
+        );
+    }
+
+    #[test]
+    fn resource_config_validate_accepts_consistent_config() {
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(1000),
+            min_free_memory_mib: Some(50),
+            ..ResourceConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(ResourceConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn resource_config_validate_rejects_zero_values() {
+        let config = ResourceConfig {
+            max_foreground_queries: Some(0),
+            ..ResourceConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn resource_monitor_memory_increase_decrease() {
         let monitor = ResourceMonitor::new();
 
@@ -759,8 +956,10 @@ mod tests {
 
     #[test]
     fn foreground_slot_capacity_is_enforced() {
-        let mut config = ResourceConfig::default();
-        config.max_foreground_queries = Some(3);
+        let config = ResourceConfig {
+            max_foreground_queries: Some(3),
+            ..ResourceConfig::default()
+        };
         let monitor = ResourceMonitor::from_config(&config);
 
         assert!(monitor.acquire_foreground_slot());
@@ -779,8 +978,10 @@ mod tests {
 
     #[test]
     fn foreground_guard_releases_on_drop() {
-        let mut config = ResourceConfig::default();
-        config.max_foreground_queries = Some(1);
+        let config = ResourceConfig {
+            max_foreground_queries: Some(1),
+            ..ResourceConfig::default()
+        };
         let monitor = ResourceMonitor::from_config(&config);
 
         {
@@ -794,9 +995,11 @@ mod tests {
 
     #[test]
     fn background_capacity_is_separate_and_below_foreground() {
-        let mut config = ResourceConfig::default();
-        config.max_foreground_queries = Some(4);
-        config.max_background_workers = Some(2);
+        let config = ResourceConfig {
+            max_foreground_queries: Some(4),
+            max_background_workers: Some(2),
+            ..ResourceConfig::default()
+        };
         let monitor = ResourceMonitor::from_config(&config);
 
         assert_eq!(monitor.foreground_capacity(), 4);
@@ -814,14 +1017,17 @@ mod tests {
 
     #[test]
     fn background_slots_refused_under_pause_advisory() {
-        let mut config = ResourceConfig::default();
-        // Force emergency: memory used above budget minus min free.
-        config.total_memory_budget_mib = Some(300);
-        config.min_free_memory_mib = Some(256);
+        // A coherent config (min_free well within the 15% ceiling) that
+        // still reaches Emergency once usage is high enough.
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(300),
+            min_free_memory_mib: Some(30),
+            ..ResourceConfig::default()
+        };
         let monitor = ResourceMonitor::from_config(&config);
 
-        // 100 MiB used → free = 200 < 256 → Emergency → Pause/Emergency advisory.
-        monitor.record_memory_increase(100);
+        // 280 MiB used → free = 20 < 30 → Emergency → Pause/Emergency advisory.
+        monitor.record_memory_increase(280);
         assert_eq!(current_advisory(&monitor), ResourceAdvisory::Emergency);
         assert!(
             !monitor.acquire_background_slot(),
@@ -937,8 +1143,10 @@ mod tests {
         use std::sync::atomic::AtomicUsize as _Unused;
         let _ = _Unused::new(0);
 
-        let mut config = ResourceConfig::default();
-        config.max_foreground_queries = Some(4);
+        let config = ResourceConfig {
+            max_foreground_queries: Some(4),
+            ..ResourceConfig::default()
+        };
         let monitor = Arc::new(ResourceMonitor::from_config(&config));
 
         let mut handles = Vec::new();

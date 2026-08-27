@@ -32,8 +32,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build + test (host targets)
-        if: matrix.target != 'x86_64-apple-darwin'
+      - name: Build + test
+        # Every matrix entry runs on a NATIVE runner for its target
+        # (windows-latest=MSVC host, ubuntu-latest=x86_64 host,
+        # macos-13=Intel host, macos-latest=Apple Silicon host) — none of
+        # these are cross-compiled, so there is no platform here that can't
+        # actually run its own test suite. Skipping any of them would be a
+        # silent NOT VERIFIED masquerading as a passing release gate.
         run: cargo test --workspace
       - name: Package release archive
         shell: bash

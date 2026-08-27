@@ -61,7 +61,7 @@
 //! - [`FLUSH_INTERVAL`]: flush at least every 50 ms
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -193,7 +193,6 @@ impl WriterQueueHandle {
         })?;
 
         // Block until the worker sends back the result.
-        
 
         result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
     }
@@ -212,9 +211,6 @@ pub struct WriterQueue {
     handle: WriterQueueHandle,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
-    /// Number of pending mutations currently in the queue.  Updated atomically
-    /// on enqueue/dequeue for observability.
-    pending_count: AtomicUsize,
 }
 
 impl WriterQueue {
@@ -241,7 +237,6 @@ impl WriterQueue {
     {
         let (tx, rx) = mpsc::sync_channel::<WorkItem>(QUEUE_CAPACITY);
         let poisoned = Arc::new(AtomicBool::new(false));
-        let pending_count = AtomicUsize::new(0);
         let handle = WriterQueueHandle {
             tx,
             poisoned: Arc::clone(&poisoned),
@@ -261,7 +256,6 @@ impl WriterQueue {
             handle,
             shutdown,
             worker: Some(worker),
-            pending_count,
         })
     }
 
@@ -278,9 +272,13 @@ impl Drop for WriterQueue {
         self.shutdown.store(true, Ordering::Release);
 
         if let Some(jh) = self.worker.take() {
-            // If the thread panicked we discard the panic value; the DB is
-            // safely closed when `conn` is dropped inside the worker.
-            let _ = jh.join();
+            // The DB is safely closed when `conn` is dropped inside the
+            // worker regardless of outcome, but a panic here means the
+            // writer thread died mid-work — that's not "clean shutdown"
+            // and must be observable, not silently discarded.
+            if let Err(panic) = jh.join() {
+                error!("writer thread panicked during shutdown: {panic:?}");
+            }
         }
     }
 }
