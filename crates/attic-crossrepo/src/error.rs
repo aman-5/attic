@@ -38,4 +38,12 @@ pub enum CrossRepoError {
         /// Contextual detail.
         context: String,
     },
+
+    /// No authoritative SourceRevision exists for the repository.
+    /// Cross-repo catalog/edges require a real Phase 1B/2 source revision.
+    #[error("no source revision for repository {repository_id} — index first")]
+    NoSourceRevision {
+        /// The repository that lacks a source revision.
+        repository_id: String,
+    },
 }

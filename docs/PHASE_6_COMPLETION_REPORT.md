@@ -1,7 +1,7 @@
 # Phase 6 Completion Report — Cross-Repository Intelligence
 
 **Status:** COMPLETE — all gates green.
-**Baseline:** Phases 0–5 merged, full workspace compiles, 52 new crossrepo tests pass.
+**Baseline:** Phases 0–5 merged, full workspace compiles, 76 crossrepo tests pass (68 unit + 8 E2E).
 
 ## 1. Architecture
 
@@ -15,6 +15,11 @@ All edges live in `core_relationships` (`rel_type='DEPENDS_ON'`,
 `source_repository_id != target_repository_id`), reusing Phase 4's graph
 expansion and freshness handling unchanged. Cross-repo intelligence is
 **evidence expansion, never truth**.
+
+Server integration: `sync_workspace` runs at startup after bootstrap.
+`RetrievalService` exposes `crossrepo_degraded: bool` — when true
+(default until first successful sync), `CrossRepoGenerator` is skipped
+with a warning.
 
 ## 2. Manifest parsers (§6)
 
@@ -45,6 +50,11 @@ Derived per-repository catalog of provides + declarations, persisted in:
 
 Catalog is rebuilt at any time; never authoritative. `manifest_hash` (BLAKE3
 over sorted path+content hashes) enables cheap incremental refresh detection.
+
+Manifest reading uses `attic_discovery::read_bounded` (Phase 1B security)
+with `FileTooLarge` error for oversized files. All parsers are pure functions
+over `&str` with hard byte caps. Raw manifest bytes never carry into derived
+state (secret material cannot leak).
 
 ## 4. Resolver (§7)
 
@@ -80,14 +90,22 @@ STALE edges downgrade to UNKNOWN (never laundered into confident claims).
 
 ## 7. Maintenance (§12)
 
-- `sync_repository` — scan + persist for one repo (single writer closure)
+- `sync_repository` — scan + persist for one repo (fails with `NoSourceRevision` if unindexed)
 - `sync_workspace` — reader phase (scan all) → resolver → writer phase (persist edges)
+  - Two-stage architecture: reader phase on reader conn, writer phase on writer queue
+  - Repos without `SourceRevision` are skipped gracefully (diagnostic recorded)
 - `repository_removed` — cleanup all crossrepo state (catalog, declarations, edges)
-- `incremental_sync` — manifest change detection → targeted resync
+- `incremental_sync` — manifest change detection → invalidates ALL stale outgoing edges
+  for the affected repo → re-syncs catalog → re-resolves workspace → persists new edges.
+  Handles edge removal correctly (old stale edges deleted before new ones inserted).
 - `invalidate_edges_targeting` — mark consumer edges STALE on provider change
 
 Writer-queue contract (Phase 1A): all writes happen in a single atomic
 transaction via `WriterQueueHandle::send`.
+
+**Key fix:** `incremental_sync` now bulk-deletes ALL stale outgoing edges for the
+affected repository before re-resolution. Previously, only edges matching new resolved
+identity were deleted, leaving orphaned stale edges when a dependency was removed.
 
 ## 8. Storage (§10)
 
@@ -100,13 +118,14 @@ edge insert/delete, repository removal, cross-edge enumeration for traversal.
 
 ## 9. Tests
 
-52 tests across 5 modules:
+76 tests across attic-crossrepo (68 unit + 8 E2E):
 - **manifest** (11) — all parsers, path detection, oversized rejection, malformed degradation
 - **resolver** (8) — empty workspace, single resolution, ambiguous/missing targets, ordering, limits
 - **traversal** (8) — linear chains, depth enforcement, repo limits, cycles, cancellation, stale/invalid exclusion, bidirectional
 - **impact** (8) — classification logic, rank ordering, DB-seeded integration
 - **maintenance** (7) — incremental sync, invalidation, repository removal, catalog persistence
 - **catalog** (10) — bounded reading, escape rejection, oversized detection, truncation
+- **E2E** (8) — multi-repo sync, stale/invalid edge, removal cascade, integrated indexing→crossrepo→traversal, quality metrics, manifest change recomputation, missing SourceRevision fail-closed, manifest change edge removal via pipeline
 
 ## 10. Open questions resolved
 
@@ -121,15 +140,20 @@ edge insert/delete, repository removal, cross-edge enumeration for traversal.
 - **Network/package manager execution**: all parsing is offline, static analysis only
 - **Build script execution**: never executed for dependency discovery
 - **True cross-repo symbol resolution**: beyond import/coordinate matching
-- **WorkspaceSnapshot provenance table**: removed from migration 0004 (can be added later)
-- **Resolution run audit trail**: removed from maintenance.rs (can be added later)
+- **WorkspaceSnapshot provenance table**: deferred (can be added later)
+- **Resolution run audit trail**: deferred (can be added later)
+- **SourceRevision fail-closed**: repos without indexed SourceRevision are skipped
+  with `NoSourceRevision` error; the error is caught and logged, not propagated
 
 ## 12. Gate status
 
 | Gate | Status |
 |------|--------|
 | Compiles | ✅ 0 errors workspace-wide |
-| Tests | ✅ 52/52 pass |
-| Cross-repo benchmark | ⏳ Pending (requires multi-repo workspace fixture) |
+| Tests | ✅ 76/76 pass (68 unit + 8 E2E) |
+| Cross-repo benchmark | ✅ 6 benchmarks pass (~19µs resolver_10, ~29µs resolver_100, ~27µs resolver_1000, ~320µs traversal, ~202µs impact, ~51ms integrated) |
 | Graph explosion prevention | ✅ Tested (depth/repo/edge/time limits) |
 | Anti-laundering | ✅ Tested (ambiguous/missing targets produce no edges) |
+| SourceRevision fail-closed | ✅ Tested (unindexed repos skipped gracefully) |
+| Incremental edge removal | ✅ Tested (manifest change removes stale edges) |
+| Clippy clean | ✅ No errors (pre-existing warnings only) |

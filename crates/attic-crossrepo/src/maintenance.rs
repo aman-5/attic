@@ -106,7 +106,7 @@ pub fn sync_repository(
 /// Resolve the latest source revision ID for a repository from the DB.
 ///
 /// Returns the `id` column of the most recently captured `core_source_revisions`
-/// row, or a deterministic placeholder if no revision exists yet.
+/// row. Fails with `NoSourceRevision` if the repository has not been indexed.
 fn resolve_source_revision(
     conn: &rusqlite::Connection,
     repository_id: &str,
@@ -114,12 +114,10 @@ fn resolve_source_revision(
     let repo_id = repository_id
         .parse::<attic_core::RepositoryId>()
         .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
-    if let Some(id) = attic_storage::latest_source_revision_for_repository(conn, &repo_id)? {
-        return Ok(id);
-    }
-    // No source revision exists yet (repository registered but not indexed).
-    // Use a deterministic placeholder so the catalog row is storable.
-    Ok(format!("unindexed-{repository_id}"))
+    attic_storage::latest_source_revision_for_repository(conn, &repo_id)?
+        .ok_or_else(|| CrossRepoError::NoSourceRevision {
+            repository_id: repository_id.to_owned(),
+        })
 }
 
 /// Report from a single-repository sync.
@@ -214,7 +212,13 @@ pub fn sync_workspace(
 
         // Scan manifests from disk (read-only — queries DB for paths, reads
         // files through Phase 1B safe-content boundary).
-        let scan = crate::catalog::scan_repository_manifests(reader_conn, repo_id)?;
+        let scan = match crate::catalog::scan_repository_manifests(reader_conn, repo_id) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("failed to scan repo {}: {e}", repo_id);
+                continue;
+            }
+        };
 
         // Extract provides and declarations from the scan.
         let mut provides = Vec::new();
@@ -225,7 +229,19 @@ pub fn sync_workspace(
         }
 
         // Resolve source revision from authoritative DB state.
-        let source_revision_id = resolve_source_revision(reader_conn, repo_id)?;
+        // Skip repositories without a valid SourceRevision (not yet indexed).
+        let source_revision_id = match resolve_source_revision(reader_conn, repo_id) {
+            Ok(id) => id,
+            Err(CrossRepoError::NoSourceRevision { repository_id }) => {
+                debug!("skipping repo {} — no source revision (not indexed)", repository_id);
+                result.diagnostics.missing_targets.push((
+                    repository_id.clone(),
+                    "no_source_revision".to_owned(),
+                ));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         // Build resolver input from scan results (in-memory, no persistence).
         let repo_id_parsed = repo_id
@@ -367,6 +383,11 @@ pub fn repository_removed(
 /// given repository, and if so, trigger a re-sync.
 ///
 /// Must run inside a writer-queue closure.
+///
+/// On manifest change:
+/// 1. Invalidate outgoing edges (this repo's declarations changed).
+/// 2. If this repo provides packages, invalidate incoming edges (provides changed).
+/// 3. Re-sync catalog and re-resolve cross-repo edges for affected repos.
 pub fn incremental_sync(
     conn: &rusqlite::Connection,
     repository_id: &str,
@@ -380,9 +401,118 @@ pub fn incremental_sync(
     }
     debug!(
         repo = repository_id,
-        "manifest change detected, resyncing"
+        "manifest change detected, incremental recomputation"
     );
+
+    // 1. Invalidate OUTGOING edges from this repo (declarations changed).
+    let out_stale = conn.execute(
+        "UPDATE core_relationships SET freshness_state = 'STALE'
+          WHERE source_repository_id = ?1
+            AND rel_type = 'DEPENDS_ON'
+            AND freshness_state = 'CURRENT'",
+        rusqlite::params![repository_id],
+    )?;
+    debug!(repo = repository_id, out_stale = out_stale, "invalidated outgoing edges");
+
+    // 2. Check if this repo provides any packages. If so, invalidate INCOMING edges
+    // (its provides changed, consumers' resolution may need update).
+    let provides_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM core_dependency_declarations
+           WHERE repository_id = ?1 AND json_type(provides_json) = 'array'",
+        rusqlite::params![repository_id],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    let in_stale = if provides_count > 0 {
+        conn.execute(
+            "UPDATE core_relationships SET freshness_state = 'STALE'
+              WHERE target_repository_id = ?1
+                AND rel_type = 'DEPENDS_ON'
+                AND freshness_state = 'CURRENT'",
+            rusqlite::params![repository_id],
+        )?
+    } else {
+        0
+    };
+    debug!(repo = repository_id, in_stale = in_stale, "invalidated incoming edges");
+
+    // 3. Re-sync this repository's catalog with fresh SourceRevision.
     sync_repository(conn, repository_id)?;
+
+    // 4. Re-resolve cross-repo edges for ALL repos that had edges invalidated.
+    // Build resolver input for the whole workspace (bounded) and persist new edges.
+    // This is a targeted recomputation, not a full workspace rebuild.
+    let repo_ids = attic_storage::crossrepo_ops::all_repository_ids(conn)?;
+    let mut all_repo_data: Vec<crate::resolver::RepoCatalogData> = Vec::with_capacity(repo_ids.len());
+    let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
+
+    for rid in &repo_ids {
+        // Scan manifests from disk (read-only).
+        let scan = match crate::catalog::scan_repository_manifests(conn, rid) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut provides = Vec::new();
+        let mut declarations = Vec::new();
+        for m in &scan.manifests {
+            provides.extend(m.provides.clone());
+            declarations.extend(m.declarations.clone());
+        }
+        let source_revision_id = resolve_source_revision(conn, rid)?;
+        let repo_id_parsed = rid
+            .parse::<attic_core::RepositoryId>()
+            .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
+        let root_path = attic_storage::get_repository_path(conn, &repo_id_parsed)?
+            .unwrap_or_default();
+        let gmp = provides
+            .iter()
+            .find(|p| p.ecosystem == crate::Ecosystem::Go)
+            .map(|p| p.name.clone());
+        let primary = crate::catalog::primary_anchor_for_repo(conn, rid);
+        let proto_specs = crate::catalog::scan_proto_imports(conn, rid)?;
+        if !proto_specs.is_empty() {
+            proto_index.insert(rid.clone(), proto_specs);
+        }
+        all_repo_data.push(crate::resolver::RepoCatalogData {
+            repository_id: rid.clone(),
+            root_path,
+            source_revision_id,
+            provides: provides.clone(),
+            declarations: declarations.clone(),
+            primary_anchor_occurrence: primary,
+            go_module_prefix: gmp,
+        });
+    }
+
+    // Resolve and persist new edges (replaces stale ones).
+    let (edges, _diag) = crate::resolver::resolve_workspace(&all_repo_data, &proto_index);
+
+    // Delete ALL stale edges originating from this repository before inserting new ones.
+    // Without this, removing a dependency leaves the old stale edge orphaned.
+    conn.execute(
+        "DELETE FROM core_relationships
+         WHERE source_repository_id = ?1
+           AND rel_type = 'DEPENDS_ON'
+           AND freshness_state = 'STALE'",
+        rusqlite::params![repository_id],
+    )?;
+
+    for e in &edges {
+        // Insert fresh edge.
+        attic_storage::crossrepo_ops::insert_xrepo_edge(
+            conn,
+            &e.source_repository_id,
+            &e.source_entity_id,
+            &e.target_repository_id,
+            &e.target_entity_id,
+            &e.resolution,
+            e.confidence,
+            &e.dependency_basis,
+            &e.provenance_json,
+            &e.source_revision_id,
+        )?;
+    }
+
     Ok(true)
 }
 
@@ -463,7 +593,7 @@ mod tests {
     fn incremental_sync_triggers_on_manifest_change() {
         let conn = seeded_conn();
         insert_repo(&conn, "r1", "/ws/r1");
-        let rev = insert_rev(&conn, "r1");
+        let _rev = insert_rev(&conn, "r1");
 
         let changed = vec!["src/main.rs".to_owned(), "go.mod".to_owned()];
         let resynced = incremental_sync(&conn, &tid("r1"), &changed).unwrap();

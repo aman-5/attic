@@ -47,6 +47,13 @@ pub enum DiscoveryError {
     /// broaden discovery scope.
     #[error("include_untracked=false requested but git tracked-file set unavailable: {reason}")]
     TrackedFileSetUnavailable { reason: String },
+
+    /// File exceeds the configured maximum size.
+    #[error("file exceeds maximum size of {max_bytes} bytes: {path}")]
+    FileTooLarge {
+        path: PathBuf,
+        max_bytes: u64,
+    },
 }
 
 impl From<std::io::Error> for DiscoveryError {

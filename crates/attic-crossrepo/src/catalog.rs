@@ -60,61 +60,26 @@ pub fn indexed_manifest_paths(
 
 /// Read one manifest with hard bounds and path containment.
 ///
-/// Uses Phase 1B safe-content boundary: `canonicalize_within_root` for path
-/// containment and `scan_and_redact` for secret scanning defense-in-depth.
+/// Uses Phase 1B safe-content boundary via `attic_discovery::read_bounded`
+/// for path containment, size bounds, and secret scanning.
 fn read_manifest_bounded(
     repo_root: &std::path::Path,
     rel_path: &str,
 ) -> Result<Option<Vec<u8>>, CrossRepoError> {
-    if rel_path.split('/').any(|seg| seg == "..") {
-        return Ok(None);
-    }
-    // Canonicalize root first so starts_with comparison works on Windows
-    // (where std::fs::canonicalize adds \\?\ prefix).
-    let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
-        return Ok(None);
-    };
-    let joined = repo_root.join(rel_path.replace('\\', "/"));
-    // Phase 1B safe-content boundary: canonicalize within root, reject escapes.
-    let canon = match attic_discovery::canonicalize_within_root(&joined, &canon_root) {
-        Ok(p) => p,
-        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => return Ok(None),
+    match attic_discovery::read_bounded(repo_root, rel_path, limits::MAX_MANIFEST_BYTES) {
+        Ok(bytes) => Ok(bytes),
         Err(attic_discovery::DiscoveryError::PathEscape { .. }) => {
-            return Err(CrossRepoError::PathEscape(rel_path.to_owned()));
+            Err(CrossRepoError::PathEscape(rel_path.to_owned()))
         }
-        Err(_) => return Ok(None),
-    };
-    let meta = match std::fs::metadata(&canon) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    if !meta.is_file() {
-        return Ok(None);
-    }
-    if meta.len() > limits::MAX_MANIFEST_BYTES {
-        return Err(CrossRepoError::LimitExceeded {
-            limit: "MAX_MANIFEST_BYTES",
-            context: format!("{rel_path} is {} bytes", meta.len()),
-        });
-    }
-    let raw = match std::fs::read(&canon) {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
-    };
-    // Defense-in-depth: scan for secrets even though manifests are
-    // dependency declarations, not secret material.
-    if let Ok(text) = std::str::from_utf8(&raw) {
-        let scan = attic_discovery::secrets::scan_and_redact(text);
-        if !scan.findings.is_empty() {
-            debug!(
-                path = rel_path,
-                findings = scan.findings.len(),
-                "manifest contains secret patterns, redacting"
-            );
-            return Ok(Some(scan.redacted.into_bytes()));
+        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => Ok(None),
+        Err(attic_discovery::DiscoveryError::FileTooLarge { max_bytes, .. }) => {
+            Err(CrossRepoError::LimitExceeded {
+                limit: "MAX_MANIFEST_BYTES",
+                context: format!("{rel_path} exceeds {max_bytes} bytes"),
+            })
         }
+        Err(_) => Ok(None),
     }
-    Ok(Some(raw))
 }
 
 /// Read one proto file with hard bounds.
@@ -124,41 +89,11 @@ fn read_proto_bounded(
     repo_root: &std::path::Path,
     rel_path: &str,
 ) -> Result<Option<Vec<u8>>, CrossRepoError> {
-    if rel_path.split('/').any(|seg| seg == "..") {
-        return Ok(None);
-    }
-    let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
-        return Ok(None);
-    };
-    let joined = repo_root.join(rel_path.replace('\\', "/"));
-    // Phase 1B safe-content boundary: canonicalize within root, reject escapes.
-    let canon = match attic_discovery::canonicalize_within_root(&joined, &canon_root) {
-        Ok(p) => p,
-        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => return Ok(None),
-        Err(attic_discovery::DiscoveryError::PathEscape { .. }) => return Ok(None),
-        Err(_) => return Ok(None),
-    };
-    let meta = match std::fs::metadata(&canon) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    if !meta.is_file() || meta.len() > limits::MAX_MANIFEST_BYTES {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&canon)
-        .map_err(|_| CrossRepoError::InvalidRoot("proto read failed".into()))?;
-    // Phase 1B defense-in-depth: apply secret scan even though proto
-    // content is only parsed for import specifiers.  Raw bytes are never
-    // persisted or surfaced to users.
-    if let Ok(text) = std::str::from_utf8(&raw) {
-        let scan = attic_discovery::secrets::scan_and_redact(text);
-        if scan.findings.is_empty() {
-            Ok(Some(raw))
-        } else {
-            Ok(Some(scan.redacted.into_bytes()))
-        }
-    } else {
-        Ok(Some(raw))
+    match attic_discovery::read_bounded(repo_root, rel_path, limits::MAX_MANIFEST_BYTES) {
+        Ok(bytes) => Ok(bytes),
+        Err(attic_discovery::DiscoveryError::PathEscape { .. }) => Ok(None),
+        Err(attic_discovery::DiscoveryError::Canonicalize { .. }) => Ok(None),
+        Err(_) => Ok(None),
     }
 }
 
