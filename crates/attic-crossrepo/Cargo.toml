@@ -1,6 +1,6 @@
 [package]
-name         = "attic-incremental"
-description  = "Attic - Phase 2 incremental correctness: watcher, event pipeline, invalidation DAG, freshness, scheduling, recovery"
+name         = "attic-crossrepo"
+description  = "Attic - Phase 6 bounded cross-repository intelligence: dependency metadata parsing, workspace catalog, resolver, budgeted graph traversal and impact analysis"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -10,19 +10,23 @@ repository.workspace   = true
 
 [dependencies]
 attic-core.workspace      = true
-attic-storage.workspace   = true
-attic-indexing.workspace  = true
 attic-discovery.workspace = true
-attic-crossrepo.workspace = true
-notify-debouncer-full.workspace = true
+attic-evidence.workspace  = true
+attic-storage.workspace   = true
+blake3.workspace          = true
 rusqlite.workspace        = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 serde.workspace           = true
 serde_json.workspace      = true
 uuid.workspace            = true
-blake3.workspace          = true
 tracing.workspace         = true
 thiserror.workspace       = true
 
 [dev-dependencies]
+attic-indexing.workspace = true
+attic-retrieval.workspace = true
 tempfile.workspace        = true
+criterion                 = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crossrepo_bench"
+harness = false

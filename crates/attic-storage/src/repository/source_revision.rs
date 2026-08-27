@@ -107,6 +107,27 @@ pub fn exists_source_revision(
     Ok(count > 0)
 }
 
+/// Return the most recently captured source revision ID for a repository, or
+/// `None` if no revisions exist.
+pub fn latest_source_revision_for_repository(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+) -> Result<Option<String>, StorageError> {
+    let result = conn.query_row(
+        "SELECT id FROM core_source_revisions
+          WHERE repository_id = ?1
+          ORDER BY captured_at DESC
+          LIMIT 1",
+        rusqlite::params![repository_id.to_string_repr()],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Sqlite(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

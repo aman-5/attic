@@ -80,7 +80,7 @@ pub use secrets::{
     FileSizeTier, LargeFileStream, PreprocessResult, SMALL_FILE_THRESHOLD as MAX_FULL_LOAD_BYTES,
     ScanResult, SecretFinding, SecretScanDecision, VERY_LARGE_FILE_THRESHOLD as MAX_LARGE_BYTES,
 };
-pub use security::canonicalize_within_root;
+pub use security::{canonicalize_within_root, read_bounded};
 pub use walk::{EligibleEntry, WalkResult};
 
 // ---------------------------------------------------------------------------

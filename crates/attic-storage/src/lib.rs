@@ -11,6 +11,7 @@
 //! - S6: bounded writer queue
 
 pub mod connection;
+pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
 pub mod indexing_publication;
@@ -24,6 +25,14 @@ pub mod server_state;
 pub mod writer;
 
 pub use connection::{DbPool, open_db};
+pub use crossrepo_ops::{
+    CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
+    all_catalog_entries, all_repository_ids, catalog_entry, create_workspace_snapshot,
+    cross_edges_all, cross_edges_between, cross_edges_for_entities, cross_edges_touching, delete_all_xrepo_edges_touching,
+    delete_xrepo_edges_between, declarations_for_repository, delete_declarations_for_repository,
+    insert_declaration, insert_xrepo_edge, latest_workspace_snapshot, providers_of_identity,
+    remove_repository_crossrepo_data, snapshot_revisions, upsert_catalog_row,
+};
 pub use error::StorageError;
 pub use fts::{
     FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit,
@@ -66,6 +75,7 @@ pub use repository::repository::{
 };
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
+    latest_source_revision_for_repository,
 };
 pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occurrence};
 pub use retrieval_reads::{

@@ -19,6 +19,7 @@ attic-indexing.workspace  = true
 attic-discovery.workspace = true
 attic-incremental.workspace = true
 attic-retrieval = { path = '../attic-retrieval' }
+attic-crossrepo = { path = '../attic-crossrepo' }
 attic-semantic  = { path = '../attic-semantic' }
 attic-evidence = { path = '../attic-evidence' }
 rmcp  = { workspace = true, features = ["client"] }
@@ -32,4 +33,5 @@ anyhow.workspace          = true
 
 [dev-dependencies]
 tempfile.workspace = true
+regex = "1"
 

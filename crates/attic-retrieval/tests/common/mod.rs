@@ -205,6 +205,7 @@ impl Fixture {
             readers: self.pool.clone(),
             writer: self.writer.clone(),
             semantic: None,
+            crossrepo_degraded: false,
         }
     }
 
@@ -219,6 +220,7 @@ impl Fixture {
             semantic: Some(std::sync::Arc::new(
                 attic_retrieval::semantic::SemanticStack::in_memory(provider)?,
             )),
+            crossrepo_degraded: false,
         })
     }
 

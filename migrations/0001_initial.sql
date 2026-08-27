@@ -52,17 +52,6 @@ CREATE TABLE IF NOT EXISTS core_source_revisions (
 CREATE INDEX IF NOT EXISTS idx_source_revisions_repo
     ON core_source_revisions(repository_id, captured_at DESC);
 
-CREATE TABLE IF NOT EXISTS core_workspace_snapshots (
-    id          TEXT    NOT NULL PRIMARY KEY,   -- UUID
-    created_at  INTEGER NOT NULL                -- microseconds since Unix epoch (UTC)
-);
-
-CREATE TABLE IF NOT EXISTS core_workspace_snapshot_revisions (
-    snapshot_id         TEXT    NOT NULL REFERENCES core_workspace_snapshots(id),
-    source_revision_id  TEXT    NOT NULL REFERENCES core_source_revisions(id),
-    PRIMARY KEY (snapshot_id, source_revision_id)
-);
-
 -- ============================================================
 -- SECTION 3: Index Generation Tracking
 -- ============================================================

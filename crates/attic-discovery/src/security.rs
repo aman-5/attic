@@ -193,6 +193,75 @@ fn extension_of(file_name: &str) -> Option<&str> {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Bounded safe-content read API (Phase 1B)
+// ---------------------------------------------------------------------------
+
+/// Read a file within a repository root with Phase 1B safety guarantees.
+///
+/// Guarantees:
+/// - Path is validated to be within `repo_root` (canonicalization + escape check)
+/// - File size is bounded by `max_bytes`
+/// - Content is scanned for secrets via `scan_and_redact`
+/// - Returns `Ok(None)` if file doesn't exist, is too large, or path escapes
+/// - Returns `Ok(Some(redacted_bytes))` on success
+///
+/// This is the single authoritative bounded read path for manifest/proto/config
+/// files consumed as indexing evidence. All callers MUST use this instead of
+/// raw `std::fs::read`.
+pub fn read_bounded(
+    repo_root: &Path,
+    rel_path: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, DiscoveryError> {
+    // Reject path traversal in input.
+    if rel_path.split('/').any(|seg| seg == "..") {
+        return Ok(None);
+    }
+
+    // Canonicalize the root first so starts_with comparison works on Windows
+    // (where std::fs::canonicalize adds \\?\ prefix).
+    let Ok(canon_root) = std::fs::canonicalize(repo_root) else {
+        return Ok(None);
+    };
+
+    let joined = repo_root.join(rel_path.replace('\\', "/"));
+
+    // Phase 1B safe-content boundary: canonicalize within root, reject escapes.
+    let canon = canonicalize_within_root(&joined, &canon_root)?;
+
+    // Size bound before read.
+    let meta = std::fs::metadata(&canon)
+        .map_err(|_| DiscoveryError::Canonicalize {
+            path: canon.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        })?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > max_bytes {
+        return Err(DiscoveryError::FileTooLarge {
+            path: canon,
+            max_bytes,
+        });
+    }
+
+    // Read and apply secret scan.
+    let raw = std::fs::read(&canon)
+        .map_err(|e| DiscoveryError::Canonicalize { path: canon, source: e })?;
+
+    if let Ok(text) = std::str::from_utf8(&raw) {
+        let scan = crate::secrets::scan_and_redact(text);
+        if scan.findings.is_empty() {
+            Ok(Some(raw))
+        } else {
+            Ok(Some(scan.redacted.into_bytes()))
+        }
+    } else {
+        Ok(Some(raw))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
