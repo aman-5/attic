@@ -1,16 +1,29 @@
 name: Release
 
-# A successful CI run on main automatically produces the next v0.1.x
-# release.
+# Release model:
+#
+#   Successful CI on main
+#           ↓
+#   Prepare next v0.1.x version
+#           ↓
+#   Required builds:
+#     - Windows x64
+#     - Linux x64
+#     - macOS Apple Silicon
+#           ↓
+#   ALL required builds pass
+#           ↓
+#   Create tag + GitHub Release
+#           ↓
+#   macOS Intel continues independently
+#           ↓
+#   If Intel succeeds later, attach its binary to the SAME release.
 #
 # Example:
 #
-#   first successful main build -> v0.1.0
-#   next successful main build  -> v0.1.1
-#   next                        -> v0.1.2
-#
-# The release tag is created ONLY after all supported platform binaries
-# have built, tested, packaged, and uploaded successfully.
+#   first successful release -> v0.1.0
+#   next successful release  -> v0.1.1
+#   next                     -> v0.1.2
 
 on:
   workflow_run:
@@ -27,21 +40,26 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Prevent two main pushes from racing to create the same v0.1.x version.
+concurrency:
+  group: attic-release
+  cancel-in-progress: false
+
+
 jobs:
 
-  # ---------------------------------------------------------------------------
-  # Determine whether this CI run should produce a release and calculate the
-  # next version.
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # PREPARE
+  # ===========================================================================
 
   prepare:
     name: prepare release
     runs-on: ubuntu-latest
 
-    # Automatic releases:
-    #   CI must have succeeded AND the CI run must belong to main.
+    # Automatic release:
+    #   CI must have succeeded and must have run for main.
     #
-    # Manual workflow_dispatch is also allowed.
+    # Manual workflow_dispatch is also supported.
     if: >
       github.event_name == 'workflow_dispatch' ||
       (
@@ -55,6 +73,11 @@ jobs:
       already_released: ${{ steps.version.outputs.already_released }}
 
     steps:
+
+      # -----------------------------------------------------------------------
+      # Resolve exact commit that passed CI
+      # -----------------------------------------------------------------------
+
       - name: Resolve source commit
         id: source
         shell: bash
@@ -68,24 +91,43 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "source SHA: $SHA"
 
-      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Checkout with complete history/tags
+      # -----------------------------------------------------------------------
+
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           ref: ${{ steps.source.outputs.sha }}
           fetch-depth: 0
 
+
       - name: Fetch tags
         shell: bash
-        run: git fetch --force --tags
+        run: |
+          git fetch --force --tags
+
+
+      # -----------------------------------------------------------------------
+      # Calculate next v0.1.x
+      # -----------------------------------------------------------------------
 
       - name: Determine next v0.1.x version
         id: version
         shell: bash
         run: |
+          set -euo pipefail
+
           SHA="${{ steps.source.outputs.sha }}"
 
+          # -------------------------------------------------------------------
           # Idempotency:
+          #
           # If this exact commit already has a v0.1.x tag, do not create
-          # another release when the workflow is rerun.
+          # another version when this workflow is rerun.
+          # -------------------------------------------------------------------
+
           EXISTING="$(
             git tag --points-at "$SHA" \
               | grep -E '^v0\.1\.[0-9]+$' \
@@ -93,13 +135,26 @@ jobs:
           )"
 
           if [[ -n "$EXISTING" ]]; then
-            echo "commit already released as $EXISTING"
+            echo "Commit already released as $EXISTING"
+
             echo "version=$EXISTING" >> "$GITHUB_OUTPUT"
             echo "already_released=true" >> "$GITHUB_OUTPUT"
+
             exit 0
           fi
 
-          # Extract numeric patch components and sort NUMERICALLY.
+
+          # -------------------------------------------------------------------
+          # Determine highest existing numeric patch.
+          #
+          # Numeric sorting is important:
+          #
+          #   v0.1.9
+          #   v0.1.10
+          #
+          # must produce v0.1.11.
+          # -------------------------------------------------------------------
+
           LATEST_PATCH="$(
             git tag -l 'v0.1.*' \
               | sed -nE 's/^v0\.1\.([0-9]+)$/\1/p' \
@@ -115,19 +170,17 @@ jobs:
 
           VERSION="v0.1.${NEXT_PATCH}"
 
-          echo "next version: $VERSION"
+          echo "Next release: $VERSION"
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "already_released=false" >> "$GITHUB_OUTPUT"
 
 
-  # ---------------------------------------------------------------------------
-  # Build/test/package every supported platform.
+  # ===========================================================================
+  # REQUIRED RELEASE BUILDS
   #
-  # NO tag exists yet.
-  # If any matrix entry fails, publish never runs and therefore no release/tag
-  # is created.
-  # ---------------------------------------------------------------------------
+  # These THREE platforms must succeed before a release is published.
+  # ===========================================================================
 
   build:
     name: build ${{ matrix.target }}
@@ -143,68 +196,209 @@ jobs:
       matrix:
         include:
 
+          # -------------------------------------------------------------------
+          # Windows x64
+          # -------------------------------------------------------------------
+
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+
+
+          # -------------------------------------------------------------------
+          # Linux x64
+          # -------------------------------------------------------------------
 
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
 
-          - target: x86_64-apple-darwin
-            os: macos-13
+
+          # -------------------------------------------------------------------
+          # macOS Apple Silicon
+          #
+          # aarch64 = M1 / M2 / M3 / M4 / future ARM64 Apple Silicon
+          # -------------------------------------------------------------------
 
           - target: aarch64-apple-darwin
             os: macos-latest
 
+
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+
+      # -----------------------------------------------------------------------
+      # Tests
+      # -----------------------------------------------------------------------
 
       - name: Run tests
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace
+
+
+      # -----------------------------------------------------------------------
+      # Package
+      # -----------------------------------------------------------------------
 
       - name: Package release
         shell: bash
         env:
           ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          # package.sh expects the numeric version without the leading "v".
+          set -euo pipefail
+
+          # package.sh expects:
+          #
+          #   0.1.0
+          #
+          # rather than:
+          #
+          #   v0.1.0
+
           export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
 
           bash tools/package.sh \
             --target "${{ matrix.target }}" \
             --out dist
 
+
       - name: Show packaged files
         shell: bash
         run: |
           find dist -maxdepth 2 -type f -print
 
+
+      # -----------------------------------------------------------------------
+      # Store artifact inside this workflow run
+      # -----------------------------------------------------------------------
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: attic-${{ matrix.target }}
+
           path: |
             dist/*.zip
             dist/*.zip.sha256
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+
           if-no-files-found: error
 
 
-  # ---------------------------------------------------------------------------
-  # Only reached when ALL four platform builds succeeded.
+  # ===========================================================================
+  # OPTIONAL INTEL macOS BUILD
   #
-  # Now create the tag and publish the GitHub Release.
-  # ---------------------------------------------------------------------------
+  # IMPORTANT:
+  #
+  # publish DOES NOT depend on this job.
+  #
+  # Therefore if GitHub has no Intel Mac runner available, this job can remain
+  # queued without blocking Windows/Linux/Apple-Silicon release publication.
+  # ===========================================================================
+
+  build-intel-macos:
+    name: build x86_64-apple-darwin
+
+    needs:
+      - prepare
+
+    if: needs.prepare.outputs.already_released != 'true'
+
+    runs-on: macos-13
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+
+      # -----------------------------------------------------------------------
+      # Tests
+      # -----------------------------------------------------------------------
+
+      - name: Run tests
+        run: |
+          cargo test --workspace
+
+
+      # -----------------------------------------------------------------------
+      # Package
+      # -----------------------------------------------------------------------
+
+      - name: Package release
+        shell: bash
+        env:
+          ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
+
+          bash tools/package.sh \
+            --target "x86_64-apple-darwin" \
+            --out dist
+
+
+      - name: Show packaged files
+        shell: bash
+        run: |
+          find dist -maxdepth 2 -type f -print
+
+
+      # -----------------------------------------------------------------------
+      # Store Intel artifact
+      # -----------------------------------------------------------------------
+
+      - name: Upload Intel macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attic-x86_64-apple-darwin
+
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+          if-no-files-found: error
+
+
+  # ===========================================================================
+  # PUBLISH REQUIRED RELEASE
+  #
+  # This depends ONLY on:
+  #
+  #   prepare
+  #   required 3-platform build matrix
+  #
+  # It deliberately DOES NOT depend on build-intel-macos.
+  # ===========================================================================
 
   publish:
     name: publish ${{ needs.prepare.outputs.version }}
@@ -218,10 +412,52 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
+
+
+      # -----------------------------------------------------------------------
+      # Download ONLY the required platform artifacts.
+      #
+      # We intentionally do not wildcard-download Intel here because whether
+      # Intel happened to finish early must not affect initial release contents.
+      # -----------------------------------------------------------------------
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: attic-x86_64-pc-windows-msvc
+          path: dist
+
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: attic-x86_64-unknown-linux-gnu
+          path: dist
+
+
+      - name: Download Apple Silicon artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: attic-aarch64-apple-darwin
+          path: dist
+
+
+      - name: Show release files
+        shell: bash
+        run: |
+          find dist -maxdepth 1 -type f -print
+
+
+      # -----------------------------------------------------------------------
+      # Create tag ONLY after required binaries have successfully built,
+      # packaged and been downloaded.
+      # -----------------------------------------------------------------------
 
       - name: Create release tag
         shell: bash
@@ -229,10 +465,16 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
+          set -euo pipefail
+
           git fetch --force --tags
 
-          # Protect against an unexpected concurrent/rerun duplicate.
+          # -------------------------------------------------------------------
+          # Protect against unexpected reruns/concurrency.
+          # -------------------------------------------------------------------
+
           if git rev-parse "$VERSION" >/dev/null 2>&1; then
+
             EXISTING_SHA="$(git rev-list -n 1 "$VERSION")"
 
             if [[ "$EXISTING_SHA" != "$SHA" ]]; then
@@ -241,33 +483,113 @@ jobs:
             fi
 
             echo "$VERSION already exists on this commit"
+
           else
+
             git tag "$VERSION" "$SHA"
             git push origin "$VERSION"
+
           fi
 
-      - name: Download platform artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: attic-*
-          merge-multiple: true
 
-      - name: Show release files
-        shell: bash
-        run: |
-          find dist -maxdepth 1 -type f -print
+      # -----------------------------------------------------------------------
+      # Publish initial GitHub Release.
+      #
+      # Contains:
+      #
+      #   Windows x64
+      #   Linux x64
+      #   macOS Apple Silicon
+      #
+      # Intel Mac may be attached later.
+      # -----------------------------------------------------------------------
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.version }}
           target_commitish: ${{ needs.prepare.outputs.sha }}
+
           files: |
             dist/*.zip
             dist/*.zip.sha256
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+
           draft: false
           prerelease: false
           generate_release_notes: true
+
+
+  # ===========================================================================
+  # ATTACH INTEL MACOS LATER
+  #
+  # This runs only when BOTH:
+  #
+  #   initial release has been published
+  #   Intel macOS build succeeded
+  #
+  # If Intel waits three hours for a runner, this job simply waits for Intel.
+  #
+  # It does NOT create another version.
+  #
+  # Example:
+  #
+  #   v0.1.0 initially:
+  #
+  #       Windows
+  #       Linux
+  #       Apple Silicon
+  #
+  #   later:
+  #
+  #       Intel finishes
+  #             ↓
+  #       Intel artifact attached to SAME v0.1.0
+  # ===========================================================================
+
+  attach-intel-macos:
+    name: attach Intel macOS binary
+
+    needs:
+      - prepare
+      - publish
+      - build-intel-macos
+
+    if: >
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.publish.result == 'success' &&
+      needs.build-intel-macos.result == 'success' &&
+      needs.prepare.outputs.already_released != 'true'
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Download Intel macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: attic-x86_64-apple-darwin
+          path: dist
+
+
+      - name: Show Intel release files
+        shell: bash
+        run: |
+          find dist -maxdepth 1 -type f -print
+
+
+      # -----------------------------------------------------------------------
+      # softprops/action-gh-release updates the EXISTING release associated
+      # with this tag and uploads the additional files.
+      # -----------------------------------------------------------------------
+
+      - name: Attach Intel macOS files to existing release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
