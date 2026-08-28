@@ -3402,8 +3402,22 @@ mod tests {
         stdin.flush().unwrap();
         let stdout = child.stdout.as_mut().unwrap();
         let mut line = String::new();
-        BufReader::new(stdout).read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("I/O error reading MCP child stdout");
+        if line.is_empty() {
+            // Child exited before producing any output — typically a startup
+            // crash.  Collect the exit status so the failure message is useful
+            // (especially on Windows where path / env issues cause silent exits).
+            let status = child.try_wait().ok().flatten();
+            panic!(
+                "MCP child produced EOF (empty stdout) — child likely crashed before \
+                 responding.\n  Exit status : {status:?}\n  Sent message: {msg}"
+            );
+        }
+        serde_json::from_str(&line).unwrap_or_else(|e| {
+            panic!("Failed to parse MCP response as JSON: {e}\n  Raw line: {line:?}");
+        })
     }
 
     /// Write-only send for notifications (which receive no reply).
@@ -3417,6 +3431,10 @@ mod tests {
         let bin = require_binary();
         let tmp = TempDir::new().unwrap();
         let mut child = Command::new(&bin)
+            // ATTIC_HOME is required on all platforms so the server can locate
+            // its data directory.  Without it the process exits immediately on
+            // Windows before writing anything to stdout, causing an EOF panic.
+            .env("ATTIC_HOME", tmp.path())
             .env(
                 "ATTIC_DB_PATH",
                 tmp.path().join("test.db").to_str().unwrap(),
