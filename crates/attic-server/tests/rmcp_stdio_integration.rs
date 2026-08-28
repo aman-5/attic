@@ -382,12 +382,20 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
             .await
             .expect("status tool");
         let v: Value = serde_json::from_str(&status_text).expect("status payload is JSON");
-        if let Some(watcher) = v.get("watcher") {
-            let mode = watcher.get("mode").and_then(|m| m.as_str()).unwrap_or("");
-            if mode == "native-watcher" || mode == "periodic-reconciliation" {
-                watcher_ready = true;
-                break;
-            }
+        // Multi-root `status` reports one watcher per repository under
+        // `workspace.repositories[]`, not a single top-level `watcher`.
+        let any_watcher_ready = v["workspace"]["repositories"]
+            .as_array()
+            .map(|repos| {
+                repos.iter().any(|r| {
+                    let mode = r["watcher"]["mode"].as_str().unwrap_or("");
+                    mode == "native-watcher" || mode == "periodic-reconciliation"
+                })
+            })
+            .unwrap_or(false);
+        if any_watcher_ready {
+            watcher_ready = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

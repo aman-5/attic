@@ -29,7 +29,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -83,11 +83,14 @@ struct AtticServer {
     pool: DbPool,
     writer: WriterQueueHandle,
     _queue: Arc<WriterQueue>,
-    /// Phase 2 incremental service; present only in watch mode.
-    incremental: Option<Arc<attic_incremental::IncrementalService>>,
-    /// Which change-detection mechanism is running (`None` = incremental
-    /// disabled explicitly).
-    watch_mode: Option<attic_incremental::WatchMode>,
+    /// Phase 2 incremental service, keyed by `repository_id`. One entry per
+    /// successfully bootstrapped configured root — a multi-root workspace
+    /// runs one watcher per repository, sharing this process's single
+    /// pool/writer/scheduler (see §10-12 of the multi-root design).
+    incremental: HashMap<String, Arc<attic_incremental::IncrementalService>>,
+    /// Which change-detection mechanism is running per `repository_id`
+    /// (absent key = incremental disabled/not yet started for that repo).
+    watch_mode: HashMap<String, attic_incremental::WatchMode>,
     /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     /// Phase 6 cross-repo subsystem health.  `true` = degraded: sync
@@ -157,8 +160,8 @@ impl AtticServer {
             pool,
             writer,
             _queue,
-            incremental: None,
-            watch_mode: None,
+            incremental: HashMap::new(),
+            watch_mode: HashMap::new(),
             semantic,
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
@@ -717,10 +720,17 @@ fn handle_repo_map(
     )]))
 }
 
+/// `status` reports the WHOLE workspace, not one repository (§20): a
+/// multi-root workspace with one healthy repository and two degraded ones
+/// must never be reported as uniformly "ok". `incremental`/`watch_mode` are
+/// keyed by `repository_id`, one entry per repository this process is
+/// actively watching — repositories known to storage but absent from these
+/// maps (never configured this run, or a watcher failed to start) are
+/// reported as `DISABLED` rather than silently omitted.
 fn handle_status(
     pool: &DbPool,
-    incremental: Option<&Arc<attic_incremental::IncrementalService>>,
-    watch_mode: Option<attic_incremental::WatchMode>,
+    incremental: &HashMap<String, Arc<attic_incremental::IncrementalService>>,
+    watch_mode: &HashMap<String, attic_incremental::WatchMode>,
     resource_monitor: Option<&attic_storage::resource_manager::ResourceMonitor>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
@@ -745,50 +755,74 @@ fn handle_status(
         });
     }
 
-    // Incremental subsystem state — including EXPLICIT degraded modes.  The
-    // server never claims a mode it is not actually running.
-    payload["watcher"] = json!({
-        "mode": match (watch_mode, incremental.is_some()) {
-            (Some(m), _) => m.as_str(),
-            (None, true) => "starting",
-            (None, false) => "disabled",
-        },
-        "active": matches!(watch_mode, Some(attic_incremental::WatchMode::NativeWatcher)),
-        "periodic_reconciliation": matches!(
-            watch_mode,
-            Some(attic_incremental::WatchMode::PeriodicReconciliation)
-        ),
-    });
-
-    if let Some(svc) = incremental {
-        match svc.status_snapshot(pool) {
-            Ok(snap) => {
-                let recovery_state = if snap.reconciliation_required {
-                    "RECONCILIATION_REQUIRED"
-                } else if snap.tasks.pending > 0 || snap.tasks.running > 0 {
-                    "INDEXING"
-                } else {
-                    "CURRENT"
-                };
-                payload["incremental"] = json!({
-                    "state": recovery_state,
-                    "events_ingested": snap.events_ingested,
-                    "hints_dropped": snap.hints_dropped,
-                    "watcher_errors": snap.watcher_errors,
-                    "raw_batches_dropped": snap.raw_batches_dropped,
-                    "reconciliation_required": snap.reconciliation_required,
-                    "freshness": snap.freshness,
-                    "tasks": snap.tasks,
-                });
-            }
-            Err(e) => {
-                payload["incremental"] = json!({
-                    "state": "UNKNOWN",
-                    "error": e.to_string(),
-                });
-            }
+    // Per-repository watcher/incremental state — one entry per repository
+    // known to storage, independent of every other repository's health.
+    let repo_stats = pool.with_reader(get_repository_stats)?;
+    let mut repositories = Vec::with_capacity(repo_stats.len());
+    let mut current = 0u64;
+    let mut indexing = 0u64;
+    let mut reconciliation_required = 0u64;
+    let mut disabled = 0u64;
+    for rs in &repo_stats {
+        let (state, watcher_json) = match (incremental.get(&rs.id), watch_mode.get(&rs.id)) {
+            (Some(svc), Some(mode)) => match svc.status_snapshot(pool) {
+                Ok(snap) => {
+                    let state = if snap.reconciliation_required {
+                        "RECONCILIATION_REQUIRED"
+                    } else if snap.tasks.pending > 0 || snap.tasks.running > 0 {
+                        "INDEXING"
+                    } else {
+                        "CURRENT"
+                    };
+                    (
+                        state,
+                        json!({
+                            "mode": mode.as_str(),
+                            "active": matches!(mode, attic_incremental::WatchMode::NativeWatcher),
+                            "periodic_reconciliation": matches!(
+                                mode,
+                                attic_incremental::WatchMode::PeriodicReconciliation
+                            ),
+                            "events_ingested": snap.events_ingested,
+                            "hints_dropped": snap.hints_dropped,
+                            "watcher_errors": snap.watcher_errors,
+                            "raw_batches_dropped": snap.raw_batches_dropped,
+                            "reconciliation_required": snap.reconciliation_required,
+                            "freshness": snap.freshness,
+                            "tasks": snap.tasks,
+                        }),
+                    )
+                }
+                Err(e) => (
+                    "UNKNOWN",
+                    json!({ "mode": mode.as_str(), "error": e.to_string() }),
+                ),
+            },
+            _ => ("DISABLED", json!({ "mode": "disabled", "active": false })),
+        };
+        match state {
+            "CURRENT" => current += 1,
+            "INDEXING" => indexing += 1,
+            "RECONCILIATION_REQUIRED" => reconciliation_required += 1,
+            _ => disabled += 1,
         }
+        repositories.push(json!({
+            "repository_id": rs.id,
+            "display_name": rs.display_name,
+            "file_count": rs.file_count,
+            "unit_count": rs.unit_count,
+            "state": state,
+            "watcher": watcher_json,
+        }));
     }
+    payload["workspace"] = json!({
+        "configured_repository_count": repo_stats.len(),
+        "current_repository_count": current,
+        "indexing_repository_count": indexing,
+        "reconciliation_required_repository_count": reconciliation_required,
+        "disabled_repository_count": disabled,
+        "repositories": repositories,
+    });
 
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&payload)?,
@@ -1003,7 +1037,7 @@ impl ServerHandler for AtticServer {
         let writer = self.writer.clone();
         let incremental = self.incremental.clone();
         let semantic = self.semantic.clone();
-        let watch_mode = self.watch_mode;
+        let watch_mode = self.watch_mode.clone();
         let crossrepo_degraded = self
             .crossrepo_degraded
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -1039,8 +1073,8 @@ impl ServerHandler for AtticServer {
                 "repo_map" => handle_repo_map(&pool, &args),
                 "status" => handle_status(
                     &pool,
-                    incremental.as_ref(),
-                    watch_mode,
+                    &incremental,
+                    &watch_mode,
                     self.resource_monitor.as_ref().map(|m| m.as_ref()),
                 ),
                 "context" => handle_context(
@@ -1063,6 +1097,160 @@ impl ServerHandler for AtticServer {
             }
         }
     }
+}
+
+// ─── multi-root workspace configuration ───────────────────────────────────────
+//
+// One Attic process serves ONE logical workspace made of one or more
+// independent repository roots. Roots may live anywhere on disk — they are
+// never required to share a filesystem parent, be symlinked together, or be
+// git submodules. Two mutually exclusive ways to configure the workspace:
+//
+//   ATTIC_WORKSPACE_ROOT=<path>        legacy single-repository convenience
+//   ATTIC_CONFIG=<path to config file> multi-root: one `[[repositories]]`
+//                                       block per root, e.g.
+//                                         [[repositories]]
+//                                         path = "C:\Users\me\Desktop\Dump"
+//
+//                                         [[repositories]]
+//                                         path = "C:\Adobe-Projects\EDS\HDFC"
+//
+// Setting both is rejected as ambiguous configuration rather than silently
+// preferring one. Neither set => watch mode/incremental indexing stays
+// disabled exactly as before (unindexed MCP server).
+
+/// Read the configured repository roots from the environment.
+///
+/// Returns the RAW (unvalidated, uncanonicalized) list in configuration
+/// order. Existence/directory/canonicalization checks happen later, per
+/// root, so one bad entry never prevents the others from being reported —
+/// see [`validate_configured_roots`].
+fn load_workspace_roots() -> anyhow::Result<Vec<PathBuf>> {
+    let config_path = std::env::var("ATTIC_CONFIG").ok();
+    let legacy_root = std::env::var("ATTIC_WORKSPACE_ROOT").ok();
+    if config_path.is_some() && legacy_root.is_some() {
+        anyhow::bail!(
+            "ATTIC_CONFIG and ATTIC_WORKSPACE_ROOT are mutually exclusive — set only one \
+             (ATTIC_CONFIG for multi-root workspaces, ATTIC_WORKSPACE_ROOT for a single repository)"
+        );
+    }
+    if let Some(path) = config_path {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read ATTIC_CONFIG file '{path}': {e}"))?;
+        parse_repositories_config(&contents)
+            .map_err(|e| anyhow::anyhow!("invalid ATTIC_CONFIG ('{path}'): {e}"))
+    } else if let Some(root) = legacy_root {
+        Ok(vec![PathBuf::from(root)])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Parse the minimal `[[repositories]] / path = "..."` configuration
+/// grammar. Deliberately NOT a general TOML parser (no heavyweight config
+/// framework dependency for what is, structurally, a flat list of paths):
+/// blank lines and `#` comments are ignored, `[[repositories]]` opens a
+/// block, any other `[...]` line closes it, and each block must contain
+/// exactly one `path = "..."` entry. Quoted text is taken literally (no
+/// escape processing) so ordinary single-backslash Windows paths work
+/// as-is.
+fn parse_repositories_config(contents: &str) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut in_block = false;
+    for (idx, raw_line) in contents.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "[[repositories]]" {
+            in_block = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_block = false;
+            continue;
+        }
+        if !in_block {
+            return Err(format!(
+                "line {lineno}: expected a `[[repositories]]` block before `{line}`"
+            ));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "line {lineno}: expected `path = \"...\"`, got: {line}"
+            ));
+        };
+        if key.trim() != "path" {
+            return Err(format!(
+                "line {lineno}: unknown key '{}' inside [[repositories]] (only `path` is supported)",
+                key.trim()
+            ));
+        }
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .ok_or_else(|| format!("line {lineno}: path value must be a quoted string"))?;
+        if unquoted.is_empty() {
+            return Err(format!("line {lineno}: empty path"));
+        }
+        roots.push(PathBuf::from(unquoted));
+        in_block = false; // one `path` per `[[repositories]]` block
+    }
+    if roots.is_empty() {
+        return Err("no [[repositories]] entries with a `path` found".to_string());
+    }
+    Ok(roots)
+}
+
+/// Validate every configured root INDEPENDENTLY (existence, directory-ness,
+/// canonicalization) and deterministically drop exact canonical duplicates.
+///
+/// A root failing validation is skipped (logged) rather than failing the
+/// whole workspace — startup configuration for repo B being broken must
+/// never prevent repos A and C from being registered, indexed, and served
+/// (failure isolation).  Order is preserved so unrelated configuration
+/// reordering does not change which duplicate survives.
+fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut valid = Vec::new();
+    for raw_root in raw_roots {
+        if !raw_root.exists() {
+            error!(
+                "configured repository root does not exist, skipping: {}",
+                raw_root.display()
+            );
+            continue;
+        }
+        if !raw_root.is_dir() {
+            error!(
+                "configured repository root is not a directory, skipping: {}",
+                raw_root.display()
+            );
+            continue;
+        }
+        let canonical = match raw_root.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    "failed to canonicalize configured repository root {}: {e}, skipping",
+                    raw_root.display()
+                );
+                continue;
+            }
+        };
+        if !seen.insert(canonical.clone()) {
+            warn!(
+                "duplicate configured repository root (same canonical path as an earlier entry), skipping: {}",
+                canonical.display()
+            );
+            continue;
+        }
+        valid.push(canonical);
+    }
+    valid
 }
 
 // ─── main ──────────────────────────────────────────────────────────────────────
@@ -1152,36 +1340,65 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut watch_handle: Option<attic_incremental::IncrementalWatch> = None;
+    let mut watch_handles: Vec<attic_incremental::IncrementalWatch> = Vec::new();
     let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
-    // ─── Phase 2 watch mode (ATTIC_WORKSPACE_ROOT present) ──────────────────
-    if let Ok(ws) = std::env::var("ATTIC_WORKSPACE_ROOT") {
-        let root = PathBuf::from(&ws);
+    // ─── Multi-root workspace bootstrap ─────────────────────────────────────
+    //
+    // `roots` may be zero (no ATTIC_CONFIG/ATTIC_WORKSPACE_ROOT — watch mode
+    // stays disabled, same as before), one (legacy single-repository), or
+    // many arbitrary/unrelated filesystem paths (multi-root workspace).
+    let raw_roots = load_workspace_roots()?;
+    let roots = validate_configured_roots(raw_roots);
 
-        // 1. Bootstrap / index the workspace synchronously on first run.
+    if !roots.is_empty() {
+        // 1. Bootstrap / index every configured root, INDEPENDENTLY.
         //
-        // FAIL-CLOSED: a failed initial indexing must never leave stale or
-        // partial state presented as CURRENT.  The publication itself is
-        // atomic, but any failure here means we cannot vouch for the
-        // workspace — refuse to serve rather than guess.
-        let srv = server.clone();
-        let root_for_bootstrap = root.clone();
-        let boot =
-            tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        match evaluate_bootstrap(&boot) {
-            BootstrapAction::Proceed(_) => {}
-            BootstrapAction::FailClosed(why) => {
-                error!("workspace bootstrap FAILED — refusing to serve (fail-closed): {why}");
-                return Err(anyhow::anyhow!("bootstrap failed: {why}"));
+        // Failure isolation (§9/§14): a repository that fails to index is
+        // logged and skipped — it never blocks or corrupts the other
+        // configured repositories. Only when EVERY root fails do we refuse
+        // to serve entirely, since a workspace with zero usable
+        // repositories cannot vouch for anything as CURRENT.
+        let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
+        for root in &roots {
+            let srv = server.clone();
+            let root_for_bootstrap = root.clone();
+            let boot =
+                tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match evaluate_bootstrap(&boot) {
+                BootstrapAction::Proceed(repository_id) => {
+                    info!(
+                        repository_id = %repository_id,
+                        root = %root.display(),
+                        "repository bootstrapped"
+                    );
+                    bootstrapped.push((root.clone(), repository_id));
+                }
+                BootstrapAction::FailClosed(why) => {
+                    error!(
+                        "repository bootstrap FAILED for {} — this repository is degraded/unavailable, \
+                         other configured repositories are unaffected: {why}",
+                        root.display()
+                    );
+                }
             }
+        }
+        if bootstrapped.is_empty() {
+            error!(
+                "every configured repository root failed to bootstrap — refusing to serve (fail-closed)"
+            );
+            return Err(anyhow::anyhow!(
+                "no configured repository could be bootstrapped"
+            ));
         }
 
         // Phase 6 cross-repository workspace sync: after all repos are
         // indexed, resolve cross-repo dependency edges and persist them.
-        // This runs once at startup before the incremental watcher begins.
+        // This is already workspace-wide (every repository currently in
+        // storage, not just the roots configured for THIS run), so it runs
+        // once regardless of how many roots were just bootstrapped.
         {
             let writer = server.writer.clone();
             let pool = server.pool.clone();
@@ -1252,58 +1469,72 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => warn!("offline refresh planning failed: {e}"),
         }
 
-        // 3. Scheduler — fallible: a scheduler that cannot start its workers
-        //    is never silently accepted.
+        // 3. ONE shared scheduler for the whole process (§10: one
+        //    coordinated WriterQueue, not one scheduler/database per
+        //    repository). Its workers resolve each claimed task's OWN
+        //    repository root dynamically from storage; the root passed
+        //    here is only the legacy fallback for repository-less tasks,
+        //    which the multi-root startup path above never produces.
+        //    Fallible: a scheduler that cannot start its workers is never
+        //    silently accepted.
         let policy = DiscoveryPolicy::default_git();
         let monitor = server.resource_monitor.clone();
         match attic_incremental::spawn_scheduler(
             attic_incremental::SchedulerConfig::default(),
             server.pool.clone(),
             server.writer.clone(),
-            root.clone(),
+            bootstrapped[0].0.clone(),
             policy.clone(),
             monitor,
         ) {
             Ok(sched) => sched_handle = Some(sched),
             Err(e) => {
-                error!("scheduler startup failed — incremental mode DISABLED: {e}");
-                server.watch_mode = None;
-                server.incremental = None;
+                error!(
+                    "scheduler startup failed — incremental mode DISABLED for all repositories: {e}"
+                );
                 // Continue serving WITHOUT incremental claims; status reports
-                // watcher.mode = "disabled".
-                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
+                // watcher.mode = "disabled" for every configured repository.
+                return serve_until_closed(server, sched_handle, watch_handles, semantic_enricher)
                     .await;
             }
         }
 
-        // 4. Change detection: native watcher, or a REAL bounded periodic
-        //    reconciliation loop as fallback — both perform actual work and
-        //    the active mode is exposed via `status`.
-        let service = Arc::new(
-            attic_incremental::IncrementalService::new(&root, policy)
-                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
-        );
-        match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
-            Ok(watch) => {
-                info!(
-                    mode = watch.mode().as_str(),
-                    "incremental change detection started"
-                );
-                server.watch_mode = Some(watch.mode());
-                watch_handle = Some(watch);
-            }
-            Err(e) => {
-                error!("change detection failed to start ({e}) — incremental DISABLED");
-                server.watch_mode = None;
-                server.incremental = None;
-                return serve_until_closed(server, sched_handle, watch_handle, semantic_enricher)
-                    .await;
+        // 4. Change detection — one watcher PER successfully bootstrapped
+        //    repository root (§12): each retains its own repository
+        //    identity/state, so a change under root A is normalized and
+        //    verified relative to root A alone and can never be
+        //    interpreted against root B's boundary. A watcher failing to
+        //    start for one repository does not affect the others.
+        for (root, repository_id) in &bootstrapped {
+            let service = Arc::new(
+                attic_incremental::IncrementalService::new(root, policy.clone())
+                    .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
+            );
+            match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
+                Ok(watch) => {
+                    info!(
+                        repository_id = %repository_id,
+                        root = %root.display(),
+                        mode = watch.mode().as_str(),
+                        "incremental change detection started"
+                    );
+                    server
+                        .watch_mode
+                        .insert(repository_id.clone(), watch.mode());
+                    server.incremental.insert(repository_id.clone(), service);
+                    watch_handles.push(watch);
+                }
+                Err(e) => {
+                    error!(
+                        "change detection failed to start for {} ({e}) — incremental DISABLED for this repository",
+                        root.display()
+                    );
+                }
             }
         }
-        server.incremental = Some(service);
     }
 
-    serve_until_closed(server, sched_handle, watch_handle, semantic_enricher).await
+    serve_until_closed(server, sched_handle, watch_handles, semantic_enricher).await
 }
 
 /// Outcome of the initial workspace indexing decision.
@@ -1349,7 +1580,7 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
 async fn serve_until_closed(
     server: AtticServer,
     sched_handle: Option<attic_incremental::SchedulerHandle>,
-    mut watch: Option<attic_incremental::IncrementalWatch>,
+    mut watches: Vec<attic_incremental::IncrementalWatch>,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
 ) -> anyhow::Result<()> {
     // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
@@ -1387,7 +1618,7 @@ async fn serve_until_closed(
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
     //    threads poll a stop flag / condvar, not indefinite blocking I/O).
-    if let Some(w) = watch.as_mut() {
+    for w in watches.iter_mut() {
         w.stop();
     }
     if let Some(sched) = sched_handle {
@@ -1501,6 +1732,76 @@ mod tests {
             server.semantic.is_some(),
             "explicit ATTIC_SEMANTIC=1 must enable the experimental layer"
         );
+    }
+
+    // ── Multi-root workspace configuration: parsing + validation ──────────
+
+    #[test]
+    fn parse_repositories_config_reads_three_unrelated_roots() {
+        let contents = r#"
+            # Three arbitrary repository roots, no common parent.
+            [[repositories]]
+            path = "C:\Users\amanbansal\Desktop\Dump"
+
+            [[repositories]]
+            path = "C:\Adobe-Projects\EDS\HDFC"
+
+            [[repositories]]
+            path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+        "#;
+        let roots = parse_repositories_config(contents).expect("valid config");
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(r"C:\Users\amanbansal\Desktop\Dump"),
+                PathBuf::from(r"C:\Adobe-Projects\EDS\HDFC"),
+                PathBuf::from(r"C:\Adobe-Projects\HDFC-Bank-on-prem"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_repositories_config_rejects_missing_path_key() {
+        let contents = "[[repositories]]\nroot = \"/a\"\n";
+        let err = parse_repositories_config(contents).unwrap_err();
+        assert!(err.contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn parse_repositories_config_rejects_empty_file() {
+        let err = parse_repositories_config("").unwrap_err();
+        assert!(err.contains("no [[repositories]]"), "{err}");
+    }
+
+    #[test]
+    fn validate_configured_roots_skips_missing_and_dedups_canonical_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-repo");
+        fs::create_dir_all(&real).unwrap();
+        let missing = tmp.path().join("does-not-exist");
+
+        // The same real root listed twice (once via a `.` component that
+        // canonicalizes to the same path) must collapse to one entry, and
+        // the missing root must be skipped rather than failing everything.
+        let raw = vec![real.clone(), missing, real.join(".")];
+        let valid = validate_configured_roots(raw);
+        assert_eq!(valid.len(), 1, "expected exactly one deduped valid root");
+        assert_eq!(valid[0], real.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn validate_configured_roots_isolates_failures_across_unrelated_roots() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_c = TempDir::new().unwrap();
+        let broken = PathBuf::from("Z:\\this\\does\\not\\exist\\at\\all");
+
+        // Three configured roots with NO common parent; the middle one is
+        // broken. Both good roots must still validate (failure isolation).
+        let raw = vec![tmp_a.path().to_path_buf(), broken, tmp_c.path().to_path_buf()];
+        let valid = validate_configured_roots(raw);
+        assert_eq!(valid.len(), 2, "the two valid unrelated roots must survive");
+        assert!(valid.contains(&tmp_a.path().canonicalize().unwrap()));
+        assert!(valid.contains(&tmp_c.path().canonicalize().unwrap()));
     }
 
     fn text_of(r: &CallToolResult) -> String {
@@ -2176,7 +2477,13 @@ mod tests {
     #[test]
     fn status_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        let r = handle_status(&make_server(&tmp).pool, None, None, None).unwrap();
+        let r = handle_status(
+            &make_server(&tmp).pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
@@ -2204,7 +2511,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, None, None, None).unwrap();
+        let r = handle_status(&srv.pool, &HashMap::new(), &HashMap::new(), None).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -2908,6 +3215,180 @@ mod tests {
         );
 
         child2.kill().ok();
+    }
+
+    /// THE multi-root acceptance test (§23-25 of the multi-root design): ONE
+    /// Attic process, started ONCE, configured via `ATTIC_CONFIG` with THREE
+    /// repository roots that share NO common filesystem parent (three
+    /// independent `TempDir`s, not subdirectories of one workspace, no
+    /// symlinks, no submodules). Verifies status reports all three as
+    /// configured/current, workspace-wide and repository-scoped search both
+    /// work and never cross repository boundaries, and `file` is scoped to
+    /// the requesting repository's own root.
+    #[test]
+    fn mcp_multi_root_workspace_via_config_no_common_parent() {
+        let bin = require_binary();
+
+        // Three UNRELATED roots — each its own TempDir, never nested inside
+        // one another or under a shared configured parent.
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let repo_c = TempDir::new().unwrap();
+        fs::write(
+            repo_a.path().join("alpha.txt"),
+            "ALPHA_MARKER_TOKEN one two three",
+        )
+        .unwrap();
+        fs::write(
+            repo_b.path().join("beta.txt"),
+            "BETA_MARKER_TOKEN four five six",
+        )
+        .unwrap();
+        fs::write(
+            repo_c.path().join("gamma.txt"),
+            "GAMMA_MARKER_TOKEN seven eight nine",
+        )
+        .unwrap();
+
+        // Config directory is itself unrelated to any of the three roots.
+        let cfg_dir = TempDir::new().unwrap();
+        let cfg_path = cfg_dir.path().join("attic-workspace.conf");
+        fs::write(
+            &cfg_path,
+            format!(
+                "[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n",
+                repo_a.path().display(),
+                repo_b.path().display(),
+                repo_c.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let db_dir = TempDir::new().unwrap();
+        let mut child = Command::new(&bin)
+            .env(
+                "ATTIC_DB_PATH",
+                db_dir.path().join("multiroot.db").to_str().unwrap(),
+            )
+            .env("ATTIC_CONFIG", cfg_path.to_str().unwrap())
+            .env_remove("ATTIC_WORKSPACE_ROOT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn attic (multi-root)");
+        let mut stdin = child.stdin.take().unwrap();
+        let init = mcp_request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "attic-multiroot-test", "version": "0"}
+            }),
+        );
+        let resp = send_recv(&mut child, &mut stdin, &init);
+        assert_eq!(resp["id"], 1, "init failed: {resp}");
+        send_only(
+            &mut stdin,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        );
+
+        // ── status: all three repositories configured and CURRENT ─────────
+        let status_call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
+        let status_resp = send_recv(&mut child, &mut stdin, &status_call);
+        let status_text = status_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        let status_v: Value = serde_json::from_str(status_text).expect("status is JSON");
+        assert_eq!(status_v["status"], "ok");
+        assert_eq!(
+            status_v["workspace"]["configured_repository_count"], 3,
+            "expected exactly 3 configured repositories; status={status_v}"
+        );
+        assert_eq!(
+            status_v["workspace"]["current_repository_count"], 3,
+            "all 3 unrelated roots must bootstrap+watch successfully in ONE process; status={status_v}"
+        );
+        assert_eq!(status_v["workspace"]["disabled_repository_count"], 0);
+
+        // ── workspace-wide search: each marker resolves to a DISTINCT repo,
+        //    and the returned path never crosses into another root ────────
+        let search_for = |id: u64, query: &str, stdin: &mut std::process::ChildStdin, child: &mut std::process::Child| -> (String, String) {
+            let call = mcp_request(id, "tools/call", json!({"name":"search","arguments":{"query": query}}));
+            let resp = send_recv(child, stdin, &call);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+            let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
+            let results = v["results"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                results.len(),
+                1,
+                "expected exactly one workspace-wide hit for {query}, got: {text}"
+            );
+            (
+                results[0]["repository_id"].as_str().unwrap_or("").to_string(),
+                results[0]["path"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        let (repo_a_id, path_a) = search_for(3, "ALPHA_MARKER_TOKEN", &mut stdin, &mut child);
+        let (repo_b_id, path_b) = search_for(4, "BETA_MARKER_TOKEN", &mut stdin, &mut child);
+        let (repo_c_id, path_c) = search_for(5, "GAMMA_MARKER_TOKEN", &mut stdin, &mut child);
+        assert!(path_a.contains("alpha.txt"), "path_a={path_a}");
+        assert!(path_b.contains("beta.txt"), "path_b={path_b}");
+        assert!(path_c.contains("gamma.txt"), "path_c={path_c}");
+        assert_ne!(repo_a_id, repo_b_id);
+        assert_ne!(repo_b_id, repo_c_id);
+        assert_ne!(repo_a_id, repo_c_id);
+
+        // ── repository-scoped search must never leak across roots: asking
+        //    repo A for repo C's marker returns nothing ───────────────────
+        let scoped_call = mcp_request(
+            6,
+            "tools/call",
+            json!({"name":"search","arguments":{"query":"GAMMA_MARKER_TOKEN","repository_id": repo_a_id}}),
+        );
+        let scoped_resp = send_recv(&mut child, &mut stdin, &scoped_call);
+        let scoped_text = scoped_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        let scoped_v: Value = serde_json::from_str(scoped_text).unwrap_or(json!({}));
+        assert_eq!(
+            scoped_v["results"].as_array().map(Vec::len).unwrap_or(0),
+            0,
+            "repo A scoped search must not see repo C's content: {scoped_text}"
+        );
+
+        // ── `file`: repo-scoped read resolves the CORRECT repository's own
+        //    root, never another configured root's file with the same name.
+        let file_call = mcp_request(
+            7,
+            "tools/call",
+            json!({"name":"file","arguments":{"repository_id": repo_a_id, "path": "alpha.txt"}}),
+        );
+        let file_resp = send_recv(&mut child, &mut stdin, &file_call);
+        let file_text = file_resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            file_text.contains("ALPHA_MARKER_TOKEN"),
+            "file tool must read repo A's own alpha.txt: {file_text:.300}"
+        );
+
+        // repo A does not contain gamma.txt — must be a clean not-found, not
+        // a cross-root read of repo C's file of the same relative name.
+        let cross_call = mcp_request(
+            8,
+            "tools/call",
+            json!({"name":"file","arguments":{"repository_id": repo_a_id, "path": "gamma.txt"}}),
+        );
+        let cross_resp = send_recv(&mut child, &mut stdin, &cross_call);
+        let cross_text = cross_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !cross_text.contains("GAMMA_MARKER_TOKEN"),
+            "repo A file access must never resolve repo C's content: {cross_text:.300}"
+        );
+
+        child.kill().ok();
     }
 
     #[test]

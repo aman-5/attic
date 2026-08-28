@@ -313,15 +313,41 @@ pub fn record_clean_shutdown_marker(writer: &WriterQueueHandle) -> Result<(), In
     })
 }
 
-/// Enqueue a RECONCILIATION task (deduped; workspace scope).
+/// Enqueue a RECONCILIATION task with no repository scope (legacy/global;
+/// deduped against other repository-less reconciliation tasks).
+///
+/// Kept for single-repository callers/tests where the process has exactly
+/// one configured root. Multi-root callers MUST use
+/// [`schedule_reconciliation_for`] so the task carries the repository it
+/// actually applies to — otherwise a repository-less task is only ever
+/// executed against whichever default root the scheduler was started with,
+/// silently skipping every other configured repository.
 pub fn schedule_reconciliation(writer: &WriterQueueHandle) -> Result<bool, IncrementalError> {
+    schedule_reconciliation_scoped(writer, None)
+}
+
+/// Enqueue a RECONCILIATION task scoped to one specific repository (deduped
+/// per-repository, so N configured repositories can each have an
+/// outstanding reconciliation task at the same time without colliding).
+pub fn schedule_reconciliation_for(
+    writer: &WriterQueueHandle,
+    repository_id: &str,
+) -> Result<bool, IncrementalError> {
+    schedule_reconciliation_scoped(writer, Some(repository_id))
+}
+
+fn schedule_reconciliation_scoped(
+    writer: &WriterQueueHandle,
+    repository_id: Option<&str>,
+) -> Result<bool, IncrementalError> {
     const RECONCILE_PRIORITY: i64 = 40;
     let id = uuid::Uuid::new_v4().to_string();
+    let repository_id = repository_id.map(|s| s.to_string());
     let outcome = run_on_writer(writer, move |conn| {
         enqueue_task(
             conn,
             &id,
-            None,
+            repository_id.as_deref(),
             TASK_RECONCILIATION,
             RECONCILE_PRIORITY,
             "{}",

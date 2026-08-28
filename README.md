@@ -153,32 +153,52 @@ surface.
 ATTIC_WORKSPACE_ROOT=/home/you/projects/my-app   # or C:\projects\my-app
 ```
 
-**Multiple repositories** (a realistic workspace of 20–30+ services):
+**Multiple repositories, anywhere on disk:** a realistic workspace is
+rarely one directory tree — repositories often live in unrelated
+locations with no common parent, e.g.:
 
 ```text
-workspace/
-├── frontend/
-├── api/
-├── auth-service/
-├── payments/
-├── shared-libs/
-└── infrastructure/
+C:\Users\amanbansal\Desktop\Dump
+C:\Adobe-Projects\EDS\HDFC
+C:\Adobe-Projects\HDFC-Bank-on-prem
 ```
 
-Point `ATTIC_WORKSPACE_ROOT` at the parent directory. Discovery treats
-**any nested Git repository boundary** — a true Git submodule *or* a
-plain, independently-cloned repository sitting under the workspace root —
-as its own `core_repositories` entry with independent source/index state;
-this does not require `.gitmodules`. Cross-repository dependency
-resolution (`attic-crossrepo`) then runs automatically at startup,
-resolving edges like "which repositories depend on the shared auth
-package" from each repository's own manifests (`package.json`,
-`pom.xml`, `go.mod`, `.gitmodules`, etc.).
+Set `ATTIC_CONFIG` to a small config file listing each root explicitly —
+no symlinks, no moving repositories under one directory, no Git
+submodules, and no additional MCP entries/databases:
 
-A **single** `attic` process owns one workspace/database: one watcher, one
-MCP transport, one SQLite writer. Attic does not support multiple
-processes writing to the same database concurrently — give each
-concurrently running instance its own `ATTIC_DATA_DIR`.
+```text
+[[repositories]]
+path = "C:\Users\amanbansal\Desktop\Dump"
+
+[[repositories]]
+path = "C:\Adobe-Projects\EDS\HDFC"
+
+[[repositories]]
+path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+```
+
+```sh
+# .env / MCP client config
+ATTIC_CONFIG=/absolute/path/to/attic-workspace.conf
+```
+
+`ATTIC_CONFIG` and `ATTIC_WORKSPACE_ROOT` are mutually exclusive — set only
+one. Each configured root is validated (must exist, be a directory,
+canonicalize) and indexed/watched independently; a root that fails
+validation is skipped (logged) rather than failing the other configured
+repositories. Cross-repository dependency resolution (`attic-crossrepo`)
+then runs automatically at startup across every repository currently
+known to storage, resolving edges like "which repositories depend on the
+shared auth package" from each repository's own manifests (`package.json`,
+`pom.xml`, `go.mod`, `.gitmodules`, etc.) — arbitrary, unrelated roots work
+exactly like repositories that happen to share a parent directory.
+
+A **single** `attic` process owns one logical workspace and one
+database: one coordinated writer queue, one MCP transport, one watcher
+per configured repository. Attic does **not** support multiple `attic-server` processes writing to the same database
+concurrently — give each concurrently running instance its own
+`ATTIC_DATA_DIR`.
 
 ## Project Knowledge
 
@@ -251,7 +271,8 @@ All configuration is via environment variables — there are no CLI flags.
 
 | Variable | Purpose |
 |---|---|
-| `ATTIC_WORKSPACE_ROOT` | Repository (or multi-repo parent) root to index and watch. Omit to serve whatever is already indexed without indexing anything new. |
+| `ATTIC_WORKSPACE_ROOT` | Single repository root to index and watch. Omit to serve whatever is already indexed without indexing anything new. Mutually exclusive with `ATTIC_CONFIG`. |
+| `ATTIC_CONFIG` | Path to a workspace config file listing multiple `[[repositories]]` roots (arbitrary locations, no common parent required). Mutually exclusive with `ATTIC_WORKSPACE_ROOT`. See [Workspaces & Multiple Repositories](#workspaces--multiple-repositories). |
 | `ATTIC_DATA_DIR` | Overrides the data directory (default: platform application-data dir). |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
 | `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer — see [Semantic search](#semantic-search-optional). |

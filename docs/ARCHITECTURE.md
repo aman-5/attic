@@ -109,33 +109,44 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
 ## Process and ownership model
 
-- **One `attic` process owns one workspace.** (The binary is built from the
-  `attic-server` crate — hence that crate/component name elsewhere in this
-  doc — but the executable itself is named `attic`; see README Quick
-  Start.) A single process holds the one SQLite writer (`WriterQueue`), the
-  one filesystem watcher, and the one MCP stdio transport for a given
-  database file. This is not a configuration choice —
-  `run_startup_recovery`, the watcher epoch, and `ops_server_state` all
-  assume single-process ownership. Attic does **not** support multiple
-  processes concurrently writing to the same database.
-- **Multi-repository workspaces** are supported by pointing
-  `ATTIC_WORKSPACE_ROOT` at a parent directory containing any number of
-  nested Git repositories — true submodules or plain independent
-  checkouts sit side by side under one root — each becoming its own
-  `core_repositories` row. Cross-repository dependency resolution
-  (`attic-crossrepo::maintenance::sync_workspace`) runs once at startup,
-  inside that single process:
+- **One `attic` process owns one logical workspace.** (The binary is built
+  from the `attic-server` crate — hence that crate/component name
+  elsewhere in this doc — but the executable itself is named `attic`; see
+  README Quick Start.) A single process holds the one SQLite writer
+  (`WriterQueue`), one MCP stdio transport, and one filesystem watcher
+  **per configured repository**, all for a given database file. This is
+  not a configuration choice — `run_startup_recovery`, the watcher epoch,
+  and `ops_server_state` all assume single-process ownership. Attic does
+  **not** support multiple processes concurrently writing to the same
+  database.
+- **Multi-root workspaces**: the logical workspace is the SET of
+  configured repository roots, not one filesystem directory — roots may
+  live anywhere on disk with no common parent, no symlinks, and no Git
+  submodule relationship between them. `ATTIC_CONFIG` points at a small
+  config file listing arbitrary `[[repositories]]` roots (`ATTIC_WORKSPACE_ROOT`
+  remains the single-repository convenience form; the two are mutually
+  exclusive). Each root is validated and bootstrapped independently and
+  becomes its own `core_repositories` row. Cross-repository dependency
+  resolution (`attic-crossrepo::maintenance::sync_workspace`) runs once at
+  startup, inside that single process, over every repository currently in
+  storage:
 
   ```text
-  workspace/ (ATTIC_WORKSPACE_ROOT)
-  ├── repo A ─┐
-  ├── repo B ─┼─ each keeps independent source/index state (own
-  └── repo C ─┘  core_repositories row, own SourceRevisions) —
-                 sync_workspace resolves edges BETWEEN them and
-                 records provenance back to the WorkspaceSnapshot
-                 (parent hash) that was current when each edge
-                 was last resolved.
+  Logical Workspace
+  ├── repo A (C:\Users\amanbansal\Desktop\Dump)      ─┐
+  ├── repo B (C:\Adobe-Projects\EDS\HDFC)             ─┼─ each keeps independent
+  └── repo C (C:\Adobe-Projects\HDFC-Bank-on-prem)    ─┘  source/index state (own
+                 core_repositories row, own SourceRevisions, own watcher) —
+                 sync_workspace resolves edges BETWEEN them and records
+                 provenance back to the WorkspaceSnapshot (parent hash)
+                 that was current when each edge was last resolved.
   ```
+
+  The scheduler's task queue is shared across every configured
+  repository: each claimed task resolves its OWN repository's root from
+  storage before doing any filesystem work, so a task belonging to repo B
+  is never executed against repo A's root, and one bad root never blocks
+  or corrupts the others (failure isolation).
 
 - **Repository isolation / stable identity**: every repository, file, and
   retrieval unit has a stable, content-addressed identity independent of

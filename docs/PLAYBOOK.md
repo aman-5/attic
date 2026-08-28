@@ -77,8 +77,11 @@ reset (below) is the supported way to force a clean slate.
 ### Multi-repository operation
 
 See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
-`ATTIC_WORKSPACE_ROOT`, any number of nested Git repositories underneath it
-(no `.gitmodules` requirement — plain independent checkouts work the same).
+logical workspace, any number of configured repository roots — either
+`ATTIC_WORKSPACE_ROOT` for a single repository, or `ATTIC_CONFIG` pointing
+at a config file with one `[[repositories]] path = "..."` entry per root
+for multiple roots. Configured roots may live anywhere on disk with no
+common parent, no symlinks required, and no `.gitmodules` requirement.
 **Do not** run two `attic` processes against the same `attic.db` —
 this is not a supported or tested configuration; give each concurrently
 running instance its own `ATTIC_DATA_DIR`.
