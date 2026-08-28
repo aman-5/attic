@@ -36,6 +36,17 @@ criteria, before Attic can be called production-ready.
     (`macos-latest`).
   - Acceptance: same as above.
 
+## Legal
+
+- [ ] License copyright-holder confirmation — `LICENSE-MIT`/`LICENSE-APACHE`
+  currently attribute copyright to "Attic Contributors", matching
+  `Cargo.toml`'s `license = "MIT OR Apache-2.0"` declaration. No new legal
+  decision was made when these files were added; whether "Attic
+  Contributors" is the correct/final copyright holder (vs. a specific
+  individual or organization) has not been confirmed by any authoritative
+  source and should be verified by whoever owns the release before the
+  first public release.
+
 ## Packaging / release archive
 
 - [ ] Clean binary installation test
@@ -151,7 +162,7 @@ criteria, before Attic can be called production-ready.
 - [ ] Final Phase 6 cross-repository quality benchmark — compare against
       the Phase 6 baseline, specifically re-verifying that cross-repo
       evidence now reaches the MCP `context` response (fixed this cycle
-      per `docs/PHASE_7_COMPLETION_REPORT.md` bug #3) at benchmark scale,
+      per the Phase 7 hardening pass, bug #3) at benchmark scale,
       not just in the 3-repo fixture used to root-cause it.
 - [ ] Unsupported-claim regression — verify the evidence-sufficiency gate
       still rejects claims without adequate grounding at scale.

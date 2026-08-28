@@ -26,10 +26,11 @@ unless you explicitly opt in to the (disabled-by-default) semantic layer.
    binary by full path in your MCP client configuration below.
 
 > **Supported platforms**: Windows x86_64, Linux x86_64, macOS x86_64, and
-> macOS ARM64 are built and tested in CI on every release
+> macOS ARM64 are built and packaged in CI on every release
 > (`.github/workflows/release.yml`). A platform is only claimed "verified"
-> once CI has actually run the test suite on it — see
-> `docs/PHASE_7_COMPLETION_REPORT.md` for the current per-platform status.
+> once CI has actually run the full test suite on it — see
+> `docs/FINAL_VALIDATION_TODO.md` for the current, authoritative per-platform
+> verification status.
 
 ## Configure a workspace
 
@@ -216,8 +217,12 @@ tools/package.sh --target <x86_64-pc-windows-msvc|x86_64-unknown-linux-gnu|x86_6
 
 ## Documentation
 
-- `docs/PHASE_7_COMPLETION_REPORT.md` — current production-readiness status,
-  verified platforms, and measured results.
+- `docs/ARCHITECTURE.md` — how Attic is built: pipeline, process/ownership
+  model, storage concurrency, security, crash recovery.
+- `docs/PLAYBOOK.md` — operations manual: start/stop, troubleshooting,
+  recovery, development, and maintenance procedures.
+- `docs/FINAL_VALIDATION_TODO.md` — authoritative list of what has and has
+  not yet been independently verified (platform CI, scale/soak/stress).
 - `docs/contracts/` — normative behavioral contracts (retrieval, evidence,
   recovery, resources, etc.).
 - `docs/decisions/` — architecture decision records.

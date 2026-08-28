@@ -51,4 +51,3 @@ docs.rs + Cargo.lock on 2026-08-26; compile+run verified on
 
 - rmcp 3.1.4 verified at https://crates.io/crates/rmcp on 2026-08-24; MSRV 1.88 confirmed.
 - All bootstrap dep versions verified on crates.io on 2026-08-24.
-- See `Attic_AI_Agent_Implementation_Pack/06_reference/DEPENDENCY_VERIFICATION_2026-08-24.md` for full verification log.

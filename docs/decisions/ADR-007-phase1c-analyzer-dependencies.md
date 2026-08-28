@@ -165,8 +165,6 @@ If no specialized analyzer is registered for the given `FileType`, the
 
 ## References
 
-- `Attic_AI_Agent_Implementation_Pack/03_phases/PHASE_1C_ANALYZERS.md`
-- `Attic_AI_Agent_Implementation_Pack/02_contracts/CONTRACT_CHECKLIST.md`
 - `docs/decisions/ADR-005-phase1b-discovery-dependencies.md`
 - `crates/attic-analyzers/src/api.rs`
 - `crates/attic-analyzers/src/generic.rs`
