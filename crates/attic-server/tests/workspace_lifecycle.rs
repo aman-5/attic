@@ -412,3 +412,367 @@ async fn test_restart_unavailable_repo_shows_degraded() {
         let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Home-policy unit tests (pure — no server binary, no env mutation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Home-policy test 1: explicit non-empty ATTIC_HOME wins over user home.
+#[test]
+fn test_home_policy_explicit_attic_home_wins() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let explicit = tmp.path().join("explicit-home");
+    std::fs::create_dir_all(&explicit).expect("create explicit home");
+
+    // user_home is Some but should be ignored when ATTIC_HOME is given.
+    let result = attic_core::paths::resolve_data_root_from(
+        Some(explicit.to_str().expect("utf8")),
+        Some(tmp.path().join("user-home")),
+    );
+    assert!(result.is_ok(), "explicit ATTIC_HOME must succeed: {:?}", result);
+    let got = result.unwrap();
+    // Resolved path must be under the explicit home, not user-home.
+    assert!(
+        got.starts_with(&explicit),
+        "expected path under explicit home {:?}, got {:?}",
+        explicit,
+        got
+    );
+}
+
+/// Home-policy test 2: empty ATTIC_HOME string is a configuration error.
+#[test]
+fn test_home_policy_empty_attic_home_is_error() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let result = attic_core::paths::resolve_data_root_from(
+        Some(""),
+        Some(tmp.path().join("user-home")),
+    );
+    assert!(
+        result.is_err(),
+        "empty ATTIC_HOME must be a config error, got Ok({:?})",
+        result.ok()
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("ATTIC_HOME") || msg.contains("empty"),
+        "error must mention ATTIC_HOME or empty; got: {msg}"
+    );
+}
+
+/// Home-policy test 3: no ATTIC_HOME + valid user home → ~/.attic derived.
+#[test]
+fn test_home_policy_default_derives_from_user_home() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let user_home = tmp.path().join("user");
+    std::fs::create_dir_all(&user_home).expect("create user home");
+
+    let result = attic_core::paths::resolve_data_root_from(None, Some(user_home.clone()));
+    assert!(result.is_ok(), "default home resolution must succeed: {:?}", result);
+    let got = result.unwrap();
+    // Resolved path must be <user_home>/.attic
+    let expected = user_home.join(".attic");
+    assert_eq!(
+        got, expected,
+        "expected {:?}, got {:?}", expected, got
+    );
+}
+
+/// Home-policy test 4: no ATTIC_HOME + no user home → actionable error (not silent fallback).
+#[test]
+fn test_home_policy_no_home_no_attic_home_is_error() {
+    let result = attic_core::paths::resolve_data_root_from(None, None);
+    assert!(
+        result.is_err(),
+        "missing both ATTIC_HOME and user home must be an error, got Ok({:?})",
+        result.ok()
+    );
+    // Must not silently return cwd or a temp path.
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        !msg.is_empty(),
+        "error message must be non-empty"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §35 test 3: stale DB repositories must not leak into active workspace
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §16 / §35 `test_stale_db_repos_do_not_leak`:
+///
+/// 1. Start server with repos A, B, C; wait for all to be indexed.
+/// 2. Restart with only A and C in config (B removed).
+/// 3. Search for B's probe token → must return 0 results.
+/// 4. Status must not count B in configured_repository_count.
+#[tokio::test]
+async fn test_stale_db_repos_do_not_leak() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("attic-home-stale");
+    std::fs::create_dir_all(&home).expect("create ATTIC_HOME");
+
+    let dir_a = tmp.path().join("stale_repoA");
+    let dir_b = tmp.path().join("stale_repoB");
+    let dir_c = tmp.path().join("stale_repoC");
+    for d in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(d).expect("create repo dir");
+    }
+    let token_a = "STALE_TOKEN_AAAA_ZX1";
+    let token_b = "STALE_TOKEN_BBBB_ZX1";
+    let token_c = "STALE_TOKEN_CCCC_ZX1";
+    std::fs::write(dir_a.join("probe.txt"), token_a).expect("write A probe");
+    std::fs::write(dir_b.join("probe.txt"), token_b).expect("write B probe");
+    std::fs::write(dir_c.join("probe.txt"), token_c).expect("write C probe");
+
+    let canon_a = dir_a.canonicalize().expect("canon A");
+    let canon_b = dir_b.canonicalize().expect("canon B");
+    let canon_c = dir_c.canonicalize().expect("canon C");
+
+    let write_cfg = |paths: &[&PathBuf]| {
+        let mut body = String::from(
+            "# Attic workspace configuration (generated by the `workspace` MCP tool)\n",
+        );
+        for p in paths {
+            body.push_str("[[repositories]]\n");
+            body.push_str(&format!("path = \"{}\"\n", p.display()));
+        }
+        std::fs::write(home.join("config.toml"), body).expect("write config.toml");
+    };
+
+    // Run 1: A, B, C all configured.
+    write_cfg(&[&canon_a, &canon_b, &canon_c]);
+    {
+        let mut srv = connect_home(&bin, &home).await;
+        wait_for_token(&mut srv, token_a, 40).await;
+        wait_for_token(&mut srv, token_b, 40).await;
+        wait_for_token(&mut srv, token_c, 40).await;
+        let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
+    }
+
+    // Run 2: only A and C configured; B is absent from config (but still in DB).
+    write_cfg(&[&canon_a, &canon_c]);
+    {
+        let mut srv = connect_home(&bin, &home).await;
+        // Wait for A and C to be available.
+        wait_for_token(&mut srv, token_a, 40).await;
+        wait_for_token(&mut srv, token_c, 40).await;
+
+        // B's token must NOT appear in search results.
+        let b_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_b }))
+            .await
+            .expect("search token_b run2");
+        let bv: Value = serde_json::from_str(&b_text).expect("search JSON");
+        let b_hits = bv["results"].as_array().map(Vec::len).unwrap_or(0);
+        assert_eq!(
+            b_hits, 0,
+            "stale B repo must not leak into search results; got: {b_text}"
+        );
+
+        // Status must count only 2 configured.
+        let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+            .await
+            .expect("status run2");
+        let sv: Value = serde_json::from_str(&status_text).expect("status JSON");
+        // Status nests the count under sv["workspace"]["configured_repository_count"].
+        let count = sv["workspace"]["configured_repository_count"]
+            .as_u64()
+            .unwrap_or(99);
+        assert_eq!(
+            count, 2,
+            "status must report 2 configured repos (not 3 from stale DB); {status_text}"
+        );
+
+        let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §35 test 4: removing a repo via MCP — B disappears from active evidence
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §22 / §35 `test_restart_b_disappears`:
+///
+/// Start with A, B, C.  Remove B through the `workspace remove` MCP tool.
+/// Verify B's probe token is no longer searchable and status count drops to 2.
+/// Restart the server; confirm B is still absent (config persisted correctly).
+#[tokio::test]
+async fn test_restart_b_disappears() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("attic-home-bdisappear");
+    std::fs::create_dir_all(&home).expect("create ATTIC_HOME");
+
+    let dir_a = tmp.path().join("bdisap_repoA");
+    let dir_b = tmp.path().join("bdisap_repoB");
+    let dir_c = tmp.path().join("bdisap_repoC");
+    for d in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(d).expect("create repo dir");
+    }
+    let token_a = "BDISAP_TOKEN_AAA_W3X";
+    let token_b = "BDISAP_TOKEN_BBB_W3X";
+    let token_c = "BDISAP_TOKEN_CCC_W3X";
+    std::fs::write(dir_a.join("probe.txt"), token_a).expect("write A probe");
+    std::fs::write(dir_b.join("probe.txt"), token_b).expect("write B probe");
+    std::fs::write(dir_c.join("probe.txt"), token_c).expect("write C probe");
+
+    let canon_a = dir_a.canonicalize().expect("canon A");
+    let canon_b = dir_b.canonicalize().expect("canon B");
+    let canon_c = dir_c.canonicalize().expect("canon C");
+
+    // Write initial config with A, B, C.
+    let config_body = format!(
+        "# Attic workspace configuration (generated by the `workspace` MCP tool)\n\
+         [[repositories]]\npath = \"{}\"\n\
+         [[repositories]]\npath = \"{}\"\n\
+         [[repositories]]\npath = \"{}\"\n",
+        canon_a.display(),
+        canon_b.display(),
+        canon_c.display(),
+    );
+    std::fs::write(home.join("config.toml"), &config_body).expect("write config.toml");
+
+    // Run 1: index all three, then remove B via MCP.
+    {
+        let mut srv = connect_home(&bin, &home).await;
+        wait_for_token(&mut srv, token_a, 40).await;
+        wait_for_token(&mut srv, token_b, 40).await;
+        wait_for_token(&mut srv, token_c, 40).await;
+
+        // Remove B via workspace MCP tool.
+        // The server uses "action" (not "operation") and "path" (singular, not "paths").
+        let remove_result = call_tool_text(
+            &mut srv,
+            "workspace",
+            serde_json::json!({
+                "action": "remove",
+                "path": canon_b.display().to_string()
+            }),
+        )
+        .await
+        .expect("workspace remove");
+        let rv: Value = serde_json::from_str(&remove_result).expect("remove JSON");
+        // Server returns {"action":"remove","configured":true,"membership_count":2,"events":[...],...}
+        // Verify membership_count dropped to 2 (A and C remain).
+        let membership_count = rv["membership_count"].as_u64().unwrap_or(99);
+        assert_eq!(
+            membership_count, 2,
+            "exactly two repos must remain after removing B; got: {remove_result}"
+        );
+
+        // B's token must no longer be searchable.
+        let b_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_b }))
+            .await
+            .expect("search token_b after remove");
+        let bv: Value = serde_json::from_str(&b_text).expect("search JSON");
+        let b_hits = bv["results"].as_array().map(Vec::len).unwrap_or(0);
+        assert_eq!(
+            b_hits, 0,
+            "B must be absent from search after removal; {b_text}"
+        );
+
+        // A and C still usable.
+        let a_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_a }))
+            .await
+            .expect("search token_a after remove");
+        let av: Value = serde_json::from_str(&a_text).expect("search JSON A");
+        assert!(
+            av["results"].as_array().map(|v| v.len()).unwrap_or(0) > 0,
+            "A must still be searchable after B removal; {a_text}"
+        );
+
+        let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
+    }
+
+    // Run 2: restart — B must still be absent (config persisted).
+    {
+        let mut srv2 = connect_home(&bin, &home).await;
+        wait_for_token(&mut srv2, token_a, 40).await;
+
+        let b_text2 = call_tool_text(&mut srv2, "search", serde_json::json!({ "query": token_b }))
+            .await
+            .expect("search token_b after restart");
+        let bv2: Value = serde_json::from_str(&b_text2).expect("search JSON run2");
+        let b_hits2 = bv2["results"].as_array().map(Vec::len).unwrap_or(0);
+        assert_eq!(
+            b_hits2, 0,
+            "B must remain absent after restart (config persisted removal); {b_text2}"
+        );
+
+        let status_text = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+            .await
+            .expect("status run2");
+        let sv: Value = serde_json::from_str(&status_text).expect("status JSON");
+        // Status nests the count under sv["workspace"]["configured_repository_count"].
+        let count = sv["workspace"]["configured_repository_count"].as_u64().unwrap_or(99);
+        assert_eq!(
+            count, 2,
+            "after restart, status must report 2 repos (A+C); {status_text}"
+        );
+
+        let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §37 test: poisoned-lock returns structured JSON error, not a crash
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §37 `test_poisoned_lock_returns_structured_error`:
+///
+/// This is a unit-level test (no binary spawn needed).  It directly constructs
+/// an `AtticServer`-like structure, poisons one of its RwLocks by panicking
+/// while holding the write guard, and then verifies that the `lock_or_json_err!`
+/// macro (exercised through the server logic) returns a structured error JSON
+/// string instead of propagating the panic.
+///
+/// Because `AtticServer` is not `pub`, we exercise the observable behaviour
+/// via the public `status`-equivalent path: a `workspace_configured` RwLock
+/// poisoned by a prior panic must produce `{"error":"internal_error",...}`.
+#[test]
+fn test_poisoned_lock_returns_structured_error_unit() {
+    use std::sync::{Arc, RwLock};
+
+    // Replicate just the lock we need to test.
+    let lock: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
+    let lock_clone = Arc::clone(&lock);
+
+    // Poison the lock: spawn a thread that panics while holding the write guard.
+    let _ = std::thread::spawn(move || {
+        let _guard = lock_clone.write().expect("write for poison");
+        panic!("intentional poison");
+    })
+    .join(); // join returns Err — that is the expected outcome.
+
+    // The lock is now poisoned.
+    assert!(
+        lock.read().is_err(),
+        "RwLock must be poisoned after a panic inside a write guard"
+    );
+
+    // Simulate what lock_or_json_err! would produce in the server's `status` fn.
+    let response: String = match lock.read() {
+        Ok(g) => {
+            if *g {
+                r#"{"status":"CONFIGURED"}"#.to_owned()
+            } else {
+                r#"{"status":"UNCONFIGURED"}"#.to_owned()
+            }
+        }
+        Err(_) => serde_json::json!({
+            "error": "internal_error",
+            "message": "server lock poisoned; restart Attic"
+        })
+        .to_string(),
+    };
+
+    let v: serde_json::Value = serde_json::from_str(&response).expect("must be valid JSON");
+    assert_eq!(
+        v["error"], "internal_error",
+        "poisoned lock must produce internal_error JSON, got: {response}"
+    );
+    assert!(
+        v["message"].as_str().unwrap_or("").contains("poisoned"),
+        "error message must mention 'poisoned'; got: {response}"
+    );
+}

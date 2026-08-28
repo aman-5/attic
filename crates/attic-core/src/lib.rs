@@ -36,4 +36,4 @@ pub use domain::{
     value_types::{ResourceBudgets, SourceSpan},
 };
 pub use error::CoreError;
-pub use paths::AtticPaths;
+pub use paths::{AtticPaths, PathResolutionError, resolve_data_root_from};

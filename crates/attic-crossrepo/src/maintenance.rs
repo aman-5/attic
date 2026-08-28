@@ -149,6 +149,11 @@ pub struct WorkspaceSyncOptions {
     pub deadline: Deadline,
     /// Cooperative cancellation token.
     pub cancel: CancelToken,
+    /// When `Some`, only these repository IDs participate in the sync.
+    /// Repositories present in storage but absent from this list are excluded
+    /// from catalog scanning, edge resolution, and workspace snapshot
+    /// provenance (§14 workspace membership is authoritative).
+    pub active_repository_ids: Option<Vec<String>>,
 }
 
 impl Default for WorkspaceSyncOptions {
@@ -156,6 +161,7 @@ impl Default for WorkspaceSyncOptions {
         Self {
             deadline: Deadline::after(std::time::Duration::from_secs(30)),
             cancel: CancelToken::never(),
+            active_repository_ids: None,
         }
     }
 }
@@ -201,7 +207,17 @@ pub fn sync_workspace(
     };
 
     // ── Stage 1: Reader phase (read-only, bounded I/O) ────────────────
-    let repo_ids = attic_storage::crossrepo_ops::all_repository_ids(reader_conn)?;
+    let all_ids = attic_storage::crossrepo_ops::all_repository_ids(reader_conn)?;
+    // §14: workspace membership is authoritative. When active_repository_ids is
+    // provided, restrict the sync to only those IDs. Repositories present in
+    // storage but absent from the active set must not participate.
+    let repo_ids: Vec<String> = match &opts.active_repository_ids {
+        Some(active) => all_ids
+            .into_iter()
+            .filter(|id| active.contains(id))
+            .collect(),
+        None => all_ids,
+    };
     let total = repo_ids.len();
     let mut all_repo_data: Vec<RepoCatalogData> = Vec::with_capacity(total);
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
@@ -395,6 +411,34 @@ pub fn sync_workspace(
     result.edges_emitted = edges_len;
     result.snapshot_id = snapshot_id_cell.lock().unwrap().clone();
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Convenience wrapper: membership-scoped workspace maintenance
+// ---------------------------------------------------------------------------
+
+/// Run a full workspace sync scoped to the given active repository IDs.
+///
+/// Equivalent to calling `sync_workspace` but restricts the sync to only the
+/// repositories listed in `active_ids` (§14 membership is authoritative).
+/// Repositories present in the database but absent from `active_ids` are
+/// excluded from scanning, edge resolution and snapshot provenance.
+///
+/// `pool` provides the reader connection; `writer` is the single write queue.
+pub fn run_workspace_maintenance_with_membership(
+    pool: &attic_storage::DbPool,
+    writer: &attic_storage::WriterQueueHandle,
+    active_ids: Vec<String>,
+) -> Result<WorkspaceSyncResult, CrossRepoError> {
+    let opts = WorkspaceSyncOptions {
+        active_repository_ids: Some(active_ids),
+        ..Default::default()
+    };
+    pool.with_reader(|conn| {
+        sync_workspace(conn, writer, &opts)
+            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+    })
+    .map_err(CrossRepoError::Storage)
 }
 
 // ---------------------------------------------------------------------------

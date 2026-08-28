@@ -1850,12 +1850,13 @@ async fn main() -> anyhow::Result<()> {
     // Phase 7: platform-appropriate data/cache/temp policy (see
     // attic_core::paths).  The data root is user-global (OS application-data
     // directory); workspaces are never written to.
-    let paths = attic_core::AtticPaths::resolve()?;
+    let paths = attic_core::AtticPaths::resolve();
+    paths.ensure_dirs()?;
     let db_path = paths.db_path();
     info!(
-        "attic starting, db={} (home {})",
+        "attic starting, db={} (data root {})",
         db_path.display(),
-        paths.home.display()
+        paths.data_root.display()
     );
 
     let server = AtticServer::new(&db_path)?;
@@ -1924,7 +1925,7 @@ async fn main() -> anyhow::Result<()> {
     // status reports UNCONFIGURED, and the MCP `workspace` tool is the
     // configuration entry point), one (legacy single-repository), or many
     // arbitrary/unrelated filesystem paths (multi-root workspace).
-    let default_config = paths.config_file.clone();
+    let default_config = paths.config_path();
     let (config_source, raw_roots) = load_workspace_roots(&default_config)?;
     let validation = validate_configured_roots(raw_roots);
     let roots = validation.valid.clone();
