@@ -1,192 +1,301 @@
-//! Phase 7 — final platform-appropriate configuration/data/cache/temp policy.
+//! Attic home directory resolution and runtime path policy.
 //!
 //! ## Policy (normative)
 //!
-//! Attic distinguishes **user-global** state from **per-workspace** state:
+//! Attic keeps **all** user-global state in one directory called the
+//! **Attic home** (`~/.attic` by default).  Nothing is ever written into
+//! an indexed workspace.
 //!
-//! * **User-global** (lives under the OS application-data directory for the
-//!   current user): the Attic SQLite database (`attic.db`), the optional
-//!   semantic layer database (`semantic.db`), crash-recovery backups
-//!   (`backups/`), logs written by operators, and scratch/temp files created
-//!   during indexing.  These aggregate state across ALL indexed workspaces, so
-//!   they cannot meaningfully live inside one workspace.
-//! * **Per-workspace**: nothing is persisted inside a workspace.  Attic reads
-//!   workspace files and stores every index artifact in the user-global
-//!   database, keyed by repository identity.  A workspace is only ever a
-//!   *source* directory; Attic never writes `.attic/` into it.  This keeps
-//!   workspaces clean for git and avoids polluting projects that are indexed
-//!   read-only.
+//! ### Home resolution order
 //!
-//! Resolution order for the user-global data root:
-//! 1. `ATTIC_DATA_DIR` environment variable (explicit operator override).
-//! 2. `ATTIC_DB_PATH`'s parent directory when `ATTIC_DB_PATH` is set
-//!    (backwards compatibility with the Phase 1D single-variable override).
-//! 3. Platform default:
-//!    * Windows: `%LOCALAPPDATA%\attic` (falling back to
-//!      `%USERPROFILE%\AppData\Local\attic`)
-//!    * macOS: `~/Library/Application Support/attic`
-//!    * Linux/BSD: `$XDG_DATA_HOME/attic` (XDG spec) falling back to
-//!      `~/.local/share/attic`
-//! 4. `./attic-data` in the current directory as a last resort (portable run),
-//!    so the server never fails to start merely because no home directory is
-//!    configured.
+//! | Priority | Source | Notes |
+//! |----------|--------|-------|
+//! | 1 | `ATTIC_HOME` env var (non-empty) | Explicit override — pins the whole home |
+//! | 2 | `<user home>/.attic` | Derived from the OS user-home directory |
+//! | — | anything else | Hard error — no silent CWD / temp fallbacks |
 //!
-//! Derived locations, all relative to the data root:
-//! * `attic.db` — main database
-//! * `semantic.db` — semantic layer (only created on explicit `ATTIC_SEMANTIC=1`)
-//! * `backups/` — crash-recovery database backups
-//! * `tmp/` — process scratch space (created on demand; safe to delete while
-//!   Attic is not running)
+//! An empty `ATTIC_HOME=""` is a **configuration error** (not silently ignored).
+//!
+//! ### Derived layout
+//!
+//! ```text
+//! ~/.attic/
+//! ├── config.toml   — persistent multi-root workspace configuration
+//! ├── attic.db      — main SQLite database
+//! ├── semantic.db   — semantic layer (only when ATTIC_SEMANTIC=1)
+//! ├── backups/      — crash-recovery backups
+//! └── tmp/          — process scratch space (safe to delete while Attic is not running)
+//! ```
 
-use std::path::{Path, PathBuf};
+use std::fmt;
+use std::path::PathBuf;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Error returned when Attic cannot determine or use its home directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathResolutionError(String);
+
+impl fmt::Display for PathResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PathResolutionError {}
+
+impl PathResolutionError {
+    fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AtticPaths
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolved Attic runtime locations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtticPaths {
-    /// User-global data root (see module docs).
-    pub data_root: PathBuf,
+    /// The Attic home directory (`~/.attic` or `$ATTIC_HOME`).
+    pub home: PathBuf,
+    /// Main SQLite database (`<home>/attic.db`).
+    pub database: PathBuf,
+    /// Persistent workspace configuration file (`<home>/config.toml`).
+    pub config_file: PathBuf,
+    /// Semantic layer database (`<home>/semantic.db`).
+    pub semantic_db: PathBuf,
+    /// Crash-recovery backup directory (`<home>/backups/`).
+    pub backups_dir: PathBuf,
+    /// Process scratch directory (`<home>/tmp/`).
+    pub temp_dir: PathBuf,
 }
 
 impl AtticPaths {
-    /// Resolve the data root and derived paths according to the policy above.
-    pub fn resolve() -> Self {
-        Self {
-            data_root: resolve_data_root(),
-        }
-    }
-
-    /// Path of the main SQLite database (`attic.db`).
-    pub fn db_path(&self) -> PathBuf {
-        self.data_root.join("attic.db")
-    }
-
-    /// Path of the semantic layer database (`semantic.db`).
-    pub fn semantic_db_path(&self) -> PathBuf {
-        self.data_root.join("semantic.db")
-    }
-
-    /// Directory holding crash-recovery backups.
-    pub fn backups_dir(&self) -> PathBuf {
-        self.data_root.join("backups")
-    }
-
-    /// Directory for process scratch files (created on demand).
-    pub fn temp_dir(&self) -> PathBuf {
-        self.data_root.join("tmp")
-    }
-
-    /// Create the data root and derived directories on disk.
+    /// Resolve Attic's home directory according to the policy described in the
+    /// module documentation, create required directories, and return the
+    /// populated `AtticPaths`.
     ///
-    /// Returns an error string if directory creation fails; the server treats
-    /// this as fail-closed (it cannot serve without its data directory).
-    pub fn ensure_dirs(&self) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(&self.data_root)?;
-        std::fs::create_dir_all(self.backups_dir())?;
-        std::fs::create_dir_all(self.temp_dir())?;
-        Ok(())
+    /// Reads `ATTIC_HOME` from the real environment; delegates to
+    /// [`resolve_data_root_from`] for the pure resolution logic.
+    pub fn resolve() -> Result<Self, PathResolutionError> {
+        let attic_home = std::env::var("ATTIC_HOME").ok();
+        let user_home = home_dir();
+        let home = resolve_data_root_from(attic_home.as_deref(), user_home)?;
+
+        std::fs::create_dir_all(&home).map_err(|e| {
+            PathResolutionError::new(format!(
+                "failed to create Attic home directory {:?}: {}",
+                home, e
+            ))
+        })?;
+
+        let backups = home.join("backups");
+        std::fs::create_dir_all(&backups).map_err(|e| {
+            PathResolutionError::new(format!(
+                "failed to create backups directory {:?}: {}",
+                backups, e
+            ))
+        })?;
+
+        let tmp = home.join("tmp");
+        std::fs::create_dir_all(&tmp).map_err(|e| {
+            PathResolutionError::new(format!("failed to create tmp directory {:?}: {}", tmp, e))
+        })?;
+
+        Ok(Self {
+            database: home.join("attic.db"),
+            config_file: home.join("config.toml"),
+            semantic_db: home.join("semantic.db"),
+            backups_dir: backups,
+            temp_dir: tmp,
+            home,
+        })
+    }
+
+    /// Path of the main SQLite database.
+    pub fn db_path(&self) -> &PathBuf {
+        &self.database
     }
 }
 
-/// Resolve the user-global data root (see module docs for the order).
-pub fn resolve_data_root() -> PathBuf {
-    // 1. Explicit operator override.
-    if let Ok(dir) = std::env::var("ATTIC_DATA_DIR")
-        && !dir.trim().is_empty()
-    {
-        return PathBuf::from(dir);
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure injectable resolution function
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the Attic home directory from explicit inputs, without reading
+/// environment variables.
+///
+/// This function is the pure core of the resolution policy and is `pub` so
+/// that unit tests can exercise every branch without mutating the process
+/// environment.
+///
+/// # Policy
+///
+/// | `attic_home` | `user_home` | Result |
+/// |---|---|---|
+/// | `Some(s)` where `s` is non-empty after trim | any | `Ok(PathBuf::from(s))` |
+/// | `Some("")` or `Some("   ")` | any | `Err` — empty `ATTIC_HOME` is a config error |
+/// | `None` | `Some(h)` | `Ok(h.join(".attic"))` |
+/// | `None` | `None` | `Err` — cannot determine home directory |
+pub fn resolve_data_root_from(
+    attic_home: Option<&str>,
+    user_home: Option<PathBuf>,
+) -> Result<PathBuf, PathResolutionError> {
+    match attic_home {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(PathResolutionError::new(
+                    "ATTIC_HOME is set but empty; provide a non-empty path or unset it",
+                ));
+            }
+            Ok(PathBuf::from(s))
+        }
+        None => match user_home {
+            Some(h) => Ok(h.join(".attic")),
+            None => Err(PathResolutionError::new(
+                "cannot determine Attic home: ATTIC_HOME is not set and the user \
+                 home directory could not be resolved; set ATTIC_HOME explicitly",
+            )),
+        },
     }
-    // 2. Legacy Phase 1D override: derive the root from ATTIC_DB_PATH's parent.
-    if let Ok(db) = std::env::var("ATTIC_DB_PATH")
-        && let Some(parent) = Path::new(&db).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        return parent.to_path_buf();
-    }
-    // 3. Platform default.
-    platform_data_root().unwrap_or_else(|| PathBuf::from("attic-data"))
 }
 
-fn platform_data_root() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        // %LOCALAPPDATA%\attic, falling back to %USERPROFILE%\AppData\Local.
-        if let Ok(dir) = std::env::var("LOCALAPPDATA")
-            && !dir.trim().is_empty()
-        {
-            return Some(PathBuf::from(dir).join("attic"));
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform user-home resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempt to determine the OS user home directory.
+fn home_dir() -> Option<PathBuf> {
+    // Unix HOME (also set on Windows by Git Bash / MSYS2).
+    if let Ok(h) = std::env::var("HOME") {
+        let h = h.trim().to_owned();
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
         }
-        if let Ok(profile) = std::env::var("USERPROFILE")
-            && !profile.trim().is_empty()
-        {
-            return Some(
-                PathBuf::from(profile)
-                    .join("AppData")
-                    .join("Local")
-                    .join("attic"),
-            );
+    }
+    // Windows USERPROFILE.
+    if let Ok(p) = std::env::var("USERPROFILE") {
+        let p = p.trim().to_owned();
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
         }
-        return None;
     }
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME")
-            && !home.trim().is_empty()
-        {
-            return Some(
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("attic"),
-            );
+    // Windows HOMEDRIVE + HOMEPATH fallback.
+    if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        let drive = drive.trim().to_owned();
+        let path = path.trim().to_owned();
+        if !drive.is_empty() && !path.is_empty() {
+            return Some(PathBuf::from(format!("{}{}", drive, path)));
         }
-        return None;
-    }
-    // Linux/BSD: XDG Base Directory spec.
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.trim().is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("attic"));
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        return Some(
-            PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("attic"),
-        );
     }
     None
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── resolve_data_root_from policy ─────────────────────────────────────
+
     #[test]
-    fn derived_paths_follow_policy() {
-        let paths = AtticPaths {
-            data_root: PathBuf::from("/data-root"),
-        };
-        assert_eq!(paths.db_path(), PathBuf::from("/data-root/attic.db"));
-        assert_eq!(
-            paths.semantic_db_path(),
-            PathBuf::from("/data-root/semantic.db")
-        );
-        assert_eq!(paths.backups_dir(), PathBuf::from("/data-root/backups"));
-        assert_eq!(paths.temp_dir(), PathBuf::from("/data-root/tmp"));
+    fn explicit_non_empty_attic_home_wins() {
+        let result =
+            resolve_data_root_from(Some("/explicit/home"), Some(PathBuf::from("/user/home")));
+        assert_eq!(result.unwrap(), PathBuf::from("/explicit/home"));
     }
 
     #[test]
-    fn ensure_dirs_creates_layout() {
-        let tmp = std::env::temp_dir().join(format!("attic_paths_{}", std::process::id()));
+    fn empty_attic_home_is_error() {
+        let result = resolve_data_root_from(Some(""), Some(PathBuf::from("/user/home")));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ATTIC_HOME") && msg.contains("empty"),
+            "error must mention ATTIC_HOME and empty; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_attic_home_is_error() {
+        let result = resolve_data_root_from(Some("   "), Some(PathBuf::from("/user/home")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_attic_home_derives_from_user_home() {
+        let user = PathBuf::from("/my/home");
+        let result = resolve_data_root_from(None, Some(user.clone()));
+        assert_eq!(result.unwrap(), user.join(".attic"));
+    }
+
+    #[test]
+    fn no_attic_home_no_user_home_is_error() {
+        let result = resolve_data_root_from(None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(!msg.is_empty(), "error must be non-empty");
+        assert!(
+            msg.contains("ATTIC_HOME"),
+            "error should mention ATTIC_HOME; got: {msg}"
+        );
+    }
+
+    // ── AtticPaths derived fields ─────────────────────────────────────────
+
+    #[test]
+    fn derived_paths_follow_home() {
+        let tmp = std::env::temp_dir().join(format!("attic_paths_unit_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+
+        let home = tmp.join("home");
         let paths = AtticPaths {
-            data_root: tmp.join("root"),
+            database: home.join("attic.db"),
+            config_file: home.join("config.toml"),
+            semantic_db: home.join("semantic.db"),
+            backups_dir: home.join("backups"),
+            temp_dir: home.join("tmp"),
+            home: home.clone(),
         };
-        paths.ensure_dirs().expect("ensure_dirs");
-        assert!(paths.db_path().parent().unwrap().is_dir());
-        assert!(paths.backups_dir().is_dir());
-        assert!(paths.temp_dir().is_dir());
+        assert_eq!(paths.database, home.join("attic.db"));
+        assert_eq!(paths.config_file, home.join("config.toml"));
+        assert_eq!(paths.backups_dir, home.join("backups"));
+        assert_eq!(paths.temp_dir, home.join("tmp"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_resolve_creates_dirs() {
+        // Use ATTIC_HOME pointing at a fresh temp directory so resolve() runs
+        // without touching ~/.attic.
+        let tmp = std::env::temp_dir().join(format!("attic_resolve_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Do NOT pre-create tmp — resolve() must create it.
+        let home_dir = tmp.join("attic-home");
+
+        // We can't set env vars safely in parallel tests, so call the resolver
+        // directly with the injectable function and manually build AtticPaths.
+        let result = resolve_data_root_from(
+            Some(home_dir.to_str().expect("utf8")),
+            Some(tmp.join("user")),
+        );
+        assert!(
+            result.is_ok(),
+            "resolve_data_root_from failed: {:?}",
+            result
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved, home_dir);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

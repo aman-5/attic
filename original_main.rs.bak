@@ -5,6 +5,7 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
+use attic_crossrepo::maintenance as crossrepo_maintenance;
 use attic_discovery::{
     DiscoveryPolicy, SecretScanDecision, canonicalize_within_root, preprocess_file_content,
 };
@@ -36,42 +37,6 @@ use std::{
 };
 use thiserror::Error;
 use tracing::{error, info, warn};
-
-/// Map a poisoned RwLock/Mutex to [`ServerError::Retrieval`] in handler
-/// functions that return `Result<_, ServerError>`.
-macro_rules! lock_or_server_err {
-    ($expr:expr, $name:literal) => {
-        $expr.map_err(|_| {
-            ServerError::Retrieval(format!("server lock poisoned ({}); restart Attic", $name))
-        })
-    };
-}
-
-/// Acquire a lock inside an async `call_tool` handler, returning a structured
-/// `CallToolResult::error` early if the lock is poisoned rather than panicking
-/// the MCP process.  Only valid inside async move blocks returning
-/// `Result<CallToolResponse, McpError>`.
-macro_rules! lock_or_call_err {
-    ($expr:expr, $name:literal) => {
-        match $expr {
-            Ok(g) => g,
-            Err(_) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    serde_json::json!({
-                        "error": "internal_error",
-                        "message": concat!(
-                            "server lock poisoned (",
-                            $name,
-                            "); restart Attic"
-                        )
-                    })
-                    .to_string(),
-                )])
-                .into())
-            }
-        }
-    };
-}
 
 const SERVER_NAME: &str = "attic";
 const SERVER_VERSION: &str = "0.1.0";
@@ -124,8 +89,7 @@ struct AtticServer {
     /// pool/writer/scheduler (see ┬º10-12 of the multi-root design).
     /// `Arc<RwLock<...>>` so the runtime `workspace` tool can add/remove
     /// membership through `&self`.
-    incremental:
-        Arc<std::sync::RwLock<HashMap<String, Arc<attic_incremental::IncrementalService>>>>,
+    incremental: Arc<std::sync::RwLock<HashMap<String, Arc<attic_incremental::IncrementalService>>>>,
     /// Which change-detection mechanism is running per `repository_id`
     /// (absent key = incremental disabled/not yet started for that repo).
     watch_mode: Arc<std::sync::RwLock<HashMap<String, attic_incremental::WatchMode>>>,
@@ -277,13 +241,11 @@ impl AtticServer {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ServerError::InvalidArg("missing 'action' (inspect|add|remove|set)".into())
-            })?
+            .ok_or_else(|| ServerError::InvalidArg("missing 'action' (inspect|add|remove|set)".into()))?
             .to_string();
 
         if action == "inspect" {
-            let active = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+            let active = self.active_roots.read().expect("active_roots poison").clone();
             let configured = self
                 .workspace_configured
                 .load(std::sync::atomic::Ordering::SeqCst);
@@ -303,14 +265,10 @@ impl AtticServer {
         fn validate_root(path: &str) -> Result<PathBuf, ServerError> {
             let p = PathBuf::from(path);
             if !p.exists() {
-                return Err(ServerError::InvalidArg(format!(
-                    "path does not exist: {path}"
-                )));
+                return Err(ServerError::InvalidArg(format!("path does not exist: {path}")));
             }
             if !p.is_dir() {
-                return Err(ServerError::InvalidArg(format!(
-                    "path is not a directory: {path}"
-                )));
+                return Err(ServerError::InvalidArg(format!("path is not a directory: {path}")));
             }
             p.canonicalize()
                 .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
@@ -335,8 +293,7 @@ impl AtticServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
                 let canon = validate_root(path)?;
-                let mut active =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+                let mut active = self.active_roots.read().expect("active_roots poison").clone();
                 if !active.contains(&canon) {
                     active.push(canon);
                 }
@@ -347,13 +304,14 @@ impl AtticServer {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ServerError::InvalidArg("missing 'path' for remove".into()))?;
-                let canon = PathBuf::from(path).canonicalize().map_err(|e| {
-                    ServerError::InvalidArg(format!(
-                        "cannot canonicalize removal path '{path}': {e}"
-                    ))
-                })?;
-                let current =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+                let canon = PathBuf::from(path)
+                    .canonicalize()
+                    .map_err(|e| {
+                        ServerError::InvalidArg(format!(
+                            "cannot canonicalize removal path '{path}': {e}"
+                        ))
+                    })?;
+                let current = self.active_roots.read().expect("active_roots poison").clone();
                 dedup_keep_order(
                     current
                         .into_iter()
@@ -365,9 +323,7 @@ impl AtticServer {
                 let paths = args
                     .get("paths")
                     .and_then(|v| v.as_array())
-                    .ok_or_else(|| {
-                        ServerError::InvalidArg("missing 'paths' (array) for set".into())
-                    })?
+                    .ok_or_else(|| ServerError::InvalidArg("missing 'paths' (array) for set".into()))?
                     .iter()
                     .map(|v| {
                         v.as_str()
@@ -384,7 +340,7 @@ impl AtticServer {
         };
 
         // Compute added/removed roots relative to the current live membership.
-        let old_active = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+        let old_active = self.active_roots.read().expect("active_roots poison").clone();
         let added: Vec<PathBuf> = new_active
             .iter()
             .filter(|r| !old_active.contains(r))
@@ -399,14 +355,15 @@ impl AtticServer {
         // 1. Persist the new membership atomically BEFORE touching live state,
         //    so a crash still leaves a coherent durable config.
         if new_active.is_empty() {
-            remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
+            remove_workspace_config(&self.default_config)
+                .map_err(ServerError::InvalidArg)?;
         } else {
             persist_repositories_config(&self.default_config, &new_active)
                 .map_err(ServerError::InvalidArg)?;
         }
 
         // 2. Update in-memory authoritative membership + configured flag.
-        *lock_or_server_err!(self.active_roots.write(), "active_roots")? = new_active.clone();
+        *self.active_roots.write().expect("active_roots poison") = new_active.clone();
         self.workspace_configured
             .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
 
@@ -438,44 +395,34 @@ impl AtticServer {
             {
                 Ok(Ok(repo_id)) => {
                     // ┬º23: clear any prior degraded-add marker for this root.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.remove(root);
-                    }
-                    let started = self.start_watcher(root, &repo_id);
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .remove(root);
+                    let started = self.start_watcher(&root, &repo_id);
                     events.push(format!(
                         "added + {} root: {}",
-                        if started {
-                            "started watcher for"
-                        } else {
-                            "indexed"
-                        },
+                        if started { "started watcher for" } else { "indexed" },
                         root.display()
                     ));
                 }
                 Ok(Err(e)) => {
                     // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
-                    }
-                    tracing::warn!(
-                        "bootstrap of newly added root {} failed: {e}",
-                        root.display()
-                    );
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .insert(root.clone());
+                    tracing::warn!("bootstrap of newly added root {} failed: {e}", root.display());
+                    events.push(format!("failed to index added root {}: {e}", root.display()));
                 }
                 Err(e) => {
                     // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
-                    }
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .insert(root.clone());
                     tracing::warn!("bootstrap task for {} failed: {e}", root.display());
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
+                    events.push(format!("failed to index added root {}: {e}", root.display()));
                 }
             }
         }
@@ -496,29 +443,22 @@ impl AtticServer {
     /// Stop the live watcher for `repository_id`, if any, and drop its
     /// incremental/watch-mode bookkeeping. Idempotent.
     fn stop_watcher(&self, repository_id: &str) {
-        match self.watches.lock() {
-            Ok(mut g) => {
-                if let Some(mut w) = g.remove(repository_id) {
-                    w.stop();
-                }
-            }
-            Err(_) => {
-                error!(
-                    repository_id,
-                    "watches lock poisoned in stop_watcher; skipping watcher cleanup"
-                );
-            }
+        if let Some(mut watch) = self
+            .watches
+            .lock()
+            .expect("watches poison")
+            .remove(repository_id)
+        {
+            watch.stop();
         }
-        if let Ok(mut g) = self.incremental.write() {
-            g.remove(repository_id);
-        } else {
-            error!(repository_id, "incremental lock poisoned in stop_watcher");
-        }
-        if let Ok(mut g) = self.watch_mode.write() {
-            g.remove(repository_id);
-        } else {
-            error!(repository_id, "watch_mode lock poisoned in stop_watcher");
-        }
+        self.incremental
+            .write()
+            .expect("incremental poison")
+            .remove(repository_id);
+        self.watch_mode
+            .write()
+            .expect("watch_mode poison")
+            .remove(repository_id);
     }
 
     /// Start a watcher for `root` (already bootstrapped/registered as
@@ -527,49 +467,24 @@ impl AtticServer {
     /// and the root remains indexed but incrementally-disabled.
     fn start_watcher(&self, root: &Path, repository_id: &str) -> bool {
         let policy = DiscoveryPolicy::default_git();
-        let service = Arc::new(
-            attic_incremental::IncrementalService::new(root, policy.clone())
-                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
-        );
+        let service =
+            Arc::new(attic_incremental::IncrementalService::new(root, policy.clone())
+                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS));
         match service.start_incremental_watch(self.pool.clone(), self.writer.clone()) {
             Ok(watch) => {
                 let mode = watch.mode();
-                match self.watches.lock() {
-                    Ok(mut g) => {
-                        g.insert(repository_id.to_string(), watch);
-                    }
-                    Err(_) => {
-                        error!(
-                            repository_id = %repository_id,
-                            "watches lock poisoned in start_watcher; watcher created but not registered"
-                        );
-                        return false;
-                    }
-                }
-                match self.watch_mode.write() {
-                    Ok(mut g) => {
-                        g.insert(repository_id.to_string(), mode);
-                    }
-                    Err(_) => {
-                        error!(
-                            repository_id = %repository_id,
-                            "watch_mode lock poisoned in start_watcher; degrading"
-                        );
-                        return false;
-                    }
-                }
-                match self.incremental.write() {
-                    Ok(mut g) => {
-                        g.insert(repository_id.to_string(), service);
-                    }
-                    Err(_) => {
-                        error!(
-                            repository_id = %repository_id,
-                            "incremental lock poisoned in start_watcher; degrading"
-                        );
-                        return false;
-                    }
-                }
+                self.watches
+                    .lock()
+                    .expect("watches poison")
+                    .insert(repository_id.to_string(), watch);
+                self.watch_mode
+                    .write()
+                    .expect("watch_mode poison")
+                    .insert(repository_id.to_string(), mode);
+                self.incremental
+                    .write()
+                    .expect("incremental poison")
+                    .insert(repository_id.to_string(), service);
                 info!(
                     repository_id = %repository_id,
                     root = %root.display(),
@@ -1278,7 +1193,9 @@ fn handle_status(
     // membership or hidden behind an otherwise-current summary.
     let unavailable: Vec<Value> = unavailable_roots
         .iter()
-        .map(|(p, reason)| json!({ "path": p.display().to_string(), "reason": reason }))
+        .map(|(p, reason)| {
+            json!({ "path": p.display().to_string(), "reason": reason })
+        })
         .collect();
     payload["workspace"] = json!({
         "configured": true,
@@ -1537,10 +1454,7 @@ impl ServerHandler for AtticServer {
         let workspace_configured = self
             .workspace_configured
             .load(std::sync::atomic::Ordering::SeqCst);
-        // Clone the Arc so the lock can be acquired inside the async block
-        // using lock_or_call_err! — returning a second async move block from
-        // the synchronous preamble would create a type mismatch.
-        let active_roots_arc = self.active_roots.clone();
+        let active_roots = self.active_roots.read().expect("active_roots poison").clone();
         let crossrepo_degraded = self
             .crossrepo_degraded
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -1549,12 +1463,6 @@ impl ServerHandler for AtticServer {
             request.arguments.unwrap_or_default().into_iter().collect();
 
         async move {
-            // Acquire active_roots inside the async block so a poisoned lock
-            // returns a structured error via lock_or_call_err! rather than
-            // panicking the process or requiring a second async move return
-            // type in the synchronous preamble.
-            let active_roots = lock_or_call_err!(active_roots_arc.read(), "active_roots").clone();
-
             // Phase 7: memory-aware foreground admission.  Each MCP tool call
             // must acquire a foreground slot (hard capacity from configuration)
             // before any work happens; when the server is at capacity the
@@ -1603,34 +1511,38 @@ impl ServerHandler for AtticServer {
                     // a clear structured error identifying the missing configuration
                     // and the path to fix it (the `workspace` MCP tool). `status` and
                     // `workspace inspect` remain available.
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "workspace not configured: no repository roots are configured yet. \
                          Use the `workspace` tool (action=add or set) to configure the \
                          logical workspace, or start the server with ATTIC_CONFIG / \
                          ATTIC_WORKSPACE_ROOT / a persistent <ATTIC_HOME>/config.toml."
-                            .to_string(),
-                    )])
+                    ))])
                     .into());
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
                 "search" => handle_search(&pool, &args, &active_ids),
                 "repo_map" => handle_repo_map(&pool, &args, &active_ids),
                 "status" => {
-                    let inc = lock_or_call_err!(incremental.read(), "incremental");
-                    let wm = lock_or_call_err!(watch_mode.read(), "watch_mode");
+                    let inc = incremental.read().expect("incremental poison");
+                    let wm = watch_mode.read().expect("watch_mode poison");
                     // ┬º23: merge startup unavailable_roots with any in-flight
                     // pending_index_failed entries so status always reflects the
                     // true degraded set without requiring a restart.
-                    let base_unavail =
-                        lock_or_call_err!(self.unavailable_roots.read(), "unavailable_roots");
-                    let failed_guard =
-                        lock_or_call_err!(self.pending_index_failed.lock(), "pending_index_failed");
+                    let base_unavail = self
+                        .unavailable_roots
+                        .read()
+                        .expect("unavailable_roots poison");
+                    let failed_guard = self
+                        .pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison");
                     let mut combined_unavail: Vec<(PathBuf, String)> =
                         base_unavail.iter().cloned().collect();
                     for p in failed_guard.iter() {
                         // Only add if not already present in the base list.
                         if !combined_unavail.iter().any(|(bp, _)| bp == p) {
-                            combined_unavail.push((p.clone(), "indexing_failed".to_string()));
+                            combined_unavail
+                                .push((p.clone(), "indexing_failed".to_string()));
                         }
                     }
                     drop(failed_guard);
@@ -1742,25 +1654,14 @@ fn load_workspace_roots(default_config: &Path) -> anyhow::Result<(ConfigSource, 
         return Ok((ConfigSource::Explicit(path), roots));
     }
     if default_config.exists() {
-        let contents = std::fs::read_to_string(default_config).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to read workspace config '{}': {e}",
-                default_config.display()
-            )
-        })?;
-        let roots = parse_repositories_config(&contents).map_err(|e| {
-            anyhow::anyhow!(
-                "invalid workspace config ('{}'): {e}",
-                default_config.display()
-            )
-        })?;
+        let contents = std::fs::read_to_string(default_config)
+            .map_err(|e| anyhow::anyhow!("failed to read workspace config '{}': {e}", default_config.display()))?;
+        let roots = parse_repositories_config(&contents)
+            .map_err(|e| anyhow::anyhow!("invalid workspace config ('{}'): {e}", default_config.display()))?;
         return Ok((ConfigSource::Persistent, roots));
     }
     if let Some(root) = legacy_root {
-        return Ok((
-            ConfigSource::Legacy(root.clone()),
-            vec![PathBuf::from(root)],
-        ));
+        return Ok((ConfigSource::Legacy(root.clone()), vec![PathBuf::from(root)]));
     }
     Ok((ConfigSource::Unconfigured, Vec::new()))
 }
@@ -1772,8 +1673,7 @@ fn load_workspace_roots(default_config: &Path) -> anyhow::Result<(ConfigSource, 
 /// written inside double quotes verbatim (single-backslash Windows paths
 /// survive as-is, matching the reader's literal quote handling).
 fn serialize_repositories_config(roots: &[PathBuf]) -> String {
-    let mut out =
-        String::from("# Attic workspace configuration (generated by the `workspace` MCP tool)\n");
+    let mut out = String::from("# Attic workspace configuration (generated by the `workspace` MCP tool)\n");
     for root in roots {
         out.push_str("[[repositories]]\n");
         out.push_str(&format!("path = \"{}\"\n", root.display()));
@@ -1788,12 +1688,8 @@ fn persist_repositories_config(path: &Path, roots: &[PathBuf]) -> Result<(), Str
     let tmp = path.with_extension("config.toml.tmp");
     std::fs::write(&tmp, &contents)
         .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        format!(
-            "failed to finalize workspace config '{}': {e}",
-            path.display()
-        )
-    })
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("failed to finalize workspace config '{}': {e}", path.display()))
 }
 
 /// Remove an empty workspace config so a workspace reported as configured for
@@ -1802,10 +1698,7 @@ fn remove_workspace_config(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "failed to remove workspace config '{}': {e}",
-            path.display()
-        )),
+        Err(e) => Err(format!("failed to remove workspace config '{}': {e}", path.display())),
     }
 }
 
@@ -1957,15 +1850,16 @@ async fn main() -> anyhow::Result<()> {
     // Phase 7: platform-appropriate data/cache/temp policy (see
     // attic_core::paths).  The data root is user-global (OS application-data
     // directory); workspaces are never written to.
-    let paths = attic_core::AtticPaths::resolve()?;
+    let paths = attic_core::AtticPaths::resolve();
+    paths.ensure_dirs()?;
     let db_path = paths.db_path();
     info!(
-        "attic starting, db={} (home {})",
+        "attic starting, db={} (data root {})",
         db_path.display(),
-        paths.home.display()
+        paths.data_root.display()
     );
 
-    let server = AtticServer::new(db_path)?;
+    let server = AtticServer::new(&db_path)?;
 
     // Phase 5/7: when the semantic layer is opt-in and opened successfully,
     // it needs a background worker to actually drain the enrichment queue ΓÇö
@@ -2009,7 +1903,7 @@ async fn main() -> anyhow::Result<()> {
     // per the crash recovery contract (┬º3, ┬º5).
     // Open a fresh writer connection just for the verification step; this
     // does not affect the primary writer connection or the connection pool.
-    let (verify_conn, _verify_pool) = attic_storage::open_db(db_path)
+    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path)
         .map_err(|e| anyhow::anyhow!("failed to open verification connection: {e}"))?;
     let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
     drop(verify_conn); // always release the verification connection
@@ -2031,18 +1925,15 @@ async fn main() -> anyhow::Result<()> {
     // status reports UNCONFIGURED, and the MCP `workspace` tool is the
     // configuration entry point), one (legacy single-repository), or many
     // arbitrary/unrelated filesystem paths (multi-root workspace).
-    let default_config = paths.config_file.clone();
+    let default_config = paths.config_path();
     let (config_source, raw_roots) = load_workspace_roots(&default_config)?;
     let validation = validate_configured_roots(raw_roots);
     let roots = validation.valid.clone();
-    match server.unavailable_roots.write() {
-        Ok(mut g) => *g = validation.unavailable.clone(),
-        Err(_) => return Err(anyhow::anyhow!("startup lock poisoned: unavailable_roots")),
-    }
-    match server.active_roots.write() {
-        Ok(mut g) => *g = roots.clone(),
-        Err(_) => return Err(anyhow::anyhow!("startup lock poisoned: active_roots")),
-    }
+    *server
+        .unavailable_roots
+        .write()
+        .expect("unavailable_roots poison") = validation.unavailable.clone();
+    *server.active_roots.write().expect("active_roots poison") = roots.clone();
     server.workspace_configured.store(
         config_source != ConfigSource::Unconfigured,
         std::sync::atomic::Ordering::SeqCst,
@@ -2099,37 +1990,21 @@ async fn main() -> anyhow::Result<()> {
 
         // Phase 6 cross-repository workspace sync: after all repos are
         // indexed, resolve cross-repo dependency edges and persist them.
-        //
-        // Membership scoping (§14/§16/§25):
-        //   • Explicit ATTIC_CONFIG / persistent config.toml (multi-root
-        //     workspace): scope sync to ONLY the bootstrapped repositories
-        //     so historical DB repos cannot contaminate the active snapshot.
-        //   • Legacy ATTIC_WORKSPACE_ROOT (single-root hint): the DB may
-        //     contain more repositories than the one configured root (e.g.
-        //     the test pre-seeds all three repos then points at one root to
-        //     trigger cross-repo resolution). In this mode pass None so the
-        //     sync uses ALL DB repos — the single root is just an indexing
-        //     hint, not an authoritative membership boundary.
+        // This is already workspace-wide (every repository currently in
+        // storage, not just the roots configured for THIS run), so it runs
+        // once regardless of how many roots were just bootstrapped.
         {
             let writer = server.writer.clone();
             let pool = server.pool.clone();
-            let active_ids_for_sync: Option<Vec<String>> = match &config_source {
-                ConfigSource::Explicit(_) | ConfigSource::Persistent => {
-                    Some(bootstrapped.iter().map(|(_, id)| id.clone()).collect())
-                }
-                // Legacy single-root or unconfigured: do not restrict scope.
-                ConfigSource::Legacy(_) | ConfigSource::Unconfigured => None,
-            };
             match tokio::task::spawn_blocking(move || {
-                let opts = attic_crossrepo::maintenance::WorkspaceSyncOptions {
-                    active_repository_ids: active_ids_for_sync,
-                    ..Default::default()
-                };
                 pool.with_reader(|conn| {
-                    attic_crossrepo::maintenance::sync_workspace(conn, &writer, &opts)
-                        .map_err(|e| StorageError::Worker(e.to_string()))
+                    crossrepo_maintenance::sync_workspace(
+                        conn,
+                        &writer,
+                        &crossrepo_maintenance::WorkspaceSyncOptions::default(),
+                    )
+                    .map_err(|e| StorageError::Worker(e.to_string()))
                 })
-                .map_err(|e| StorageError::Worker(e.to_string()))
             })
             .await
             {
@@ -2237,21 +2112,21 @@ async fn main() -> anyhow::Result<()> {
                         "incremental change detection started"
                     );
                     let mode = watch.mode();
-                    if let Ok(mut g) = server.watch_mode.write() {
-                        g.insert(repository_id.clone(), mode);
-                    } else {
-                        error!(repository_id = %repository_id, "watch_mode lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.incremental.write() {
-                        g.insert(repository_id.clone(), service);
-                    } else {
-                        error!(repository_id = %repository_id, "incremental lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.watches.lock() {
-                        g.insert(repository_id.clone(), watch);
-                    } else {
-                        error!(repository_id = %repository_id, "watches lock poisoned in startup watcher loop");
-                    }
+                    server
+                        .watch_mode
+                        .write()
+                        .expect("watch_mode poison")
+                        .insert(repository_id.clone(), mode);
+                    server
+                        .incremental
+                        .write()
+                        .expect("incremental poison")
+                        .insert(repository_id.clone(), service);
+                    server
+                        .watches
+                        .lock()
+                        .expect("watches poison")
+                        .insert(repository_id.clone(), watch);
                 }
                 Err(e) => {
                     error!(
@@ -2349,16 +2224,16 @@ async fn serve_until_closed(
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
     //    threads poll a stop flag / condvar, not indefinite blocking I/O).
-    {
-        let mut watches_guard = watches_for_shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        for watch in watches_guard.values_mut() {
-            watch.stop();
-        }
-    } // MutexGuard is definitely dropped here
-
+    let mut watches_guard = watches_for_shutdown
+        .lock()
+        .expect("watches poison");
+    let mut live_watches: Vec<&mut attic_incremental::IncrementalWatch> =
+        watches_guard.values_mut().collect();
+    for w in live_watches.iter_mut() {
+        w.stop();
+    }
+    drop(live_watches);
+    drop(watches_guard);
     if let Some(sched) = sched_handle {
         sched.shutdown();
     }
@@ -2535,21 +2410,13 @@ mod tests {
         // the missing root must be skipped rather than failing everything.
         let raw = vec![real.clone(), missing, real.join(".")];
         let out = validate_configured_roots(raw);
-        assert_eq!(
-            out.valid.len(),
-            1,
-            "expected exactly one deduped valid root"
-        );
+        assert_eq!(out.valid.len(), 1, "expected exactly one deduped valid root");
         assert_eq!(out.valid[0], real.canonicalize().unwrap());
         // ┬º17: the missing root is preserved as configured-but-unavailable,
         // never silently discarded.
         assert_eq!(out.unavailable.len(), 1, "missing root must be reported");
         // The third raw entry canonicalizes to the same real root ΓåÆ duplicate.
-        assert_eq!(
-            out.duplicates.len(),
-            1,
-            "canonical duplicate must be reported"
-        );
+        assert_eq!(out.duplicates.len(), 1, "canonical duplicate must be reported");
     }
 
     #[test]
@@ -2560,17 +2427,9 @@ mod tests {
 
         // Three configured roots with NO common parent; the middle one is
         // broken. Both good roots must still validate (failure isolation).
-        let raw = vec![
-            tmp_a.path().to_path_buf(),
-            broken.clone(),
-            tmp_c.path().to_path_buf(),
-        ];
+        let raw = vec![tmp_a.path().to_path_buf(), broken.clone(), tmp_c.path().to_path_buf()];
         let out = validate_configured_roots(raw);
-        assert_eq!(
-            out.valid.len(),
-            2,
-            "the two valid unrelated roots must survive"
-        );
+        assert_eq!(out.valid.len(), 2, "the two valid unrelated roots must survive");
         assert!(out.valid.contains(&tmp_a.path().canonicalize().unwrap()));
         assert!(out.valid.contains(&tmp_c.path().canonicalize().unwrap()));
         // ┬º17: the broken root is reported as unavailable with a reason.
@@ -2996,9 +2855,7 @@ mod tests {
         a.insert("repository_id".into(), json!(id));
         a.insert("path".into(), json!("f.txt"));
         a.insert("start_byte".into(), json!(u64::MAX));
-        let err = handle_file(&srv.pool, &a, &ids(&srv))
-            .unwrap_err()
-            .to_string();
+        let err = handle_file(&srv.pool, &a, &ids(&srv)).unwrap_err().to_string();
         assert!(
             err.contains("maximum allowed") || err.contains("non-negative"),
             "{err}"
@@ -3290,16 +3147,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(
-            &srv.pool,
-            &HashMap::new(),
-            &HashMap::new(),
-            None,
-            true,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let r = handle_status(&srv.pool, &HashMap::new(), &HashMap::new(), None, true, &[], &[]).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -3362,7 +3210,6 @@ mod tests {
         tmp: &TempDir,
     ) -> (std::process::Child, std::process::ChildStdin) {
         let mut child = Command::new(bin)
-            .env("ATTIC_HOME", tmp.path())
             .env(
                 "ATTIC_DB_PATH",
                 tmp.path().join("test.db").to_str().unwrap(),
@@ -4114,16 +3961,8 @@ mod tests {
 
         // ΓöÇΓöÇ workspace-wide search: each marker resolves to a DISTINCT repo,
         //    and the returned path never crosses into another root ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        let search_for = |id: u64,
-                          query: &str,
-                          stdin: &mut std::process::ChildStdin,
-                          child: &mut std::process::Child|
-         -> (String, String) {
-            let call = mcp_request(
-                id,
-                "tools/call",
-                json!({"name":"search","arguments":{"query": query}}),
-            );
+        let search_for = |id: u64, query: &str, stdin: &mut std::process::ChildStdin, child: &mut std::process::Child| -> (String, String) {
+            let call = mcp_request(id, "tools/call", json!({"name":"search","arguments":{"query": query}}));
             let resp = send_recv(child, stdin, &call);
             let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
@@ -4134,10 +3973,7 @@ mod tests {
                 "expected exactly one workspace-wide hit for {query}, got: {text}"
             );
             (
-                results[0]["repository_id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
+                results[0]["repository_id"].as_str().unwrap_or("").to_string(),
                 results[0]["path"].as_str().unwrap_or("").to_string(),
             )
         };
@@ -4177,9 +4013,7 @@ mod tests {
             json!({"name":"file","arguments":{"repository_id": repo_a_id, "path": "alpha.txt"}}),
         );
         let file_resp = send_recv(&mut child, &mut stdin, &file_call);
-        let file_text = file_resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let file_text = file_resp["result"]["content"][0]["text"].as_str().unwrap_or("");
         assert!(
             file_text.contains("ALPHA_MARKER_TOKEN"),
             "file tool must read repo A's own alpha.txt: {file_text:.300}"
@@ -4227,7 +4061,8 @@ mod tests {
 
         // load_workspace_roots reads env vars ΓÇö only safe when ambient vars
         // are not set (avoid racy env mutation in parallel test threads).
-        if std::env::var("ATTIC_CONFIG").is_err() && std::env::var("ATTIC_WORKSPACE_ROOT").is_err()
+        if std::env::var("ATTIC_CONFIG").is_err()
+            && std::env::var("ATTIC_WORKSPACE_ROOT").is_err()
         {
             let result = load_workspace_roots(&cfg);
             let msg = result.unwrap_err().to_string();

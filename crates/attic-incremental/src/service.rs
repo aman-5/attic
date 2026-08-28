@@ -470,7 +470,7 @@ impl IncrementalService {
                 .store(true, Ordering::SeqCst);
             let repo_id = self.resolve_repo(pool)?;
             mark_paths_unknown(writer, &repo_id, &cs.uncertain)?;
-            recovery::schedule_reconciliation(writer)?;
+            recovery::schedule_reconciliation_for(writer, &repo_id)?;
         }
 
         // ── Verified restorations: hash matched ⇒ UNKNOWN→CURRENT ─────────
@@ -482,7 +482,8 @@ impl IncrementalService {
 
         if cs.policy_changed {
             debug!("discovery-policy input changed; scheduling targeted rediscovery");
-            recovery::schedule_reconciliation(writer)?;
+            let repo_id = self.resolve_repo(pool)?;
+            recovery::schedule_reconciliation_for(writer, &repo_id)?;
             report.policy_rediscovery_scheduled = true;
         }
 
@@ -511,7 +512,7 @@ impl IncrementalService {
                     &repo_id,
                     &cs.touched_paths().into_iter().collect::<Vec<_>>(),
                 )?;
-                recovery::schedule_reconciliation(writer)?;
+                recovery::schedule_reconciliation_for(writer, &repo_id)?;
                 report.queue_saturated = true;
             }
         }
@@ -698,7 +699,7 @@ impl IncrementalService {
                             let drops = svc_pump.note_raw_drops(&dropped);
                             if drops > 0 {
                                 // Saturation ⇒ authoritative rescan, deduped.
-                                let _ = recovery::schedule_reconciliation(&writer);
+                                schedule_reconciliation_for_service(&svc_pump, &pool, &writer);
                             }
                             if !normalized.is_empty() {
                                 svc_pump.ingest(&normalized);
@@ -711,12 +712,12 @@ impl IncrementalService {
                         Ok(PumpMsg::Batch(Err(errors))) => {
                             let drops = svc_pump.note_raw_drops(&dropped);
                             if drops > 0 {
-                                let _ = recovery::schedule_reconciliation(&writer);
+                                schedule_reconciliation_for_service(&svc_pump, &pool, &writer);
                             }
                             for e in errors {
                                 svc_pump.on_watcher_error(&e.to_string());
                             }
-                            let _ = recovery::schedule_reconciliation(&writer);
+                            schedule_reconciliation_for_service(&svc_pump, &pool, &writer);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             if std::env::var("ATTIC_PUMP_TRACE").is_ok() {
@@ -727,7 +728,7 @@ impl IncrementalService {
                             // watcher produced nothing further.
                             let drops = svc_pump.note_raw_drops(&dropped);
                             if drops > 0 {
-                                let _ = recovery::schedule_reconciliation(&writer);
+                                schedule_reconciliation_for_service(&svc_pump, &pool, &writer);
                             }
                             if let Err(e) = svc_pump.apply_pending(&pool, &writer, None) {
                                 warn!(error = %e, "watch pump tick apply failed");
@@ -868,6 +869,25 @@ pub(crate) fn apply_restored(
         }
         Ok(())
     })
+}
+
+/// Best-effort reconciliation trigger from the watch pump thread, scoped to
+/// this service's own repository when it is already resolved. Falls back to
+/// the repository-less legacy form when the repository has not been
+/// bootstrapped yet — never silently reconciles a DIFFERENT repository.
+fn schedule_reconciliation_for_service(
+    svc: &IncrementalService,
+    pool: &DbPool,
+    writer: &WriterQueueHandle,
+) {
+    match svc.resolve_repo(pool).ok() {
+        Some(repo_id) => {
+            let _ = recovery::schedule_reconciliation_for(writer, &repo_id);
+        }
+        None => {
+            let _ = recovery::schedule_reconciliation(writer);
+        }
+    }
 }
 
 /// Mark specific paths' latest occurrences UNKNOWN (trust degradation).

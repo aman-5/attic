@@ -53,15 +53,28 @@ Attic's tools when it needs repository knowledge.
 
 Add it to your client's MCP server configuration:
 
+**Recommended (no environment variables needed):** just add the server —
+Attic connects even with nothing configured, then you configure it by simply
+telling your AI client:
+
+> Configure Attic with these repositories:
+> `C:\Users\me\Desktop\Dump`
+> `C:\work\HDFC`
+> `D:\repos\HDFC-Bank-on-prem`
+
+The AI invokes Attic's `workspace` MCP tool; Attic validates the roots,
+persists them atomically to `~/.attic/config.toml` (override the location
+with `ATTIC_HOME`), indexes and watches each repository, and reloads the
+same workspace automatically on every subsequent launch. Roots may live
+anywhere on disk — no common parent, no symlinks, one process, one database.
+
 ```json
 {
   "mcpServers": {
     "attic": {
       "command": "/absolute/path/to/attic-server",
       "args": [],
-      "env": {
-        "ATTIC_WORKSPACE_ROOT": "/absolute/path/to/your/repo"
-      }
+      "env": {}
     }
   }
 }
@@ -73,7 +86,7 @@ Add it to your client's MCP server configuration:
 {
   "mcpServers": {
     "attic": {
-      "command": "C:\\Users\\you\\AppData\\Local\\attic\\bin\\attic-server.exe",
+      "command": "C:\\Users\\you\\.attic\\bin\\attic-server.exe",
       "args": [],
       "env": {
         "ATTIC_WORKSPACE_ROOT": "C:\\Users\\you\\code\\myrepo"
@@ -89,7 +102,7 @@ Add it to your client's MCP server configuration:
 {
   "mcpServers": {
     "attic": {
-      "command": "/home/you/.local/share/attic/bin/attic-server",
+      "command": "/home/you/.attic/bin/attic-server",
       "args": [],
       "env": {
         "ATTIC_WORKSPACE_ROOT": "/home/you/code/myrepo"
@@ -146,39 +159,67 @@ surface.
 
 ## Workspaces & Multiple Repositories
 
-**Single repository:**
+**Configuration precedence** (deterministic, never silently combined):
+
+1. `ATTIC_CONFIG=<path>` — explicit multi-root config file
+2. `<ATTIC_HOME>/config.toml` (default `~/.attic/config.toml`) — persistent
+   workspace config, written automatically by the `workspace` MCP tool
+3. `ATTIC_WORKSPACE_ROOT=<path>` — legacy single-repository convenience
+4. none — UNCONFIGURED first run; configure through the `workspace` MCP tool
+
+**Single repository (legacy):**
 
 ```sh
 # .env / MCP client config
 ATTIC_WORKSPACE_ROOT=/home/you/projects/my-app   # or C:\projects\my-app
 ```
 
-**Multiple repositories** (a realistic workspace of 20–30+ services):
+**Multiple repositories, anywhere on disk:** a realistic workspace is
+rarely one directory tree — repositories often live in unrelated
+locations with no common parent, e.g.:
 
 ```text
-workspace/
-├── frontend/
-├── api/
-├── auth-service/
-├── payments/
-├── shared-libs/
-└── infrastructure/
+C:\Users\amanbansal\Desktop\Dump
+C:\Adobe-Projects\EDS\HDFC
+C:\Adobe-Projects\HDFC-Bank-on-prem
 ```
 
-Point `ATTIC_WORKSPACE_ROOT` at the parent directory. Discovery treats
-**any nested Git repository boundary** — a true Git submodule *or* a
-plain, independently-cloned repository sitting under the workspace root —
-as its own `core_repositories` entry with independent source/index state;
-this does not require `.gitmodules`. Cross-repository dependency
-resolution (`attic-crossrepo`) then runs automatically at startup,
-resolving edges like "which repositories depend on the shared auth
-package" from each repository's own manifests (`package.json`,
-`pom.xml`, `go.mod`, `.gitmodules`, etc.).
+Set `ATTIC_CONFIG` to a small config file listing each root explicitly —
+no symlinks, no moving repositories under one directory, no Git
+submodules, and no additional MCP entries/databases:
 
-A **single** `attic` process owns one workspace/database: one watcher, one
-MCP transport, one SQLite writer. Attic does not support multiple
-processes writing to the same database concurrently — give each
-concurrently running instance its own `ATTIC_DATA_DIR`.
+```text
+[[repositories]]
+path = "C:\Users\amanbansal\Desktop\Dump"
+
+[[repositories]]
+path = "C:\Adobe-Projects\EDS\HDFC"
+
+[[repositories]]
+path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+```
+
+```sh
+# .env / MCP client config
+ATTIC_CONFIG=/absolute/path/to/attic-workspace.conf
+```
+
+`ATTIC_CONFIG` and `ATTIC_WORKSPACE_ROOT` are mutually exclusive — set only
+one. Each configured root is validated (must exist, be a directory,
+canonicalize) and indexed/watched independently; a root that fails
+validation is skipped (logged) rather than failing the other configured
+repositories. Cross-repository dependency resolution (`attic-crossrepo`)
+then runs automatically at startup across every repository currently
+known to storage, resolving edges like "which repositories depend on the
+shared auth package" from each repository's own manifests (`package.json`,
+`pom.xml`, `go.mod`, `.gitmodules`, etc.) — arbitrary, unrelated roots work
+exactly like repositories that happen to share a parent directory.
+
+A **single** `attic` process owns one logical workspace and one
+database: one coordinated writer queue, one MCP transport, one watcher
+per configured repository. Attic does **not** support multiple `attic-server` processes writing to the same database
+concurrently — give each concurrently running instance its own
+`ATTIC_HOME`.
 
 ## Project Knowledge
 
@@ -251,8 +292,9 @@ All configuration is via environment variables — there are no CLI flags.
 
 | Variable | Purpose |
 |---|---|
-| `ATTIC_WORKSPACE_ROOT` | Repository (or multi-repo parent) root to index and watch. Omit to serve whatever is already indexed without indexing anything new. |
-| `ATTIC_DATA_DIR` | Overrides the data directory (default: platform application-data dir). |
+| `ATTIC_WORKSPACE_ROOT` | Single repository root to index and watch. Omit to start UNCONFIGURED (no `~/.attic/config.toml`) or resume from persistent config. Mutually exclusive with `ATTIC_CONFIG`. |
+| `ATTIC_CONFIG` | Path to a workspace config file listing multiple `[[repositories]]` roots (arbitrary locations, no common parent required). Mutually exclusive with `ATTIC_WORKSPACE_ROOT`. See [Workspaces & Multiple Repositories](#workspaces--multiple-repositories). |
+| `ATTIC_HOME` | Overrides the Attic application home directory (default: `~/.attic`). Config, database, and runtime state all derive from this location. An empty `ATTIC_HOME` is a startup error — unset it or provide a valid path. |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
 | `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
@@ -262,13 +304,12 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_manager.rs`. |
 | `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
 
-Data root resolution order: `ATTIC_DATA_DIR` → `ATTIC_DB_PATH`'s parent
-directory → platform default (`%LOCALAPPDATA%\attic` on Windows,
-`~/Library/Application Support/attic` on macOS, `$XDG_DATA_HOME/attic` or
-`~/.local/share/attic` on Linux) → `./attic-data` as a last resort. `setup.sh`
-/ `setup.ps1` install the binary itself under `<data root>/bin/`, alongside
-(but separate from) this same directory. Attic never writes into your
-workspace — all index state is user-global.
+Home resolution: `ATTIC_HOME` (if set and non-empty) → `~/.attic` (derived
+from the OS user home directory). Setting `ATTIC_HOME` to an empty string is
+a startup error — unset it or provide a valid path. `ATTIC_DB_PATH` is
+supported as an explicit database path override for advanced/testing use.
+Attic never writes into your workspace — all index state is stored under the
+Attic home directory.
 
 ### Semantic search (optional)
 
@@ -281,7 +322,7 @@ flag. Canonical (lexical/structural) retrieval never depends on it.
 ## Troubleshooting
 
 - **Server exits immediately on startup**: check stderr for a fail-closed
-  message — usually a corrupted database (try a fresh `ATTIC_DATA_DIR` to
+  message — usually a corrupted database (try a fresh `ATTIC_HOME` to
   isolate) or a workspace bootstrap failure (bad permissions, path doesn't
   exist).
 - **`status` reports degraded cross-repo state**: cross-repository

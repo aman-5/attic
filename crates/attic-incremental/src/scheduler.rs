@@ -13,7 +13,8 @@ use attic_indexing::IndexOptions;
 use attic_storage::{
     ClaimedTask, DbPool, EnqueueOutcome, IncrementalTaskPayload, ResourceMonitor,
     TASK_INCREMENTAL_INDEX, TASK_RECONCILIATION, TaskCounts, TaskOutcome, WriterQueueHandle,
-    claim_next_pending_task, enqueue_task, finish_task, get_task_counts, set_task_checkpoint,
+    claim_next_pending_task, enqueue_task, finish_task, get_repository_path, get_task_counts,
+    set_task_checkpoint,
 };
 
 use crate::changeset::VerifiedChangeSet;
@@ -388,6 +389,25 @@ fn execute_task(
     task: &ClaimedTask,
     monitor: Option<&ResourceMonitor>,
 ) -> TaskOutcome {
+    // Multi-root correctness: the scheduler's task queue is shared across
+    // every configured repository, so the caller-supplied `root` (a single
+    // default, kept for legacy single-repo callers) must never be applied
+    // to a task that actually belongs to a different repository. Resolve
+    // the task's OWN repository root from storage and shadow `root` with
+    // it; only tasks with no repository_id (legacy/global reconciliation)
+    // fall back to the caller-supplied default.
+    let resolved_root: std::path::PathBuf = task
+        .repository_id
+        .as_deref()
+        .and_then(|rid| rid.parse::<attic_core::RepositoryId>().ok())
+        .and_then(|typed| {
+            pool.with_reader(|c| get_repository_path(c, &typed))
+                .ok()
+                .flatten()
+        })
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.to_path_buf());
+    let root: &std::path::Path = &resolved_root;
     match task.task_type.as_str() {
         TASK_INCREMENTAL_INDEX => {
             let payload: Option<IncrementalTaskPayload> =

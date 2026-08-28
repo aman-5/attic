@@ -135,7 +135,7 @@ fn bench_traversal_linear_chain(c: &mut criterion::Criterion) {
         .unwrap();
         rev_ids.push(srid.to_string_repr().to_string());
     }
-    for i in 0..9 {
+    for (i, rev_id) in rev_ids.iter().enumerate().take(9) {
         let src_id =
             uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("bench-r{i}").as_bytes())
                 .to_string();
@@ -154,7 +154,7 @@ fn bench_traversal_linear_chain(c: &mut criterion::Criterion) {
             0.9,
             "GO_MODULE",
             "{}",
-            &rev_ids[i],
+            rev_id,
         )
         .unwrap();
     }
@@ -206,7 +206,7 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
         .unwrap();
         rev_ids.push(srid.to_string_repr().to_string());
     }
-    for i in 0..9 {
+    for (i, rev_id) in rev_ids.iter().enumerate().take(9) {
         let src_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, format!("imp-r{i}").as_bytes())
             .to_string();
         let tgt_id = uuid::Uuid::new_v5(
@@ -224,7 +224,7 @@ fn bench_impact_linear_chain(c: &mut criterion::Criterion) {
             0.9,
             "GO_MODULE",
             "{}",
-            &rev_ids[i],
+            rev_id,
         )
         .unwrap();
     }

@@ -161,7 +161,9 @@ async fn rmcp_client_full_lifecycle_over_stdio() {
         .await
         .expect("status tool");
     let v: Value = serde_json::from_str(&status_text).expect("status payload is JSON");
-    assert_eq!(v["status"], "ok", "{status_text}");
+    // No workspace configured in this test: status must succeed but report
+    // UNCONFIGURED rather than fabricate an authoritative empty workspace.
+    assert_eq!(v["status"], "unconfigured", "{status_text}");
 
     // 4. Unknown tool yields error content through normal MCP results.
     let unknown = call_tool_text(&mut srv, "does_not_exist", serde_json::json!({}))
@@ -382,12 +384,20 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
             .await
             .expect("status tool");
         let v: Value = serde_json::from_str(&status_text).expect("status payload is JSON");
-        if let Some(watcher) = v.get("watcher") {
-            let mode = watcher.get("mode").and_then(|m| m.as_str()).unwrap_or("");
-            if mode == "native-watcher" || mode == "periodic-reconciliation" {
-                watcher_ready = true;
-                break;
-            }
+        // Multi-root `status` reports one watcher per repository under
+        // `workspace.repositories[]`, not a single top-level `watcher`.
+        let any_watcher_ready = v["workspace"]["repositories"]
+            .as_array()
+            .map(|repos| {
+                repos.iter().any(|r| {
+                    let mode = r["watcher"]["mode"].as_str().unwrap_or("");
+                    mode == "native-watcher" || mode == "periodic-reconciliation"
+                })
+            })
+            .unwrap_or(false);
+        if any_watcher_ready {
+            watcher_ready = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -526,4 +536,194 @@ async fn rmcp_client_crossrepo_multi_repo_fixture() {
     let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close())
         .await
         .expect("graceful shutdown timed out");
+}
+
+/// REQUIRED first-run workspace-lifecycle gate (spec §8/§10/§11/§36):
+///
+/// A pristine Attic install with an empty ATTIC_HOME must start over stdio,
+/// report UNCONFIGURED, refuse retrieval until configured, then be configured
+/// ENTIRELY at runtime through the `workspace` MCP tool with three arbitrary
+/// UNRELATED roots (no common parent). The membership must be persisted to
+/// <ATTIC_HOME>/config.toml, survive a full process restart, and support
+/// runtime removal.
+#[tokio::test]
+async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("attic-home");
+
+    // Spawn with ONLY an explicit ATTIC_HOME: no ATTIC_DB_PATH, no
+    // ATTIC_CONFIG, no ATTIC_WORKSPACE_ROOT.
+    fn spawn(bin: &Path, home: &Path) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.env("ATTIC_HOME", home)
+            .env_remove("ATTIC_DB_PATH")
+            .env_remove("ATTIC_CONFIG")
+            .env_remove("ATTIC_WORKSPACE_ROOT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd
+    }
+    async fn connect_home(bin: &Path, home: &Path) -> ServerHandle {
+        let mut child = spawn(bin, home).spawn().expect("spawn attic server");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stdin = child.stdin.take().expect("stdin piped");
+        let service = match tokio::time::timeout(IO_TIMEOUT, ().serve((stdout, stdin))).await {
+            Ok(Ok(s)) => s,
+            other => panic!("rmcp handshake failed: {other:?}"),
+        };
+        ServerHandle { child, service }
+    }
+
+    // Three arbitrary, deliberately UNRELATED roots with no common parent.
+    let roots = ["repoalpha", "repobeta", "repogamma"];
+    let mut tokens = Vec::new();
+    for (i, name) in roots.iter().enumerate() {
+        let dir = tmp.path().join(format!("root{i}_{name}"));
+        std::fs::create_dir_all(&dir).expect("create root");
+        let token = format!("first_run_token_{name}");
+        std::fs::write(
+            dir.join(format!("{name}_probe.rs")),
+            format!("pub fn {token}() {{}}\n"),
+        )
+        .expect("write probe");
+        tokens.push(token);
+    }
+    // Server-side validation canonicalizes roots (on Windows this adds the
+    // \?\ extended-length prefix), so the persisted config holds canonical
+    // paths. Mirror that here for the on-disk assertions.
+    let root_paths: Vec<String> = (0..3)
+        .map(|i| {
+            std::fs::canonicalize(tmp.path().join(format!("root{i}_{}", roots[i])))
+                .expect("canonicalize root")
+                .display()
+                .to_string()
+        })
+        .collect();
+
+    // ── First run: UNCONFIGURED ──
+    let mut srv = connect_home(&bin, &home).await;
+
+    let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status on pristine install");
+    let v: Value = serde_json::from_str(&status_text).expect("status JSON");
+    assert_eq!(
+        v["status"], "unconfigured",
+        "pristine install: {status_text}"
+    );
+
+    let search_err = call_tool_text(
+        &mut srv,
+        "search",
+        serde_json::json!({ "query": "anything" }),
+    )
+    .await
+    .unwrap_or_else(|e| e);
+    assert!(
+        search_err.contains("workspace not configured"),
+        "search must refuse while UNCONFIGURED, got {search_err:?}"
+    );
+
+    // ── Configure entirely at runtime through the `workspace` tool ──
+    for p in &root_paths {
+        let resp = call_tool_text(
+            &mut srv,
+            "workspace",
+            serde_json::json!({ "action": "add", "path": p }),
+        )
+        .await
+        .expect("workspace add");
+        assert!(resp.contains("config.toml"), "add response: {resp}");
+    }
+
+    let inspect = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({ "action": "inspect" }),
+    )
+    .await
+    .expect("workspace inspect");
+    let v: Value = serde_json::from_str(&inspect).expect("inspect JSON");
+    assert_eq!(v["membership_count"], 3, "{inspect}");
+    assert_eq!(v["configured"], true, "{inspect}");
+
+    // Membership was durably persisted to <ATTIC_HOME>/config.toml.
+    let cfg = std::fs::read_to_string(home.join("config.toml")).expect("persistent config");
+    for p in &root_paths {
+        assert!(cfg.contains(p), "config.toml must contain {p}: {cfg}");
+    }
+
+    // Each root is independently indexed and searchable through the SAME
+    // process/DB (bootstrap is synchronous inside the workspace call).
+    for token in &tokens {
+        let mut found = false;
+        for _ in 0..30 {
+            let text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token }))
+                .await
+                .unwrap_or_else(|e| e);
+            let v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => panic!("search returned non-JSON: {text}"),
+            };
+            if v["results"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(found, "token {token} never became searchable");
+    }
+
+    let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status after configure");
+    let v: Value = serde_json::from_str(&status_text).unwrap();
+    assert_eq!(
+        v["workspace"]["configured_repository_count"], 3,
+        "{status_text}"
+    );
+
+    // Graceful shutdown, then restart from the SAME ATTIC_HOME.
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
+    drop(srv);
+
+    let mut srv = connect_home(&bin, &home).await;
+    let inspect = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({ "action": "inspect" }),
+    )
+    .await
+    .expect("inspect after restart");
+    let v: Value = serde_json::from_str(&inspect).expect("inspect JSON");
+    assert_eq!(
+        v["membership_count"], 3,
+        "membership must persist: {inspect}"
+    );
+
+    // Runtime removal through MCP, verified both live and on disk.
+    let removed = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({ "action": "remove", "path": root_paths[1] }),
+    )
+    .await
+    .expect("workspace remove");
+    let v: Value = serde_json::from_str(&removed).unwrap();
+    assert_eq!(v["membership_count"], 2, "{removed}");
+
+    let cfg = std::fs::read_to_string(home.join("config.toml")).expect("config after remove");
+    assert!(
+        !cfg.contains(&root_paths[1]),
+        "removed root must leave config: {cfg}"
+    );
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
 }
