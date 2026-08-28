@@ -5,7 +5,6 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
-use attic_crossrepo::maintenance as crossrepo_maintenance;
 use attic_discovery::{
     DiscoveryPolicy, SecretScanDecision, canonicalize_within_root, preprocess_file_content,
 };
@@ -442,7 +441,7 @@ impl AtticServer {
                     if let Ok(mut g) = self.pending_index_failed.lock() {
                         g.remove(root);
                     }
-                    let started = self.start_watcher(&root, &repo_id);
+                    let started = self.start_watcher(root, &repo_id);
                     events.push(format!(
                         "added + {} root: {}",
                         if started {
@@ -1604,12 +1603,13 @@ impl ServerHandler for AtticServer {
                     // a clear structured error identifying the missing configuration
                     // and the path to fix it (the `workspace` MCP tool). `status` and
                     // `workspace inspect` remain available.
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         "workspace not configured: no repository roots are configured yet. \
                          Use the `workspace` tool (action=add or set) to configure the \
                          logical workspace, or start the server with ATTIC_CONFIG / \
                          ATTIC_WORKSPACE_ROOT / a persistent <ATTIC_HOME>/config.toml."
-                    ))])
+                            .to_string(),
+                    )])
                     .into());
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
@@ -1965,7 +1965,7 @@ async fn main() -> anyhow::Result<()> {
         paths.home.display()
     );
 
-    let server = AtticServer::new(&db_path)?;
+    let server = AtticServer::new(db_path)?;
 
     // Phase 5/7: when the semantic layer is opt-in and opened successfully,
     // it needs a background worker to actually drain the enrichment queue ΓÇö
@@ -2009,7 +2009,7 @@ async fn main() -> anyhow::Result<()> {
     // per the crash recovery contract (┬º3, ┬º5).
     // Open a fresh writer connection just for the verification step; this
     // does not affect the primary writer connection or the connection pool.
-    let (verify_conn, _verify_pool) = attic_storage::open_db(&db_path)
+    let (verify_conn, _verify_pool) = attic_storage::open_db(db_path)
         .map_err(|e| anyhow::anyhow!("failed to open verification connection: {e}"))?;
     let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
     drop(verify_conn); // always release the verification connection
@@ -2349,16 +2349,16 @@ async fn serve_until_closed(
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
     //    threads poll a stop flag / condvar, not indefinite blocking I/O).
-    let mut watches_guard = watches_for_shutdown
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut live_watches: Vec<&mut attic_incremental::IncrementalWatch> =
-        watches_guard.values_mut().collect();
-    for w in live_watches.iter_mut() {
-        w.stop();
-    }
-    drop(live_watches);
-    drop(watches_guard);
+    {
+        let mut watches_guard = watches_for_shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        for watch in watches_guard.values_mut() {
+            watch.stop();
+        }
+    } // MutexGuard is definitely dropped here
+
     if let Some(sched) = sched_handle {
         sched.shutdown();
     }
