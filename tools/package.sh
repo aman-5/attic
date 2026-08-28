@@ -123,4 +123,18 @@ case "$TARGET" in
   *) (cd "$OUT" && tar -czf "${NAME}.tar.gz" "$NAME") ;;
 esac
 
-echo "OK: $ARCHIVE (+ compressed archive in $OUT)"
+# Checksum the compressed archive (not the staged directory) so a
+# zero-toolchain setup script can verify the exact file it downloaded
+# before ever executing it.
+COMPRESSED="$(find "$OUT" -maxdepth 1 -name "${NAME}.*" -type f | head -1)"
+if [[ -n "$COMPRESSED" ]]; then
+  if command -v sha256sum >/dev/null; then
+    (cd "$OUT" && sha256sum "$(basename "$COMPRESSED")" > "$(basename "$COMPRESSED").sha256")
+  elif command -v shasum >/dev/null; then
+    (cd "$OUT" && shasum -a 256 "$(basename "$COMPRESSED")" > "$(basename "$COMPRESSED").sha256")
+  else
+    echo "WARN: no sha256sum/shasum found — skipping checksum file" >&2
+  fi
+fi
+
+echo "OK: $ARCHIVE (+ compressed archive + .sha256 in $OUT)"
