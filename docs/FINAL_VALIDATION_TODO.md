@@ -52,8 +52,9 @@ criteria, before Attic can be called production-ready.
 - [ ] Clean binary installation test
   - Prerequisite: a release archive built by CI (not hand-staged).
   - Workload: on a machine with no Rust/Cargo/MSVC/MinGW/Xcode/GCC/Node
-    installed, extract the archive and run `attic-server` against
-    `ATTIC_WORKSPACE_ROOT` pointing at a real repo; drive one `initialize`
+    installed, extract the archive and run `attic-server` (the packaged,
+    renamed binary — see `tools/package.sh`) against `ATTIC_WORKSPACE_ROOT`
+    pointing at a real repo; drive one `initialize`
     → `tools/call(search)` round-trip over stdio.
   - Acceptance: server starts, indexes, answers a query, shuts down
     cleanly (clean-shutdown marker recorded) without any toolchain present.

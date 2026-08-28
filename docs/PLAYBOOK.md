@@ -9,7 +9,7 @@ install/config quick-starts, see `README.md`.
 ### Start
 
 ```sh
-ATTIC_WORKSPACE_ROOT=/path/to/repo attic-server   # attic-server.exe on Windows
+ATTIC_WORKSPACE_ROOT=/path/to/repo target/release/attic   # target\release\attic.exe on Windows
 ```
 
 Omitting `ATTIC_WORKSPACE_ROOT` still starts the server (serves whatever is
@@ -77,7 +77,7 @@ reset (below) is the supported way to force a clean slate.
 
 See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
 `ATTIC_WORKSPACE_ROOT`, repositories linked as Git submodules underneath it.
-**Do not** run two `attic-server` processes against the same `attic.db` —
+**Do not** run two `attic` processes against the same `attic.db` —
 this is not a supported or tested configuration; give each concurrently
 running instance its own `ATTIC_DATA_DIR`.
 
@@ -120,6 +120,21 @@ or `0`) at any time is safe — delete `semantic.db` if you also want to
 reclaim disk; canonical retrieval never depends on it.
 
 ## Troubleshooting
+
+Quick reference — see the detailed entries below each row for exact checks:
+
+| Problem | What to check |
+|---|---|
+| MCP won't connect | executable path, stderr (not stdout), stdio not intercepted |
+| Repository missing | `ATTIC_WORKSPACE_ROOT`/submodules, `.gitignore`, `status.db.repository_count` |
+| File appears "ignored" | discovery/`.gitignore` policy (`DiscoveryPolicy::default_git()`) |
+| Results stale | startup reconciliation, `[index freshness: ...]` note on `file` |
+| Indexing appears stuck | `status.incremental.tasks`, `watcher_errors`, stderr scheduler errors |
+| Watcher degraded | `status.watcher.mode` (`periodic-reconciliation` vs `native-watcher`) |
+| Cross-repo unavailable | stderr `cross-repo workspace sync failed`; single-repo unaffected |
+| Semantic unavailable | expected unless `ATTIC_SEMANTIC=1`; check stderr `semantic layer unavailable` |
+| High disk usage | `attic.db*`, `semantic.db`, `backups/` under the data dir — not `target/` (see Development) |
+| High memory / "server busy" | `status.resource_pressure`, `ATTIC_TOTAL_MEMORY_BUDGET_MIB` / `ATTIC_MAX_FOREGROUND_QUERIES` |
 
 - **MCP connection failure**: confirm the client is invoking the exact
   binary path and that stdio is not being intercepted by another wrapper.
@@ -247,9 +262,19 @@ macOS or your distribution's `build-essential`/`gcc` package on Linux.
 None of the above is required for end users of a prebuilt binary — see
 README's Install section.
 
+**`target/`** is Cargo's build/cache output directory (debug and release
+artifacts, incremental compilation cache) — it is not Attic's runtime
+index (that lives in the user-global data directory, see README) and is
+not part of the product repository or a release archive. `cargo clean`
+safely removes it at any time; it will be regenerated on the next build.
+
 ## Maintenance
 
-- **Schema migration**: add a new file under `migrations/`, wire it into
+- **Schema migration**: `migrations/` holds Attic's ordered SQLite schema
+  migrations, required at every startup. Never delete or rename an
+  already-applied migration — even one whose filename carries historical
+  phase terminology (e.g. `0002_phase1d.sql`); future migrations should use
+  descriptive production names instead. Add a new file, wire it into
   `run_migrations` (`crates/attic-storage/src/migration.rs`); migrations
   apply forward-only and are rejected if unrecognized (see Recovery above).
 - **IndexGeneration compatibility**: see

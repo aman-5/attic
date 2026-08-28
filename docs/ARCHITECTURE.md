@@ -16,7 +16,87 @@ evidence-grounded question answering — over the Model Context Protocol
 (MCP), so an MCP-capable AI client can ground its answers in real,
 verifiable source rather than guessing.
 
-The guiding separation, preserved throughout the pipeline:
+The guiding separation, preserved throughout the pipeline — see
+[Retrieval & evidence](#retrieval--evidence) below:
+`SOURCE != INDEX != RETRIEVAL CANDIDATE != EVIDENCE != CONTEXT != ANSWER`.
+
+## Architecture overview
+
+```mermaid
+flowchart TD
+    A[Workspace / Repositories] --> B[Discovery + Security]
+    B --> C[Analyzers]
+    C --> D[Canonical Index]
+    D --> E[Incremental Freshness]
+    D --> F[Retrieval Planner]
+    E --> F
+    F --> G[Evidence Manager]
+    G --> H[MCP Server]
+    H --> I[AI Client]
+```
+
+- **Discovery + security** (`attic-discovery`) — gitignore-aware walk,
+  path-traversal/symlink guards, secrets scan. Git submodules become one
+  `core_repositories` entry each (ADR-006).
+- **Analyzers** (`attic-analyzers`) — `GenericAnalyzer` (universal
+  fallback, every text file searchable) plus structural (tree-sitter)
+  analyzers for Java, Python, Go, JavaScript, TypeScript.
+- **Canonical index** (`attic-storage`, SQLite + FTS5) — files, retrieval
+  units, structural nodes, symbols, relationships. One coordinated
+  `WriterQueue` (single writer, serialized transactions); a `DbPool` of
+  concurrent read-only connections (WAL mode). `attic-indexing` publishes
+  each run atomically; no other code path writes index data.
+- **Incremental freshness** (`attic-incremental`) — native filesystem
+  watcher, falling back to periodic reconciliation. Freshness states:
+  `CURRENT` / `STALE` / `UNKNOWN` / pending refresh. Flow on change:
+  `filesystem change → verify → invalidate affected artifacts → recompute
+  affected artifacts → publish → CURRENT` — Attic never rebuilds the whole
+  workspace for a normal edit. Startup recovery reconciles any interrupted
+  work before serving.
+- **Retrieval Planner** (`attic-retrieval`) — a Query Evidence Contract
+  selects required evidence per query intent (definition/navigation/
+  configuration/architecture/debugging/impact/dependency/test/knowledge);
+  candidates come from lexical (FTS5) + symbol + structural + relationship
+  graph + optional semantic sources.
+- **Evidence Manager** (`attic-evidence`) — verifies claims against
+  retrieved evidence, assigns confidence, returns `INSUFFICIENT_EVIDENCE`
+  explicitly rather than guessing.
+- **Cross-repository intelligence** (`attic-crossrepo`) — resolves
+  dependency edges across submodule repositories once at startup; gates
+  cross-repo-dependent answers while degraded.
+- **MCP surface** (`attic-server`) — rmcp stdio transport; tools: `file`,
+  `search`, `repo_map`, `status`, `context`.
+
+### Indexing pipeline
+
+```mermaid
+flowchart LR
+    A[Files] --> B[Discovery]
+    B --> C[Security / Secret Handling]
+    C --> D[Analyzer Registry]
+    D --> E[Generic or Structural Analyzer]
+    E --> F[Retrieval Units / Symbols / Relationships]
+    F --> G[SQLite + FTS]
+```
+
+Each file's `SourceRevision` (content-addressed identity via BLAKE3) and
+the workspace's `WorkspaceSnapshot` are computed during discovery, before
+the analyzer stage — every downstream artifact traces back to the exact
+revision it was derived from.
+
+### Retrieval & evidence
+
+```mermaid
+flowchart LR
+    Q[Question] --> P[Retrieval Planner]
+    P --> C[Candidates]
+    C --> E[Evidence Validation]
+    E --> M[Evidence Manager]
+    M --> X[Context]
+    X --> A[AI Client]
+```
+
+The guiding separation, preserved throughout:
 
 ```text
 SOURCE  !=  INDEX  !=  RETRIEVAL CANDIDATE  !=  EVIDENCE  !=  CONTEXT  !=  ANSWER
@@ -26,79 +106,34 @@ Repositories on disk are always the source of truth. Every index, graph,
 embedding, and cache is derived and disposable — Attic can always
 reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
-## Pipeline
-
-```text
-Workspace (ATTIC_WORKSPACE_ROOT)
-   |
-   v
-Discovery + security          (attic-discovery)
-   - gitignore-aware walk, path-traversal/symlink guards, secrets scan
-   - Git submodules => one core_repositories entry per submodule (ADR-006)
-   |
-   v
-SourceRevision / WorkspaceSnapshot   (attic-core domain types)
-   - content-addressed identity (BLAKE3) for files and repositories
-   |
-   v
-Analyzer Registry              (attic-analyzers)
-   - GenericAnalyzer: universal fallback, every text file is searchable
-   - structural analyzers (tree-sitter): Java, Python, Go, JavaScript,
-     TypeScript get symbols/structure in addition to full-text search
-   |
-   v
-Canonical model
-   - files, retrieval units, structural nodes, symbols, relationships
-   |
-   v
-Storage: SQLite + FTS5          (attic-storage)
-   - one coordinated WriterQueue (single writer, serialized transactions)
-   - DbPool of concurrent read-only connections (WAL mode)
-   - attic-indexing publishes each indexing run atomically through the
-     writer; no other code path writes index data
-   |
-   v
-Incremental freshness / invalidation   (attic-incremental)
-   - native filesystem watcher, falling back to periodic reconciliation
-   - freshness states: CURRENT / STALE / UNKNOWN / pending refresh
-   - startup recovery reconciles any interrupted work before serving
-   |
-   v
-Retrieval Planner + candidate generation   (attic-retrieval)
-   - Query Evidence Contract selects required evidence per query intent
-     (definition/navigation/configuration/architecture/debugging/impact/
-     dependency/test/knowledge)
-   - candidates: lexical (FTS5) + symbol + structural + relationship graph
-     + optional semantic
-   |
-   v
-Evidence Manager                (attic-evidence)
-   - verifies claims against retrieved evidence, assigns confidence,
-     returns INSUFFICIENT_EVIDENCE explicitly rather than guessing
-   |
-   v
-Cross-repository intelligence   (attic-crossrepo)
-   - resolves dependency edges across submodule repositories once at
-     startup; gates cross-repo-dependent answers while degraded
-   |
-   v
-MCP surface                     (attic-server)
-   - rmcp stdio transport; tools: file, search, repo_map, status, context
-```
-
 ## Process and ownership model
 
-- **One `attic-server` process owns one workspace.** A single process holds
-  the one SQLite writer (`WriterQueue`), the one filesystem watcher, and the
-  one MCP stdio transport for a given database file. This is not a
-  configuration choice — `run_startup_recovery`, the watcher epoch, and
-  `ops_server_state` all assume single-process ownership. Attic does **not**
-  support multiple processes concurrently writing to the same database.
+- **One `attic` process owns one workspace.** (The binary is built from the
+  `attic-server` crate — hence that crate/component name elsewhere in this
+  doc — but the executable itself is named `attic`; see README Quick
+  Start.) A single process holds the one SQLite writer (`WriterQueue`), the
+  one filesystem watcher, and the one MCP stdio transport for a given
+  database file. This is not a configuration choice —
+  `run_startup_recovery`, the watcher epoch, and `ops_server_state` all
+  assume single-process ownership. Attic does **not** support multiple
+  processes concurrently writing to the same database.
 - **Multi-repository workspaces** are supported by pointing
   `ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are linked
   as Git submodules; each submodule becomes its own `core_repositories` row.
   Cross-repository dependency resolution (`attic-crossrepo::maintenance::
-  sync_workspace`) runs once at startup, inside that single process.
+  sync_workspace`) runs once at startup, inside that single process:
+
+  ```text
+  workspace/ (ATTIC_WORKSPACE_ROOT)
+  ├── repo A ─┐
+  ├── repo B ─┼─ each keeps independent source/index state (own
+  └── repo C ─┘  core_repositories row, own SourceRevisions) —
+                 sync_workspace resolves edges BETWEEN them and
+                 records provenance back to the WorkspaceSnapshot
+                 (parent hash) that was current when each edge
+                 was last resolved.
+  ```
+
 - **Repository isolation / stable identity**: every repository, file, and
   retrieval unit has a stable, content-addressed identity independent of
   path, so renames and moves don't fragment history and cross-repository
@@ -125,10 +160,30 @@ still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
 gate on usability.
 
+| Input | Analyzer | Result |
+|---|---|---|
+| Any text file | `GenericAnalyzer` | Full-text search, no symbols |
+| Java / Python / Go / JS / TS | Structural (tree-sitter) | Symbols, definitions, relationships |
+| Rust / Swift / C++ / Kotlin / etc. | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later without changing the pipeline |
+
 ## Project Knowledge authority model
 
+```text
+Source code ----------\
+Tests -----------------\
+Documentation ---------- Evidence Manager -> confidence-ranked evidence
+Project Knowledge ------/    (authority differs; none is excluded)
+Relationships ---------/
+```
+
+Project Knowledge is useful context, not permission to override
+contradictory current source — a `context` query surfaces a detected
+contradiction between a knowledge claim and the source/tests, it never
+silently prefers one (see "Evidence & retrieval" invariants below).
+
 Attic distinguishes two documentation tiers, enforced purely by path, in
-`crates/attic-retrieval/src/candidates.rs::source_type_for_path`:
+`crates/attic-retrieval/src/candidates.rs::source_type_for_path` (regression
+tests: `candidates::source_type_for_path_tests`):
 
 - **`knowledge/**`** — deliberately curated content → `EvidenceSourceType::
   Knowledge` → `AuthorityLevel::ProjectKnowledge`, the highest documentation
