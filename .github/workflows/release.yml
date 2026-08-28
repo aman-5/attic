@@ -255,27 +255,87 @@ jobs:
       # Package
       # -----------------------------------------------------------------------
 
-      - name: Package release
+      - name: Stage Windows release
+        if: runner.os == 'Windows'
         shell: bash
         env:
           ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
+          export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
 
-          # package.sh expects:
-          #
-          #   0.1.0
-          #
-          # rather than:
-          #
-          #   v0.1.0
+          bash tools/package.sh \
+            --target "${{ matrix.target }}" \
+            --out dist \
+            --stage-only
 
+      - name: Create and verify Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Target = "${{ matrix.target }}"
+          $Name = "attic-$env:RELEASE_TAG-$Target"
+          $Stage = Join-Path $PWD "dist\$Name"
+          $Archive = Join-Path $PWD "dist\$Name.zip"
+          $Checksum = "$Archive.sha256"
+          $VerifyDir = Join-Path $env:RUNNER_TEMP "attic-release-verify-$Target"
+
+          if (-not (Test-Path -LiteralPath $Stage -PathType Container)) {
+              throw "Staged release directory is missing: $Stage"
+          }
+
+          Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $Checksum -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $VerifyDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          Compress-Archive `
+              -LiteralPath $Stage `
+              -DestinationPath $Archive `
+              -Force
+
+          if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
+              throw "Windows release ZIP was not created: $Archive"
+          }
+
+          New-Item -ItemType Directory -Path $VerifyDir -Force | Out-Null
+          Expand-Archive `
+              -LiteralPath $Archive `
+              -DestinationPath $VerifyDir `
+              -Force
+
+          $ExpectedBinary = Join-Path $VerifyDir "$Name\attic-server.exe"
+          if (-not (Test-Path -LiteralPath $ExpectedBinary -PathType Leaf)) {
+              throw "Windows ZIP does not contain expected binary: $ExpectedBinary"
+          }
+
+          $Hash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ArchiveFileName = Split-Path -Leaf $Archive
+          "$Hash  $ArchiveFileName" | Set-Content -LiteralPath $Checksum -Encoding ascii
+
+          if (-not (Test-Path -LiteralPath $Checksum -PathType Leaf)) {
+              throw "Windows checksum was not created: $Checksum"
+          }
+
+          Write-Host "OK: $Archive"
+          Write-Host "OK: $Checksum"
+          Write-Host "OK: extracted binary verified at $ExpectedBinary"
+
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
           export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
 
           bash tools/package.sh \
             --target "${{ matrix.target }}" \
             --out dist
-
 
       - name: Verify packaged artifact contract
         shell: bash

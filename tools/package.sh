@@ -24,9 +24,10 @@
 #   aarch64-apple-darwin        macOS ARM64
 set -euo pipefail
 
-usage() { echo "usage: $0 --target <triple> [--out <dir>] | --verify <dir>" >&2; exit 2; }
+usage() { echo "usage: $0 --target <triple> [--out <dir>] [--stage-only] | --verify <dir>" >&2; exit 2; }
 
 MODE=build
+STAGE_ONLY=false
 TARGET=
 OUT=dist
 while [[ $# -gt 0 ]]; do
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --target) TARGET="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --verify) MODE=verify; VERIFY_DIR="$2"; shift 2 ;;
+    --stage-only) STAGE_ONLY=true; shift ;;
     *) usage ;;
   esac
 done
@@ -117,6 +119,14 @@ done
 echo "== verifying staged archive"
 bash "$0" --verify "$STAGE"
 
+# Windows uses --stage-only. The GitHub workflow creates the ZIP in native
+# PowerShell, avoiding Git Bash/MSYS path rewriting at the Bash -> PowerShell
+# process boundary.
+if [[ "$STAGE_ONLY" == true ]]; then
+  echo "OK: staged release directory: $STAGE"
+  exit 0
+fi
+
 ARCHIVE_BASE="$OUT/${NAME}"
 
 # Remove stale archives for this exact release/target so checksum selection is
@@ -126,22 +136,14 @@ rm -f "${ARCHIVE_BASE}.zip" "${ARCHIVE_BASE}.zip.sha256" \
 
 case "$TARGET" in
   *windows*)
-    # GitHub's Windows runner always has PowerShell. Do not silently fall back
-    # to tar.gz: setup.ps1 and the release contract require a ZIP on Windows.
-    command -v powershell.exe >/dev/null 2>&1 || {
-      echo "FAIL: powershell.exe is required to create the Windows ZIP" >&2
-      exit 1
-    }
-    OUT_ABS="$(cd "$OUT" && pwd -W 2>/dev/null || cd "$OUT" && pwd)"
-    powershell.exe -NoProfile -NonInteractive -Command       "Compress-Archive -LiteralPath '$OUT_ABS/$NAME' -DestinationPath '$OUT_ABS/${NAME}.zip' -Force"
-    COMPRESSED="${ARCHIVE_BASE}.zip"
+    echo "FAIL: Windows archive creation must run in the native PowerShell release step; use --stage-only" >&2
+    exit 1
     ;;
   *)
     (cd "$OUT" && tar -czf "${NAME}.tar.gz" "$NAME")
     COMPRESSED="${ARCHIVE_BASE}.tar.gz"
     ;;
 esac
-
 test -f "$COMPRESSED" || { echo "FAIL: expected archive not created: $COMPRESSED" >&2; exit 1; }
 
 # Checksum the exact compressed archive the installer will download.
