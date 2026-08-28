@@ -86,7 +86,7 @@ anywhere on disk — no common parent, no symlinks, one process, one database.
 {
   "mcpServers": {
     "attic": {
-      "command": "C:\\Users\\you\\AppData\\Local\\attic\\bin\\attic-server.exe",
+      "command": "C:\\Users\\you\\.attic\\bin\\attic-server.exe",
       "args": [],
       "env": {
         "ATTIC_WORKSPACE_ROOT": "C:\\Users\\you\\code\\myrepo"
@@ -102,7 +102,7 @@ anywhere on disk — no common parent, no symlinks, one process, one database.
 {
   "mcpServers": {
     "attic": {
-      "command": "/home/you/.local/share/attic/bin/attic-server",
+      "command": "/home/you/.attic/bin/attic-server",
       "args": [],
       "env": {
         "ATTIC_WORKSPACE_ROOT": "/home/you/code/myrepo"
@@ -219,7 +219,7 @@ A **single** `attic` process owns one logical workspace and one
 database: one coordinated writer queue, one MCP transport, one watcher
 per configured repository. Attic does **not** support multiple `attic-server` processes writing to the same database
 concurrently — give each concurrently running instance its own
-`ATTIC_DATA_DIR`.
+`ATTIC_HOME`.
 
 ## Project Knowledge
 
@@ -292,9 +292,9 @@ All configuration is via environment variables — there are no CLI flags.
 
 | Variable | Purpose |
 |---|---|
-| `ATTIC_WORKSPACE_ROOT` | Single repository root to index and watch. Omit to serve whatever is already indexed without indexing anything new. Mutually exclusive with `ATTIC_CONFIG`. |
+| `ATTIC_WORKSPACE_ROOT` | Single repository root to index and watch. Omit to start UNCONFIGURED (no `~/.attic/config.toml`) or resume from persistent config. Mutually exclusive with `ATTIC_CONFIG`. |
 | `ATTIC_CONFIG` | Path to a workspace config file listing multiple `[[repositories]]` roots (arbitrary locations, no common parent required). Mutually exclusive with `ATTIC_WORKSPACE_ROOT`. See [Workspaces & Multiple Repositories](#workspaces--multiple-repositories). |
-| `ATTIC_DATA_DIR` | Overrides the data directory (default: platform application-data dir). |
+| `ATTIC_HOME` | Overrides the Attic application home directory (default: `~/.attic`). Config, database, and runtime state all derive from this location. An empty `ATTIC_HOME` is a startup error — unset it or provide a valid path. |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
 | `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
@@ -304,13 +304,12 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_manager.rs`. |
 | `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
 
-Data root resolution order: `ATTIC_DATA_DIR` → `ATTIC_DB_PATH`'s parent
-directory → platform default (`%LOCALAPPDATA%\attic` on Windows,
-`~/Library/Application Support/attic` on macOS, `$XDG_DATA_HOME/attic` or
-`~/.local/share/attic` on Linux) → `./attic-data` as a last resort. `setup.sh`
-/ `setup.ps1` install the binary itself under `<data root>/bin/`, alongside
-(but separate from) this same directory. Attic never writes into your
-workspace — all index state is user-global.
+Home resolution: `ATTIC_HOME` (if set and non-empty) → `~/.attic` (derived
+from the OS user home directory). Setting `ATTIC_HOME` to an empty string is
+a startup error — unset it or provide a valid path. `ATTIC_DB_PATH` is
+supported as an explicit database path override for advanced/testing use.
+Attic never writes into your workspace — all index state is stored under the
+Attic home directory.
 
 ### Semantic search (optional)
 
@@ -323,7 +322,7 @@ flag. Canonical (lexical/structural) retrieval never depends on it.
 ## Troubleshooting
 
 - **Server exits immediately on startup**: check stderr for a fail-closed
-  message — usually a corrupted database (try a fresh `ATTIC_DATA_DIR` to
+  message — usually a corrupted database (try a fresh `ATTIC_HOME` to
   isolate) or a workspace bootstrap failure (bad permissions, path doesn't
   exist).
 - **`status` reports degraded cross-repo state**: cross-repository

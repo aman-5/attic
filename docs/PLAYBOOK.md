@@ -12,8 +12,13 @@ install/config quick-starts, see `README.md`.
 ATTIC_WORKSPACE_ROOT=/path/to/repo target/release/attic   # target\release\attic.exe on Windows
 ```
 
-Omitting `ATTIC_WORKSPACE_ROOT` still starts the server (serves whatever is
-already indexed in `attic.db`); no new indexing happens.
+Omitting `ATTIC_WORKSPACE_ROOT` starts the server as UNCONFIGURED if no
+persistent `~/.attic/config.toml` exists — it starts successfully but
+returns a structured error for query tools (`search`, `file`, `context`,
+`repo_map`). If `~/.attic/config.toml` already exists (written by a prior
+`workspace` MCP tool call), that workspace is loaded and resumed
+automatically. Configure the workspace through the `workspace` MCP tool, or
+set `ATTIC_CONFIG` / `ATTIC_WORKSPACE_ROOT`.
 
 ### Stop
 
