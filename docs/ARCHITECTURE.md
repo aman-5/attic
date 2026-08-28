@@ -36,8 +36,9 @@ flowchart TD
 ```
 
 - **Discovery + security** (`attic-discovery`) — gitignore-aware walk,
-  path-traversal/symlink guards, secrets scan. Git submodules become one
-  `core_repositories` entry each (ADR-006).
+  path-traversal/symlink guards, secrets scan. Any nested Git repository —
+  submodule or plain independent checkout — becomes one `core_repositories`
+  entry each (ADR-006).
 - **Analyzers** (`attic-analyzers`) — `GenericAnalyzer` (universal
   fallback, every text file searchable) plus structural (tree-sitter)
   analyzers for Java, Python, Go, JavaScript, TypeScript.
@@ -62,7 +63,7 @@ flowchart TD
   retrieved evidence, assigns confidence, returns `INSUFFICIENT_EVIDENCE`
   explicitly rather than guessing.
 - **Cross-repository intelligence** (`attic-crossrepo`) — resolves
-  dependency edges across submodule repositories once at startup; gates
+  dependency edges across the workspace's member repositories once at startup; gates
   cross-repo-dependent answers while degraded.
 - **MCP surface** (`attic-server`) — rmcp stdio transport; tools: `file`,
   `search`, `repo_map`, `status`, `context`.
@@ -118,10 +119,12 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   assume single-process ownership. Attic does **not** support multiple
   processes concurrently writing to the same database.
 - **Multi-repository workspaces** are supported by pointing
-  `ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are linked
-  as Git submodules; each submodule becomes its own `core_repositories` row.
-  Cross-repository dependency resolution (`attic-crossrepo::maintenance::
-  sync_workspace`) runs once at startup, inside that single process:
+  `ATTIC_WORKSPACE_ROOT` at a parent directory containing any number of
+  nested Git repositories — true submodules or plain independent
+  checkouts sit side by side under one root — each becoming its own
+  `core_repositories` row. Cross-repository dependency resolution
+  (`attic-crossrepo::maintenance::sync_workspace`) runs once at startup,
+  inside that single process:
 
   ```text
   workspace/ (ATTIC_WORKSPACE_ROOT)
@@ -267,11 +270,17 @@ rationale lives only in the archive branch's git history now):
   than a hand-rolled `.gitignore` parser, and **BLAKE3** for all content
   hashing — both chosen to avoid subtly-wrong reimplementations of
   well-specified algorithms.
-- **Git submodules are the multi-repository primitive**: each submodule
-  becomes its own `core_repositories` row with its own identity; the parent
-  `WorkspaceSnapshot` records every submodule's HEAD SHA so the parent hash
-  changes whenever any submodule advances. Uninitialized submodules are
-  skipped, not errored.
+- **Any nested Git repository is the multi-repository primitive, not
+  specifically a Git submodule**: discovery (`attic-discovery::walk`)
+  treats any subdirectory containing its own `.git` (file or directory) as
+  a separate repository boundary — a true submodule (`.gitmodules`-linked)
+  and a plain, independently-cloned repository sitting under the workspace
+  root are handled identically. Each becomes its own `core_repositories`
+  row with its own identity; `create_workspace_snapshot` records each
+  repository's current `SourceRevisionId` generically, so the workspace
+  snapshot changes whenever any member repository advances — this is not
+  gitlink/`.gitmodules`-specific. Uninitialized submodules (present in
+  `.gitmodules` but not checked out) are skipped, not errored.
 - **`CancellationToken` is a plain `Arc<AtomicBool>` newtype**, not
   `tokio_util::sync::CancellationToken` — analyzer/indexing work is
   synchronous, so a lock-free shared flag is sufficient and avoids an

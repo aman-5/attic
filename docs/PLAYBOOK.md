@@ -64,10 +64,11 @@ Call the `status` MCP tool. Key fields:
 ### Repository add/remove
 
 Repositories are discovered from the configured workspace root (a single
-repo, or Git submodules under a parent directory) — there is no separate
-"register a repository" tool. To add a repository, add it (or its
-submodule) under the workspace root and restart, or wait for the watcher to
-pick up a new submodule on the next reconciliation pass. To remove one,
+repo, or any number of nested Git repositories — true submodules or plain
+independent checkouts — under a parent directory) — there is no separate
+"register a repository" tool. To add a repository, clone or place it under
+the workspace root and restart, or wait for the watcher to pick it up on
+the next reconciliation pass. To remove one,
 remove it from the workspace root; its indexed data becomes orphaned and is
 cleaned up on the next full reconciliation. There is currently no
 single-repository "forget and purge immediately" tool — a data-directory
@@ -76,7 +77,8 @@ reset (below) is the supported way to force a clean slate.
 ### Multi-repository operation
 
 See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
-`ATTIC_WORKSPACE_ROOT`, repositories linked as Git submodules underneath it.
+`ATTIC_WORKSPACE_ROOT`, any number of nested Git repositories underneath it
+(no `.gitmodules` requirement — plain independent checkouts work the same).
 **Do not** run two `attic` processes against the same `attic.db` —
 this is not a supported or tested configuration; give each concurrently
 running instance its own `ATTIC_DATA_DIR`.

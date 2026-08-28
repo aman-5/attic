@@ -68,6 +68,23 @@ criteria, before Attic can be called production-ready.
   - Acceptance: exactly one binary, README, license files, `docs/`;
     no dev debris (`build_errors*.txt`, `*.log`, `target/`).
 
+- [ ] `setup.sh` / `setup.ps1` end-to-end acceptance (added this pass,
+  NOT yet run against a real release)
+  - Prerequisite: a tag push (`v*`) has actually gone through the release
+    workflow and produced a published GitHub Release with archives +
+    `.sha256` files attached (the `publish` job added to
+    `.github/workflows/release.yml` this pass — itself unverified until a
+    real tag is pushed).
+  - Workload: on a clean machine per platform (no Rust/Cargo/MSVC/MinGW/
+    Xcode/GCC), run `./setup.sh` (Linux/macOS) or `./setup.ps1` (Windows)
+    with no arguments; confirm it resolves the latest tag, downloads the
+    correct archive, verifies the checksum, installs under
+    `<data root>/bin/`, and prints a working MCP config.
+  - Also verify the negative path: a deliberately corrupted/mismatched
+    `.sha256` causes the script to fail loudly and install nothing.
+  - Acceptance: identical to the "Clean binary installation test" above,
+    reached via the setup script instead of a hand-extracted archive.
+
 ## Scale benchmarks
 
 - [ ] 25–30 repository scale test
