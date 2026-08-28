@@ -1,6 +1,6 @@
 //! Analyzer API — trait and all input/output types per the approved contract.
 //!
-//! See `docs/contracts/analyzers.md` for the canonical definitions.
+//! See `docs/ARCHITECTURE.md` for the canonical definitions.
 //! This module is the single authoritative Rust encoding of that contract.
 
 use std::path::PathBuf;
@@ -551,7 +551,7 @@ impl AnalyzerOutput {
 /// Implementations must be `Send + Sync` so they can be shared across threads
 /// in the registry.
 ///
-/// Contract invariants (from `docs/contracts/analyzers.md`):
+/// Contract invariants (from `docs/ARCHITECTURE.md`):
 /// 1. Must check `input.cancellation_token.is_cancelled()` at the start of
 ///    every O(n) loop and return partial output with a `CANCELLED` diagnostic.
 /// 2. Must respect `input.resource_budget` and emit `RESOURCE_EXHAUSTED`

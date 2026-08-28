@@ -36,13 +36,25 @@ criteria, before Attic can be called production-ready.
     (`macos-latest`).
   - Acceptance: same as above.
 
+## Legal
+
+- [ ] License copyright-holder confirmation — `LICENSE-MIT`/`LICENSE-APACHE`
+  currently attribute copyright to "Attic Contributors", matching
+  `Cargo.toml`'s `license = "MIT OR Apache-2.0"` declaration. No new legal
+  decision was made when these files were added; whether "Attic
+  Contributors" is the correct/final copyright holder (vs. a specific
+  individual or organization) has not been confirmed by any authoritative
+  source and should be verified by whoever owns the release before the
+  first public release.
+
 ## Packaging / release archive
 
 - [ ] Clean binary installation test
   - Prerequisite: a release archive built by CI (not hand-staged).
   - Workload: on a machine with no Rust/Cargo/MSVC/MinGW/Xcode/GCC/Node
-    installed, extract the archive and run `attic-server` against
-    `ATTIC_WORKSPACE_ROOT` pointing at a real repo; drive one `initialize`
+    installed, extract the archive and run `attic-server` (the packaged,
+    renamed binary — see `tools/package.sh`) against `ATTIC_WORKSPACE_ROOT`
+    pointing at a real repo; drive one `initialize`
     → `tools/call(search)` round-trip over stdio.
   - Acceptance: server starts, indexes, answers a query, shuts down
     cleanly (clean-shutdown marker recorded) without any toolchain present.
@@ -71,8 +83,8 @@ criteria, before Attic can be called production-ready.
     rows.
   - Metrics: FAST/NORMAL/DEEP query latency at that scale, FTS index size,
     memory under sustained query load.
-  - Acceptance: query latency stays within the answer-mode budgets defined
-    in `docs/contracts/answer_modes.md`.
+  - Acceptance: query latency stays within the FAST/NORMAL/DEEP time
+    budgets defined in `crates/attic-retrieval/src/mode.rs`.
 
 ## Indexing / startup benchmarks
 
@@ -151,7 +163,7 @@ criteria, before Attic can be called production-ready.
 - [ ] Final Phase 6 cross-repository quality benchmark — compare against
       the Phase 6 baseline, specifically re-verifying that cross-repo
       evidence now reaches the MCP `context` response (fixed this cycle
-      per `docs/PHASE_7_COMPLETION_REPORT.md` bug #3) at benchmark scale,
+      per the Phase 7 hardening pass, bug #3) at benchmark scale,
       not just in the 3-repo fixture used to root-cause it.
 - [ ] Unsupported-claim regression — verify the evidence-sufficiency gate
       still rejects claims without adequate grounding at scale.
@@ -161,6 +173,20 @@ criteria, before Attic can be called production-ready.
       precision/recall at benchmark scale.
 - [ ] Configuration lookup regression — config-file evidence retrieval
       accuracy at benchmark scale.
+
+## Follow-up scale-tuning items (transferred from OPEN_QUESTIONS.md)
+
+- [ ] Mode-scaled proactive verification breadth — NORMAL/DEEP currently
+  proactively checksum a fixed top-5 ranked evidence items (ADR-012 D4).
+  Whether this breadth should scale with mode depth or corpus size (without
+  violating filesystem-scan budgets) needs measurement on a larger corpus
+  than the current fixtures provide.
+- [ ] Brute-force kNN scale ceiling — semantic kNN (when `ATTIC_SEMANTIC=1`)
+  is currently a bounded brute-force scan over `semantic.db` (ADR-014 D4);
+  measured sub-millisecond at fixture scale. Revisit an in-DB vector index
+  or external store only if/when selected-unit counts reach ~10^5 on real
+  workspaces AND query-time kNN latency is measured to exceed the NORMAL
+  semantic time budget (`crates/attic-retrieval/src/mode.rs`).
 
 ## Open items surfaced but not independently re-benchmarked this pass
 

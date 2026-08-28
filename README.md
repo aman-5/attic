@@ -1,76 +1,44 @@
 # Attic
 
-Attic is a local-first code intelligence server for AI coding assistants. It
-indexes your repositories into a SQLite-backed store and exposes retrieval —
-search, file access, repo maps, and evidence-grounded question answering —
-over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), so
-any MCP-capable client (Claude Code, Claude Desktop, etc.) can ground its
-answers in your actual code instead of guessing.
+Attic is a local MCP server that gives AI coding agents persistent,
+evidence-backed understanding of large codebases and multi-repository
+workspaces.
 
-Attic runs entirely on your machine: no code or query leaves your computer
-unless you explicitly opt in to the (disabled-by-default) semantic layer.
+## Why Attic?
 
-## Install (binary, no build tools required)
+- **Fast code search** — full-text search over indexed content, not a slow re-grep every turn.
+- **Structural understanding** — symbols, definitions, and relationships for supported languages.
+- **Incremental indexing** — a filesystem watcher keeps the index current without full rebuilds.
+- **Evidence-backed context** — answers are checked against real source spans, with an explicit `INSUFFICIENT_EVIDENCE` result instead of a guess.
+- **Multi-repository relationships** — cross-repo dependency resolution across Git submodules in one workspace.
+- **Curated project knowledge** — a `knowledge/` tier for facts that aren't obvious from source.
+- **Local-first** — runs entirely on your machine; nothing leaves it unless you opt in to the (disabled-by-default) semantic layer.
 
-1. Download the archive for your platform from the project's Releases page:
-   - `attic-v<version>-x86_64-pc-windows-msvc.zip` — Windows x86_64
-   - `attic-v<version>-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64
-   - `attic-v<version>-x86_64-apple-darwin.tar.gz` — macOS x86_64 (Intel)
-   - `attic-v<version>-aarch64-apple-darwin.tar.gz` — macOS ARM64 (Apple Silicon)
-2. Extract it anywhere. The archive contains exactly one binary
-   (`attic-server` / `attic-server.exe`), a `README.md`, license files, and
-   `docs/`. Nothing else needs to be installed — Attic bundles its own
-   SQLite; end users do not need Rust, Cargo, MSVC Build Tools, MinGW, Xcode
-   command-line tools, GCC, Node.js, or Tree-sitter development packages.
-3. (Optional) Put the extracted directory on your `PATH`, or reference the
-   binary by full path in your MCP client configuration below.
-
-> **Supported platforms**: Windows x86_64, Linux x86_64, macOS x86_64, and
-> macOS ARM64 are built and tested in CI on every release
-> (`.github/workflows/release.yml`). A platform is only claimed "verified"
-> once CI has actually run the test suite on it — see
-> `docs/PHASE_7_COMPLETION_REPORT.md` for the current per-platform status.
-
-## Configure a workspace
-
-Attic indexes one repository root per running server instance, set via an
-environment variable:
+## Quick Start
 
 ```sh
-ATTIC_WORKSPACE_ROOT=/path/to/your/repo attic-server
+git clone https://github.com/aman-5/attic
+cd attic
+cargo build --release --package attic-server
 ```
 
-On first start, Attic performs a one-time synchronous index of the workspace,
-then watches it for changes (native filesystem watcher, falling back to
-periodic reconciliation where unavailable) and re-indexes incrementally as
-files change. If `ATTIC_WORKSPACE_ROOT` is unset, Attic still starts and
-serves whatever repositories are already in its database (useful for
-inspecting a previously-indexed workspace, or for pure MCP tool testing).
+The binary is built at `target/release/attic` (`target\release\attic.exe` on
+Windows). See [Platform setup](#platform-setup) below for prerequisites
+(Rust toolchain, a linker).
 
-For multi-repository / cross-repo dependency resolution, point
-`ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are linked as
-Git submodules (each submodule becomes its own `core_repositories` entry —
-see ADR-006). A **single** `attic-server` process owns the workspace: one
-watcher, one MCP transport, one SQLite writer. Cross-repo dependency
-resolution runs automatically at startup within that one process — see
-`crates/attic-crossrepo` and `docs/contracts/query_evidence.md`.
+## Connect to your AI/MCP client
 
-Attic does **not** support multiple `attic-server` processes writing to the
-same database concurrently — the writer, watcher, and startup-recovery logic
-all assume single-process ownership of a given `attic.db`. Point every
-workspace's `ATTIC_DATA_DIR` (or `ATTIC_DB_PATH`) at its own, distinct
-location if you run more than one Attic instance on a machine.
+Attic is an MCP server: transport is **stdio**. Your AI client starts the
+`attic` process, Attic indexes and maintains the workspace you point it at,
+and the client calls Attic's tools when it needs repository knowledge.
 
-## Configure your MCP client
-
-Attic speaks MCP over stdio. Example configuration (Claude Code /
-Claude Desktop `mcp_config.json`-style):
+Add it to your client's MCP server configuration:
 
 ```json
 {
   "mcpServers": {
     "attic": {
-      "command": "/absolute/path/to/attic-server",
+      "command": "/absolute/path/to/target/release/attic",
       "args": [],
       "env": {
         "ATTIC_WORKSPACE_ROOT": "/absolute/path/to/your/repo"
@@ -80,144 +48,236 @@ Claude Desktop `mcp_config.json`-style):
 }
 ```
 
-On Windows, use `attic-server.exe` and Windows-style paths
-(`C:\\Users\\you\\code\\myrepo`).
+**Windows example:**
 
-Once connected, Attic exposes these MCP tools:
+```json
+{
+  "mcpServers": {
+    "attic": {
+      "command": "C:\\Users\\you\\code\\attic\\target\\release\\attic.exe",
+      "args": [],
+      "env": {
+        "ATTIC_WORKSPACE_ROOT": "C:\\Users\\you\\code\\myrepo"
+      }
+    }
+  }
+}
+```
+
+**Linux/macOS example:**
+
+```json
+{
+  "mcpServers": {
+    "attic": {
+      "command": "/home/you/code/attic/target/release/attic",
+      "args": [],
+      "env": {
+        "ATTIC_WORKSPACE_ROOT": "/home/you/code/myrepo"
+      }
+    }
+  }
+}
+```
+
+This configuration shape is client-neutral: place the same
+command/args/env into whichever MCP-server settings your client exposes
+(Claude Code, Claude Desktop, or any other MCP-capable client).
+
+## Use it
+
+Once connected, just ask your AI client questions about the workspace — it
+invokes Attic's MCP tools automatically. You don't need to construct MCP
+JSON-RPC requests by hand. For example:
+
+```text
+"Find where authentication tokens are validated."
+"Show me every implementation of PaymentProvider."
+"Which repositories depend on the shared auth package?"
+"If I change UserService.create(), what may be affected?"
+"Explain how checkout flows from the API to persistence."
+"Find the configuration controlling retry behavior."
+```
+
+## What Attic can do
+
+On first start with `ATTIC_WORKSPACE_ROOT` set, Attic performs a one-time
+synchronous index of the workspace, then watches it for changes (native
+filesystem watcher, falling back to periodic reconciliation) and re-indexes
+incrementally. Repositories on disk are always the source of truth — every
+index, graph, and cache is derived and disposable.
+
+## MCP Tools
 
 | Tool | Purpose |
 |---|---|
-| `search` | Full-text search over indexed content |
-| `file` | Read a file (or bounded region) from the live workspace |
-| `context` | Evidence-grounded answer to a natural-language question (`FAST` / `NORMAL` / `DEEP` modes) |
+| `search` | Full-text search over indexed workspace content |
+| `file` | Read a bounded, verified region of a file from the live workspace |
 | `repo_map` | Structural overview of a repository |
-| `status` | Server health, watcher mode, resource-pressure advisory |
+| `context` | Evidence-backed answer to a natural-language question (`FAST` / `NORMAL` / `DEEP` modes) |
+| `status` | Server/indexing health, watcher mode, resource-pressure advisory |
 
-## Run
+Exact schemas are defined once in
+`crates/attic-server/src/main.rs::make_tools()` and returned via
+`tools/list` — that function is the single source of truth for the tool
+surface. Detailed argument reference lives in `docs/PLAYBOOK.md` where
+useful; this table is the everyday reference.
 
-```sh
-attic-server
+## Project Knowledge
+
+```text
+my-project/
+├── src/
+├── tests/
+├── docs/
+└── knowledge/
+    ├── architecture.md
+    ├── domain.md
+    ├── conventions.md
+    └── ownership.md
 ```
 
-Attic logs to stderr (structured, `tracing`-based) and speaks MCP JSON-RPC
-on stdin/stdout — this is the same contract your MCP client uses, so you can
-also drive it manually for debugging:
+Any Markdown file under `knowledge/**` in an indexed repository is treated
+as curated **Project Knowledge** — Attic's highest documentation authority
+tier. Everything else (`README.md`, `docs/**`, an `ARCHITECTURE.md` outside
+`knowledge/`) is ordinary documentation: still fully searchable, just not
+elevated to the same authority.
 
-```sh
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"debug","version":"0"}}}\n' | attic-server
+Put in `knowledge/`:
+
+- architecture intent and rationale
+- domain terminology
+- ownership
+- project conventions
+- deployment assumptions
+- decisions not obvious from source
+
+Never put in `knowledge/`: secrets, API keys, temporary prompts, or
+transient chat instructions — knowledge files are indexed and served
+through the same tools as source code, so anything written there is as
+discoverable as any file in the repo.
+
+This is optional — a repository with no `knowledge/` directory works the
+same, just without that top evidence tier. See `knowledge/README.md` in
+this repository for a ready-to-copy template.
+
+## Multi-repository workspaces
+
+```text
+workspace/
+├── frontend/
+├── api/
+├── auth-service/
+├── shared-libs/
+└── infrastructure/
 ```
 
-Stop the server with Ctrl+C (SIGINT) or by closing its stdio transport —
-either path runs the same graceful shutdown: in-flight work finishes, a WAL
-checkpoint and crash-recovery backup are written, and the database is closed
-cleanly before exit.
+Point `ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are
+linked as **Git submodules**; each submodule becomes its own
+`core_repositories` entry. Cross-repository dependency resolution
+(`attic-crossrepo`) runs automatically at startup, resolving edges like
+"which repositories depend on the shared auth package" or "what does
+changing this symbol affect elsewhere in the workspace."
 
-## Semantic search (optional, opt-in)
+A **single** `attic` process owns one workspace/database: one
+watcher, one MCP transport, one SQLite writer. Attic does not support
+multiple processes writing to the same database concurrently — give each
+concurrently running instance its own `ATTIC_DATA_DIR`.
 
-Attic's semantic (embedding-based) retrieval layer is **disabled by
-default**. It only activates when explicitly requested:
+## Architecture overview
 
-```sh
-ATTIC_SEMANTIC=1 ATTIC_WORKSPACE_ROOT=/path/to/repo attic-server
-```
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for diagrams and design
+details: the indexing pipeline, retrieval/evidence model, incremental
+freshness, cross-repository resolution, and language support.
 
-When disabled, Attic never creates the semantic database file, never
-computes embeddings, and retrieval falls back cleanly to lexical/structural
-search only — deleting the semantic database at any time is always safe and
-degrades gracefully rather than breaking the server.
+## Platform setup
 
-## Runtime data: what's workspace-local vs. user-global
+Building from source requires:
 
-Attic never writes into your workspace — no `.attic/` directory appears in
-your repo, so indexing a read-only or third-party checkout is always safe.
-All index state, caches, and logs are **user-global**, stored once per
-machine and shared across every workspace you point Attic at:
+- **Rust** — pinned in `rust-toolchain.toml` (currently `1.98.0`,
+  MSRV `1.88`); `rustup show` in the repo root installs it automatically.
+- **A linker for your platform**:
+  - **Windows (recommended)**: Microsoft "Build Tools for Visual Studio"
+    with the C++ build tools workload (Visual Studio IDE not required).
+  - **Windows (no MSVC)**: GNU/MinGW via [Scoop](https://scoop.sh)
+    (`scoop install mingw`), then `rustup target add x86_64-pc-windows-gnu`
+    — see `docs/PLAYBOOK.md` (Development) for the linker override needed.
+  - **Linux**: system `cc`/`clang` (e.g. `build-essential` on Debian/Ubuntu)
+    — tree-sitter grammars build their bundled C sources via `cc`.
+  - **macOS**: `xcode-select --install` (Command Line Tools).
 
-| Path | Contents |
+Attic bundles its own SQLite; no separate database install is required on
+any platform.
+
+## Configuration
+
+All configuration is via environment variables — there are no CLI flags.
+
+| Variable | Purpose |
 |---|---|
-| `attic.db` | Main SQLite index (all indexed repositories) |
-| `semantic.db` | Semantic embeddings (only created when `ATTIC_SEMANTIC=1`) |
-| `backups/` | Crash-recovery database backups (most recent 3 retained) |
-| `tmp/` | Process scratch space (safe to delete while Attic is not running) |
+| `ATTIC_WORKSPACE_ROOT` | Repository (or submodule parent) root to index and watch. Omit to serve whatever is already indexed without indexing anything new. |
+| `ATTIC_DATA_DIR` | Overrides the data directory (default: platform application-data dir). |
+| `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
+| `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer. |
+| `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
+| `ATTIC_TOTAL_MEMORY_BUDGET_MIB` | Total memory budget enforced by the resource monitor. |
+| `ATTIC_MAX_FOREGROUND_QUERIES` | Concurrent foreground MCP query cap. |
+| `ATTIC_MAX_BACKGROUND_WORKERS` | Concurrent background (indexing/semantic) worker cap. |
+| `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_manager.rs`. |
+| `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
 
-The data root defaults to the platform's standard application-data
-directory, and can be overridden:
-
-- **Resolution order**: `ATTIC_DATA_DIR` env var → `ATTIC_DB_PATH`'s parent
-  directory (legacy single-variable override) → platform default → `./attic-data`
-  in the current directory as a last-resort fallback.
-- **Windows**: `%LOCALAPPDATA%\attic`
-- **macOS**: `~/Library/Application Support/attic`
-- **Linux/BSD**: `$XDG_DATA_HOME/attic` (falls back to `~/.local/share/attic`)
-
-See `crates/attic-core/src/paths.rs` for the normative policy and its tests.
-
-### Resource limits
-
-Attic ships with production defaults (1024 MiB total memory budget, 64
-concurrent foreground MCP queries, background indexing/semantic workers
-capped strictly below the foreground capacity so interactive queries are
-never starved). All of these are overridable via `ATTIC_*` environment
-variables — see `crates/attic-storage/src/resource_manager.rs` for the full
-list (`ATTIC_TOTAL_MEMORY_BUDGET_MIB`, `ATTIC_MAX_FOREGROUND_QUERIES`,
-`ATTIC_MAX_BACKGROUND_WORKERS`, etc.).
+Data root resolution order: `ATTIC_DATA_DIR` → `ATTIC_DB_PATH`'s parent
+directory → platform default (`%LOCALAPPDATA%\attic` on Windows,
+`~/Library/Application Support/attic` on macOS, `$XDG_DATA_HOME/attic` or
+`~/.local/share/attic` on Linux) → `./attic-data` as a last resort. Attic
+never writes into your workspace — all index state is user-global.
 
 ## Troubleshooting
 
 - **Server exits immediately on startup**: check stderr for a fail-closed
-  message. Attic refuses to serve rather than risk stale/incorrect answers —
-  common causes are a corrupted database (run with a fresh `ATTIC_DATA_DIR`
-  to isolate) or a workspace bootstrap failure (bad permissions, workspace
-  path doesn't exist).
-- **`status` tool reports `degraded` cross-repo state**: cross-repository
-  dependency resolution hasn't completed yet (runs once at startup) or
-  failed; local single-repo retrieval is unaffected.
-- **High memory / "server busy" errors**: Attic is enforcing its configured
-  memory/concurrency budget. Raise `ATTIC_TOTAL_MEMORY_BUDGET_MIB` /
-  `ATTIC_MAX_FOREGROUND_QUERIES` if your machine has headroom, or reduce the
-  number of concurrently indexed repositories.
-- **Stale results after external changes** (e.g. `git checkout` while Attic
-  was stopped): Attic reconciles on startup, but you can force a fresh
-  index by removing `attic.db*` from the data directory (see above) and
-  restarting.
+  message — usually a corrupted database (try a fresh `ATTIC_DATA_DIR` to
+  isolate) or a workspace bootstrap failure (bad permissions, path doesn't
+  exist).
+- **`status` reports degraded cross-repo state**: cross-repository
+  resolution hasn't completed yet or failed; single-repo retrieval is
+  unaffected.
+- **High memory / "server busy" errors**: Attic is enforcing its
+  configured resource budget — raise `ATTIC_TOTAL_MEMORY_BUDGET_MIB` /
+  `ATTIC_MAX_FOREGROUND_QUERIES` or reduce concurrently indexed repos.
+- **Stale results after external changes**: Attic reconciles on startup;
+  to force a fresh index, stop Attic and remove `attic.db*` from the data
+  directory.
 
-## Uninstall
+See `docs/PLAYBOOK.md` for a fuller troubleshooting table and recovery
+procedures.
 
-Attic makes no registry entries, no services, and no changes outside its
-data directory:
-
-1. Delete the extracted binary/directory.
-2. Delete the data directory listed above (`attic.db*`, `backups/`, `tmp/`)
-   if you want to remove all indexed data — this is optional; leaving it in
-   place has no effect once the binary is gone.
-3. Remove the `attic` entry from your MCP client's configuration.
-
-## Building from source
-
-End users should use the prebuilt binaries above. Building from source is
-only needed for development or unsupported platforms, and requires:
-
-- Rust (see `rust-toolchain.toml` for the pinned version) via
-  [rustup](https://rustup.rs)
-- A working linker for your platform (MSVC Build Tools on Windows, or a
-  GNU/MinGW toolchain — see `docs/local-setup/WINDOWS.md` for a from-source
-  Windows setup; system `cc`/`clang` on Linux/macOS)
+## Development
 
 ```sh
-cargo build --release --package attic-server
-# binary at target/release/attic (or attic.exe on Windows)
+cargo test -p <crate>                                 # focused test
+cargo test --workspace                                # full suite
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-To build a release archive with the same layout as the official releases:
+See `docs/PLAYBOOK.md` (Development, Maintenance) for the full developer
+workflow: schema migrations, adding an analyzer, and the release process.
 
-```sh
-tools/package.sh --target <x86_64-pc-windows-msvc|x86_64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin> --out dist
-```
+Precompiled release archives (built by `tools/package.sh` / CI on tag push)
+are also available for users who don't want to build from source — see
+`.github/workflows/release.yml` and `docs/FINAL_VALIDATION_TODO.md` for
+current per-platform verification status. This is a convenience path, not
+the primary workflow. Note the binary name differs between the two paths:
+a source build produces `target/release/attic` (`attic.exe` on Windows),
+while `tools/package.sh` renames it to `attic-server` (`attic-server.exe`)
+inside the packaged archive for end-user clarity — point your MCP client's
+`command` at whichever one you actually have.
 
 ## Documentation
 
-- `docs/PHASE_7_COMPLETION_REPORT.md` — current production-readiness status,
-  verified platforms, and measured results.
-- `docs/contracts/` — normative behavioral contracts (retrieval, evidence,
-  recovery, resources, etc.).
-- `docs/decisions/` — architecture decision records.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — visual system design:
+  pipeline, ownership model, storage concurrency, security, crash recovery.
+- [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) — operations manual: start/stop,
+  troubleshooting, recovery, development, and maintenance procedures.
+- [`docs/FINAL_VALIDATION_TODO.md`](docs/FINAL_VALIDATION_TODO.md) —
+  authoritative list of what has and hasn't yet been independently
+  verified (platform CI, scale/soak/stress).

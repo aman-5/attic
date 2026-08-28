@@ -1,4 +1,4 @@
-//! AnswerModePolicy (`docs/contracts/answer_modes.md`, C12): explicit,
+//! AnswerModePolicy (`docs/ARCHITECTURE.md`, C12): explicit,
 //! enforceable resource budgets for FAST / NORMAL / DEEP.
 //!
 //! Budgets are compile-time defaults overridable at startup; they are not

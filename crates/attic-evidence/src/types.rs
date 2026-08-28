@@ -1,5 +1,5 @@
 //! Canonical `Evidence` object and its supporting enums
-//! (`docs/contracts/evidence.md`).
+//! (`docs/ARCHITECTURE.md`).
 
 use serde::{Deserialize, Serialize};
 
@@ -109,7 +109,7 @@ pub struct RetrievalSource {
     pub query_fragment: String,
 }
 
-/// The canonical Evidence object (`docs/contracts/evidence.md`).
+/// The canonical Evidence object (`docs/ARCHITECTURE.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
     /// UUID (lowercase hyphenated string), stable for the query lifetime.

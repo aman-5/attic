@@ -80,10 +80,17 @@ impl Candidate {
 
 /// Classify an indexed path into the canonical evidence source type
 /// (deterministic; documented in ADR-012).
+///
+/// Only paths under the deliberately curated `knowledge/` boundary receive
+/// `Knowledge` (-> `ProjectKnowledge` authority). An ordinary `README.md` or
+/// `architecture.md` living anywhere else in the repository is real,
+/// searchable documentation evidence (`Documentation` authority) — it must
+/// not be silently elevated to the same authority as curated project
+/// knowledge just because of its filename.
 pub fn source_type_for_path(path: &str) -> EvidenceSourceType {
     let lower = path.to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
-    if lower.starts_with("knowledge/") || name == "readme.md" || name == "architecture.md" {
+    if lower.starts_with("knowledge/") {
         return EvidenceSourceType::Knowledge;
     }
     // Test markers across supported languages.
@@ -606,6 +613,58 @@ impl CrossRepoGenerator {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod source_type_for_path_tests {
+    use super::*;
+
+    // Regression coverage for the knowledge/** vs. ordinary-documentation
+    // authority boundary documented in README.md / docs/ARCHITECTURE.md —
+    // this boundary was previously asserted only in prose, not in a test.
+
+    #[test]
+    fn knowledge_prefix_classifies_as_knowledge() {
+        assert_eq!(
+            source_type_for_path("knowledge/architecture.md"),
+            EvidenceSourceType::Knowledge
+        );
+        assert_eq!(
+            source_type_for_path("knowledge/nested/dir/domain.md"),
+            EvidenceSourceType::Knowledge
+        );
+    }
+
+    #[test]
+    fn knowledge_prefix_match_is_case_insensitive() {
+        assert_eq!(
+            source_type_for_path("Knowledge/Domain.MD"),
+            EvidenceSourceType::Knowledge
+        );
+    }
+
+    #[test]
+    fn ordinary_docs_outside_knowledge_are_not_elevated() {
+        assert_eq!(
+            source_type_for_path("README.md"),
+            EvidenceSourceType::Documentation
+        );
+        assert_eq!(
+            source_type_for_path("docs/ARCHITECTURE.md"),
+            EvidenceSourceType::Documentation
+        );
+    }
+
+    #[test]
+    fn knowledge_in_filename_without_the_path_prefix_is_not_elevated() {
+        // A file merely named "knowledge" (or containing the word) outside
+        // the `knowledge/` directory must not be silently promoted to
+        // ProjectKnowledge authority just because of its filename.
+        assert_eq!(
+            source_type_for_path("src/knowledge_base.md"),
+            EvidenceSourceType::Documentation
+        );
     }
 }
 

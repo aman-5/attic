@@ -22,6 +22,3 @@ build_errors*.txt
 
 # editor
 *.rs.bk
-
-#base-Files
-#/Attic_AI_Agent_Implementation_Pack/*

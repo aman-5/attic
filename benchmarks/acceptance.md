@@ -115,7 +115,7 @@ Every case execution must remain within its declared `ResourceBudget`. Violation
 
 ### 3.4 RetrievalPlan Observability Gates
 
-- All required `RetrievalPlan` fields (per `docs/contracts/retrieval_plan.md §2.1`) present and non-null in every persisted plan.
+- All required `RetrievalPlan` fields (see `crates/attic-retrieval/src/plan.rs`) present and non-null in every persisted plan.
 - Steps form a valid linear sequence by `step_index`.
 - Plans persisted to `ops_retrieval_log` before answer delivery: 100% compliance.
 - `plan_json` size limits: FAST ≤ 64 KB, NORMAL ≤ 256 KB, DEEP ≤ 1 MB.
@@ -127,7 +127,7 @@ Every case execution must remain within its declared `ResourceBudget`. Violation
 
 ### 3.6 Secret Safety Gates (zero tolerance)
 
-- No secret content (per `docs/contracts/secrets.md` V1 patterns) in any answer text.
+- No secret content (see `crates/attic-discovery/src/secrets.rs` V1 patterns) in any answer text.
 - No raw secret bytes in `ops_retrieval_log.plan_json`.
 - No secret patterns in server logs during benchmark runs.
 - Pre-flight: FTS5 tables (`fts_retrieval_units`, `fts_symbol_names`) must contain no V1 secret pattern matches before the suite runs.

@@ -1,6 +1,6 @@
 //! V1 query taxonomy and the deterministic query router (classifier).
 //!
-//! Contract: `docs/contracts/query_evidence.md` §Definitions + invariant 6:
+//! Contract: `docs/ARCHITECTURE.md` §Definitions + invariant 6:
 //! classification is a pure function of the input text — no network, no LLM,
 //! no wall-clock. Uncertain classifications are surfaced with an explicit
 //! confidence level and competing signals; they never silently become

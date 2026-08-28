@@ -2,4 +2,4 @@
 #
 # This file does NOT contain machine-specific paths or platform targets.
 # Platform-specific linker setup (e.g. Windows GNU toolchain) belongs in
-# a developer's local, untracked override — see docs/local-setup/WINDOWS.md.
+# a developer's local, untracked override — see docs/PLAYBOOK.md (Development).
