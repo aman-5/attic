@@ -3705,6 +3705,7 @@ mod tests {
         {
             let (mut child, mut stdin) = {
                 let mut child = Command::new(&bin)
+                    .env("ATTIC_HOME", tmp.path())
                     .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -3802,6 +3803,7 @@ mod tests {
 
         let (mut child, mut stdin) = {
             let mut child = Command::new(&bin)
+                .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
                 // Point ATTIC_WORKSPACE_ROOT at provider_dir so the server
                 // bootstraps and then runs sync_workspace over all DB repos.
@@ -3978,6 +3980,7 @@ mod tests {
         // the updated catalog.
         let (mut child2, mut stdin2) = {
             let mut child = Command::new(&bin)
+                .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
                 .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
                 .stdin(Stdio::piped())
