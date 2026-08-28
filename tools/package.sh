@@ -115,7 +115,7 @@ done
 done
 
 echo "== verifying staged archive"
-"$0" --verify "$STAGE"
+bash "$0" --verify "$STAGE"
 
 ARCHIVE="$OUT/${NAME}"
 case "$TARGET" in
