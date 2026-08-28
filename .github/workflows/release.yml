@@ -277,6 +277,26 @@ jobs:
             --out dist
 
 
+      - name: Verify packaged artifact contract
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="attic-${RELEASE_TAG}-${{ matrix.target }}"
+
+          case "${{ matrix.target }}" in
+            *windows*) ARCHIVE="dist/${NAME}.zip" ;;
+            *)         ARCHIVE="dist/${NAME}.tar.gz" ;;
+          esac
+
+          test -f "$ARCHIVE"
+          test -f "${ARCHIVE}.sha256"
+
+          echo "verified release artifact: $ARCHIVE"
+          echo "verified checksum: ${ARCHIVE}.sha256"
+
+
       - name: Show packaged files
         shell: bash
         run: |
@@ -365,6 +385,19 @@ jobs:
           bash tools/package.sh \
             --target "x86_64-apple-darwin" \
             --out dist
+
+
+      - name: Verify packaged artifact contract
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="dist/attic-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz"
+          test -f "$ARCHIVE"
+          test -f "${ARCHIVE}.sha256"
+          echo "verified release artifact: $ARCHIVE"
+          echo "verified checksum: ${ARCHIVE}.sha256"
 
 
       - name: Show packaged files

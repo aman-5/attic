@@ -105,49 +105,53 @@ Write-Host ""
 
 if ($Version -eq "latest") {
 
-    $ApiUrl =
-        "https://api.github.com/repos/$Repo/releases/latest"
+    # Avoid api.github.com here: unauthenticated REST requests are rate-limited.
+    # The normal GitHub URL redirects to /releases/tag/<tag> and requires no token.
+    $LatestUrl = "https://github.com/$Repo/releases/latest"
 
     try {
+        $Response = Invoke-WebRequest `
+            -Uri $LatestUrl `
+            -UseBasicParsing `
+            -ErrorAction Stop
 
-        $Release =
-            Invoke-RestMethod `
-                -Uri $ApiUrl `
-                -Headers @{
-                    "User-Agent" = "attic-setup"
-                    "Accept"     = "application/vnd.github+json"
-                }
+        $FinalUrl = $null
+
+        # Windows PowerShell 5.1
+        if ($Response.BaseResponse -and $Response.BaseResponse.ResponseUri) {
+            $FinalUrl = $Response.BaseResponse.ResponseUri.AbsoluteUri
+        }
+        # PowerShell 7+
+        elseif (
+            $Response.BaseResponse -and
+            $Response.BaseResponse.RequestMessage -and
+            $Response.BaseResponse.RequestMessage.RequestUri
+        ) {
+            $FinalUrl = $Response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+        }
+
+        if ([string]::IsNullOrWhiteSpace($FinalUrl)) {
+            Fail "GitHub resolved the latest release, but the final release URL could not be determined."
+        }
 
     } catch {
-
-        $StatusCode = $null
-
-        if ($_.Exception.Response) {
-            try {
-                $StatusCode =
-                    [int]$_.Exception.Response.StatusCode
-            } catch {
-                $StatusCode = $null
-            }
-        }
-
-        if ($StatusCode -eq 404) {
-            Fail "No published Attic release exists yet."
-        }
-
         Fail "Could not reach GitHub to resolve the latest Attic release: $_"
     }
 
-
-    $Tag = $Release.tag_name
-
-    if ([string]::IsNullOrWhiteSpace($Tag)) {
-        Fail "GitHub returned a release without a tag."
+    if ($FinalUrl -notmatch '/releases/tag/(v[^/?#]+)') {
+        Fail "Could not determine the latest Attic release tag from '$FinalUrl'."
     }
+
+    $Tag = $Matches[1]
 
 } else {
 
     $Tag = $Version
+}
+
+
+if ([string]::IsNullOrWhiteSpace($Tag)) {
+    Fail "Could not determine the Attic release tag."
 }
 
 

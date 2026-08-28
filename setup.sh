@@ -138,59 +138,34 @@ log ""
 
 if [[ "$VERSION" == "latest" ]]; then
 
-    API_URL="https://api.github.com/repos/$REPO/releases/latest"
+    # Avoid api.github.com: unauthenticated REST requests are rate-limited.
+    # Follow the normal GitHub latest-release redirect instead.
+    LATEST_URL="https://github.com/$REPO/releases/latest"
 
-    RESPONSE_FILE="$(mktemp)"
-    HTTP_CODE="$(
-        curl \
-            -sS \
-            -L \
-            -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: attic-setup" \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            "$API_URL"
-    )" || {
-        rm -f "$RESPONSE_FILE"
-        fail "could not reach GitHub to resolve the latest Attic release"
-    }
+    FINAL_URL="$(
+        curl             -fsSL             -o /dev/null             -w '%{url_effective}'             "$LATEST_URL"
+    )" || fail "could not reach GitHub to resolve the latest Attic release"
 
-
-    if [[ "$HTTP_CODE" == "404" ]]; then
-
-        rm -f "$RESPONSE_FILE"
-
-        fail "No published Attic release exists yet."
-
-    fi
-
-
-    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
-
-        rm -f "$RESPONSE_FILE"
-
-        fail "GitHub release lookup failed with HTTP status $HTTP_CODE"
-
-    fi
-
-
-    TAG="$(
-        grep -m1 '"tag_name"' "$RESPONSE_FILE" |
-            sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
-    )"
-
-
-    rm -f "$RESPONSE_FILE"
-
-
-    if [[ -z "$TAG" ]]; then
-        fail "could not resolve latest Attic release tag"
-    fi
+    case "$FINAL_URL" in
+        */releases/tag/*)
+            TAG="${FINAL_URL##*/releases/tag/}"
+            TAG="${TAG%%\?*}"
+            TAG="${TAG%%\#*}"
+            ;;
+        *)
+            fail "could not determine the latest Attic release tag from: $FINAL_URL"
+            ;;
+    esac
 
 else
 
     TAG="$VERSION"
 
+fi
+
+
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "invalid Attic release tag: $TAG"
 fi
 
 
