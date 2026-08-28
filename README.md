@@ -51,10 +51,10 @@ inspecting a previously-indexed workspace, or for pure MCP tool testing).
 For multi-repository / cross-repo dependency resolution, point
 `ATTIC_WORKSPACE_ROOT` at a parent directory whose repositories are linked as
 Git submodules (each submodule becomes its own `core_repositories` entry —
-see ADR-006). A **single** `attic-server` process owns the workspace: one
-watcher, one MCP transport, one SQLite writer. Cross-repo dependency
-resolution runs automatically at startup within that one process — see
-`crates/attic-crossrepo` and `docs/contracts/query_evidence.md`.
+see `docs/ARCHITECTURE.md`). A **single** `attic-server` process owns the
+workspace: one watcher, one MCP transport, one SQLite writer. Cross-repo
+dependency resolution runs automatically at startup within that one
+process — see `crates/attic-crossrepo`.
 
 Attic does **not** support multiple `attic-server` processes writing to the
 same database concurrently — the writer, watcher, and startup-recovery logic
@@ -251,6 +251,3 @@ tools/package.sh --target <x86_64-pc-windows-msvc|x86_64-unknown-linux-gnu|x86_6
   recovery, development, and maintenance procedures.
 - `docs/FINAL_VALIDATION_TODO.md` — authoritative list of what has and has
   not yet been independently verified (platform CI, scale/soak/stress).
-- `docs/contracts/` — normative behavioral contracts (retrieval, evidence,
-  recovery, resources, etc.).
-- `docs/decisions/` — architecture decision records.

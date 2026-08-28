@@ -82,8 +82,8 @@ criteria, before Attic can be called production-ready.
     rows.
   - Metrics: FAST/NORMAL/DEEP query latency at that scale, FTS index size,
     memory under sustained query load.
-  - Acceptance: query latency stays within the answer-mode budgets defined
-    in `docs/contracts/answer_modes.md`.
+  - Acceptance: query latency stays within the FAST/NORMAL/DEEP time
+    budgets defined in `crates/attic-retrieval/src/mode.rs`.
 
 ## Indexing / startup benchmarks
 
@@ -185,7 +185,7 @@ criteria, before Attic can be called production-ready.
   measured sub-millisecond at fixture scale. Revisit an in-DB vector index
   or external store only if/when selected-unit counts reach ~10^5 on real
   workspaces AND query-time kNN latency is measured to exceed the NORMAL
-  semantic time budget (`docs/contracts/answer_modes.md`).
+  semantic time budget (`crates/attic-retrieval/src/mode.rs`).
 
 ## Open items surfaced but not independently re-benchmarked this pass
 

@@ -29,7 +29,7 @@
 //! per file, which reads, secret-scans, and returns the (possibly redacted)
 //! content for that single file without accumulating workspace-wide state.
 //!
-//! Large-file handling follows `docs/contracts/large_files.md`:
+//! Large-file handling follows `docs/ARCHITECTURE.md`:
 //!
 //! | Tier       | Size             | Secrets scan              | Content returned                |
 //! |------------|------------------|---------------------------|---------------------------------|

@@ -1,9 +1,11 @@
 # Attic — Architecture
 
 This document describes Attic **as it exists in the current codebase**, not
-as a history of how it was built. For decision rationale on specific
-technical choices, see `docs/decisions/` (ADRs). For normative behavioral
-contracts (exact invariants, edge cases), see `docs/contracts/`.
+as a history of how it was built. "Key design decisions" and "Core
+behavioral invariants" below consolidate what used to be a separate ADR/
+contract document set; this file is now the single authoritative
+architecture reference — nothing else needs to be read to understand how
+the system behaves.
 
 ## What Attic is
 
@@ -141,9 +143,7 @@ documentation is never excluded from search or `context` results, it simply
 doesn't carry the same weight when the evidence manager resolves
 contradictions. The boundary is the `knowledge/` path prefix only —
 filenames are never special-cased outside it. See `knowledge/README.md` in
-this repository for the end-user-facing explanation and template, and
-`docs/contracts/evidence.md` for the full `AuthorityLevel`/`EvidenceSourceType`
-contract this implements.
+this repository for the end-user-facing explanation and template.
 
 ## Known design limitations (not blocking, no action taken)
 
@@ -174,6 +174,157 @@ before being closed:
   invalidation automatically — an analyzer upgrade requires a manual
   re-index (see `docs/PLAYBOOK.md` Maintenance). Republication does replace
   analyzer-derived artifacts wholesale once triggered.
+- **A corrupt database is not auto-quarantined.** On a startup integrity-check
+  failure, Attic logs the violation and refuses to serve (fail-closed) but
+  does **not** rename or move the corrupt `attic.db` aside automatically —
+  the operator must do this manually before restoring from backup or
+  rebuilding (see `docs/PLAYBOOK.md` Recovery).
+- **No enforced upper bound on `max_context_tokens`.** `ResourceConfig::
+  validate()` only rejects `0`; there is no configured ceiling on how high
+  `ATTIC_MAX_CONTEXT_TOKENS` (default `8192`) can be set.
+
+## Key design decisions
+
+Permanent, non-obvious decisions worth knowing when changing this system —
+condensed from the project's ADR history (full alternatives-considered
+rationale lives only in the archive branch's git history now):
+
+- **SQLite WAL checkpointing**: automatic frame-count checkpointing
+  (`PRAGMA wal_autocheckpoint = 1000`, PASSIVE) on the writer connection,
+  plus a background PASSIVE checkpoint every 5 minutes and a FULL checkpoint
+  immediately before every backup — chosen over a purely time-based trigger
+  to bound WAL growth under bursty write load without blocking readers.
+- **Secret-pattern versioning**: `core_file_occurrences.secret_pattern_version`
+  and `core_index_generations.secret_detector_version` are tracked
+  independently of the schema version so that shipping an improved secret
+  pattern set can trigger a targeted re-scan (`PARTIALLY_REBUILDABLE`)
+  without forcing a full workspace rebuild.
+- **Single-process ownership is a schema-level guarantee, not just a
+  convention**: `ops_server_state` has a `CHECK` constraint pinning it to
+  exactly one row, so a second process attempting to run against the same
+  database cannot silently diverge into two independent server-state views.
+- **Per-subsystem compatibility versioning**: `core_index_generations.
+  subsystem_versions_json` tracks schema/analyzer/segmentation/discovery
+  versions independently, so a change in one subsystem (e.g. an analyzer
+  upgrade) triggers exactly the scoped invalidation it needs
+  (`PARTIALLY_REBUILDABLE`) instead of an all-or-nothing rebuild.
+- **Discovery uses the `ignore` crate** (ripgrep's gitignore engine) rather
+  than a hand-rolled `.gitignore` parser, and **BLAKE3** for all content
+  hashing — both chosen to avoid subtly-wrong reimplementations of
+  well-specified algorithms.
+- **Git submodules are the multi-repository primitive**: each submodule
+  becomes its own `core_repositories` row with its own identity; the parent
+  `WorkspaceSnapshot` records every submodule's HEAD SHA so the parent hash
+  changes whenever any submodule advances. Uninitialized submodules are
+  skipped, not errored.
+- **`CancellationToken` is a plain `Arc<AtomicBool>` newtype**, not
+  `tokio_util::sync::CancellationToken` — analyzer/indexing work is
+  synchronous, so a lock-free shared flag is sufficient and avoids an
+  unnecessary tokio-internals dependency at that layer. (rmcp's own
+  cancellation token is used separately at the MCP-service-lifecycle level.)
+- **Analyzer selection is deterministic**: `AnalyzerRegistry::select()`
+  picks the analyzer with the highest-ordinal `CapabilityKind` for a file
+  type, breaking ties by name — reproducible indexing runs are a hard
+  requirement, so "first registered wins" was rejected.
+- **`GenericAnalyzer` chunks at 500 lines per `RetrievalUnit`** — large
+  enough for useful context, small enough to stay well under embedding
+  token limits if the semantic layer is enabled; language-agnostic since it
+  requires no parser.
+- **Filesystem watching uses `notify-debouncer-full`** (on top of `notify`
+  8.2.x) for cross-platform debounced change events, with periodic
+  reconciliation as the documented fallback when native watching isn't
+  available.
+- **Cross-file relationship edges persist even when unresolved.** An import
+  or reference that can't yet be resolved to a concrete symbol is stored
+  with a deterministic *logical* id rather than being dropped, so it becomes
+  traceable evidence immediately and resolves in place once its target is
+  indexed.
+- **Source verification is span-local with strict lineage preservation**:
+  when `context` verifies a claim against source, it re-checks the exact
+  cited span against the exact `source_revision_id` it was drawn from —
+  never a broader "does this file still look right" check — and charges the
+  actual bytes scanned against the query's resource budget, not an estimate.
+- **Claims only ever cite context-grounded evidence.** The evidence
+  pipeline does not allow a claim in a `context` response to reference
+  evidence that isn't part of the assembled context returned alongside it.
+
+## Core behavioral invariants
+
+A condensed reference of the invariants that most affect correctness and
+observable behavior, verified against the current implementation. This is
+not exhaustive engineering detail (that level of specification now exists
+only in git history on the archive branch) — it's what a maintainer changing
+this system needs to not accidentally break.
+
+**Discovery & security**
+- A path marked security-forbidden is never made eligible by any include
+  rule, regardless of rule ordering.
+- Ignored paths produce no occurrence record at all — not even as excluded.
+- The discovery walk never escapes the configured workspace root, including
+  via symlinks.
+- Discovery never executes repository content as code or shell commands.
+
+**Identity**
+- A file's stable identity is never reused after deletion (recreating a file
+  at the same path gets a new identity) except a narrow, conservative
+  same-content-same-path-same-window reuse case.
+- Identity-match confidence is always explicit; a `HEURISTIC` match is never
+  silently promoted to `EXACT` (see the rename-detection limitation above).
+- Deleting a file invalidates its dependent derived artifacts (symbols,
+  relationships, retrieval units) without deleting the file's identity
+  record itself.
+
+**Secrets**
+- Secret bytes never reach `core_retrieval_units`, FTS tables, evidence, or
+  any other derived/persisted layer — scanning happens before content enters
+  the pipeline, and the unredacted in-memory copy is discarded after
+  analysis.
+- A path-level security-forbidden exclusion always takes precedence over
+  scanner results — the file is never even opened for scanning.
+
+**Storage**
+- Every row with a foreign key to a source revision has a non-null,
+  valid `source_revision_id` — an artifact that loses this link is treated
+  as invalid rather than trusted.
+- No user-controlled string is ever concatenated into SQL; all queries use
+  parameter binding.
+- `core_evidence` rows are append-only — a stale row is marked `STALE`, not
+  overwritten.
+
+**Freshness & invalidation**
+- An artifact in `INVALID` state is never returned as valid evidence; a
+  `STALE` one may be returned, but only with that state visibly attached.
+- The invalidation dependency graph is acyclic, and propagation always
+  completes before any dependent recomputation begins.
+- Invalidated rows are never silently deleted — they persist until an
+  explicit maintenance pass prunes them.
+
+**Evidence & retrieval**
+- Evidence with `freshness_state = INVALID` never reaches an LLM-facing
+  context.
+- A detected contradiction between evidence sources is surfaced, never
+  silently dropped in favor of one side.
+- `FAST` mode never touches the filesystem or an embedding lookup — a code
+  path that does so for a `FAST`-mode query is a contract violation.
+- A `RetrievalPlan` is finalized exactly once and its steps are append-only;
+  every piece of evidence considered is accounted for as either used or
+  explicitly dropped, never silently ignored.
+
+**Recovery**
+- The server refuses to accept any MCP tool call until startup recovery
+  reaches a ready state (fail-closed, not a soft warning).
+- Startup recovery is idempotent — running it against an already-recovered
+  database is a no-op.
+- No recovery step deletes source files; only derived artifacts (indexes,
+  plans, caches) are ever invalidated or rebuilt.
+- A crash-recovery backup is written only after a successful WAL checkpoint,
+  never mid-recovery.
+
+**Resources**
+- Every scheduled unit of work has an associated resource budget from
+  creation; nothing runs unbudgeted.
+- The writer queue is drained (bounded) before process exit — shutdown never
+  abandons a write mid-flight without at least attempting to finish it.
 
 ## Semantic layer (optional, default-disabled)
 
@@ -215,8 +366,8 @@ fail-closed — if recovery cannot establish a safe state, or the subsequent
 database integrity check fails, the process refuses to serve rather than
 present possibly-stale or corrupt data as `CURRENT`. On clean shutdown,
 Attic performs an explicit WAL checkpoint and writes a crash-recovery backup
-(most recent 3 retained) before exiting. See `docs/contracts/recovery.md`
-for the full contract.
+(most recent 3 retained) before exiting — see "Core behavioral invariants"
+above for the recovery guarantees this implements.
 
 ## MCP surface
 

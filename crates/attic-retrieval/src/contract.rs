@@ -1,4 +1,4 @@
-//! Query Evidence Contracts (`docs/contracts/query_evidence.md`).
+//! Query Evidence Contracts (`docs/ARCHITECTURE.md`).
 //!
 //! Every QueryType maps to an explicit contract stating which evidence is
 //! REQUIRED before Attic may speak, what is merely preferred, how fresh it
@@ -85,7 +85,7 @@ const REL_CODE: &[ST] = &[ST::Relationship, ST::SourceCode];
 const DEP_DECL: &[ST] = &[ST::Configuration, ST::SourceCode, ST::Relationship];
 
 /// Per-query specification of required/preferred evidence and expansion
-/// bounds (`docs/contracts/query_evidence.md`).
+/// bounds (`docs/ARCHITECTURE.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryEvidenceContract {
     /// The intent this contract belongs to.
@@ -107,7 +107,7 @@ pub struct QueryEvidenceContract {
     pub expansion_budget: ExpansionBudget,
 }
 
-/// Expansion budget (`docs/contracts/query_evidence.md` ExpansionBudget).
+/// Expansion budget (`docs/ARCHITECTURE.md` ExpansionBudget).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpansionBudget {
     /// Maximum targeted-expansion rounds.

@@ -186,10 +186,12 @@ reclaim disk; canonical retrieval never depends on it.
   `tmp/` are all disposable/reconstructible. Nothing under a workspace root
   is ever written by Attic — only the user-global data directory holds
   Attic's own state.
-- **DB recovery**: if startup reports an integrity violation, restore from
-  the most recent file in `backups/` (rename it over `attic.db`, remove
-  `attic.db-wal`/`-shm`) or fall back to a full rebuild (above) if backups
-  are also unusable.
+- **DB recovery**: if startup reports an integrity violation, Attic refuses
+  to serve but does **not** automatically move the corrupt file aside —
+  manually rename/remove `attic.db`, `attic.db-wal`, `attic.db-shm` first,
+  then either copy the most recent file from `backups/` into place as
+  `attic.db` or fall back to a full rebuild (above) if backups are also
+  unusable.
 - **Semantic rebuild**: delete `semantic.db` and restart with
   `ATTIC_SEMANTIC=1`; the background enrichment worker repopulates it from
   scratch. Canonical retrieval is unaffected while this happens.
@@ -251,7 +253,6 @@ README's Install section.
   `run_migrations` (`crates/attic-storage/src/migration.rs`); migrations
   apply forward-only and are rejected if unrecognized (see Recovery above).
 - **IndexGeneration compatibility**: see
-  `docs/decisions/ADR-004-index-generation-subsystem-versions.md` and
   `crates/attic-core/src/domain/subsystem_versions.rs` — bump the relevant
   subsystem version when changing what an analyzer/generation produces, so
   stale generations are correctly invalidated rather than silently reused.

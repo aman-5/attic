@@ -1,4 +1,4 @@
-//! Per-query budget accounting (`docs/contracts/answer_modes.md` rules
+//! Per-query budget accounting (`docs/ARCHITECTURE.md` rules
 //! AM-E1..E8). Every limit that is reached is recorded as an observable
 //! event; exhaustion never silently looks like a complete answer.
 

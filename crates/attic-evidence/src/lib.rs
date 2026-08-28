@@ -7,7 +7,7 @@
 //! f64, ids as lowercase hyphenated UUID strings.
 //!
 //! Contracts implemented here:
-//! - `docs/contracts/evidence.md` (Evidence, SourceType, AuthorityLevel,
+//! - `docs/ARCHITECTURE.md` (Evidence, SourceType, AuthorityLevel,
 //!   FreshnessState, VerificationState, RetrievalSource, RankingSignals)
 //! - claim/answer-verification shapes used by the Phase 4 Answer Verifier.
 

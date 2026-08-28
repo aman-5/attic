@@ -1,7 +1,7 @@
 //! Analyzer registry — deterministic selection of the best analyzer for a
 //! given file type.
 //!
-//! Selection algorithm (from `docs/contracts/analyzers.md`):
+//! Selection algorithm (from `docs/ARCHITECTURE.md`):
 //!
 //! 1. Look up specialized analyzers registered for the detected `FileType`.
 //!    If multiple match, prefer the one with the highest declared

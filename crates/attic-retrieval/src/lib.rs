@@ -14,9 +14,9 @@
 //! Critical principle: **retrieval proposes candidates. Evidence determines
 //! what Attic is justified in saying.**
 //!
-//! Contracts implemented: `docs/contracts/evidence.md`,
+//! Contracts implemented: `docs/ARCHITECTURE.md`,
 //! `query_evidence.md`, `answer_modes.md`, `retrieval_plan.md`;
-//! architecture decisions in `docs/decisions/ADR-012-phase4-retrieval.md`.
+//! architecture decisions in `docs/ARCHITECTURE.md`.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]

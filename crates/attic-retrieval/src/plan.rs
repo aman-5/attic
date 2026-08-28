@@ -1,4 +1,4 @@
-//! RetrievalPlan (`docs/contracts/retrieval_plan.md`, C13): the
+//! RetrievalPlan (`docs/ARCHITECTURE.md`, C13): the
 //! serializable, loggable description of every decision made to answer a
 //! query. It is the single source of truth for what happened during a query;
 //! every subsystem writes a step into it; it is finalized exactly once and

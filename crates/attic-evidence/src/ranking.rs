@@ -1,4 +1,4 @@
-//! Observable per-dimension ranking signals (`docs/contracts/evidence.md`
+//! Observable per-dimension ranking signals (`docs/ARCHITECTURE.md`
 //! RankingSignals). The combined score is derived, never the only signal
 //! used; every component signal stays inspectable for debugging and
 //! benchmarking.

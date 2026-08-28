@@ -145,7 +145,7 @@ str_enum! {
     /// Whether the index data for this file/artifact is up-to-date.
     ///
     /// Values are fixed by `migrations/0001_initial.sql` and the invalidation
-    /// contract (`docs/contracts/invalidation.md`): CURRENT | STALE | UNKNOWN |
+    /// contract (`docs/ARCHITECTURE.md`): CURRENT | STALE | UNKNOWN |
     /// INVALID | PENDING_REFRESH.  Phase 2 enforces the legal transitions via
     /// the freshness state machine in the incremental service; storage only
     /// persists the value.
@@ -222,7 +222,7 @@ str_enum! {
     /// Artifact type recorded in `core_invalidation_records.artifact_type`.
     ///
     /// Values fixed by `migrations/0001_initial.sql` and the invalidation
-    /// contract (`docs/contracts/invalidation.md` §Definitions).
+    /// contract (`docs/ARCHITECTURE.md` §Definitions).
     InvalidationArtifactType {
         /// A file's observed state at a source revision.
         FileOccurrence   => "FILE_OCCURRENCE",
