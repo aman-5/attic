@@ -1,124 +1,367 @@
 <#
 .SYNOPSIS
-  Zero-toolchain setup for Attic (Windows).
+  Zero-toolchain setup/update for Attic on Windows.
 
 .DESCRIPTION
-  Normal-user path: downloads the prebuilt Attic binary for Windows x86_64
-  from the project's GitHub Releases, verifies its SHA-256 checksum,
-  installs it locally (no administrator privileges), and prints
-  ready-to-paste MCP client configuration.
+  Downloads the latest prebuilt Attic Windows x86_64 binary from GitHub
+  Releases, verifies its SHA-256 checksum, and installs it under ATTIC_HOME.
 
-  This does NOT compile Attic and does NOT require Rust/Cargo/MSVC Build
-  Tools. Contributors who want to build from source should use
-  `cargo build --release --package attic-server` instead — see
-  docs/PLAYBOOK.md.
+  Default ATTIC_HOME:
+
+      C:\Users\<user>\.attic
+
+  This does NOT require:
+      Rust
+      Cargo
+      MSVC Build Tools
+      administrator privileges
 
 .PARAMETER Version
-  Release tag to install (e.g. "v0.1.0"). Defaults to the latest release.
+  Optional release tag such as v0.1.3.
+
+  Default:
+      latest
 #>
+
 param(
     [string]$Version = "latest"
 )
 
 $ErrorActionPreference = "Stop"
+
 $Repo = "aman-5/attic"
 
-function Fail($msg) {
-    Write-Error "ERROR: $msg"
+
+function Fail {
+    param([string]$Message)
+
+    Write-Error "ERROR: $Message"
     exit 1
 }
 
-# ── 1. Detect architecture → release target triple ──────────────────────────
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
-if ($arch -ne [System.Runtime.InteropServices.Architecture]::X64) {
-    Fail "no prebuilt Attic binary for Windows/$arch yet — build from source (docs/PLAYBOOK.md)"
-}
-$target = "x86_64-pc-windows-msvc"
-Write-Host "detected platform: Windows/x64 -> $target"
 
-# ── 2. Resolve the release tag ───────────────────────────────────────────────
-if ($Version -eq "latest") {
-    $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "attic-setup" }
-    } catch {
-        Fail "could not reach $apiUrl to resolve the latest release: $_"
+# -----------------------------------------------------------------------------
+# 1. Resolve ATTIC_HOME
+# -----------------------------------------------------------------------------
+
+if (Test-Path Env:ATTIC_HOME) {
+
+    if ([string]::IsNullOrWhiteSpace($env:ATTIC_HOME)) {
+        Fail "ATTIC_HOME is set but empty. Remove it or provide a valid directory."
     }
-    $tag = $release.tag_name
-    if (-not $tag) { Fail "could not resolve latest release tag from $apiUrl" }
+
+    $AtticHome = $env:ATTIC_HOME
+
 } else {
-    $tag = $Version
+
+    if ([string]::IsNullOrWhiteSpace($HOME)) {
+        Fail "Could not determine the user home directory. Set ATTIC_HOME explicitly."
+    }
+
+    $AtticHome = Join-Path $HOME ".attic"
 }
-Write-Host "release tag: $tag"
 
-$name = "attic-$tag-$target"
-$archive = "$name.zip"
-$baseUrl = "https://github.com/$Repo/releases/download/$tag"
 
-# ── 3. Download archive + published checksum over HTTPS ─────────────────────
-$workDir = Join-Path $env:TEMP ("attic-setup-" + [System.Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 try {
-    $archivePath = Join-Path $workDir $archive
-    $checksumPath = Join-Path $workDir "$archive.sha256"
+    New-Item `
+        -ItemType Directory `
+        -Path $AtticHome `
+        -Force `
+        | Out-Null
+} catch {
+    Fail "Could not create Attic home directory '$AtticHome': $_"
+}
 
-    Write-Host "downloading $archive ..."
+
+Write-Host "Attic home:"
+Write-Host "  $AtticHome"
+Write-Host ""
+
+
+# -----------------------------------------------------------------------------
+# 2. Detect Windows architecture
+# -----------------------------------------------------------------------------
+
+$Architecture =
+    [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+
+
+if ($Architecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
+
+    Fail "No prebuilt Attic binary currently exists for Windows/$Architecture."
+}
+
+
+$Target = "x86_64-pc-windows-msvc"
+
+Write-Host "Detected platform:"
+Write-Host "  Windows/x64 -> $Target"
+Write-Host ""
+
+
+# -----------------------------------------------------------------------------
+# 3. Resolve GitHub release
+# -----------------------------------------------------------------------------
+
+if ($Version -eq "latest") {
+
+    $ApiUrl =
+        "https://api.github.com/repos/$Repo/releases/latest"
+
     try {
-        Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
+
+        $Release =
+            Invoke-RestMethod `
+                -Uri $ApiUrl `
+                -Headers @{
+                    "User-Agent" = "attic-setup"
+                    "Accept"     = "application/vnd.github+json"
+                }
+
     } catch {
-        Fail "download failed: $baseUrl/$archive"
+
+        $StatusCode = $null
+
+        if ($_.Exception.Response) {
+            try {
+                $StatusCode =
+                    [int]$_.Exception.Response.StatusCode
+            } catch {
+                $StatusCode = $null
+            }
+        }
+
+        if ($StatusCode -eq 404) {
+            Fail "No published Attic release exists yet."
+        }
+
+        Fail "Could not reach GitHub to resolve the latest Attic release: $_"
     }
+
+
+    $Tag = $Release.tag_name
+
+    if ([string]::IsNullOrWhiteSpace($Tag)) {
+        Fail "GitHub returned a release without a tag."
+    }
+
+} else {
+
+    $Tag = $Version
+}
+
+
+Write-Host "Release:"
+Write-Host "  $Tag"
+Write-Host ""
+
+
+# -----------------------------------------------------------------------------
+# 4. Determine artifact names
+# -----------------------------------------------------------------------------
+
+$Name =
+    "attic-$Tag-$Target"
+
+$Archive =
+    "$Name.zip"
+
+$Checksum =
+    "$Archive.sha256"
+
+$BaseUrl =
+    "https://github.com/$Repo/releases/download/$Tag"
+
+
+# -----------------------------------------------------------------------------
+# 5. Create temporary download directory
+# -----------------------------------------------------------------------------
+
+$WorkDir =
+    Join-Path `
+        $env:TEMP `
+        ("attic-setup-" + [Guid]::NewGuid().ToString("N"))
+
+
+New-Item `
+    -ItemType Directory `
+    -Path $WorkDir `
+    -Force `
+    | Out-Null
+
+
+try {
+
+    $ArchivePath =
+        Join-Path $WorkDir $Archive
+
+    $ChecksumPath =
+        Join-Path $WorkDir $Checksum
+
+
+    # -------------------------------------------------------------------------
+    # 6. Download archive
+    # -------------------------------------------------------------------------
+
+    Write-Host "Downloading:"
+    Write-Host "  $Archive"
+
     try {
-        Invoke-WebRequest -Uri "$baseUrl/$archive.sha256" -OutFile $checksumPath -UseBasicParsing
+
+        Invoke-WebRequest `
+            -Uri "$BaseUrl/$Archive" `
+            -OutFile $ArchivePath `
+            -UseBasicParsing
+
     } catch {
-        Fail "checksum download failed: $baseUrl/$archive.sha256 (refusing to install an unverified binary)"
+
+        Fail "Could not download $BaseUrl/$Archive"
     }
 
-    # ── 4. Verify integrity BEFORE extracting anything ──────────────────────
-    $expected = (Get-Content $checksumPath | Select-Object -First 1) -split '\s+' | Select-Object -First 1
-    $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
-    if ($expected.ToLower() -ne $actual.ToLower()) {
-        Fail "checksum verification FAILED for $archive (expected $expected, got $actual) — refusing to install"
+
+    # -------------------------------------------------------------------------
+    # 7. Download checksum
+    # -------------------------------------------------------------------------
+
+    try {
+
+        Invoke-WebRequest `
+            -Uri "$BaseUrl/$Checksum" `
+            -OutFile $ChecksumPath `
+            -UseBasicParsing
+
+    } catch {
+
+        Fail "Could not download checksum $BaseUrl/$Checksum. Refusing to install an unverified binary."
     }
-    Write-Host "checksum OK"
 
-    # ── 5. Extract and install (no admin; user-local install directory) ─────
-    Expand-Archive -Path $archivePath -DestinationPath $workDir -Force
 
-    $installRoot = if ($env:ATTIC_DATA_DIR) { $env:ATTIC_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "attic" }
-    $binDir = Join-Path $installRoot "bin"
-    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    # -------------------------------------------------------------------------
+    # 8. Verify SHA-256
+    # -------------------------------------------------------------------------
 
-    $srcExe = Join-Path (Join-Path $workDir $name) "attic-server.exe"
-    $binPath = Join-Path $binDir "attic-server.exe"
-    Copy-Item -Path $srcExe -Destination $binPath -Force
+    $Expected =
+        (
+            Get-Content $ChecksumPath |
+            Select-Object -First 1
+        ) -split '\s+' |
+        Select-Object -First 1
 
-    Write-Host "installed: $binPath"
 
-    # ── 6. Print ready-to-paste MCP configuration ────────────────────────────
-    $binPathJson = $binPath.Replace('\', '\\')
+    if ([string]::IsNullOrWhiteSpace($Expected)) {
+        Fail "Downloaded checksum file is invalid."
+    }
+
+
+    $Actual =
+        (
+            Get-FileHash `
+                -Path $ArchivePath `
+                -Algorithm SHA256
+        ).Hash
+
+
+    if ($Expected.ToLowerInvariant() -ne $Actual.ToLowerInvariant()) {
+
+        Fail "Checksum verification FAILED for $Archive. Expected $Expected but got $Actual."
+    }
+
+
+    Write-Host "Checksum OK"
     Write-Host ""
-    Write-Host "Attic is installed at:"
-    Write-Host "  $binPath"
+
+
+    # -------------------------------------------------------------------------
+    # 9. Extract
+    # -------------------------------------------------------------------------
+
+    Expand-Archive `
+        -Path $ArchivePath `
+        -DestinationPath $WorkDir `
+        -Force
+
+
+    $SourceExe =
+        Join-Path `
+            (Join-Path $WorkDir $Name) `
+            "attic-server.exe"
+
+
+    if (-not (Test-Path $SourceExe)) {
+
+        Fail "Release archive does not contain attic-server.exe at the expected location."
+    }
+
+
+    # -------------------------------------------------------------------------
+    # 10. Install/update
+    # -------------------------------------------------------------------------
+
+    $BinPath =
+        Join-Path $AtticHome "attic-server.exe"
+
+
+    try {
+
+        Copy-Item `
+            -Path $SourceExe `
+            -Destination $BinPath `
+            -Force
+
+    } catch {
+
+        Fail "Could not install Attic to '$BinPath'. If Attic is currently running, stop the MCP server and run setup again."
+    }
+
+
+    Write-Host "Attic installed successfully:"
+    Write-Host "  $BinPath"
     Write-Host ""
-    Write-Host "Add this to your MCP client's server configuration, then set"
-    Write-Host "ATTIC_WORKSPACE_ROOT to the repository (or multi-repo workspace root) you"
-    Write-Host "want Attic to index:"
+
+
+    # -------------------------------------------------------------------------
+    # 11. Print MCP configuration
+    # -------------------------------------------------------------------------
+
+    $BinPathJson =
+        $BinPath.Replace('\', '\\')
+
+
+    Write-Host "Add Attic to your AI client's MCP configuration:"
     Write-Host ""
+
     Write-Host "{"
-    Write-Host "  ""mcpServers"": {"
-    Write-Host "    ""attic"": {"
-    Write-Host "      ""command"": ""$binPathJson"","
-    Write-Host "      ""args"": [],"
-    Write-Host "      ""env"": {"
-    Write-Host "        ""ATTIC_WORKSPACE_ROOT"": ""C:\\absolute\\path\\to\\your\\repo"""
-    Write-Host "      }"
+    Write-Host '  "mcpServers": {'
+    Write-Host '    "attic": {'
+    Write-Host "      `"command`": `"$BinPathJson`","
+    Write-Host '      "args": []'
     Write-Host "    }"
     Write-Host "  }"
     Write-Host "}"
+
     Write-Host ""
-    Write-Host "See docs/PLAYBOOK.md for troubleshooting and docs/ARCHITECTURE.md for how"
-    Write-Host "Attic works."
+    Write-Host "Attic uses MCP over stdio."
+    Write-Host ""
+    Write-Host "No repository configuration is required in the MCP JSON."
+    Write-Host ""
+    Write-Host "After your AI client connects to Attic, tell it:"
+    Write-Host ""
+    Write-Host '  Configure Attic to index these repositories:'
+    Write-Host '  C:\path\repo-a'
+    Write-Host '  D:\path\repo-b'
+    Write-Host '  E:\path\repo-c'
+    Write-Host ""
+    Write-Host "Attic will persist the workspace configuration under:"
+    Write-Host "  $AtticHome"
+    Write-Host ""
+    Write-Host "Running setup.ps1 again updates the installed Attic binary"
+    Write-Host "to the latest published release."
+
 } finally {
-    Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    Remove-Item `
+        -Path $WorkDir `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
 }

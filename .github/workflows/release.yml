@@ -1,72 +1,273 @@
 name: Release
 
-# Builds release binaries for ALL supported platforms.  Local verification is
-# only possible for the host platform; the remaining platform gates are
-# verified HERE, by CI.  A release may only be cut when this workflow is
-# green on every matrix entry.
+# A successful CI run on main automatically produces the next v0.1.x
+# release.
+#
+# Example:
+#
+#   first successful main build -> v0.1.0
+#   next successful main build  -> v0.1.1
+#   next                        -> v0.1.2
+#
+# The release tag is created ONLY after all supported platform binaries
+# have built, tested, packaged, and uploaded successfully.
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+
+  # ---------------------------------------------------------------------------
+  # Determine whether this CI run should produce a release and calculate the
+  # next version.
+  # ---------------------------------------------------------------------------
+
+  prepare:
+    name: prepare release
+    runs-on: ubuntu-latest
+
+    # Automatic releases:
+    #   CI must have succeeded AND the CI run must belong to main.
+    #
+    # Manual workflow_dispatch is also allowed.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.source.outputs.sha }}
+      already_released: ${{ steps.version.outputs.already_released }}
+
+    steps:
+      - name: Resolve source commit
+        id: source
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHA="${{ github.sha }}"
+          else
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          fi
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "source SHA: $SHA"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Fetch tags
+        shell: bash
+        run: git fetch --force --tags
+
+      - name: Determine next v0.1.x version
+        id: version
+        shell: bash
+        run: |
+          SHA="${{ steps.source.outputs.sha }}"
+
+          # Idempotency:
+          # If this exact commit already has a v0.1.x tag, do not create
+          # another release when the workflow is rerun.
+          EXISTING="$(
+            git tag --points-at "$SHA" \
+              | grep -E '^v0\.1\.[0-9]+$' \
+              | head -n 1 || true
+          )"
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "commit already released as $EXISTING"
+            echo "version=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "already_released=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract numeric patch components and sort NUMERICALLY.
+          LATEST_PATCH="$(
+            git tag -l 'v0.1.*' \
+              | sed -nE 's/^v0\.1\.([0-9]+)$/\1/p' \
+              | sort -n \
+              | tail -n 1
+          )"
+
+          if [[ -z "$LATEST_PATCH" ]]; then
+            NEXT_PATCH=0
+          else
+            NEXT_PATCH=$((LATEST_PATCH + 1))
+          fi
+
+          VERSION="v0.1.${NEXT_PATCH}"
+
+          echo "next version: $VERSION"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "already_released=false" >> "$GITHUB_OUTPUT"
+
+
+  # ---------------------------------------------------------------------------
+  # Build/test/package every supported platform.
+  #
+  # NO tag exists yet.
+  # If any matrix entry fails, publish never runs and therefore no release/tag
+  # is created.
+  # ---------------------------------------------------------------------------
+
   build:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    name: build ${{ matrix.target }}
+
+    needs:
+      - prepare
+
+    if: needs.prepare.outputs.already_released != 'true'
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
+
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+
           - target: x86_64-apple-darwin
             os: macos-13
+
           - target: aarch64-apple-darwin
             os: macos-latest
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
-      - name: Build + test
-        # Every matrix entry runs on a NATIVE runner for its target
-        # (windows-latest=MSVC host, ubuntu-latest=x86_64 host,
-        # macos-13=Intel host, macos-latest=Apple Silicon host) — none of
-        # these are cross-compiled, so there is no platform here that can't
-        # actually run its own test suite. Skipping any of them would be a
-        # silent NOT VERIFIED masquerading as a passing release gate.
+
+      - name: Run tests
         run: cargo test --workspace
-      - name: Package release archive
+
+      - name: Package release
         shell: bash
-        run: bash tools/package.sh --target ${{ matrix.target }} --out dist
-      - name: Upload artifact
+        env:
+          ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          # package.sh expects the numeric version without the leading "v".
+          export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
+
+          bash tools/package.sh \
+            --target "${{ matrix.target }}" \
+            --out dist
+
+      - name: Show packaged files
+        shell: bash
+        run: |
+          find dist -maxdepth 2 -type f -print
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: attic-${{ matrix.target }}
-          path: dist/attic-*
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
 
-  # Publishing a GitHub Release is what makes "download from the Releases
-  # page" (README Quick Start / setup.ps1 / setup.sh) actually true — without
-  # this job, `build` only produces ephemeral, login-gated workflow-run
-  # artifacts, not a public downloadable release.
+
+  # ---------------------------------------------------------------------------
+  # Only reached when ALL four platform builds succeeded.
+  #
+  # Now create the tag and publish the GitHub Release.
+  # ---------------------------------------------------------------------------
+
   publish:
-    name: publish release
-    needs: build
+    name: publish ${{ needs.prepare.outputs.version }}
+
+    needs:
+      - prepare
+      - build
+
+    if: needs.prepare.outputs.already_released != 'true'
+
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Create release tag
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          git fetch --force --tags
+
+          # Protect against an unexpected concurrent/rerun duplicate.
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            EXISTING_SHA="$(git rev-list -n 1 "$VERSION")"
+
+            if [[ "$EXISTING_SHA" != "$SHA" ]]; then
+              echo "ERROR: $VERSION already exists on another commit"
+              exit 1
+            fi
+
+            echo "$VERSION already exists on this commit"
+          else
+            git tag "$VERSION" "$SHA"
+            git push origin "$VERSION"
+          fi
+
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: attic-*
           merge-multiple: true
+
+      - name: Show release files
+        shell: bash
+        run: |
+          find dist -maxdepth 1 -type f -print
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/attic-v*
+          tag_name: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           draft: false
+          prerelease: false
           generate_release_notes: true
