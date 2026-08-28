@@ -970,4 +970,80 @@ mod tests {
         let result = incremental_sync(&conn, &tid("nonexistent"), &["go.mod".to_owned()]);
         assert!(result.is_err(), "should propagate error for missing repo");
     }
+
+    /// §14 / §16 — `active_repository_ids` must exclude stale DB repos from
+    /// catalog scanning, edge resolution and snapshot provenance.
+    ///
+    /// Three repositories (r_a, r_b, r_c) are seeded into the DB.
+    /// `sync_workspace` is called with `active_repository_ids = Some([r_a, r_c])`.
+    /// r_b must not appear in `repository_reports` and must not participate in
+    /// any cross-repo edges or the workspace snapshot.
+    #[test]
+    fn sync_workspace_active_ids_excludes_stale() {
+        use attic_storage::writer::WriterQueue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Phase 1: seed three repos via a dedicated connection (closed before
+        // the writer/reader connections are opened to avoid WAL contention).
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            configure_connection(&conn).unwrap();
+            run_migrations(&conn).unwrap();
+            insert_repo(&conn, "r_a", "/tmp/r_a");
+            insert_repo(&conn, "r_b", "/tmp/r_b");
+            insert_repo(&conn, "r_c", "/tmp/r_c");
+            insert_rev(&conn, "r_a");
+            insert_rev(&conn, "r_b");
+            insert_rev(&conn, "r_c");
+        }
+
+        // Phase 2: open separate writer and reader connections.
+        let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&writer_conn).unwrap();
+        let wq = WriterQueue::new(writer_conn).unwrap();
+        let writer_handle = wq.handle();
+
+        let reader_conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&reader_conn).unwrap();
+
+        let a_id = tid("r_a");
+        let b_id = tid("r_b");
+        let c_id = tid("r_c");
+
+        // Sync only r_a and r_c — r_b is present in the DB but excluded.
+        let opts = WorkspaceSyncOptions {
+            active_repository_ids: Some(vec![a_id.clone(), c_id.clone()]),
+            ..Default::default()
+        };
+        let result = sync_workspace(&reader_conn, &writer_handle, &opts)
+            .expect("sync_workspace must succeed");
+
+        // r_b must NOT appear in repository_reports.
+        let reported_ids: Vec<&str> = result
+            .repository_reports
+            .iter()
+            .map(|r| r.repository_id.as_str())
+            .collect();
+        assert!(
+            !reported_ids.contains(&b_id.as_str()),
+            "r_b must be excluded from sync when not in active_repository_ids; \
+             reported: {reported_ids:?}"
+        );
+
+        // Verify no cross-repo edges involving r_b were written.
+        let b_edge_count: i64 = reader_conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_relationships \
+                  WHERE source_repository_id = ?1 OR target_repository_id = ?1",
+                rusqlite::params![b_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(
+            b_edge_count, 0,
+            "no cross-repo edges must reference the excluded repo r_b"
+        );
+    }
 }
