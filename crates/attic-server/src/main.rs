@@ -3369,7 +3369,7 @@ mod tests {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn attic server");
         let mut stdin = child.stdin.take().unwrap();
@@ -3450,7 +3450,7 @@ mod tests {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
@@ -3708,7 +3708,7 @@ mod tests {
                     .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .spawn()
                     .expect("spawn attic (degraded)");
                 let mut stdin = child.stdin.take().unwrap();
@@ -3808,7 +3808,7 @@ mod tests {
                 .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn attic (synced)");
             let mut stdin = child.stdin.take().unwrap();
@@ -3982,7 +3982,7 @@ mod tests {
                 .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn attic (post-manifest-change)");
             let mut stdin = child.stdin.take().unwrap();
