@@ -53,15 +53,28 @@ Attic's tools when it needs repository knowledge.
 
 Add it to your client's MCP server configuration:
 
+**Recommended (no environment variables needed):** just add the server —
+Attic connects even with nothing configured, then you configure it by simply
+telling your AI client:
+
+> Configure Attic with these repositories:
+> `C:\Users\me\Desktop\Dump`
+> `C:\work\HDFC`
+> `D:\repos\HDFC-Bank-on-prem`
+
+The AI invokes Attic's `workspace` MCP tool; Attic validates the roots,
+persists them atomically to `~/.attic/config.toml` (override the location
+with `ATTIC_HOME`), indexes and watches each repository, and reloads the
+same workspace automatically on every subsequent launch. Roots may live
+anywhere on disk — no common parent, no symlinks, one process, one database.
+
 ```json
 {
   "mcpServers": {
     "attic": {
       "command": "/absolute/path/to/attic-server",
       "args": [],
-      "env": {
-        "ATTIC_WORKSPACE_ROOT": "/absolute/path/to/your/repo"
-      }
+      "env": {}
     }
   }
 }
@@ -146,7 +159,15 @@ surface.
 
 ## Workspaces & Multiple Repositories
 
-**Single repository:**
+**Configuration precedence** (deterministic, never silently combined):
+
+1. `ATTIC_CONFIG=<path>` — explicit multi-root config file
+2. `<ATTIC_HOME>/config.toml` (default `~/.attic/config.toml`) — persistent
+   workspace config, written automatically by the `workspace` MCP tool
+3. `ATTIC_WORKSPACE_ROOT=<path>` — legacy single-repository convenience
+4. none — UNCONFIGURED first run; configure through the `workspace` MCP tool
+
+**Single repository (legacy):**
 
 ```sh
 # .env / MCP client config

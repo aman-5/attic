@@ -63,25 +63,31 @@ Call the `status` MCP tool. Key fields:
 
 ### Repository add/remove
 
-Repositories are discovered from the configured workspace root (a single
-repo, or any number of nested Git repositories — true submodules or plain
-independent checkouts — under a parent directory) — there is no separate
-"register a repository" tool. To add a repository, clone or place it under
-the workspace root and restart, or wait for the watcher to pick it up on
-the next reconciliation pass. To remove one,
-remove it from the workspace root; its indexed data becomes orphaned and is
-cleaned up on the next full reconciliation. There is currently no
-single-repository "forget and purge immediately" tool — a data-directory
-reset (below) is the supported way to force a clean slate.
+Workspace membership is managed at runtime through the `workspace` MCP tool
+(no restart, no config editing): `workspace {action:"add", path:"D:\new-service"}`
+validates + canonicalizes the root, indexes it, starts its watcher, and
+persists membership atomically to `<ATTIC_HOME>/config.toml`;
+`{action:"remove", path:...}` stops the watcher and drops the repository
+from active retrieval immediately (its historical indexed data stays in
+storage but can never leak into search/context/status); `{action:"set",
+paths:[...]}` authoritatively replaces the whole membership;
+`{action:"inspect"}` reports the current state. Tell your AI client
+"add D:\new-service to Attic" and it does exactly this.
 
 ### Multi-repository operation
 
 See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
-logical workspace, any number of configured repository roots — either
-`ATTIC_WORKSPACE_ROOT` for a single repository, or `ATTIC_CONFIG` pointing
-at a config file with one `[[repositories]] path = "..."` entry per root
-for multiple roots. Configured roots may live anywhere on disk with no
-common parent, no symlinks required, and no `.gitmodules` requirement.
+logical workspace, any number of configured repository roots. Configuration
+precedence: `ATTIC_CONFIG` (explicit config file with one
+`[[repositories]] path = "..."` entry per root) → the persistent
+`<ATTIC_HOME>/config.toml` (default `~/.attic/config.toml`, written by the
+`workspace` MCP tool) → `ATTIC_WORKSPACE_ROOT` (legacy single repository) →
+UNCONFIGURED (server starts fine; configure via MCP). Configured roots may
+live anywhere on disk with no common parent, no symlinks required, and no
+`.gitmodules` requirement. Roots configured but temporarily unavailable
+(e.g. an unmounted external drive) are reported by `status` under
+`workspace.unavailable_repositories` with `degraded: true` — the remaining
+roots stay usable.
 **Do not** run two `attic` processes against the same `attic.db` —
 this is not a supported or tested configuration; give each concurrently
 running instance its own `ATTIC_DATA_DIR`.
@@ -150,9 +156,16 @@ Quick reference — see the detailed entries below each row for exact checks:
   `ATTIC_DATA_DIR` to isolate), workspace path doesn't exist or isn't
   readable, or invalid `ATTIC_*` resource configuration
   (`ResourceConfig::validate()` rejects self-contradictory overrides).
-- **Repository missing from `search`/`repo_map`**: confirm it's actually
-  under `ATTIC_WORKSPACE_ROOT` (or a submodule of it) and not excluded by
-  `.gitignore`/discovery policy; check `status.db.repository_count`.
+- **Repository missing from `search`/`repo_map`**: confirm it is part of
+  the configured workspace (`workspace {action:"inspect"}`) and not
+  excluded by `.gitignore`/discovery policy; check
+  `status.workspace.configured_repository_count`. A repository still in the
+  DB but removed from membership is intentionally invisible — that is the
+  membership-authoritative isolation contract, not data loss.
+- **`workspace not configured` errors from `search`/`file`/`context`**: the
+  server started with no workspace configuration (fresh install). This is
+  the intended first-run state — use the `workspace` MCP tool (or set
+  `ATTIC_CONFIG`/`ATTIC_WORKSPACE_ROOT`) to configure it.
 - **File appears "ignored"**: discovery is gitignore-aware by default
   (`DiscoveryPolicy::default_git()`); a `.gitignore`'d file is not indexed
   even if you can read it manually.

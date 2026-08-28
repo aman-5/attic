@@ -87,10 +87,36 @@ struct AtticServer {
     /// successfully bootstrapped configured root — a multi-root workspace
     /// runs one watcher per repository, sharing this process's single
     /// pool/writer/scheduler (see §10-12 of the multi-root design).
-    incremental: HashMap<String, Arc<attic_incremental::IncrementalService>>,
+    /// `Arc<RwLock<...>>` so the runtime `workspace` tool can add/remove
+    /// membership through `&self`.
+    incremental: Arc<std::sync::RwLock<HashMap<String, Arc<attic_incremental::IncrementalService>>>>,
     /// Which change-detection mechanism is running per `repository_id`
     /// (absent key = incremental disabled/not yet started for that repo).
-    watch_mode: HashMap<String, attic_incremental::WatchMode>,
+    watch_mode: Arc<std::sync::RwLock<HashMap<String, attic_incremental::WatchMode>>>,
+    /// Live change-detection handles, keyed by `repository_id`. Owned here
+    /// (not by `main`) so the runtime `workspace` MCP tool can start and stop
+    /// watchers for roots that are added/removed while the process is up.
+    watches: Arc<std::sync::Mutex<HashMap<String, attic_incremental::IncrementalWatch>>>,
+    /// Whether the logical workspace is configured (any `ATTIC_CONFIG`, the
+    /// persistent default config file, or `ATTIC_WORKSPACE_ROOT`). `false`
+    /// (UNCONFIGURED first run) gates query tools and drives status.
+    workspace_configured: Arc<std::sync::atomic::AtomicBool>,
+    /// Current active (validated, canonicalized) roots, in config order.
+    /// Updated on runtime `workspace` mutations; the authoritative set for
+    /// membership-scoped outputs (status/query guards/WorkspaceSnapshot).
+    active_roots: Arc<std::sync::RwLock<Vec<PathBuf>>>,
+    /// Path of the persistent default workspace config file (where the MCP
+    /// `workspace` tool writes runtime membership changes).
+    default_config: PathBuf,
+    /// Configured-but-unavailable roots this run (spec §17): preserved from
+    /// configuration, reported by `status` as degraded, never active.
+    unavailable_roots: Arc<std::sync::RwLock<Vec<(PathBuf, String)>>>,
+    /// §23 degraded-add marker: roots whose `bootstrap_workspace` succeeded
+    /// (config is authoritative) but whose post-config indexing task failed
+    /// at runtime.  Reported by `status` as degraded/pending so the caller
+    /// can see the failure without requiring a restart.  In-memory only —
+    /// a restart will re-attempt indexing from the persisted config.
+    pending_index_failed: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     /// Phase 6 cross-repo subsystem health.  `true` = degraded: sync
@@ -160,8 +186,14 @@ impl AtticServer {
             pool,
             writer,
             _queue,
-            incremental: HashMap::new(),
-            watch_mode: HashMap::new(),
+            incremental: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            watch_mode: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            watches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            workspace_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
+            default_config: db_path.with_file_name("config.toml"),
+            unavailable_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
+            pending_index_failed: Arc::new(std::sync::Mutex::new(HashSet::new())),
             semantic,
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
@@ -192,6 +224,284 @@ impl AtticServer {
             .map(|r| r.repository_id)
             .map_err(ServerError::Indexing)
     }
+
+    /// Runtime logical-workspace membership management via the `workspace`
+    /// MCP tool.
+    ///
+    /// `inspect` is a pure read. `add`/`remove`/`set` mutate membership,
+    /// persist it atomically to the default `<home>/config.toml` (so it
+    /// survives restarts), and reconcile LIVE watchers: newly added roots are
+    /// bootstrapped/indexed and watched immediately, removed roots have their
+    /// watcher stopped. This makes first-run, fully-runtime configuration
+    /// possible on a pristine machine with no environment variables.
+    async fn handle_workspace(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> Result<CallToolResult, ServerError> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServerError::InvalidArg("missing 'action' (inspect|add|remove|set)".into()))?
+            .to_string();
+
+        if action == "inspect" {
+            let active = self.active_roots.read().expect("active_roots poison").clone();
+            let configured = self
+                .workspace_configured
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let payload = json!({
+                "configured": configured,
+                "unconfigured": !configured,
+                "config_file": self.default_config.display().to_string(),
+                "membership_count": active.len(),
+                "roots": active.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+            });
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&payload)?,
+            )]));
+        }
+
+        /// Validate + canonicalize a single root path for membership changes.
+        fn validate_root(path: &str) -> Result<PathBuf, ServerError> {
+            let p = PathBuf::from(path);
+            if !p.exists() {
+                return Err(ServerError::InvalidArg(format!("path does not exist: {path}")));
+            }
+            if !p.is_dir() {
+                return Err(ServerError::InvalidArg(format!("path is not a directory: {path}")));
+            }
+            p.canonicalize()
+                .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
+        }
+
+        /// Deterministic canonical dedup preserving configuration order.
+        fn dedup_keep_order(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for r in roots {
+                if seen.insert(r.clone()) {
+                    out.push(r);
+                }
+            }
+            out
+        }
+
+        let new_active: Vec<PathBuf> = match action.as_str() {
+            "add" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
+                let canon = validate_root(path)?;
+                let mut active = self.active_roots.read().expect("active_roots poison").clone();
+                if !active.contains(&canon) {
+                    active.push(canon);
+                }
+                dedup_keep_order(active)
+            }
+            "remove" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for remove".into()))?;
+                let canon = PathBuf::from(path)
+                    .canonicalize()
+                    .map_err(|e| {
+                        ServerError::InvalidArg(format!(
+                            "cannot canonicalize removal path '{path}': {e}"
+                        ))
+                    })?;
+                let current = self.active_roots.read().expect("active_roots poison").clone();
+                dedup_keep_order(
+                    current
+                        .into_iter()
+                        .filter(|r| r.as_path() != canon.as_path())
+                        .collect(),
+                )
+            }
+            "set" => {
+                let paths = args
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| ServerError::InvalidArg("missing 'paths' (array) for set".into()))?
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .ok_or_else(|| ServerError::InvalidArg("paths must be strings".into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut validated = Vec::new();
+                for p in paths {
+                    validated.push(validate_root(p)?);
+                }
+                dedup_keep_order(validated)
+            }
+            other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+        };
+
+        // Compute added/removed roots relative to the current live membership.
+        let old_active = self.active_roots.read().expect("active_roots poison").clone();
+        let added: Vec<PathBuf> = new_active
+            .iter()
+            .filter(|r| !old_active.contains(r))
+            .cloned()
+            .collect();
+        let removed: Vec<PathBuf> = old_active
+            .iter()
+            .filter(|r| !new_active.contains(r))
+            .cloned()
+            .collect();
+
+        // 1. Persist the new membership atomically BEFORE touching live state,
+        //    so a crash still leaves a coherent durable config.
+        if new_active.is_empty() {
+            remove_workspace_config(&self.default_config)
+                .map_err(ServerError::InvalidArg)?;
+        } else {
+            persist_repositories_config(&self.default_config, &new_active)
+                .map_err(ServerError::InvalidArg)?;
+        }
+
+        // 2. Update in-memory authoritative membership + configured flag.
+        *self.active_roots.write().expect("active_roots poison") = new_active.clone();
+        self.workspace_configured
+            .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
+
+        // 3. Reconcile LIVE watchers: stop watchers for removed roots,
+        //    start+bootstrap watchers for added roots. Each is isolated so a
+        //    single failure never corrupts the rest of the reconciliation.
+        let mut events = Vec::new();
+        for root in &removed {
+            let repo_id = self
+                .pool
+                .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+                .ok()
+                .flatten()
+                .map(|id| id.to_string());
+            if let Some(id) = repo_id {
+                self.stop_watcher(&id);
+                events.push(format!("stopped watcher for: {}", root.display()));
+            } else {
+                events.push(format!("removed (no registered repo): {}", root.display()));
+            }
+        }
+        for root in &added {
+            match tokio::task::spawn_blocking({
+                let server = self.clone();
+                let root = root.clone();
+                move || server.bootstrap_workspace(&root)
+            })
+            .await
+            {
+                Ok(Ok(repo_id)) => {
+                    // §23: clear any prior degraded-add marker for this root.
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .remove(root);
+                    let started = self.start_watcher(&root, &repo_id);
+                    events.push(format!(
+                        "added + {} root: {}",
+                        if started { "started watcher for" } else { "indexed" },
+                        root.display()
+                    ));
+                }
+                Ok(Err(e)) => {
+                    // §23: mark this root as degraded/pending so status surfaces it.
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .insert(root.clone());
+                    tracing::warn!("bootstrap of newly added root {} failed: {e}", root.display());
+                    events.push(format!("failed to index added root {}: {e}", root.display()));
+                }
+                Err(e) => {
+                    // §23: mark this root as degraded/pending so status surfaces it.
+                    self.pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison")
+                        .insert(root.clone());
+                    tracing::warn!("bootstrap task for {} failed: {e}", root.display());
+                    events.push(format!("failed to index added root {}: {e}", root.display()));
+                }
+            }
+        }
+
+        let payload = json!({
+            "action": action,
+            "configured": !new_active.is_empty(),
+            "config_file": self.default_config.display().to_string(),
+            "membership_count": new_active.len(),
+            "roots": new_active.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+            "events": events,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&payload)?,
+        )]))
+    }
+
+    /// Stop the live watcher for `repository_id`, if any, and drop its
+    /// incremental/watch-mode bookkeeping. Idempotent.
+    fn stop_watcher(&self, repository_id: &str) {
+        if let Some(mut watch) = self
+            .watches
+            .lock()
+            .expect("watches poison")
+            .remove(repository_id)
+        {
+            watch.stop();
+        }
+        self.incremental
+            .write()
+            .expect("incremental poison")
+            .remove(repository_id);
+        self.watch_mode
+            .write()
+            .expect("watch_mode poison")
+            .remove(repository_id);
+    }
+
+    /// Start a watcher for `root` (already bootstrapped/registered as
+    /// `repository_id`) and record it in live state. Returns true if a
+    /// watcher is now running. Best-effort: a failed watcher start is logged
+    /// and the root remains indexed but incrementally-disabled.
+    fn start_watcher(&self, root: &Path, repository_id: &str) -> bool {
+        let policy = DiscoveryPolicy::default_git();
+        let service =
+            Arc::new(attic_incremental::IncrementalService::new(root, policy.clone())
+                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS));
+        match service.start_incremental_watch(self.pool.clone(), self.writer.clone()) {
+            Ok(watch) => {
+                let mode = watch.mode();
+                self.watches
+                    .lock()
+                    .expect("watches poison")
+                    .insert(repository_id.to_string(), watch);
+                self.watch_mode
+                    .write()
+                    .expect("watch_mode poison")
+                    .insert(repository_id.to_string(), mode);
+                self.incremental
+                    .write()
+                    .expect("incremental poison")
+                    .insert(repository_id.to_string(), service);
+                info!(
+                    repository_id = %repository_id,
+                    root = %root.display(),
+                    mode = mode.as_str(),
+                    "runtime-added watcher started"
+                );
+                true
+            }
+            Err(e) => {
+                error!(
+                    "change detection failed to start for {} ({e}) — incremental DISABLED for this repository",
+                    root.display()
+                );
+                false
+            }
+        }
+    }
 }
 
 // ─── input validation ──────────────────────────────────────────────────────────
@@ -218,6 +528,18 @@ fn validate_repository_id(id: &str) -> Result<(), ServerError> {
         ));
     }
     Ok(())
+}
+
+/// Reject an explicit `repository_id` that does not belong to the currently
+/// configured logical workspace (membership-authoritative retrieval, §14/§16).
+fn require_active_member(active_ids: &HashSet<String>, repo_id: &str) -> Result<(), ServerError> {
+    if active_ids.contains(repo_id) {
+        return Ok(());
+    }
+    Err(ServerError::InvalidArg(format!(
+        "repository_id {repo_id} is not part of the configured workspace — it may have been \
+         removed from membership or never configured. Inspect membership with the `workspace` tool."
+    )))
 }
 
 // ─── region arguments: checked parsing + validation ────────────────────────────
@@ -568,6 +890,7 @@ fn enforce_response_limit(mut body: String) -> String {
 fn handle_file(
     pool: &DbPool,
     args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
 ) -> Result<CallToolResult, ServerError> {
     let repo_id = args
         .get("repository_id")
@@ -589,6 +912,7 @@ fn handle_file(
     let repo_root_str = pool
         .with_reader(|c| get_repository_path(c, &parsed_repo_id))?
         .ok_or_else(|| ServerError::InvalidArg(format!("repository_id {repo_id} not found")))?;
+    require_active_member(active_ids, repo_id)?;
     let repo_root_raw = PathBuf::from(&repo_root_str);
     // On Windows, std::fs::canonicalize adds a \\?\ extended-length prefix.
     // canonicalize_within_root canonicalizes the joined path, so the result
@@ -667,6 +991,7 @@ fn handle_file(
 fn handle_search(
     pool: &DbPool,
     args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
         .get("query")
@@ -677,6 +1002,7 @@ fn handle_search(
     let repo_id = args.get("repository_id").and_then(Value::as_str);
     if let Some(id) = repo_id {
         validate_repository_id(id)?;
+        require_active_member(active_ids, id)?;
     }
     let file_type = args.get("file_type").and_then(Value::as_str);
     if let Some(ft) = file_type {
@@ -694,7 +1020,12 @@ fn handle_search(
         language,
         max_results: MAX_SEARCH_RESULTS,
     };
-    let results = pool.with_reader(|c| fts_search(c, &params))?;
+    let mut results = pool.with_reader(|c| fts_search(c, &params))?;
+    // Membership-authoritative retrieval scope (§16/§26): a workspace-wide
+    // search (no explicit repository_id) must never surface hits from
+    // repositories that have left the configured workspace but still exist
+    // in storage.
+    results.retain(|r| active_ids.contains(&r.repository_id));
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&json!({ "results": results }))?,
     )]))
@@ -703,12 +1034,14 @@ fn handle_search(
 fn handle_repo_map(
     pool: &DbPool,
     args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
 ) -> Result<CallToolResult, ServerError> {
     let repo_id = args
         .get("repository_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
     validate_repository_id(repo_id)?;
+    require_active_member(active_ids, repo_id)?;
     let file_type = args.get("file_type").and_then(Value::as_str);
     if let Some(ft) = file_type {
         validate_filter("file_type", ft, 32)?;
@@ -732,6 +1065,9 @@ fn handle_status(
     incremental: &HashMap<String, Arc<attic_incremental::IncrementalService>>,
     watch_mode: &HashMap<String, attic_incremental::WatchMode>,
     resource_monitor: Option<&attic_storage::resource_manager::ResourceMonitor>,
+    configured: bool,
+    active_roots: &[PathBuf],
+    unavailable_roots: &[(PathBuf, String)],
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
@@ -755,15 +1091,52 @@ fn handle_status(
         });
     }
 
+    // Membership-authoritative scoping: ONLY repositories that belong to the
+    // configured logical workspace are reported as current/active. Historical
+    // repositories still present in the DB but no longer configured must not
+    // masquerade as active (spec §14-16). When UNCONFIGURED, the active set
+    // is empty and status reports "unconfigured" — stale DB repos never leak
+    // into the response.
+    let active_ids: HashSet<String> = if configured {
+        active_roots
+            .iter()
+            .filter_map(|root| {
+                pool.with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+                    .ok()
+                    .flatten()
+                    .map(|id| id.to_string())
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    if !configured {
+        payload["status"] = json!("unconfigured");
+        payload["workspace"] = json!({
+            "configured": false,
+            "unconfigured": true,
+            "configured_repository_count": 0,
+            "active_repositories": [],
+            "note": "no workspace configured yet — use the `workspace` MCP tool to add repository roots"
+        });
+        return Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&payload)?,
+        )]));
+    }
+
     // Per-repository watcher/incremental state — one entry per repository
     // known to storage, independent of every other repository's health.
     let repo_stats = pool.with_reader(get_repository_stats)?;
-    let mut repositories = Vec::with_capacity(repo_stats.len());
+    let active_stats: Vec<&attic_storage::RepositoryStats> = repo_stats
+        .iter()
+        .filter(|rs| active_ids.contains(&rs.id))
+        .collect();
+    let mut repositories = Vec::with_capacity(active_stats.len());
     let mut current = 0u64;
     let mut indexing = 0u64;
     let mut reconciliation_required = 0u64;
     let mut disabled = 0u64;
-    for rs in &repo_stats {
+    for rs in &active_stats {
         let (state, watcher_json) = match (incremental.get(&rs.id), watch_mode.get(&rs.id)) {
             (Some(svc), Some(mode)) => match svc.status_snapshot(pool) {
                 Ok(snap) => {
@@ -815,12 +1188,26 @@ fn handle_status(
             "watcher": watcher_json,
         }));
     }
+    // §17: configured-but-unavailable roots are reported explicitly so the
+    // caller can see the workspace is DEGRADED, never silently dropped from
+    // membership or hidden behind an otherwise-current summary.
+    let unavailable: Vec<Value> = unavailable_roots
+        .iter()
+        .map(|(p, reason)| {
+            json!({ "path": p.display().to_string(), "reason": reason })
+        })
+        .collect();
     payload["workspace"] = json!({
-        "configured_repository_count": repo_stats.len(),
+        "configured": true,
+        "unconfigured": false,
+        "configured_repository_count": active_stats.len(),
         "current_repository_count": current,
         "indexing_repository_count": indexing,
         "reconciliation_required_repository_count": reconciliation_required,
         "disabled_repository_count": disabled,
+        "unavailable_repository_count": unavailable.len(),
+        "degraded": !unavailable.is_empty(),
+        "unavailable_repositories": unavailable,
         "repositories": repositories,
     });
 
@@ -841,6 +1228,7 @@ fn handle_context(
     writer: &WriterQueueHandle,
     crossrepo_degraded: bool,
     args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
     resource_advisory: attic_storage::resource_manager::ResourceAdvisory,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
@@ -875,7 +1263,12 @@ fn handle_context(
     let mut request = attic_retrieval::AnswerRequest::new(query, mode);
     if let Some(id) = args.get("repository_id").and_then(Value::as_str) {
         validate_repository_id(id)?;
+        require_active_member(active_ids, id)?;
         request.repository_ids.push(id.to_owned());
+    } else {
+        // Workspace-wide context operates over current membership only
+        // (§25/§26): historical/inactive repositories never feed retrieval.
+        request.repository_ids = active_ids.iter().cloned().collect();
     }
 
     let service = attic_retrieval::RetrievalService {
@@ -1003,6 +1396,26 @@ fn make_tools() -> Vec<Tool> {
                 "required": ["query"]
             })),
         ),
+        Tool::new(
+            "workspace",
+            "Inspect and manage the configured logical workspace membership at runtime. \
+             Actions: `inspect` (report the configured + active roots and per-repository \
+             state), `add <path>`, `remove <path>`, `set [<paths...>]` (authoritatively \
+             replace membership). The configuration is persisted atomically to \
+             <ATTIC_HOME>/config.toml so it survives restarts; membership changes take \
+             effect live (bootstrap/index for newly added roots, watcher stop for removed \
+             ones). On a pristine machine this is the first-run configuration entry point.",
+            json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type":"string","enum":["inspect","add","remove","set"],"description":"Membership operation"},
+                    "path":  {"type":"string","description":"Filesystem path for add/remove"},
+                    "paths": {"type":"array","items":{"type":"string"},"description":"Full membership for set"},
+                    "force": {"type":"boolean","description":"Applied by future-proofing; currently unused"}
+                },
+                "required": ["action"]
+            })),
+        ),
     ]
 }
 
@@ -1038,6 +1451,10 @@ impl ServerHandler for AtticServer {
         let incremental = self.incremental.clone();
         let semantic = self.semantic.clone();
         let watch_mode = self.watch_mode.clone();
+        let workspace_configured = self
+            .workspace_configured
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let active_roots = self.active_roots.read().expect("active_roots poison").clone();
         let crossrepo_degraded = self
             .crossrepo_degraded
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -1067,22 +1484,85 @@ impl ServerHandler for AtticServer {
                 }
             };
             let advisory = admission.advisory();
+            // Membership-authoritative scope (§14/§16): the set of repository
+            // IDs that belong to the CURRENT configured workspace. Query tools
+            // use this so historical repositories still present in storage can
+            // never leak into active retrieval.
+            let active_ids: HashSet<String> = if workspace_configured {
+                active_roots
+                    .iter()
+                    .filter_map(|root| {
+                        pool.with_reader(|c| {
+                            lookup_repository_by_root_path(c, &root.to_string_lossy())
+                        })
+                        .ok()
+                        .flatten()
+                        .map(|id| id.to_string())
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
-                "file" => handle_file(&pool, &args),
-                "search" => handle_search(&pool, &args),
-                "repo_map" => handle_repo_map(&pool, &args),
-                "status" => handle_status(
-                    &pool,
-                    &incremental,
-                    &watch_mode,
-                    self.resource_monitor.as_ref().map(|m| m.as_ref()),
-                ),
+                "workspace" => self.handle_workspace(&args).await,
+                "file" | "search" | "repo_map" | "context" if !workspace_configured => {
+                    // UNCONFIGURED first run (§8/§30): query tools that depend on
+                    // indexed workspace state must NOT fabricate results. They return
+                    // a clear structured error identifying the missing configuration
+                    // and the path to fix it (the `workspace` MCP tool). `status` and
+                    // `workspace inspect` remain available.
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "workspace not configured: no repository roots are configured yet. \
+                         Use the `workspace` tool (action=add or set) to configure the \
+                         logical workspace, or start the server with ATTIC_CONFIG / \
+                         ATTIC_WORKSPACE_ROOT / a persistent <ATTIC_HOME>/config.toml."
+                    ))])
+                    .into());
+                }
+                "file" => handle_file(&pool, &args, &active_ids),
+                "search" => handle_search(&pool, &args, &active_ids),
+                "repo_map" => handle_repo_map(&pool, &args, &active_ids),
+                "status" => {
+                    let inc = incremental.read().expect("incremental poison");
+                    let wm = watch_mode.read().expect("watch_mode poison");
+                    // §23: merge startup unavailable_roots with any in-flight
+                    // pending_index_failed entries so status always reflects the
+                    // true degraded set without requiring a restart.
+                    let base_unavail = self
+                        .unavailable_roots
+                        .read()
+                        .expect("unavailable_roots poison");
+                    let failed_guard = self
+                        .pending_index_failed
+                        .lock()
+                        .expect("pending_index_failed poison");
+                    let mut combined_unavail: Vec<(PathBuf, String)> =
+                        base_unavail.iter().cloned().collect();
+                    for p in failed_guard.iter() {
+                        // Only add if not already present in the base list.
+                        if !combined_unavail.iter().any(|(bp, _)| bp == p) {
+                            combined_unavail
+                                .push((p.clone(), "indexing_failed".to_string()));
+                        }
+                    }
+                    drop(failed_guard);
+                    handle_status(
+                        &pool,
+                        &inc,
+                        &wm,
+                        self.resource_monitor.as_ref().map(|m| m.as_ref()),
+                        workspace_configured,
+                        &active_roots,
+                        &combined_unavail,
+                    )
+                }
                 "context" => handle_context(
                     semantic,
                     &pool,
                     &writer,
                     crossrepo_degraded,
                     &args,
+                    &active_ids,
                     advisory,
                 ),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
@@ -1104,45 +1584,121 @@ impl ServerHandler for AtticServer {
 // One Attic process serves ONE logical workspace made of one or more
 // independent repository roots. Roots may live anywhere on disk — they are
 // never required to share a filesystem parent, be symlinked together, or be
-// git submodules. Two mutually exclusive ways to configure the workspace:
+// git submodules. There is intentionally NO symlink-workspace requirement,
+// no common-parent requirement, and no per-repo process:
 //
-//   ATTIC_WORKSPACE_ROOT=<path>        legacy single-repository convenience
-//   ATTIC_CONFIG=<path to config file> multi-root: one `[[repositories]]`
-//                                       block per root, e.g.
-//                                         [[repositories]]
-//                                         path = "C:\Users\me\Desktop\Dump"
+// The logical workspace is configured in ONE of these ways (deterministic
+// precedence, never silently combined):
 //
-//                                         [[repositories]]
-//                                         path = "C:\Adobe-Projects\EDS\HDFC"
+//   1. `ATTIC_CONFIG=<path>`            explicit multi-root config file
+//   2. `<ATTIC_HOME>/config.toml`       persistent default workspace config
+//      (else the resolved user-global data root's `config.toml`)
+//   3. `ATTIC_WORKSPACE_ROOT=<path>`    legacy single-repository convenience
+//   4. (none of the above)              UNCONFIGURED first run
 //
-// Setting both is rejected as ambiguous configuration rather than silently
-// preferring one. Neither set => watch mode/incremental indexing stays
-// disabled exactly as before (unindexed MCP server).
+// The persistent default config file (source 2) is what makes the workspace
+// durable across restarts and configurable at RUNTIME through the MCP
+// `workspace` tool: on a pristine machine, the server starts UNCONFIGURED,
+// the operator calls `workspace` to add roots, and the resulting membership
+// is written back to `<ATTIC_HOME>/config.toml` so it survives the next
+// start without any environment variables.
+//
+// Config-file grammar (shared by `ATTIC_CONFIG` and the default config.toml):
+// a flat list of `[[repositories]]` blocks each holding one `path = "..."`.
+// Deliberately NOT a general TOML parser (no heavyweight config framework
+// dependency for what is, structurally, a list of paths) — see
+// [`parse_repositories_config`].
+//
+// Ambiguity policy: `ATTIC_CONFIG` and `ATTIC_WORKSPACE_ROOT` set together
+// are rejected as ambiguous rather than silently preferring one. A
+// persistent default config file takes precedence over the legacy
+// `ATTIC_WORKSPACE_ROOT` (a configured workspace always outranks a mere
+// environment hint). `ATTIC_CONFIG` always wins over the default config
+// file, since it is the most explicit source.
 
-/// Read the configured repository roots from the environment.
+/// Result of resolving where the workspace configuration comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSource {
+    /// `ATTIC_CONFIG=<path>` — most explicit.
+    Explicit(String),
+    /// Default persistent `<home>/config.toml`.
+    Persistent,
+    /// Legacy `ATTIC_WORKSPACE_ROOT=<path>` — not persisted.
+    Legacy(String),
+    /// No configuration present anywhere — UNCONFIGURED first run.
+    Unconfigured,
+}
+
+/// Read every configured repository root, in precedence order.
 ///
-/// Returns the RAW (unvalidated, uncanonicalized) list in configuration
-/// order. Existence/directory/canonicalization checks happen later, per
-/// root, so one bad entry never prevents the others from being reported —
-/// see [`validate_configured_roots`].
-fn load_workspace_roots() -> anyhow::Result<Vec<PathBuf>> {
-    let config_path = std::env::var("ATTIC_CONFIG").ok();
+/// Returns `(source, raw_roots)`. `raw_roots` is the RAW (unvalidated,
+/// uncanonicalized) list in configuration order; existence/directory/
+/// canonicalization checks and dedup happen later per root in
+/// [`validate_configured_roots`], so one bad entry never prevents the others
+/// from being reported. `source == Unconfigured` means the workspace is not
+/// configured yet — the MCP `workspace` tool remains the entry point.
+fn load_workspace_roots(default_config: &Path) -> anyhow::Result<(ConfigSource, Vec<PathBuf>)> {
+    let explicit = std::env::var("ATTIC_CONFIG").ok();
     let legacy_root = std::env::var("ATTIC_WORKSPACE_ROOT").ok();
-    if config_path.is_some() && legacy_root.is_some() {
+    if explicit.is_some() && legacy_root.is_some() {
         anyhow::bail!(
             "ATTIC_CONFIG and ATTIC_WORKSPACE_ROOT are mutually exclusive — set only one \
              (ATTIC_CONFIG for multi-root workspaces, ATTIC_WORKSPACE_ROOT for a single repository)"
         );
     }
-    if let Some(path) = config_path {
+    if let Some(path) = explicit {
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("failed to read ATTIC_CONFIG file '{path}': {e}"))?;
-        parse_repositories_config(&contents)
-            .map_err(|e| anyhow::anyhow!("invalid ATTIC_CONFIG ('{path}'): {e}"))
-    } else if let Some(root) = legacy_root {
-        Ok(vec![PathBuf::from(root)])
-    } else {
-        Ok(Vec::new())
+        let roots = parse_repositories_config(&contents)
+            .map_err(|e| anyhow::anyhow!("invalid ATTIC_CONFIG ('{path}'): {e}"))?;
+        return Ok((ConfigSource::Explicit(path), roots));
+    }
+    if default_config.exists() {
+        let contents = std::fs::read_to_string(default_config)
+            .map_err(|e| anyhow::anyhow!("failed to read workspace config '{}': {e}", default_config.display()))?;
+        let roots = parse_repositories_config(&contents)
+            .map_err(|e| anyhow::anyhow!("invalid workspace config ('{}'): {e}", default_config.display()))?;
+        return Ok((ConfigSource::Persistent, roots));
+    }
+    if let Some(root) = legacy_root {
+        return Ok((ConfigSource::Legacy(root.clone()), vec![PathBuf::from(root)]));
+    }
+    Ok((ConfigSource::Unconfigured, Vec::new()))
+}
+
+/// Serialize a list of canonicalized repository roots to the shared
+/// `[[repositories]] / path = "..."` config-file grammar.
+///
+/// Round-trips exactly with [`parse_repositories_config`]. Each root is
+/// written inside double quotes verbatim (single-backslash Windows paths
+/// survive as-is, matching the reader's literal quote handling).
+fn serialize_repositories_config(roots: &[PathBuf]) -> String {
+    let mut out = String::from("# Attic workspace configuration (generated by the `workspace` MCP tool)\n");
+    for root in roots {
+        out.push_str("[[repositories]]\n");
+        out.push_str(&format!("path = \"{}\"\n", root.display()));
+    }
+    out
+}
+
+/// Atomically persist workspace membership to `path` (write temp + rename),
+/// so a configured workspace survives process restarts without corruption.
+fn persist_repositories_config(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    let contents = serialize_repositories_config(roots);
+    let tmp = path.with_extension("config.toml.tmp");
+    std::fs::write(&tmp, &contents)
+        .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("failed to finalize workspace config '{}': {e}", path.display()))
+}
+
+/// Remove an empty workspace config so a workspace reported as configured for
+/// zero roots never lingers as an invisible, confusing file.
+fn remove_workspace_config(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove workspace config '{}': {e}", path.display())),
     }
 }
 
@@ -1213,31 +1769,51 @@ fn parse_repositories_config(contents: &str) -> Result<Vec<PathBuf>, String> {
 /// never prevent repos A and C from being registered, indexed, and served
 /// (failure isolation).  Order is preserved so unrelated configuration
 /// reordering does not change which duplicate survives.
-fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> Vec<PathBuf> {
+/// Structured outcome of workspace-root validation (spec §17): valid roots
+/// become active membership; configured-but-unavailable roots are PRESERVED
+/// (never silently discarded) so status can report them as degraded, and
+/// duplicates are reported distinctly.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RootValidation {
+    /// Canonical roots that are usable now — the active membership set.
+    valid: Vec<PathBuf>,
+    /// Configured roots that could not be used this run, with the reason.
+    unavailable: Vec<(PathBuf, String)>,
+    /// Canonical duplicate entries (same canonical path as an earlier one).
+    duplicates: Vec<PathBuf>,
+}
+
+fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> RootValidation {
     let mut seen = HashSet::new();
-    let mut valid = Vec::new();
+    let mut out = RootValidation::default();
     for raw_root in raw_roots {
         if !raw_root.exists() {
             error!(
-                "configured repository root does not exist, skipping: {}",
+                "configured repository root does not exist, keeping as UNAVAILABLE: {}",
                 raw_root.display()
             );
+            out.unavailable
+                .push((raw_root, "path does not exist".to_string()));
             continue;
         }
         if !raw_root.is_dir() {
             error!(
-                "configured repository root is not a directory, skipping: {}",
+                "configured repository root is not a directory, keeping as UNAVAILABLE: {}",
                 raw_root.display()
             );
+            out.unavailable
+                .push((raw_root, "path is not a directory".to_string()));
             continue;
         }
         let canonical = match raw_root.canonicalize() {
             Ok(c) => c,
             Err(e) => {
                 error!(
-                    "failed to canonicalize configured repository root {}: {e}, skipping",
+                    "failed to canonicalize configured repository root {}: {e}, keeping as UNAVAILABLE",
                     raw_root.display()
                 );
+                out.unavailable
+                    .push((raw_root, format!("canonicalization failed: {e}")));
                 continue;
             }
         };
@@ -1246,11 +1822,12 @@ fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> Vec<PathBuf> {
                 "duplicate configured repository root (same canonical path as an earlier entry), skipping: {}",
                 canonical.display()
             );
+            out.duplicates.push(canonical);
             continue;
         }
-        valid.push(canonical);
+        out.valid.push(canonical);
     }
-    valid
+    out
 }
 
 // ─── main ──────────────────────────────────────────────────────────────────────
@@ -1282,7 +1859,7 @@ async fn main() -> anyhow::Result<()> {
         paths.data_root.display()
     );
 
-    let mut server = AtticServer::new(&db_path)?;
+    let server = AtticServer::new(&db_path)?;
 
     // Phase 5/7: when the semantic layer is opt-in and opened successfully,
     // it needs a background worker to actually drain the enrichment queue —
@@ -1340,16 +1917,33 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut watch_handles: Vec<attic_incremental::IncrementalWatch> = Vec::new();
     let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
     // ─── Multi-root workspace bootstrap ─────────────────────────────────────
     //
-    // `roots` may be zero (no ATTIC_CONFIG/ATTIC_WORKSPACE_ROOT — watch mode
-    // stays disabled, same as before), one (legacy single-repository), or
-    // many arbitrary/unrelated filesystem paths (multi-root workspace).
-    let raw_roots = load_workspace_roots()?;
-    let roots = validate_configured_roots(raw_roots);
+    // `roots` may be zero (UNCONFIGURED first run — watch mode disabled,
+    // status reports UNCONFIGURED, and the MCP `workspace` tool is the
+    // configuration entry point), one (legacy single-repository), or many
+    // arbitrary/unrelated filesystem paths (multi-root workspace).
+    let default_config = paths.config_path();
+    let (config_source, raw_roots) = load_workspace_roots(&default_config)?;
+    let validation = validate_configured_roots(raw_roots);
+    let roots = validation.valid.clone();
+    *server
+        .unavailable_roots
+        .write()
+        .expect("unavailable_roots poison") = validation.unavailable.clone();
+    *server.active_roots.write().expect("active_roots poison") = roots.clone();
+    server.workspace_configured.store(
+        config_source != ConfigSource::Unconfigured,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    info!(
+        configured = config_source != ConfigSource::Unconfigured,
+        source = ?config_source,
+        root_count = roots.len(),
+        "workspace configuration resolved"
+    );
 
     if !roots.is_empty() {
         // 1. Bootstrap / index every configured root, INDEPENDENTLY.
@@ -1494,8 +2088,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 // Continue serving WITHOUT incremental claims; status reports
                 // watcher.mode = "disabled" for every configured repository.
-                return serve_until_closed(server, sched_handle, watch_handles, semantic_enricher)
-                    .await;
+                return serve_until_closed(server, sched_handle, semantic_enricher).await;
             }
         }
 
@@ -1518,11 +2111,22 @@ async fn main() -> anyhow::Result<()> {
                         mode = watch.mode().as_str(),
                         "incremental change detection started"
                     );
+                    let mode = watch.mode();
                     server
                         .watch_mode
-                        .insert(repository_id.clone(), watch.mode());
-                    server.incremental.insert(repository_id.clone(), service);
-                    watch_handles.push(watch);
+                        .write()
+                        .expect("watch_mode poison")
+                        .insert(repository_id.clone(), mode);
+                    server
+                        .incremental
+                        .write()
+                        .expect("incremental poison")
+                        .insert(repository_id.clone(), service);
+                    server
+                        .watches
+                        .lock()
+                        .expect("watches poison")
+                        .insert(repository_id.clone(), watch);
                 }
                 Err(e) => {
                     error!(
@@ -1534,7 +2138,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    serve_until_closed(server, sched_handle, watch_handles, semantic_enricher).await
+    serve_until_closed(server, sched_handle, semantic_enricher).await
 }
 
 /// Outcome of the initial workspace indexing decision.
@@ -1580,7 +2184,6 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
 async fn serve_until_closed(
     server: AtticServer,
     sched_handle: Option<attic_incremental::SchedulerHandle>,
-    mut watches: Vec<attic_incremental::IncrementalWatch>,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
 ) -> anyhow::Result<()> {
     // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
@@ -1593,6 +2196,9 @@ async fn serve_until_closed(
     //    resources out from under it.
     let writer_for_shutdown = server.writer.clone();
     let db_path_for_shutdown = server.db_path.clone();
+    // Clone the watcher handle map BEFORE `server` is consumed by `serve` so
+    // shutdown can deterministically stop every live watcher afterwards.
+    let watches_for_shutdown = server.watches.clone();
     let running = server
         .serve(stdio())
         .await
@@ -1618,9 +2224,16 @@ async fn serve_until_closed(
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
     //    threads poll a stop flag / condvar, not indefinite blocking I/O).
-    for w in watches.iter_mut() {
+    let mut watches_guard = watches_for_shutdown
+        .lock()
+        .expect("watches poison");
+    let mut live_watches: Vec<&mut attic_incremental::IncrementalWatch> =
+        watches_guard.values_mut().collect();
+    for w in live_watches.iter_mut() {
         w.stop();
     }
+    drop(live_watches);
+    drop(watches_guard);
     if let Some(sched) = sched_handle {
         sched.shutdown();
     }
@@ -1711,6 +2324,18 @@ mod tests {
         AtticServer::new(&tmp.path().join("test.db")).expect("AtticServer::new")
     }
 
+    /// Every repository currently registered in storage — used as the
+    /// "configured membership" set in direct handler tests, which register
+    /// repositories without going through workspace configuration.
+    fn ids(srv: &AtticServer) -> HashSet<String> {
+        srv.pool
+            .with_reader(get_repository_stats)
+            .expect("repository stats")
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
     /// Phase 5 (ADR-013 revision): default startup NEVER enables the
     /// experimental semantic layer; only an explicit opt-in may turn it on.
     #[test]
@@ -1784,9 +2409,14 @@ mod tests {
         // canonicalizes to the same path) must collapse to one entry, and
         // the missing root must be skipped rather than failing everything.
         let raw = vec![real.clone(), missing, real.join(".")];
-        let valid = validate_configured_roots(raw);
-        assert_eq!(valid.len(), 1, "expected exactly one deduped valid root");
-        assert_eq!(valid[0], real.canonicalize().unwrap());
+        let out = validate_configured_roots(raw);
+        assert_eq!(out.valid.len(), 1, "expected exactly one deduped valid root");
+        assert_eq!(out.valid[0], real.canonicalize().unwrap());
+        // §17: the missing root is preserved as configured-but-unavailable,
+        // never silently discarded.
+        assert_eq!(out.unavailable.len(), 1, "missing root must be reported");
+        // The third raw entry canonicalizes to the same real root → duplicate.
+        assert_eq!(out.duplicates.len(), 1, "canonical duplicate must be reported");
     }
 
     #[test]
@@ -1797,11 +2427,14 @@ mod tests {
 
         // Three configured roots with NO common parent; the middle one is
         // broken. Both good roots must still validate (failure isolation).
-        let raw = vec![tmp_a.path().to_path_buf(), broken, tmp_c.path().to_path_buf()];
-        let valid = validate_configured_roots(raw);
-        assert_eq!(valid.len(), 2, "the two valid unrelated roots must survive");
-        assert!(valid.contains(&tmp_a.path().canonicalize().unwrap()));
-        assert!(valid.contains(&tmp_c.path().canonicalize().unwrap()));
+        let raw = vec![tmp_a.path().to_path_buf(), broken.clone(), tmp_c.path().to_path_buf()];
+        let out = validate_configured_roots(raw);
+        assert_eq!(out.valid.len(), 2, "the two valid unrelated roots must survive");
+        assert!(out.valid.contains(&tmp_a.path().canonicalize().unwrap()));
+        assert!(out.valid.contains(&tmp_c.path().canonicalize().unwrap()));
+        // §17: the broken root is reported as unavailable with a reason.
+        assert_eq!(out.unavailable.len(), 1, "broken root must be reported");
+        assert_eq!(out.unavailable[0].0, broken);
     }
 
     fn text_of(r: &CallToolResult) -> String {
@@ -2180,7 +2813,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!("../../etc"));
         a.insert("path".into(), json!("x.rs"));
-        assert!(handle_file(&make_server(&tmp).pool, &a).is_err());
+        assert!(handle_file(&make_server(&tmp).pool, &a, &HashSet::new()).is_err());
     }
 
     #[test]
@@ -2188,7 +2821,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!("aabbccdd"));
-        let e = handle_file(&make_server(&tmp).pool, &a)
+        let e = handle_file(&make_server(&tmp).pool, &a, &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("path required"), "{e}");
@@ -2203,7 +2836,7 @@ mod tests {
             json!("deadbeef-0000-0000-0000-000000000000"),
         );
         a.insert("path".into(), json!("src/lib.rs"));
-        let e = handle_file(&make_server(&tmp).pool, &a)
+        let e = handle_file(&make_server(&tmp).pool, &a, &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("not found"), "{e}");
@@ -2222,7 +2855,7 @@ mod tests {
         a.insert("repository_id".into(), json!(id));
         a.insert("path".into(), json!("f.txt"));
         a.insert("start_byte".into(), json!(u64::MAX));
-        let err = handle_file(&srv.pool, &a).unwrap_err().to_string();
+        let err = handle_file(&srv.pool, &a, &ids(&srv)).unwrap_err().to_string();
         assert!(
             err.contains("maximum allowed") || err.contains("non-negative"),
             "{err}"
@@ -2235,7 +2868,7 @@ mod tests {
         );
         b.insert("path".into(), json!("f.txt"));
         b.insert("end_byte".into(), json!(-42));
-        assert!(handle_file(&srv.pool, &b).is_err());
+        assert!(handle_file(&srv.pool, &b, &ids(&srv)).is_err());
     }
 
     // handle_file: live read + region
@@ -2253,7 +2886,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id.clone()));
         a.insert("path".into(), json!("hello.txt"));
-        let r = handle_file(&srv.pool, &a).expect("handle_file");
+        let r = handle_file(&srv.pool, &a, &ids(&srv)).expect("handle_file");
         let text = text_of(&r);
         assert!(text.contains("line1") && text.contains("line3"), "{text}");
 
@@ -2263,7 +2896,7 @@ mod tests {
         b.insert("path".into(), json!("hello.txt"));
         b.insert("start_line".into(), json!(2u64));
         b.insert("end_line".into(), json!(2u64));
-        let r2 = handle_file(&srv.pool, &b).expect("region");
+        let r2 = handle_file(&srv.pool, &b, &ids(&srv)).expect("region");
         let t2 = text_of(&r2);
         assert!(t2.contains("line2") && !t2.contains("line1"), "{t2}");
     }
@@ -2280,7 +2913,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(id));
         a.insert("path".into(), json!("../../etc/passwd"));
-        assert!(handle_file(&srv.pool, &a).is_err());
+        assert!(handle_file(&srv.pool, &a, &ids(&srv)).is_err());
     }
 
     #[test]
@@ -2296,7 +2929,7 @@ mod tests {
         a.insert("repository_id".into(), json!(id));
         a.insert("path".into(), json!(".git/config"));
         // preprocess_file_content returns Excluded for .git/* — no error, but content is policy message
-        let r = handle_file(&srv.pool, &a);
+        let r = handle_file(&srv.pool, &a, &ids(&srv));
         match r {
             Err(e) => assert!(
                 e.to_string().contains("forbidden")
@@ -2369,7 +3002,7 @@ mod tests {
         a.insert("path".into(), json!("large_source.txt"));
         a.insert("start_byte".into(), json!(middle_offset as u64));
         a.insert("end_byte".into(), json!(middle_offset as u64 + 40));
-        let r = handle_file(&srv.pool, &a).expect("middle region");
+        let r = handle_file(&srv.pool, &a, &ids(&srv)).expect("middle region");
         let t = text_of(&r);
         assert!(t.contains("MIDDLE_MARKER_TOKEN_100"), "{t}");
         assert!(
@@ -2388,7 +3021,7 @@ mod tests {
         b.insert("path".into(), json!("large_source.txt"));
         b.insert("start_line".into(), json!(9000u64));
         b.insert("end_line".into(), json!(9000u64));
-        let r2 = handle_file(&srv.pool, &b).expect("tail line region");
+        let r2 = handle_file(&srv.pool, &b, &ids(&srv)).expect("tail line region");
         let t2 = text_of(&r2);
         assert!(t2.contains("TAIL_MARKER_TOKEN_9000"), "{t2}");
         assert!(!t2.contains("MIDDLE_MARKER_TOKEN_100"), "{t2}");
@@ -2398,7 +3031,7 @@ mod tests {
         let mut c = HashMap::new();
         c.insert("repository_id".into(), json!(repo_id));
         c.insert("path".into(), json!("large_source.txt"));
-        let r3 = handle_file(&srv.pool, &c).expect("full file");
+        let r3 = handle_file(&srv.pool, &c, &ids(&srv)).expect("full file");
         let t3 = text_of(&r3);
         assert!(
             t3.len() <= MAX_RESPONSE_BYTES + 256,
@@ -2428,7 +3061,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id));
         a.insert("path".into(), json!("huge_line.txt"));
-        let r = handle_file(&srv.pool, &a).expect("huge line file");
+        let r = handle_file(&srv.pool, &a, &ids(&srv)).expect("huge line file");
         let t = text_of(&r);
         assert!(t.len() <= MAX_RESPONSE_BYTES + 256, "len {}", t.len());
         assert!(t.contains("[truncated:"), "{:.80}", t);
@@ -2439,7 +3072,7 @@ mod tests {
     #[test]
     fn search_missing_query() {
         let tmp = TempDir::new().unwrap();
-        let e = handle_search(&make_server(&tmp).pool, &HashMap::new())
+        let e = handle_search(&make_server(&tmp).pool, &HashMap::new(), &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("query required"), "{e}");
@@ -2450,7 +3083,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut a = HashMap::new();
         a.insert("query".into(), json!("x".repeat(513)));
-        assert!(handle_search(&make_server(&tmp).pool, &a).is_err());
+        assert!(handle_search(&make_server(&tmp).pool, &a, &HashSet::new()).is_err());
     }
 
     #[test]
@@ -2459,7 +3092,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello"));
         a.insert("repository_id".into(), json!("bad!id"));
-        assert!(handle_search(&make_server(&tmp).pool, &a).is_err());
+        assert!(handle_search(&make_server(&tmp).pool, &a, &HashSet::new()).is_err());
     }
 
     #[test]
@@ -2467,7 +3100,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello"));
-        let r = handle_search(&make_server(&tmp).pool, &a).unwrap();
+        let r = handle_search(&make_server(&tmp).pool, &a, &HashSet::new()).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert!(v["results"].is_array());
@@ -2482,6 +3115,9 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            true,
+            &[],
+            &[],
         )
         .unwrap();
         let t = text_of(&r);
@@ -2493,7 +3129,7 @@ mod tests {
     #[test]
     fn repo_map_missing_repo_id() {
         let tmp = TempDir::new().unwrap();
-        let e = handle_repo_map(&make_server(&tmp).pool, &HashMap::new())
+        let e = handle_repo_map(&make_server(&tmp).pool, &HashMap::new(), &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("repository_id required"), "{e}");
@@ -2511,7 +3147,7 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, &HashMap::new(), &HashMap::new(), None).unwrap();
+        let r = handle_status(&srv.pool, &HashMap::new(), &HashMap::new(), None, true, &[], &[]).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -2520,7 +3156,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello_world"));
         a.insert("repository_id".into(), json!(repo_id.clone()));
-        let r2 = handle_search(&srv.pool, &a).unwrap();
+        let r2 = handle_search(&srv.pool, &a, &ids(&srv)).unwrap();
         let v2: Value = serde_json::from_str(&text_of(&r2)).unwrap();
         let results = v2["results"].as_array().expect("results array");
         assert!(
@@ -2692,7 +3328,9 @@ mod tests {
         assert!(content.is_array(), "expected content array: {resp}");
         let text = content[0]["text"].as_str().unwrap_or("");
         let v: Value = serde_json::from_str(text).expect("status result is JSON");
-        assert_eq!(v["status"], "ok", "unexpected status: {v}");
+        // Spawned without any workspace configuration: status must succeed
+        // and report UNCONFIGURED (spec §30), never a fabricated empty ok.
+        assert_eq!(v["status"], "unconfigured", "unexpected status: {v}");
         child.kill().ok();
     }
 
@@ -2727,8 +3365,11 @@ mod tests {
         if let Some(arr) = content.as_array() {
             let text = arr[0]["text"].as_str().unwrap_or("");
             assert!(
-                text.contains("query required") || text.contains("required"),
-                "expected 'query required' in error text, got: {text}"
+                text.contains("query required")
+                    || text.contains("required")
+                    // Spawned without workspace config: the guard fires first.
+                    || text.contains("workspace not configured"),
+                "expected validation error, got: {text}"
             );
         }
         child.kill().ok();
@@ -2786,7 +3427,10 @@ mod tests {
         let call = mcp_request(3, "tools/call", json!({"name":"context","arguments":{}}));
         let resp = send_recv(&mut child, &mut stdin, &call);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
-        assert!(text.contains("query required"), "got: {text}");
+        assert!(
+            text.contains("query required") || text.contains("workspace not configured"),
+            "got: {text}"
+        );
 
         child.kill().ok();
     }
@@ -2945,11 +3589,14 @@ mod tests {
             );
             let sresp = send_recv(&mut child, &mut stdin, &search);
             let stext = sresp["result"]["content"][0]["text"].as_str().unwrap_or("");
-            // Search must succeed and return a JSON results array (even if empty).
-            let sv: Value = serde_json::from_str(stext).unwrap_or(json!({}));
+            // Spec §30 contract update: with NO workspace configuration the
+            // search tool must refuse with a structured "workspace not
+            // configured" response instead of serving pre-seeded (stale) DB
+            // repos — the old behavior was exactly the historical-repo leak
+            // the membership-authoritative model forbids (spec §16).
             assert!(
-                sv["results"].is_array(),
-                "gate 6 FAIL: local search must work while cross-repo is degraded; got: {stext:.200}"
+                stext.contains("workspace not configured"),
+                "gate 6 FAIL: search must refuse while UNCONFIGURED; got: {stext:.200}"
             );
 
             child.kill().ok();
@@ -3390,6 +4037,69 @@ mod tests {
 
         child.kill().ok();
     }
+
+    // ── §37 failure-case unit tests ──────────────────────────────────────────
+
+    /// §37: corrupted config.toml must produce a clear diagnostic.
+    ///
+    /// The `load_workspace_roots` half is gated on the ambient environment:
+    /// running `env::remove_var` in parallel tests is racy (threads share the
+    /// process environment), so we only exercise the `load_workspace_roots`
+    /// code-path when the relevant env vars are NOT already set by the test
+    /// runner. The `parse_repositories_config` half is always safe because it
+    /// is a pure function with no env reads.
+    #[test]
+    fn corrupted_config_toml_fails_with_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(&cfg, "this is garbage \x00 not toml [[[\n").unwrap();
+
+        // Pure function — always testable regardless of ambient env.
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        let err = parse_repositories_config(&contents).unwrap_err();
+        assert!(!err.is_empty(), "must produce a diagnostic: {err}");
+
+        // load_workspace_roots reads env vars — only safe when ambient vars
+        // are not set (avoid racy env mutation in parallel test threads).
+        if std::env::var("ATTIC_CONFIG").is_err()
+            && std::env::var("ATTIC_WORKSPACE_ROOT").is_err()
+        {
+            let result = load_workspace_roots(&cfg);
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains(cfg.to_str().unwrap()) || msg.contains("config"),
+                "error must name the config file: {msg}"
+            );
+        }
+    }
+
+    /// §37: persisting config to a non-existent directory must return Err.
+    #[test]
+    fn config_write_failure_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let bad_path = tmp.path().join("nonexistent_dir").join("config.toml");
+        let roots = vec![tmp.path().to_path_buf()];
+        let result = persist_repositories_config(&bad_path, &roots);
+        assert!(result.is_err(), "write to non-existent dir must fail");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("failed to write") || msg.contains("config"),
+            "error must be descriptive: {msg}"
+        );
+    }
+
+    /// §37 watcher startup failure: NOT VERIFIED on Windows.
+    ///
+    /// `start_watcher` calls `IncrementalService::start_incremental_watch`
+    /// which either starts a native watcher or falls back to periodic
+    /// reconciliation. On Windows there is no practical seam to force this
+    /// to fail without a mock layer. The error path IS exercised by the
+    /// `start_watcher` Err arm in `handle_workspace` (logs error, returns
+    /// false, root remains indexed). Status: NOT VERIFIED — would require
+    /// refactoring IncrementalService to accept a mock watcher factory.
+    #[test]
+    #[ignore = "NOT VERIFIED on Windows — see comment above"]
+    fn watcher_startup_failure_not_verified() {}
 
     #[test]
     fn mcp_stderr_does_not_contaminate_stdout() {

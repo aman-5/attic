@@ -444,6 +444,45 @@ Attic performs an explicit WAL checkpoint and writes a crash-recovery backup
 (most recent 3 retained) before exiting — see "Core behavioral invariants"
 above for the recovery guarantees this implements.
 
+## Logical workspace model (multi-root, MCP-configured)
+
+ONE Attic MCP process serves ONE persistent logical workspace made of
+ZERO/ONE/MANY arbitrary repository roots. The workspace is configured
+through MCP itself (the `workspace` tool: `inspect`/`add`/`remove`/`set`),
+persisted atomically to `<ATTIC_HOME>/config.toml`, and reloaded on every
+subsequent launch. Historical repositories left in storage after membership
+changes never leak into active retrieval, status, WorkspaceSnapshot, or
+cross-repo intelligence.
+
+```mermaid
+flowchart TD
+    AI[AI / MCP Client]
+    MCP[Attic MCP]
+    CFG["~/.attic/config.toml"]
+    W[Logical Workspace]
+    A["Repository A<br/>C:\..."]
+    B["Repository B<br/>D:\..."]
+    C["Repository C<br/>E:\..."]
+    DB[(Shared Attic DB)]
+    CR[Cross-Repo Intelligence]
+
+    AI <--> MCP
+    MCP <--> CFG
+    CFG --> W
+    W --> A
+    W --> B
+    W --> C
+    A --> DB
+    B --> DB
+    C --> DB
+    DB --> CR
+    CR --> MCP
+```
+
+Configuration precedence: `ATTIC_CONFIG` → `<ATTIC_HOME>/config.toml` →
+`ATTIC_WORKSPACE_ROOT` → UNCONFIGURED. `ATTIC_HOME` (default `~/.attic`)
+pins the entire application home: config + database + backups + scratch.
+
 ## MCP surface
 
 Attic speaks MCP exclusively over stdio: **stdout carries only the MCP

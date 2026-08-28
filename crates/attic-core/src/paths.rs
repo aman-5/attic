@@ -17,23 +17,31 @@
 //!   workspaces clean for git and avoids polluting projects that are indexed
 //!   read-only.
 //!
-//! Resolution order for the user-global data root:
-//! 1. `ATTIC_DATA_DIR` environment variable (explicit operator override).
-//! 2. `ATTIC_DB_PATH`'s parent directory when `ATTIC_DB_PATH` is set
+//! Resolution order for the user-global data root (== ATTIC_HOME):
+//! 1. `ATTIC_HOME` environment variable (explicit operator override — the
+//!    preferred single source for the whole user-global directory).
+//! 2. `ATTIC_DATA_DIR` environment variable (legacy explicit override).
+//! 3. `ATTIC_DB_PATH`'s parent directory when `ATTIC_DB_PATH` is set
 //!    (backwards compatibility with the Phase 1D single-variable override).
-//! 3. Platform default:
+//! 4. Platform default:
 //!    * Windows: `%LOCALAPPDATA%\attic` (falling back to
 //!      `%USERPROFILE%\AppData\Local\attic`)
 //!    * macOS: `~/Library/Application Support/attic`
 //!    * Linux/BSD: `$XDG_DATA_HOME/attic` (XDG spec) falling back to
 //!      `~/.local/share/attic`
-//! 4. `./attic-data` in the current directory as a last resort (portable run),
+//! 5. `./attic-data` in the current directory as a last resort (portable run),
 //!    so the server never fails to start merely because no home directory is
 //!    configured.
+//!
+//! `ATTIC_HOME` is the recommended way to pin the user-global directory.  The
+//! persistent workspace configuration file (`config.toml`) lives inside it, so
+//! one `ATTIC_HOME` gives a caller a self-contained, durable Attic home
+//! (config + database + backups + scratch) with no other environment needed.
 //!
 //! Derived locations, all relative to the data root:
 //! * `attic.db` — main database
 //! * `semantic.db` — semantic layer (only created on explicit `ATTIC_SEMANTIC=1`)
+//! * `config.toml` — persistent multi-root workspace configuration
 //! * `backups/` — crash-recovery database backups
 //! * `tmp/` — process scratch space (created on demand; safe to delete while
 //!   Attic is not running)
@@ -65,6 +73,17 @@ impl AtticPaths {
         self.data_root.join("semantic.db")
     }
 
+    /// Path of the persistent workspace configuration file (`config.toml`).
+    ///
+    /// This is the default configuration source consulted when neither
+    /// `ATTIC_CONFIG` (explicit config path) nor `ATTIC_WORKSPACE_ROOT`
+    /// (legacy single-root) is set. It makes the logical workspace durable
+    /// across restarts so first-run configuration can happen through the MCP
+    /// `workspace` tool rather than environment variables.
+    pub fn config_path(&self) -> PathBuf {
+        self.data_root.join("config.toml")
+    }
+
     /// Directory holding crash-recovery backups.
     pub fn backups_dir(&self) -> PathBuf {
         self.data_root.join("backups")
@@ -89,20 +108,28 @@ impl AtticPaths {
 
 /// Resolve the user-global data root (see module docs for the order).
 pub fn resolve_data_root() -> PathBuf {
-    // 1. Explicit operator override.
+    // 1. Preferred explicit override: ATTIC_HOME pins the whole user-global
+    //    directory (config + db). This is deliberately the top source so a
+    //    caller can get a fully self-contained Attic home with one variable.
+    if let Ok(dir) = std::env::var("ATTIC_HOME")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    // 2. Legacy explicit override.
     if let Ok(dir) = std::env::var("ATTIC_DATA_DIR")
         && !dir.trim().is_empty()
     {
         return PathBuf::from(dir);
     }
-    // 2. Legacy Phase 1D override: derive the root from ATTIC_DB_PATH's parent.
+    // 3. Legacy Phase 1D override: derive the root from ATTIC_DB_PATH's parent.
     if let Ok(db) = std::env::var("ATTIC_DB_PATH")
         && let Some(parent) = Path::new(&db).parent()
         && !parent.as_os_str().is_empty()
     {
         return parent.to_path_buf();
     }
-    // 3. Platform default.
+    // 4. Platform default.
     platform_data_root().unwrap_or_else(|| PathBuf::from("attic-data"))
 }
 
@@ -187,6 +214,7 @@ mod tests {
         assert!(paths.db_path().parent().unwrap().is_dir());
         assert!(paths.backups_dir().is_dir());
         assert!(paths.temp_dir().is_dir());
+        assert_eq!(paths.config_path(), paths.data_root.join("config.toml"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
