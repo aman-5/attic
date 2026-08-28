@@ -4301,6 +4301,7 @@ mod tests {
         let bin = require_binary();
         let tmp = TempDir::new().unwrap();
         let mut child = Command::new(&bin)
+            .env("ATTIC_HOME", tmp.path())
             .env(
                 "ATTIC_DB_PATH",
                 tmp.path().join("test.db").to_str().unwrap(),
