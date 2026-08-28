@@ -93,23 +93,23 @@ async fn call_tool_text(
     match tokio::time::timeout(IO_TIMEOUT, fut).await {
         Ok(Ok(result)) => match result.content.first() {
             Some(ContentBlock::Text(t)) => Ok(t.text.clone()),
-            other => Err(format!("expected text content from `{tool}`, got {other:?}")),
+            other => Err(format!(
+                "expected text content from `{tool}`, got {other:?}"
+            )),
         },
         Ok(Err(e)) => Err(format!("`{tool}` call failed: {e}")),
         Err(_) => {
             let _ = srv.child.start_kill();
-            Err(format!("`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"))
+            Err(format!(
+                "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
+            ))
         }
     }
 }
 
 /// Poll `search` until `token` appears in results (up to `max_attempts × 500 ms`).
 /// Returns the `repository_id` of the first hit, or panics on timeout.
-async fn wait_for_token(
-    srv: &mut ServerHandle,
-    token: &str,
-    max_attempts: u32,
-) -> String {
+async fn wait_for_token(srv: &mut ServerHandle, token: &str, max_attempts: u32) -> String {
     for attempt in 0..max_attempts {
         let text = call_tool_text(srv, "search", serde_json::json!({ "query": token }))
             .await
@@ -189,12 +189,9 @@ async fn test_restart_reorder_preserves_ids() {
     let mut srv = connect_home(&bin, &home).await;
 
     // Wait until all probe tokens are searchable.
-    let id_a_run1 =
-        wait_for_token(&mut srv, roots[0].1, 40).await;
-    let id_b_run1 =
-        wait_for_token(&mut srv, roots[1].1, 40).await;
-    let id_c_run1 =
-        wait_for_token(&mut srv, roots[2].1, 40).await;
+    let id_a_run1 = wait_for_token(&mut srv, roots[0].1, 40).await;
+    let id_b_run1 = wait_for_token(&mut srv, roots[1].1, 40).await;
+    let id_c_run1 = wait_for_token(&mut srv, roots[2].1, 40).await;
 
     assert_ne!(id_a_run1, id_b_run1, "repos must have distinct IDs");
     assert_ne!(id_b_run1, id_c_run1, "repos must have distinct IDs");
@@ -338,7 +335,10 @@ async fn test_restart_unavailable_repo_shows_degraded() {
             .expect("status run2");
         let sv: Value = serde_json::from_str(&status_text).expect("status JSON run2");
 
-        assert_eq!(sv["status"], "ok", "run2 status must be ok (not unconfigured): {status_text}");
+        assert_eq!(
+            sv["status"], "ok",
+            "run2 status must be ok (not unconfigured): {status_text}"
+        );
         assert_eq!(
             sv["workspace"]["unavailable_repository_count"], 1,
             "run2: B must be reported unavailable; {status_text}"
@@ -353,7 +353,11 @@ async fn test_restart_unavailable_repo_shows_degraded() {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        assert_eq!(unavail.len(), 1, "run2: exactly one unavailable entry: {status_text}");
+        assert_eq!(
+            unavail.len(),
+            1,
+            "run2: exactly one unavailable entry: {status_text}"
+        );
         let unavail_path = unavail[0]["path"].as_str().unwrap_or("");
         // The path reported must include the canonical B path components.
         // On Windows canon_b may have \\?\ prefix; compare display() for robustness.
@@ -373,8 +377,7 @@ async fn test_restart_unavailable_repo_shows_degraded() {
             call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_a }))
                 .await
                 .expect("search token_a run2");
-        let av: Value =
-            serde_json::from_str(&a_results_text).expect("search JSON run2");
+        let av: Value = serde_json::from_str(&a_results_text).expect("search JSON run2");
         let a_hits = av["results"].as_array().map(Vec::len).unwrap_or(0);
         assert_eq!(
             a_hits, 1,
@@ -429,7 +432,11 @@ fn test_home_policy_explicit_attic_home_wins() {
         Some(explicit.to_str().expect("utf8")),
         Some(tmp.path().join("user-home")),
     );
-    assert!(result.is_ok(), "explicit ATTIC_HOME must succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "explicit ATTIC_HOME must succeed: {:?}",
+        result
+    );
     let got = result.unwrap();
     // Resolved path must be under the explicit home, not user-home.
     assert!(
@@ -444,10 +451,8 @@ fn test_home_policy_explicit_attic_home_wins() {
 #[test]
 fn test_home_policy_empty_attic_home_is_error() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let result = attic_core::paths::resolve_data_root_from(
-        Some(""),
-        Some(tmp.path().join("user-home")),
-    );
+    let result =
+        attic_core::paths::resolve_data_root_from(Some(""), Some(tmp.path().join("user-home")));
     assert!(
         result.is_err(),
         "empty ATTIC_HOME must be a config error, got Ok({:?})",
@@ -468,14 +473,15 @@ fn test_home_policy_default_derives_from_user_home() {
     std::fs::create_dir_all(&user_home).expect("create user home");
 
     let result = attic_core::paths::resolve_data_root_from(None, Some(user_home.clone()));
-    assert!(result.is_ok(), "default home resolution must succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "default home resolution must succeed: {:?}",
+        result
+    );
     let got = result.unwrap();
     // Resolved path must be <user_home>/.attic
     let expected = user_home.join(".attic");
-    assert_eq!(
-        got, expected,
-        "expected {:?}, got {:?}", expected, got
-    );
+    assert_eq!(got, expected, "expected {:?}, got {:?}", expected, got);
 }
 
 /// Home-policy test 4: no ATTIC_HOME + no user home → actionable error (not silent fallback).
@@ -489,10 +495,7 @@ fn test_home_policy_no_home_no_attic_home_is_error() {
     );
     // Must not silently return cwd or a temp path.
     let msg = format!("{}", result.unwrap_err());
-    assert!(
-        !msg.is_empty(),
-        "error message must be non-empty"
-    );
+    assert!(!msg.is_empty(), "error message must be non-empty");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -704,7 +707,9 @@ async fn test_restart_b_disappears() {
             .expect("status run2");
         let sv: Value = serde_json::from_str(&status_text).expect("status JSON");
         // Status nests the count under sv["workspace"]["configured_repository_count"].
-        let count = sv["workspace"]["configured_repository_count"].as_u64().unwrap_or(99);
+        let count = sv["workspace"]["configured_repository_count"]
+            .as_u64()
+            .unwrap_or(99);
         assert_eq!(
             count, 2,
             "after restart, status must report 2 repos (A+C); {status_text}"

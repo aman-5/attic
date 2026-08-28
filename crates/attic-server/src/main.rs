@@ -43,10 +43,7 @@ use tracing::{error, info, warn};
 macro_rules! lock_or_server_err {
     ($expr:expr, $name:literal) => {
         $expr.map_err(|_| {
-            ServerError::Retrieval(format!(
-                "server lock poisoned ({}); restart Attic",
-                $name
-            ))
+            ServerError::Retrieval(format!("server lock poisoned ({}); restart Attic", $name))
         })
     };
 }
@@ -128,7 +125,8 @@ struct AtticServer {
     /// pool/writer/scheduler (see ┬º10-12 of the multi-root design).
     /// `Arc<RwLock<...>>` so the runtime `workspace` tool can add/remove
     /// membership through `&self`.
-    incremental: Arc<std::sync::RwLock<HashMap<String, Arc<attic_incremental::IncrementalService>>>>,
+    incremental:
+        Arc<std::sync::RwLock<HashMap<String, Arc<attic_incremental::IncrementalService>>>>,
     /// Which change-detection mechanism is running per `repository_id`
     /// (absent key = incremental disabled/not yet started for that repo).
     watch_mode: Arc<std::sync::RwLock<HashMap<String, attic_incremental::WatchMode>>>,
@@ -280,7 +278,9 @@ impl AtticServer {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ServerError::InvalidArg("missing 'action' (inspect|add|remove|set)".into()))?
+            .ok_or_else(|| {
+                ServerError::InvalidArg("missing 'action' (inspect|add|remove|set)".into())
+            })?
             .to_string();
 
         if action == "inspect" {
@@ -304,10 +304,14 @@ impl AtticServer {
         fn validate_root(path: &str) -> Result<PathBuf, ServerError> {
             let p = PathBuf::from(path);
             if !p.exists() {
-                return Err(ServerError::InvalidArg(format!("path does not exist: {path}")));
+                return Err(ServerError::InvalidArg(format!(
+                    "path does not exist: {path}"
+                )));
             }
             if !p.is_dir() {
-                return Err(ServerError::InvalidArg(format!("path is not a directory: {path}")));
+                return Err(ServerError::InvalidArg(format!(
+                    "path is not a directory: {path}"
+                )));
             }
             p.canonicalize()
                 .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
@@ -332,7 +336,8 @@ impl AtticServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
                 let canon = validate_root(path)?;
-                let mut active = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+                let mut active =
+                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
                 if !active.contains(&canon) {
                     active.push(canon);
                 }
@@ -343,14 +348,13 @@ impl AtticServer {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ServerError::InvalidArg("missing 'path' for remove".into()))?;
-                let canon = PathBuf::from(path)
-                    .canonicalize()
-                    .map_err(|e| {
-                        ServerError::InvalidArg(format!(
-                            "cannot canonicalize removal path '{path}': {e}"
-                        ))
-                    })?;
-                let current = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
+                let canon = PathBuf::from(path).canonicalize().map_err(|e| {
+                    ServerError::InvalidArg(format!(
+                        "cannot canonicalize removal path '{path}': {e}"
+                    ))
+                })?;
+                let current =
+                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
                 dedup_keep_order(
                     current
                         .into_iter()
@@ -362,7 +366,9 @@ impl AtticServer {
                 let paths = args
                     .get("paths")
                     .and_then(|v| v.as_array())
-                    .ok_or_else(|| ServerError::InvalidArg("missing 'paths' (array) for set".into()))?
+                    .ok_or_else(|| {
+                        ServerError::InvalidArg("missing 'paths' (array) for set".into())
+                    })?
                     .iter()
                     .map(|v| {
                         v.as_str()
@@ -394,8 +400,7 @@ impl AtticServer {
         // 1. Persist the new membership atomically BEFORE touching live state,
         //    so a crash still leaves a coherent durable config.
         if new_active.is_empty() {
-            remove_workspace_config(&self.default_config)
-                .map_err(ServerError::InvalidArg)?;
+            remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
         } else {
             persist_repositories_config(&self.default_config, &new_active)
                 .map_err(ServerError::InvalidArg)?;
@@ -440,7 +445,11 @@ impl AtticServer {
                     let started = self.start_watcher(&root, &repo_id);
                     events.push(format!(
                         "added + {} root: {}",
-                        if started { "started watcher for" } else { "indexed" },
+                        if started {
+                            "started watcher for"
+                        } else {
+                            "indexed"
+                        },
                         root.display()
                     ));
                 }
@@ -449,8 +458,14 @@ impl AtticServer {
                     if let Ok(mut g) = self.pending_index_failed.lock() {
                         g.insert(root.clone());
                     }
-                    tracing::warn!("bootstrap of newly added root {} failed: {e}", root.display());
-                    events.push(format!("failed to index added root {}: {e}", root.display()));
+                    tracing::warn!(
+                        "bootstrap of newly added root {} failed: {e}",
+                        root.display()
+                    );
+                    events.push(format!(
+                        "failed to index added root {}: {e}",
+                        root.display()
+                    ));
                 }
                 Err(e) => {
                     // ┬º23: mark this root as degraded/pending so status surfaces it.
@@ -458,7 +473,10 @@ impl AtticServer {
                         g.insert(root.clone());
                     }
                     tracing::warn!("bootstrap task for {} failed: {e}", root.display());
-                    events.push(format!("failed to index added root {}: {e}", root.display()));
+                    events.push(format!(
+                        "failed to index added root {}: {e}",
+                        root.display()
+                    ));
                 }
             }
         }
@@ -510,9 +528,10 @@ impl AtticServer {
     /// and the root remains indexed but incrementally-disabled.
     fn start_watcher(&self, root: &Path, repository_id: &str) -> bool {
         let policy = DiscoveryPolicy::default_git();
-        let service =
-            Arc::new(attic_incremental::IncrementalService::new(root, policy.clone())
-                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS));
+        let service = Arc::new(
+            attic_incremental::IncrementalService::new(root, policy.clone())
+                .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
+        );
         match service.start_incremental_watch(self.pool.clone(), self.writer.clone()) {
             Ok(watch) => {
                 let mode = watch.mode();
@@ -1260,9 +1279,7 @@ fn handle_status(
     // membership or hidden behind an otherwise-current summary.
     let unavailable: Vec<Value> = unavailable_roots
         .iter()
-        .map(|(p, reason)| {
-            json!({ "path": p.display().to_string(), "reason": reason })
-        })
+        .map(|(p, reason)| json!({ "path": p.display().to_string(), "reason": reason }))
         .collect();
     payload["workspace"] = json!({
         "configured": true,
@@ -1613,8 +1630,7 @@ impl ServerHandler for AtticServer {
                     for p in failed_guard.iter() {
                         // Only add if not already present in the base list.
                         if !combined_unavail.iter().any(|(bp, _)| bp == p) {
-                            combined_unavail
-                                .push((p.clone(), "indexing_failed".to_string()));
+                            combined_unavail.push((p.clone(), "indexing_failed".to_string()));
                         }
                     }
                     drop(failed_guard);
@@ -1726,14 +1742,25 @@ fn load_workspace_roots(default_config: &Path) -> anyhow::Result<(ConfigSource, 
         return Ok((ConfigSource::Explicit(path), roots));
     }
     if default_config.exists() {
-        let contents = std::fs::read_to_string(default_config)
-            .map_err(|e| anyhow::anyhow!("failed to read workspace config '{}': {e}", default_config.display()))?;
-        let roots = parse_repositories_config(&contents)
-            .map_err(|e| anyhow::anyhow!("invalid workspace config ('{}'): {e}", default_config.display()))?;
+        let contents = std::fs::read_to_string(default_config).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read workspace config '{}': {e}",
+                default_config.display()
+            )
+        })?;
+        let roots = parse_repositories_config(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid workspace config ('{}'): {e}",
+                default_config.display()
+            )
+        })?;
         return Ok((ConfigSource::Persistent, roots));
     }
     if let Some(root) = legacy_root {
-        return Ok((ConfigSource::Legacy(root.clone()), vec![PathBuf::from(root)]));
+        return Ok((
+            ConfigSource::Legacy(root.clone()),
+            vec![PathBuf::from(root)],
+        ));
     }
     Ok((ConfigSource::Unconfigured, Vec::new()))
 }
@@ -1745,7 +1772,8 @@ fn load_workspace_roots(default_config: &Path) -> anyhow::Result<(ConfigSource, 
 /// written inside double quotes verbatim (single-backslash Windows paths
 /// survive as-is, matching the reader's literal quote handling).
 fn serialize_repositories_config(roots: &[PathBuf]) -> String {
-    let mut out = String::from("# Attic workspace configuration (generated by the `workspace` MCP tool)\n");
+    let mut out =
+        String::from("# Attic workspace configuration (generated by the `workspace` MCP tool)\n");
     for root in roots {
         out.push_str("[[repositories]]\n");
         out.push_str(&format!("path = \"{}\"\n", root.display()));
@@ -1760,8 +1788,12 @@ fn persist_repositories_config(path: &Path, roots: &[PathBuf]) -> Result<(), Str
     let tmp = path.with_extension("config.toml.tmp");
     std::fs::write(&tmp, &contents)
         .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("failed to finalize workspace config '{}': {e}", path.display()))
+    std::fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "failed to finalize workspace config '{}': {e}",
+            path.display()
+        )
+    })
 }
 
 /// Remove an empty workspace config so a workspace reported as configured for
@@ -1770,7 +1802,10 @@ fn remove_workspace_config(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove workspace config '{}': {e}", path.display())),
+        Err(e) => Err(format!(
+            "failed to remove workspace config '{}': {e}",
+            path.display()
+        )),
     }
 }
 
@@ -2500,13 +2535,21 @@ mod tests {
         // the missing root must be skipped rather than failing everything.
         let raw = vec![real.clone(), missing, real.join(".")];
         let out = validate_configured_roots(raw);
-        assert_eq!(out.valid.len(), 1, "expected exactly one deduped valid root");
+        assert_eq!(
+            out.valid.len(),
+            1,
+            "expected exactly one deduped valid root"
+        );
         assert_eq!(out.valid[0], real.canonicalize().unwrap());
         // ┬º17: the missing root is preserved as configured-but-unavailable,
         // never silently discarded.
         assert_eq!(out.unavailable.len(), 1, "missing root must be reported");
         // The third raw entry canonicalizes to the same real root ΓåÆ duplicate.
-        assert_eq!(out.duplicates.len(), 1, "canonical duplicate must be reported");
+        assert_eq!(
+            out.duplicates.len(),
+            1,
+            "canonical duplicate must be reported"
+        );
     }
 
     #[test]
@@ -2517,9 +2560,17 @@ mod tests {
 
         // Three configured roots with NO common parent; the middle one is
         // broken. Both good roots must still validate (failure isolation).
-        let raw = vec![tmp_a.path().to_path_buf(), broken.clone(), tmp_c.path().to_path_buf()];
+        let raw = vec![
+            tmp_a.path().to_path_buf(),
+            broken.clone(),
+            tmp_c.path().to_path_buf(),
+        ];
         let out = validate_configured_roots(raw);
-        assert_eq!(out.valid.len(), 2, "the two valid unrelated roots must survive");
+        assert_eq!(
+            out.valid.len(),
+            2,
+            "the two valid unrelated roots must survive"
+        );
         assert!(out.valid.contains(&tmp_a.path().canonicalize().unwrap()));
         assert!(out.valid.contains(&tmp_c.path().canonicalize().unwrap()));
         // ┬º17: the broken root is reported as unavailable with a reason.
@@ -2945,7 +2996,9 @@ mod tests {
         a.insert("repository_id".into(), json!(id));
         a.insert("path".into(), json!("f.txt"));
         a.insert("start_byte".into(), json!(u64::MAX));
-        let err = handle_file(&srv.pool, &a, &ids(&srv)).unwrap_err().to_string();
+        let err = handle_file(&srv.pool, &a, &ids(&srv))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("maximum allowed") || err.contains("non-negative"),
             "{err}"
@@ -3237,7 +3290,16 @@ mod tests {
         let repo_id = srv.bootstrap_workspace(&repo).unwrap();
 
         // status should succeed
-        let r = handle_status(&srv.pool, &HashMap::new(), &HashMap::new(), None, true, &[], &[]).unwrap();
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["status"], "ok");
 
@@ -4052,8 +4114,16 @@ mod tests {
 
         // ΓöÇΓöÇ workspace-wide search: each marker resolves to a DISTINCT repo,
         //    and the returned path never crosses into another root ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        let search_for = |id: u64, query: &str, stdin: &mut std::process::ChildStdin, child: &mut std::process::Child| -> (String, String) {
-            let call = mcp_request(id, "tools/call", json!({"name":"search","arguments":{"query": query}}));
+        let search_for = |id: u64,
+                          query: &str,
+                          stdin: &mut std::process::ChildStdin,
+                          child: &mut std::process::Child|
+         -> (String, String) {
+            let call = mcp_request(
+                id,
+                "tools/call",
+                json!({"name":"search","arguments":{"query": query}}),
+            );
             let resp = send_recv(child, stdin, &call);
             let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
             let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
@@ -4064,7 +4134,10 @@ mod tests {
                 "expected exactly one workspace-wide hit for {query}, got: {text}"
             );
             (
-                results[0]["repository_id"].as_str().unwrap_or("").to_string(),
+                results[0]["repository_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
                 results[0]["path"].as_str().unwrap_or("").to_string(),
             )
         };
@@ -4104,7 +4177,9 @@ mod tests {
             json!({"name":"file","arguments":{"repository_id": repo_a_id, "path": "alpha.txt"}}),
         );
         let file_resp = send_recv(&mut child, &mut stdin, &file_call);
-        let file_text = file_resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        let file_text = file_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             file_text.contains("ALPHA_MARKER_TOKEN"),
             "file tool must read repo A's own alpha.txt: {file_text:.300}"
@@ -4152,8 +4227,7 @@ mod tests {
 
         // load_workspace_roots reads env vars ΓÇö only safe when ambient vars
         // are not set (avoid racy env mutation in parallel test threads).
-        if std::env::var("ATTIC_CONFIG").is_err()
-            && std::env::var("ATTIC_WORKSPACE_ROOT").is_err()
+        if std::env::var("ATTIC_CONFIG").is_err() && std::env::var("ATTIC_WORKSPACE_ROOT").is_err()
         {
             let result = load_workspace_roots(&cfg);
             let msg = result.unwrap_err().to_string();

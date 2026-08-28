@@ -339,9 +339,17 @@ pub fn sync_workspace(
     // Move scans into the closure for persistence.
     let scans_clone = scans;
 
-    // Channel to receive snapshot_id from writer closure.
-    let snapshot_id_cell = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let snapshot_id_cell_clone = snapshot_id_cell.clone();
+    // Use a bounded channel (capacity 1) to return the snapshot_id from the
+    // writer closure back to the caller.  This avoids any mutex and therefore
+    // has no poisoning path that could cause a panic.
+    //
+    // Contract:
+    //   - The writer closure sends exactly one value before returning Ok(()).
+    //   - If the closure returns Err(...), writer.send() propagates the error
+    //     and the try_recv() line below is never reached.
+    //   - snap_rx cannot be dropped before the send because it lives on the
+    //     same stack frame as the writer.send() call.
+    let (snap_tx, snap_rx) = std::sync::mpsc::sync_channel::<String>(1);
 
     writer
         .send(move |conn| {
@@ -371,7 +379,15 @@ pub fn sync_workspace(
                 &snapshot_revisions_input,
                 edges_clone.len(),
             )?;
-            *snapshot_id_cell_clone.lock().unwrap() = Some(snapshot_id.clone());
+
+            // Return the snapshot_id to the caller via the channel.
+            // send() can only fail (Disconnected) if snap_rx was dropped, which
+            // cannot happen because snap_rx lives on the enclosing stack frame.
+            snap_tx.send(snapshot_id.clone()).map_err(|_| {
+                attic_storage::StorageError::Worker(
+                    "workspace sync aborted: snapshot_id channel disconnected".into(),
+                )
+            })?;
 
             // Delete all existing cross-repo DEPENDS_ON edges (clean replacement).
             for repo_id in &repo_ids_for_persistence {
@@ -408,8 +424,16 @@ pub fn sync_workspace(
         })
         .map_err(CrossRepoError::Storage)?;
 
+    // The writer closure returned Ok(()), which means it called snap_tx.send()
+    // exactly once.  try_recv() is therefore always Ok here.  If for any reason
+    // the value is absent (logic bug), we surface an error rather than panicking.
+    let snapshot_id = snap_rx.try_recv().map_err(|_| {
+        CrossRepoError::Storage(attic_storage::StorageError::Worker(
+            "workspace sync internal error: snapshot_id not received after writer success".into(),
+        ))
+    })?;
     result.edges_emitted = edges_len;
-    result.snapshot_id = snapshot_id_cell.lock().unwrap().clone();
+    result.snapshot_id = Some(snapshot_id);
     Ok(result)
 }
 
@@ -969,6 +993,77 @@ mod tests {
         // Try to sync a repository that doesn't exist — should propagate error
         let result = incremental_sync(&conn, &tid("nonexistent"), &["go.mod".to_owned()]);
         assert!(result.is_err(), "should propagate error for missing repo");
+    }
+
+    /// Prove that `sync_workspace` snapshot provenance delivery cannot panic.
+    ///
+    /// The previous implementation used `Arc<Mutex<Option<String>>>` with
+    /// `.lock().unwrap()` — if the mutex was poisoned the writer thread and
+    /// the caller would both panic.  The replacement uses a `sync_channel`,
+    /// which has no poisoning path.
+    ///
+    /// This test exercises the channel round-trip end-to-end:
+    ///  - `sync_workspace` with an empty active set succeeds,
+    ///  - `snapshot_id` is populated (the channel sent/received correctly),
+    ///  - no panic occurs.
+    ///
+    /// Additionally, a forced writer-closure failure (injected via an
+    /// empty/poisoned active set that triggers an Err return from the
+    /// closure — achieved via a storage error from the writer handle) must
+    /// propagate as `Err(CrossRepoError::Storage(...))`, not as a panic.
+    #[test]
+    fn sync_workspace_snapshot_provenance_channel_never_panics() {
+        use attic_storage::writer::WriterQueue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("provenance_test.db");
+
+        // Seed the DB then close the seeding connection.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            configure_connection(&conn).unwrap();
+            run_migrations(&conn).unwrap();
+        }
+
+        let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&writer_conn).unwrap();
+        let wq = WriterQueue::new(writer_conn).unwrap();
+        let writer_handle = wq.handle();
+
+        let reader_conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&reader_conn).unwrap();
+
+        // Happy path: empty active set → no repos scanned → snapshot still
+        // created and snapshot_id returned via channel (no panic).
+        let opts = WorkspaceSyncOptions {
+            active_repository_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let result = sync_workspace(&reader_conn, &writer_handle, &opts);
+        assert!(
+            result.is_ok(),
+            "sync_workspace with empty active set must succeed, got {result:?}"
+        );
+        let ws_result = result.unwrap();
+        assert!(
+            ws_result.snapshot_id.is_some(),
+            "snapshot_id must be populated after successful sync (channel round-trip ok)"
+        );
+        assert_eq!(ws_result.repository_reports.len(), 0);
+        assert_eq!(ws_result.edges_emitted, 0);
+
+        // Failure path: drop the writer queue (ShutDown) then call sync_workspace —
+        // must return Err, not panic.
+        drop(wq);
+        let opts2 = WorkspaceSyncOptions {
+            active_repository_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let result2 = sync_workspace(&reader_conn, &writer_handle, &opts2);
+        assert!(
+            result2.is_err(),
+            "sync_workspace must return Err when writer is shut down, not panic"
+        );
     }
 
     /// §14 / §16 — `active_repository_ids` must exclude stale DB repos from

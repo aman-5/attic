@@ -584,8 +584,11 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
         let dir = tmp.path().join(format!("root{i}_{name}"));
         std::fs::create_dir_all(&dir).expect("create root");
         let token = format!("first_run_token_{name}");
-        std::fs::write(dir.join(format!("{name}_probe.rs")), format!("pub fn {token}() {{}}\n"))
-            .expect("write probe");
+        std::fs::write(
+            dir.join(format!("{name}_probe.rs")),
+            format!("pub fn {token}() {{}}\n"),
+        )
+        .expect("write probe");
         tokens.push(token);
     }
     // Server-side validation canonicalizes roots (on Windows this adds the
@@ -607,7 +610,10 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
         .await
         .expect("status on pristine install");
     let v: Value = serde_json::from_str(&status_text).expect("status JSON");
-    assert_eq!(v["status"], "unconfigured", "pristine install: {status_text}");
+    assert_eq!(
+        v["status"], "unconfigured",
+        "pristine install: {status_text}"
+    );
 
     let search_err = call_tool_text(
         &mut srv,
@@ -633,9 +639,13 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
         assert!(resp.contains("config.toml"), "add response: {resp}");
     }
 
-    let inspect = call_tool_text(&mut srv, "workspace", serde_json::json!({ "action": "inspect" }))
-        .await
-        .expect("workspace inspect");
+    let inspect = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({ "action": "inspect" }),
+    )
+    .await
+    .expect("workspace inspect");
     let v: Value = serde_json::from_str(&inspect).expect("inspect JSON");
     assert_eq!(v["membership_count"], 3, "{inspect}");
     assert_eq!(v["configured"], true, "{inspect}");
@@ -658,7 +668,11 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
                 Ok(v) => v,
                 Err(_) => panic!("search returned non-JSON: {text}"),
             };
-            if v["results"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            if v["results"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
                 found = true;
                 break;
             }
@@ -671,18 +685,28 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
         .await
         .expect("status after configure");
     let v: Value = serde_json::from_str(&status_text).unwrap();
-    assert_eq!(v["workspace"]["configured_repository_count"], 3, "{status_text}");
+    assert_eq!(
+        v["workspace"]["configured_repository_count"], 3,
+        "{status_text}"
+    );
 
     // Graceful shutdown, then restart from the SAME ATTIC_HOME.
     let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
     drop(srv);
 
     let mut srv = connect_home(&bin, &home).await;
-    let inspect = call_tool_text(&mut srv, "workspace", serde_json::json!({ "action": "inspect" }))
-        .await
-        .expect("inspect after restart");
+    let inspect = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({ "action": "inspect" }),
+    )
+    .await
+    .expect("inspect after restart");
     let v: Value = serde_json::from_str(&inspect).expect("inspect JSON");
-    assert_eq!(v["membership_count"], 3, "membership must persist: {inspect}");
+    assert_eq!(
+        v["membership_count"], 3,
+        "membership must persist: {inspect}"
+    );
 
     // Runtime removal through MCP, verified both live and on disk.
     let removed = call_tool_text(
@@ -696,7 +720,10 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
     assert_eq!(v["membership_count"], 2, "{removed}");
 
     let cfg = std::fs::read_to_string(home.join("config.toml")).expect("config after remove");
-    assert!(!cfg.contains(&root_paths[1]), "removed root must leave config: {cfg}");
+    assert!(
+        !cfg.contains(&root_paths[1]),
+        "removed root must leave config: {cfg}"
+    );
 
     let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
 }

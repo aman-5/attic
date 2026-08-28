@@ -102,10 +102,7 @@ impl AtticPaths {
 
         let tmp = home.join("tmp");
         std::fs::create_dir_all(&tmp).map_err(|e| {
-            PathResolutionError::new(format!(
-                "failed to create tmp directory {:?}: {}",
-                tmp, e
-            ))
+            PathResolutionError::new(format!("failed to create tmp directory {:?}: {}", tmp, e))
         })?;
 
         Ok(Self {
@@ -210,10 +207,8 @@ mod tests {
 
     #[test]
     fn explicit_non_empty_attic_home_wins() {
-        let result = resolve_data_root_from(
-            Some("/explicit/home"),
-            Some(PathBuf::from("/user/home")),
-        );
+        let result =
+            resolve_data_root_from(Some("/explicit/home"), Some(PathBuf::from("/user/home")));
         assert_eq!(result.unwrap(), PathBuf::from("/explicit/home"));
     }
 
@@ -257,8 +252,7 @@ mod tests {
 
     #[test]
     fn derived_paths_follow_home() {
-        let tmp = std::env::temp_dir()
-            .join(format!("attic_paths_unit_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("attic_paths_unit_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create tmp");
 
@@ -283,8 +277,7 @@ mod tests {
     fn ensure_resolve_creates_dirs() {
         // Use ATTIC_HOME pointing at a fresh temp directory so resolve() runs
         // without touching ~/.attic.
-        let tmp = std::env::temp_dir()
-            .join(format!("attic_resolve_test_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("attic_resolve_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // Do NOT pre-create tmp — resolve() must create it.
         let home_dir = tmp.join("attic-home");
@@ -295,7 +288,11 @@ mod tests {
             Some(home_dir.to_str().expect("utf8")),
             Some(tmp.join("user")),
         );
-        assert!(result.is_ok(), "resolve_data_root_from failed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "resolve_data_root_from failed: {:?}",
+            result
+        );
         let resolved = result.unwrap();
         assert_eq!(resolved, home_dir);
 
