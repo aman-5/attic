@@ -22,3 +22,6 @@ build_errors*.txt
 
 # editor
 *.rs.bk
+
+#knowledge folder
+/knowledge/**/*
