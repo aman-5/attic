@@ -123,6 +123,58 @@ still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
 gate on usability.
 
+## Project Knowledge authority model
+
+Attic distinguishes two documentation tiers, enforced purely by path, in
+`crates/attic-retrieval/src/candidates.rs::source_type_for_path`:
+
+- **`knowledge/**`** — deliberately curated content → `EvidenceSourceType::
+  Knowledge` → `AuthorityLevel::ProjectKnowledge`, the highest documentation
+  authority Attic assigns.
+- **Everything else** (`README.md`, any `docs/**`, an `ARCHITECTURE.md`
+  living outside `knowledge/`, etc.) → `EvidenceSourceType::Documentation` →
+  `AuthorityLevel::Doc`, a medium authority. Still fully indexed, searchable,
+  and usable as evidence — just not equal to curated project knowledge.
+
+This is an **authority** distinction, not an indexing exclusion: ordinary
+documentation is never excluded from search or `context` results, it simply
+doesn't carry the same weight when the evidence manager resolves
+contradictions. The boundary is the `knowledge/` path prefix only —
+filenames are never special-cased outside it. See `knowledge/README.md` in
+this repository for the end-user-facing explanation and template, and
+`docs/contracts/evidence.md` for the full `AuthorityLevel`/`EvidenceSourceType`
+contract this implements.
+
+## Known design limitations (not blocking, no action taken)
+
+These are honest, currently-accurate statements about gaps between the
+schema/contracts and the current implementation — not defects introduced by
+this pass, and not silently resolved by it. Each needs a product decision
+before being closed:
+
+- **`core_knowledge_items` is schema-only.** The table exists (referenced by
+  cascading invalidation in `attic-storage::invalidation_ops`) but nothing
+  currently writes to it — knowledge evidence is derived directly from path
+  classification (`knowledge/**`) against the standard FTS/file-occurrence
+  data, not from this dedicated table. Populating it would enable richer
+  semantics (explicit supersession chains, `applicable_versions`) but has no
+  current consumer.
+- **Rename detection is heuristic only.** `core_identity_links` supports a
+  `GIT_RENAME`/`EXACT` basis in its schema, but no code path currently
+  computes it — all renames/moves are recorded via `CONTENT_MATCH`
+  (content-hash equality), a `HEURISTIC` confidence level. Evidence claims
+  about "the same file across a rename" are therefore never `EXACT` today.
+- **Java import resolution is source-layout-only.** Resolution uses
+  `src/main/java/...`-style path candidates plus in-run symbol evidence, not
+  `pom.xml`/`build.gradle` dependency-scope parsing. The relationship schema
+  already carries `dependency_basis=MAVEN|GRADLE` for when this is added.
+- **No automatic re-index on analyzer-version bump.** Each index generation
+  records the running `ANALYZER_REGISTRY_VERSION`, but nothing diffs a
+  stored generation's recorded version against the current one to schedule
+  invalidation automatically — an analyzer upgrade requires a manual
+  re-index (see `docs/PLAYBOOK.md` Maintenance). Republication does replace
+  analyzer-derived artifacts wholesale once triggered.
+
 ## Semantic layer (optional, default-disabled)
 
 Semantic (embedding-based) retrieval is **disabled by default** and only

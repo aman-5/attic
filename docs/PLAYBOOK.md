@@ -81,6 +81,38 @@ See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
 this is not a supported or tested configuration; give each concurrently
 running instance its own `ATTIC_DATA_DIR`.
 
+### Project Knowledge
+
+Create `knowledge/*.md` files in a repository when you have durable facts
+worth recording that aren't obvious from the code — architectural rationale,
+domain vocabulary, conventions, ownership, deployment topology. See
+`knowledge/README.md` in this repository for the full template and rules
+(what belongs, what doesn't, never secrets).
+
+Practical guidance:
+
+- **Scope**: keep each file focused (one topic per file — `architecture.md`,
+  `domain.md`, etc.) rather than one sprawling document; this keeps
+  incremental re-indexing cheap and keeps individual claims easy to verify.
+- **Keeping current**: there's no separate sync step — edit the file like
+  any other tracked file and Attic's incremental watcher re-indexes it
+  through the normal pipeline. Freshness is not evaluated differently than
+  source code: a knowledge file with unindexed edits shows as `STALE` in
+  `status` just like any other pending change.
+- **Contradictions with source/tests**: Attic does **not** silently prefer
+  knowledge over code, or vice versa — a `context` query surfaces both the
+  knowledge claim and the contradicting source/test evidence with their
+  respective authority and freshness, rather than picking one. Treat a
+  detected contradiction as a signal that the knowledge file is stale and
+  needs a human update, not as an Attic bug.
+- **Never store secrets** — knowledge files are indexed and served through
+  the same `file`/`search`/`context` tools as source, so anything written
+  there is as discoverable as source code.
+- **Durable facts, not chat instructions**: a knowledge file should describe
+  something true about the project regardless of who's asking or why — not
+  "for this task, do X." Session-scoped instructions belong in your AI
+  tool's own configuration, not in `knowledge/`.
+
 ### Semantic enable/disable
 
 Disabled by default. Enable with `ATTIC_SEMANTIC=1`. Disabling again (unset
@@ -181,11 +213,37 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --package attic-server --target x86_64-pc-windows-msvc   # release build (adjust target per platform)
 ```
 
-Windows from-source prerequisites (MSVC target): Rust via rustup, Microsoft
-C++ Build Tools with the VC.Tools.x86.x64 component, and the Windows SDK —
-see `docs/local-setup/WINDOWS.md`. Linux/macOS: a system `cc`/`clang`
-toolchain (tree-sitter grammars build their bundled C sources via `cc`).
-None of this is required for end users of a prebuilt binary.
+**Windows prerequisites (recommended: MSVC target)**: Rust via
+[rustup](https://rustup.rs) (defaults to `x86_64-pc-windows-msvc`), plus
+Microsoft "Build Tools for Visual Studio" with the **C++ build tools**
+workload (Windows SDK is included by default in that workload). Visual
+Studio IDE itself is not required — the standalone Build Tools are
+sufficient.
+
+**Windows alternative (no MSVC, GNU/MinGW toolchain)**: if you can't install
+MSVC Build Tools, install MinGW user-locally via
+[Scoop](https://scoop.sh) (`scoop install mingw`, no admin required), then
+`rustup target add x86_64-pc-windows-gnu` and build with
+`cargo build --target x86_64-pc-windows-gnu`. This requires a **local,
+untracked** linker override in your global `%USERPROFILE%\.cargo\config.toml`
+(not the repo's `.cargo/config.toml`, which stays portable and
+machine-independent):
+
+```toml
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\Users\\<you>\\scoop\\apps\\mingw\\current\\bin\\gcc.exe"
+```
+
+**Linux/macOS prerequisites**: Rust via rustup, plus a system `cc`/`clang`
+toolchain (tree-sitter grammars build their bundled C sources via `cc`) —
+typically already present, or installed via `xcode-select --install` on
+macOS or your distribution's `build-essential`/`gcc` package on Linux.
+
+None of the above is required for end users of a prebuilt binary — see
+README's Install section.
 
 ## Maintenance
 
@@ -200,7 +258,17 @@ None of this is required for end users of a prebuilt binary.
 - **Analyzer/grammar update**: bump the `tree-sitter-<language>` dependency
   in the workspace `Cargo.toml`, re-verify its ABI is within
   `tree-sitter`'s `MIN_COMPATIBLE_LANGUAGE_VERSION` (see ADR-010), re-run
-  that language's analyzer test fixtures under `fixtures/analyzers/`.
+  that language's analyzer test fixtures under `fixtures/analyzers/`. Each
+  index generation records the running `ANALYZER_REGISTRY_VERSION`, but
+  **nothing currently diffs it automatically against a stored generation's
+  version to trigger re-indexing** — after bumping an analyzer/grammar
+  version, manually trigger a full re-index of affected repositories
+  (safe reset, above) rather than assuming Attic will detect the change on
+  its own.
+- **New workspace dependency**: verify the dependency's declared license is
+  compatible with Attic's `MIT OR Apache-2.0` (`LICENSE-MIT`,
+  `LICENSE-APACHE`) before adding it, and prefer a crate with genuine
+  Linux/macOS/Windows support over one with platform-specific gaps.
 - **Adding a language**: unsupported languages already work via
   `GenericAnalyzer` (full-text search only). To add structural richness,
   add a `tree-sitter-<language>` grammar dependency and a new analyzer under

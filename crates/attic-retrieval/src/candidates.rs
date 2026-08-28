@@ -80,10 +80,17 @@ impl Candidate {
 
 /// Classify an indexed path into the canonical evidence source type
 /// (deterministic; documented in ADR-012).
+///
+/// Only paths under the deliberately curated `knowledge/` boundary receive
+/// `Knowledge` (-> `ProjectKnowledge` authority). An ordinary `README.md` or
+/// `architecture.md` living anywhere else in the repository is real,
+/// searchable documentation evidence (`Documentation` authority) — it must
+/// not be silently elevated to the same authority as curated project
+/// knowledge just because of its filename.
 pub fn source_type_for_path(path: &str) -> EvidenceSourceType {
     let lower = path.to_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
-    if lower.starts_with("knowledge/") || name == "readme.md" || name == "architecture.md" {
+    if lower.starts_with("knowledge/") {
         return EvidenceSourceType::Knowledge;
     }
     // Test markers across supported languages.

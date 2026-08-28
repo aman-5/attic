@@ -173,6 +173,20 @@ criteria, before Attic can be called production-ready.
 - [ ] Configuration lookup regression — config-file evidence retrieval
       accuracy at benchmark scale.
 
+## Follow-up scale-tuning items (transferred from OPEN_QUESTIONS.md)
+
+- [ ] Mode-scaled proactive verification breadth — NORMAL/DEEP currently
+  proactively checksum a fixed top-5 ranked evidence items (ADR-012 D4).
+  Whether this breadth should scale with mode depth or corpus size (without
+  violating filesystem-scan budgets) needs measurement on a larger corpus
+  than the current fixtures provide.
+- [ ] Brute-force kNN scale ceiling — semantic kNN (when `ATTIC_SEMANTIC=1`)
+  is currently a bounded brute-force scan over `semantic.db` (ADR-014 D4);
+  measured sub-millisecond at fixture scale. Revisit an in-DB vector index
+  or external store only if/when selected-unit counts reach ~10^5 on real
+  workspaces AND query-time kNN latency is measured to exceed the NORMAL
+  semantic time budget (`docs/contracts/answer_modes.md`).
+
 ## Open items surfaced but not independently re-benchmarked this pass
 
 - Resource Manager pressure tiers were fixed and unit-tested

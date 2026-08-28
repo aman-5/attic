@@ -127,6 +127,34 @@ computes embeddings, and retrieval falls back cleanly to lexical/structural
 search only — deleting the semantic database at any time is always safe and
 degrades gracefully rather than breaking the server.
 
+## Project Knowledge (optional)
+
+```text
+repository/
+├── src/
+├── docs/
+├── README.md
+└── knowledge/
+    ├── README.md        (see knowledge/README.md in this repo for the template)
+    ├── architecture.md
+    ├── domain.md
+    └── conventions.md
+```
+
+Attic recognizes one deliberately curated authority tier: any Markdown file
+under `knowledge/**` in an indexed repository is treated as
+**Project Knowledge** — the highest documentation authority Attic assigns
+(`AuthorityLevel::ProjectKnowledge`). Everything else — `README.md`,
+`docs/**`, an `ARCHITECTURE.md` sitting anywhere outside `knowledge/` — is
+ordinary **documentation evidence**: fully searchable and returned by
+`context`/`search` like any other file, just not elevated to the same
+authority as content you've deliberately placed under `knowledge/`.
+
+This is optional. A repository with no `knowledge/` directory works exactly
+the same, just without that top evidence tier. See `knowledge/README.md` in
+this repository for a ready-to-copy template and full guidance, and
+`docs/PLAYBOOK.md` for when/how to maintain knowledge files in practice.
+
 ## Runtime data: what's workspace-local vs. user-global
 
 Attic never writes into your workspace — no `.attic/` directory appears in
@@ -201,8 +229,8 @@ only needed for development or unsupported platforms, and requires:
 - Rust (see `rust-toolchain.toml` for the pinned version) via
   [rustup](https://rustup.rs)
 - A working linker for your platform (MSVC Build Tools on Windows, or a
-  GNU/MinGW toolchain — see `docs/local-setup/WINDOWS.md` for a from-source
-  Windows setup; system `cc`/`clang` on Linux/macOS)
+  GNU/MinGW toolchain; system `cc`/`clang` on Linux/macOS) — see
+  `docs/PLAYBOOK.md` (Development) for exact per-platform setup
 
 ```sh
 cargo build --release --package attic-server
