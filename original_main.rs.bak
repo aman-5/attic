@@ -2366,21 +2366,21 @@ mod tests {
         let contents = r#"
             # Three arbitrary repository roots, no common parent.
             [[repositories]]
-            path = "C:\Users\amanbansal\Desktop\Dump"
+            path = "C:\Users\<username>\Desktop\Dump"
 
             [[repositories]]
-            path = "C:\Adobe-Projects\EDS\HDFC"
+            path = "C:\Users\<username>\Path1"
 
             [[repositories]]
-            path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+            path = "C:\Users\<username>\Path3"
         "#;
         let roots = parse_repositories_config(contents).expect("valid config");
         assert_eq!(
             roots,
             vec![
-                PathBuf::from(r"C:\Users\amanbansal\Desktop\Dump"),
-                PathBuf::from(r"C:\Adobe-Projects\EDS\HDFC"),
-                PathBuf::from(r"C:\Adobe-Projects\HDFC-Bank-on-prem"),
+                PathBuf::from(r"C:\Users\<username>\Desktop\Dump"),
+                PathBuf::from(r"C:\Users\<username>\Path1"),
+                PathBuf::from(r"C:\Users\<username>\Path3"),
             ]
         );
     }

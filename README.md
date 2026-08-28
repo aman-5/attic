@@ -179,9 +179,9 @@ rarely one directory tree — repositories often live in unrelated
 locations with no common parent, e.g.:
 
 ```text
-C:\Users\amanbansal\Desktop\Dump
-C:\Adobe-Projects\EDS\HDFC
-C:\Adobe-Projects\HDFC-Bank-on-prem
+C:\Users\<username>\Desktop\Dump
+C:\Users\<username>\Path1
+C:\Users\<username>\Path3
 ```
 
 Set `ATTIC_CONFIG` to a small config file listing each root explicitly —
@@ -190,13 +190,13 @@ submodules, and no additional MCP entries/databases:
 
 ```text
 [[repositories]]
-path = "C:\Users\amanbansal\Desktop\Dump"
+path = "C:\Users\<username>\Desktop\Dump"
 
 [[repositories]]
-path = "C:\Adobe-Projects\EDS\HDFC"
+path = "C:\Users\<username>\Path1"
 
 [[repositories]]
-path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+path = "C:\Users\<username>\Path3"
 ```
 
 ```sh

@@ -2491,21 +2491,21 @@ mod tests {
         let contents = r#"
             # Three arbitrary repository roots, no common parent.
             [[repositories]]
-            path = "C:\Users\amanbansal\Desktop\Dump"
+            path = "C:\Users\<username>\Desktop\Dump"
 
             [[repositories]]
-            path = "C:\Adobe-Projects\EDS\HDFC"
+            path = "C:\Users\<username>\Path1"
 
             [[repositories]]
-            path = "C:\Adobe-Projects\HDFC-Bank-on-prem"
+            path = "C:\Users\<username>\Path3"
         "#;
         let roots = parse_repositories_config(contents).expect("valid config");
         assert_eq!(
             roots,
             vec![
-                PathBuf::from(r"C:\Users\amanbansal\Desktop\Dump"),
-                PathBuf::from(r"C:\Adobe-Projects\EDS\HDFC"),
-                PathBuf::from(r"C:\Adobe-Projects\HDFC-Bank-on-prem"),
+                PathBuf::from(r"C:\Users\<username>\Desktop\Dump"),
+                PathBuf::from(r"C:\Users\<username>\Path1"),
+                PathBuf::from(r"C:\Users\<username>\Path3"),
             ]
         );
     }
@@ -3406,13 +3406,22 @@ mod tests {
             .read_line(&mut line)
             .expect("I/O error reading MCP child stdout");
         if line.is_empty() {
-            // Child exited before producing any output — typically a startup
-            // crash.  Collect the exit status so the failure message is useful
-            // (especially on Windows where path / env issues cause silent exits).
             let status = child.try_wait().ok().flatten();
+
+            let stderr_output = child
+                .stderr
+                .take()
+                .map(|mut stderr| {
+                    let mut output = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut output);
+                    output
+                })
+                .unwrap_or_default();
+
             panic!(
                 "MCP child produced EOF (empty stdout) — child likely crashed before \
-                 responding.\n  Exit status : {status:?}\n  Sent message: {msg}"
+                responding.\n  Exit status : {status:?}\n  Child stderr:\n{stderr_output}\n  \
+                Sent message: {msg}"
             );
         }
         serde_json::from_str(&line).unwrap_or_else(|e| {
@@ -4092,7 +4101,7 @@ mod tests {
             .env_remove("ATTIC_WORKSPACE_ROOT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn attic (multi-root)");
         let mut stdin = child.stdin.take().unwrap();

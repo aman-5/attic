@@ -133,9 +133,9 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
   ```text
   Logical Workspace
-  ├── repo A (C:\Users\amanbansal\Desktop\Dump)      ─┐
-  ├── repo B (C:\Adobe-Projects\EDS\HDFC)             ─┼─ each keeps independent
-  └── repo C (C:\Adobe-Projects\HDFC-Bank-on-prem)    ─┘  source/index state (own
+  ├── repo A (C:\Users\<username>\Desktop\Dump)      ─┐
+  ├── repo B (C:\Users\<username>\Path1)             ─┼─ each keeps independent
+  └── repo C (C:\Users\<username>\Path3)    ─┘  source/index state (own
                  core_repositories row, own SourceRevisions, own watcher) —
                  sync_workspace resolves edges BETWEEN them and records
                  provenance back to the WorkspaceSnapshot (parent hash)
