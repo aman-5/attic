@@ -15,8 +15,7 @@ Verified locally on this checkout after the PR-1..PR-10 hardening pass
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean, whole
       workspace (was failing on a pre-existing `large_enum_variant` lint
       before this pass; fixed by boxing `FilePrep::Indexable.captured`).
-- [x] `cargo test --workspace` — all green except the three pre-existing
-      `rmcp_client_*` tests in `attic-server/tests/rmcp_stdio_integration.rs`
+- [x] `cargo test --workspace` - clean, whole workspace.
       (handshake timeout), confirmed present on the unmodified baseline too
       (unrelated to this pass).
 
@@ -42,7 +41,7 @@ items below, none of which were executed as part of this pass.
   - Acceptance: same as above.
 
 - [ ] macOS x86_64 (Intel) CI validation
-  - Command/harness: `.github/workflows/release.yml` (`macos-13` runner,
+  - Command/harness: `.github/workflows/release.yml` (`macos-15-intel` runner,
     `x86_64-apple-darwin`). This pass fixed a bug where this target's test
     step was unconditionally skipped (`if: matrix.target !=
     'x86_64-apple-darwin'`) — confirm the corrected workflow actually runs
