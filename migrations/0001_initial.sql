@@ -52,6 +52,7 @@ CREATE TABLE core_file_identities (
 
 CREATE TABLE core_file_occurrences (
     id                  TEXT    NOT NULL PRIMARY KEY,   -- UUID
+    occurrence_seq      INTEGER NOT NULL UNIQUE,         -- stable logical insertion order; never use SQLite rowid for recency
     file_identity_id    TEXT    NOT NULL REFERENCES core_file_identities(id),
     source_revision_id  TEXT    NOT NULL REFERENCES core_source_revisions(id),
     index_generation_id TEXT    REFERENCES core_index_generations(id),  -- NULL if not yet indexed
@@ -414,6 +415,9 @@ CREATE INDEX idx_evidence_source
 
 CREATE INDEX idx_file_identities_repo
     ON core_file_identities(repository_id);
+
+CREATE INDEX idx_file_occ_seq
+    ON core_file_occurrences(occurrence_seq);
 
 CREATE INDEX idx_file_occ_content_hash
     ON core_file_occurrences(content_hash);

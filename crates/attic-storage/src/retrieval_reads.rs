@@ -409,7 +409,7 @@ pub fn file_header_by_id(
     }
 }
 
-/// Latest (highest rowid) non-deleted occurrence for a repo-relative path.
+/// Latest (highest stable occurrence sequence) non-deleted occurrence for a repo-relative path.
 pub fn latest_occurrence_for_path(
     conn: &Connection,
     repository_id: &str,
@@ -418,7 +418,7 @@ pub fn latest_occurrence_for_path(
     let sql = format!(
         "SELECT {FILE_HEADER_COLS} {FILE_HEADER_FROM}
           WHERE fi.repository_id = ?1 AND fo.path = ?2
-          ORDER BY fo.rowid DESC LIMIT 1"
+          ORDER BY fo.occurrence_seq DESC LIMIT 1"
     );
     let result = conn.query_row(
         &sql,

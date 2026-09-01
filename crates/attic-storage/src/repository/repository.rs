@@ -76,22 +76,22 @@ pub fn upsert_repository(
 /// The query never returns `root_path` — absolute paths are kept server-side.
 pub fn get_repository_stats(conn: &Connection) -> Result<Vec<RepositoryStats>, StorageError> {
     // The latest-row-per-path determination MUST happen before filtering by
-    // existence_state: a path's newest row (by rowid) may be a `deleted`
+    // existence_state: a path's newest row (by stable occurrence sequence) may be a `deleted`
     // tombstone superseding an older `present` row for the same path, and
     // that tombstone must win — filtering `present` rows first (before
-    // computing MAX(rowid)) would incorrectly resurrect the stale row.
+    // computing MAX(occurrence_seq)) would incorrectly resurrect the stale row.
     let sql = "
         WITH latest_row AS (
              SELECT fi.repository_id AS repository_id,
                     fo.path AS path,
-                    MAX(fo.rowid) AS max_rowid
+                    MAX(fo.occurrence_seq) AS max_seq
                FROM core_file_occurrences fo
                JOIN core_file_identities fi ON fo.file_identity_id = fi.id
               GROUP BY fi.repository_id, fo.path
         ), latest AS (
              SELECT lr.repository_id, fo.id AS fo_id, fo.existence_state
                FROM latest_row lr
-               JOIN core_file_occurrences fo ON fo.rowid = lr.max_rowid
+               JOIN core_file_occurrences fo ON fo.occurrence_seq = lr.max_seq
         )
         SELECT r.id, r.display_name,
                COUNT(DISTINCT CASE WHEN latest.existence_state = 'present' THEN latest.fo_id END) AS files,

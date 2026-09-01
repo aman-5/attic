@@ -16,11 +16,11 @@ use attic_core::{
 use crate::error::StorageError;
 
 /// Shared CTE resolving each path in a repository to its latest occurrence
-/// row (by `rowid`), regardless of freshness/existence state. Every
+/// row (by stable `occurrence_seq`), regardless of freshness/existence state. Every
 /// "latest per path" query below joins against this so the dedup rule
 /// lives in exactly one place.
 const LATEST_OCCURRENCE_PER_PATH_CTE: &str = "WITH latest AS (
-             SELECT fo.path AS p, MAX(fo.rowid) AS m
+             SELECT fo.path AS p, MAX(fo.occurrence_seq) AS m
                FROM core_file_occurrences fo
                JOIN core_file_identities fi ON fo.file_identity_id = fi.id
               WHERE fi.repository_id = ?1
@@ -111,10 +111,12 @@ pub fn insert_file_occurrence(
 ) -> Result<(), StorageError> {
     conn.execute(
         "INSERT INTO core_file_occurrences
-             (id, file_identity_id, source_revision_id, index_generation_id,
+             (id, occurrence_seq, file_identity_id, source_revision_id, index_generation_id,
               path, content_hash, size_bytes, language,
               file_type, discovery_class, security_state, existence_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1,
+                 (SELECT COALESCE(MAX(occurrence_seq), 0) + 1 FROM core_file_occurrences),
+                 ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             rec.id.to_string_repr(),
             rec.file_identity_id.to_string_repr(),
@@ -259,7 +261,7 @@ pub fn bulk_latest_occurrence_ids_for_repository(
         "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path, fo.id
            FROM core_file_occurrences fo
-           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m"
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m"
     ))?;
     let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -274,7 +276,7 @@ pub fn bulk_latest_occurrence_ids_for_repository(
 
 /// Look up the most recent file occurrence ID for a given repository and path.
 ///
-/// Returns the `FileOccurrenceId` string of the latest occurrence (by rowid),
+/// Returns the `FileOccurrenceId` string of the latest occurrence (by stable occurrence sequence),
 /// or `None` if this path has never been indexed in the given repository.
 ///
 /// Used by `attic-indexing` to find the previous occurrence for unit deletion.
@@ -289,7 +291,7 @@ pub fn lookup_latest_file_occurrence_for_path(
            FROM core_file_occurrences fo
            JOIN core_file_identities  fi ON fo.file_identity_id = fi.id
           WHERE fi.repository_id = ?1 AND fo.path = ?2
-          ORDER BY fo.rowid DESC
+          ORDER BY fo.occurrence_seq DESC
           LIMIT 1",
         rusqlite::params![repository_id.to_string_repr(), path],
         |r| r.get(0),
@@ -329,7 +331,7 @@ pub fn lookup_occurrence_snapshot(
            FROM core_file_occurrences fo
            JOIN core_file_identities  fi ON fo.file_identity_id = fi.id
           WHERE fi.repository_id = ?1 AND fo.path = ?2
-          ORDER BY fo.rowid DESC
+          ORDER BY fo.occurrence_seq DESC
           LIMIT 1",
         rusqlite::params![repository_id.to_string_repr(), path],
         |r| {
@@ -360,7 +362,7 @@ pub fn current_path_hashes_for_repository(
         "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path, fo.content_hash
            FROM core_file_occurrences fo
-           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m
           WHERE fo.freshness_state = 'CURRENT'
             AND fo.existence_state != 'deleted'"
     ))?;
@@ -392,7 +394,7 @@ pub fn latest_active_paths_for_repository(
         "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path
            FROM core_file_occurrences fo
-           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m
           WHERE fo.existence_state != 'deleted'"
     ))?;
     let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
@@ -422,7 +424,7 @@ pub fn current_files_for_repo_map(
         "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path, fo.file_type
            FROM core_file_occurrences fo
-           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m
           WHERE fo.freshness_state = 'CURRENT'
             AND fo.existence_state != 'deleted'
             AND (?2 IS NULL OR fo.file_type = ?2)"
@@ -665,14 +667,14 @@ mod tests {
     }
 
     #[test]
-    fn bulk_latest_occurrence_ids_matches_single_lookup_and_prefers_latest_rowid() {
+    fn bulk_latest_occurrence_ids_matches_single_lookup_and_prefers_latest_occurrence_sequence() {
         let conn = migrated_conn();
         let (repo_id, rev_id) = seed_repo_and_revision(&conn);
         let fid = FileIdentityId::new_v4();
         upsert_file_identity(&conn, &fid, &repo_id, "blob:main").unwrap();
 
         // Two occurrences for the same path (simulating a reindex run) — the
-        // bulk map must resolve to the SAME latest-by-rowid row as the
+        // bulk map must resolve to the SAME latest-by-occurrence-sequence row as the
         // single lookup, not the first one inserted.
         let occ_old = FileOccurrenceId::new_v4();
         insert_file_occurrence(
@@ -792,6 +794,12 @@ mod tests {
             current,
             vec![("foo.rs".to_owned(), FileType::Rust.as_str().to_owned())]
         );
+        conn.execute_batch("VACUUM").unwrap();
+        assert_eq!(
+            lookup_latest_file_occurrence_for_path(&conn, &repo_id, "foo.rs").unwrap(),
+            Some(b.to_string_repr()),
+            "VACUUM must not change logical occurrence ordering"
+        );
 
         let deleted = FileOccurrenceId::new_v4();
         insert(
@@ -806,6 +814,13 @@ mod tests {
                 .is_empty(),
             "latest deleted occurrence must suppress, never resurrect, older CURRENT rows"
         );
+        conn.execute_batch("VACUUM").unwrap();
+        assert!(
+            current_files_for_repo_map(&conn, &repo_id, None)
+                .unwrap()
+                .is_empty(),
+            "VACUUM must not resurrect a deleted path"
+        );
 
         let recreated = FileOccurrenceId::new_v4();
         insert(
@@ -819,6 +834,12 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        conn.execute_batch("VACUUM").unwrap();
+        assert_eq!(
+            lookup_latest_file_occurrence_for_path(&conn, &repo_id, "foo.rs").unwrap(),
+            Some(recreated.to_string_repr()),
+            "VACUUM must preserve the recreated occurrence as latest"
         );
     }
 }
