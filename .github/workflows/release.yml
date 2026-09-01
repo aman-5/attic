@@ -105,7 +105,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.source.outputs.sha }}
           fetch-depth: 0
@@ -235,7 +235,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
@@ -376,7 +376,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: attic-${{ matrix.target }}
 
@@ -413,7 +413,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
@@ -479,7 +479,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload Intel macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: attic-x86_64-apple-darwin
 
@@ -515,7 +515,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
@@ -529,21 +529,21 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-pc-windows-msvc
           path: dist
 
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-unknown-linux-gnu
           path: dist
 
 
       - name: Download Apple Silicon artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-aarch64-apple-darwin
           path: dist
@@ -669,7 +669,7 @@ jobs:
     steps:
 
       - name: Download Intel macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-apple-darwin
           path: dist

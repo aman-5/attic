@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify archive layout rules
         shell: bash
@@ -53,6 +53,8 @@ jobs:
           mkdir -p /tmp/fake-archive/docs
           touch /tmp/fake-archive/attic-server
           touch /tmp/fake-archive/README.md
+          touch /tmp/fake-archive/LICENSE-MIT
+          touch /tmp/fake-archive/LICENSE-APACHE
           touch /tmp/fake-archive/docs/x.md
 
           bash tools/package.sh --verify /tmp/fake-archive
