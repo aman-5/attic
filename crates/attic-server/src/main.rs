@@ -4714,6 +4714,7 @@ mod tests {
 
         let db_dir = TempDir::new().unwrap();
         let mut child = Command::new(&bin)
+            .env("ATTIC_HOME", db_dir.path())
             .env(
                 "ATTIC_DB_PATH",
                 db_dir.path().join("multiroot.db").to_str().unwrap(),
