@@ -408,7 +408,7 @@ jobs:
 
     if: needs.prepare.outputs.already_released != 'true'
 
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
 
