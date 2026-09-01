@@ -27,10 +27,9 @@ name: Release
 
 on:
   workflow_run:
-    workflows:
-      - CI
-    types:
-      - completed
+    workflow_run:
+      workflows: ["CI"]
+      types: [completed]
 
   workflow_dispatch:
 
@@ -376,7 +375,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: attic-${{ matrix.target }}
 
@@ -479,7 +478,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload Intel macOS artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: attic-x86_64-apple-darwin
 
