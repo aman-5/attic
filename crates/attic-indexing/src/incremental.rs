@@ -27,7 +27,7 @@ use std::path::Path;
 use tracing::debug;
 
 use attic_core::{
-    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
+    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, IndexGenerationId,
     RepositoryId, SecurityState, SourceRevisionId,
 };
 use attic_discovery::{DiscoveryPolicy, manifest_hash_from_pairs};
@@ -39,8 +39,8 @@ use attic_storage::{
 };
 
 use crate::{
-    FileRecord, IndexError, IndexOptions, IndexingStore, PendingUnit, analyze_single_file,
-    infer_file_type,
+    FilePrep, FileRecord, IndexError, IndexOptions, IndexingStore, PendingUnit,
+    analyze_single_file, infer_file_type,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,15 @@ pub struct ScopedIndexResult {
     pub units_deleted: usize,
     /// New retrieval units inserted.
     pub units_inserted: usize,
+}
+
+/// A cheap (size, mtime) fingerprint used to detect a file changing between
+/// two independent reads. `None` if the file cannot currently be stat'd —
+/// callers must treat that as "cannot confirm stability", never as a match.
+fn file_fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    Some((meta.len(), modified))
 }
 
 /// Stream-hash one file with BLAKE3 (64 KiB chunks; content-only identity).
@@ -145,6 +154,11 @@ pub fn index_changes(
     // and hash failures are propagated as errors so the task retries — never
     // silently converted into "file missing".
     let mut upsert_hashes: BTreeMap<String, String> = BTreeMap::new();
+    // Fingerprint taken immediately before hashing each file — compared
+    // against a second fingerprint taken after the analyzer's independent
+    // re-read (step 5) to detect the file changing mid-capture (Phase 6.4).
+    let mut upsert_stat_before: BTreeMap<String, Option<(u64, std::time::SystemTime)>> =
+        BTreeMap::new();
     let mut vanished: Vec<String> = Vec::new();
     for rel in &changes.upserts {
         let abs = root.join(rel);
@@ -156,9 +170,11 @@ pub fn index_changes(
                 source: std::io::Error::other("indexed file path became a directory"),
             });
         }
+        let stat_before = file_fingerprint(&abs);
         match hash_file_content(&abs) {
             Ok(h) => {
                 upsert_hashes.insert(rel.clone(), h);
+                upsert_stat_before.insert(rel.clone(), stat_before);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 debug!(path = %rel, "upsert target verifiably gone before publication");
@@ -228,6 +244,8 @@ pub fn index_changes(
     let repo_id_str = repo_id.to_string_repr();
     let mut file_records: Vec<FileRecord> = Vec::new();
     let mut pending_units: Vec<PendingUnit> = Vec::new();
+    let mut tombstones: Vec<PublicationFile> = Vec::new();
+    let mut skip_tombstoned: usize = 0;
 
     for rel in &changes.upserts {
         let Some(hash) = upsert_hashes.get(rel) else {
@@ -238,7 +256,10 @@ pub fn index_changes(
             .map(|m| i64::try_from(m.len()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
-        let rec = FileRecord {
+        // security_state/is_partial_scan are placeholders overwritten below
+        // with the real, analyzer-derived values once known (P0-6) — never
+        // published as-is.
+        let mut rec = FileRecord {
             fi_id: store
                 .readers
                 .with_reader(|c| lookup_file_identity_by_basis(c, &format!("{repo_id_str}/{rel}")))
@@ -257,13 +278,67 @@ pub fn index_changes(
         };
 
         match analyze_single_file(&rec, &registry, opts) {
-            Ok((mut units, captured)) => {
+            Ok(FilePrep::Indexable {
+                mut units,
+                captured,
+                security_state,
+                is_partial_scan,
+            }) => {
+                // Phase 6.4 — file-changed-during-capture guard: `hash` above
+                // and `analyze_single_file`'s independent re-read (just now)
+                // are two temporally-separated reads of the same path. If the
+                // file changed in between, `content_hash` and the indexed
+                // retrieval-unit text could come from two different
+                // snapshots — an internally-inconsistent occurrence. Fail
+                // closed: abort the whole scoped batch for retry, exactly
+                // like any other unresolved transient condition here.
+                let stat_before = upsert_stat_before.get(rel).copied().flatten();
+                let stat_after = file_fingerprint(&rec.abs_path);
+                if stat_before.is_none() || stat_before != stat_after {
+                    return Err(IndexError::Io {
+                        path: rel.clone(),
+                        source: std::io::Error::other(
+                            "file changed between hash capture and analysis (unstable read)",
+                        ),
+                    });
+                }
+                rec.security_state = security_state;
+                rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
                 if let Some(captured) = captured {
                     pipeline.record(captured);
                 }
                 pending_units.append(&mut units);
                 file_records.push(rec);
+            }
+            Ok(FilePrep::Skip) => {
+                // Permanent, deterministic skip (excluded, or content that is
+                // not valid UTF-8/unsupported binary) — never a scheduler
+                // retry target (P0-7). If this path had prior indexed
+                // content, retire it explicitly rather than leaving a stale
+                // `Present` occurrence with no retrieval units behind
+                // (`old_occurrence_ids`, computed above, already deletes its
+                // units/structural rows — this adds the occurrence-level
+                // tombstone). A path with no prior occurrence is simply not
+                // indexed — nothing to retire.
+                debug!(path = %rel, "upsert permanently skipped (unsupported/excluded content)");
+                if old_snapshots.contains_key(rel) {
+                    skip_tombstoned += 1;
+                    // Use the CURRENT file's hash (`rec.content_hash`, already
+                    // known from step 2) rather than the old snapshot's — the
+                    // file still exists on disk, just as permanently
+                    // unsupported content, so the current hash is the more
+                    // accurate/available fact.
+                    tombstones.push(crate::build_tombstone(
+                        repo_id,
+                        rev_id,
+                        gen_id,
+                        rec.fi_id,
+                        rec.stable_id_basis.clone(),
+                        rel.clone(),
+                        rec.content_hash.clone(),
+                    ));
+                }
             }
             Err(e) => {
                 // No silent fallback: previous state stays STALE/INVALID and
@@ -296,30 +371,20 @@ pub fn index_changes(
         })
         .collect();
 
-    let mut tombstones: Vec<PublicationFile> = Vec::new();
     for rel in changes.deletes.iter().chain(vanished.iter()) {
         let snap = old_snapshots.get(rel);
         let identity_id: FileIdentityId = snap
             .and_then(|s| s.file_identity_id.parse().ok())
             .unwrap_or_else(FileIdentityId::new_v4);
-        tombstones.push(PublicationFile {
+        tombstones.push(crate::build_tombstone(
+            repo_id,
+            rev_id,
+            gen_id,
             identity_id,
-            identity_repository_id: repo_id,
-            stable_id_basis: format!("{repo_id_str}/{rel}"),
-            occurrence: PublicationOccurrence {
-                id: FileOccurrenceId::new_v4(),
-                source_revision_id: rev_id,
-                index_generation_id: Some(gen_id),
-                path: rel.clone(),
-                content_hash: snap.map(|s| s.content_hash.clone()).unwrap_or_default(),
-                size_bytes: 0,
-                language: None,
-                file_type: FileType::Other,
-                discovery_class: DiscoveryClass::Vcs,
-                security_state: SecurityState::Skipped,
-                existence_state: ExistenceState::Deleted,
-            },
-        });
+            format!("{repo_id_str}/{rel}"),
+            rel.clone(),
+            snap.map(|s| s.content_hash.clone()).unwrap_or_default(),
+        ));
     }
 
     let gen_id_str = gen_id.to_string_repr();
@@ -439,7 +504,7 @@ pub fn index_changes(
         ) else {
             continue;
         };
-        if from_snap.content_hash != *new_hash || from_snap.existence_state == "DELETED" {
+        if from_snap.content_hash != *new_hash || from_snap.existence_state == "deleted" {
             continue;
         }
         let (Ok(from_identity), Some(new_identity)) = (
@@ -496,7 +561,7 @@ pub fn index_changes(
             .map_err(IndexError::Storage)?;
     }
 
-    let deleted_count = changes.deletes.len() + vanished.len();
+    let deleted_count = changes.deletes.len() + vanished.len() + skip_tombstoned;
     debug!(
         revision = %rev_id,
         generation = %gen_id,
@@ -523,4 +588,241 @@ fn now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.3 — incremental indexing regression/dry-run matrix
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attic_discovery::DiscoveryPolicy;
+    use attic_storage::{DbPool, WriterQueue, connection::open_ro};
+    use tempfile::TempDir;
+
+    struct StoreFixture {
+        dir: TempDir,
+        db_path: std::path::PathBuf,
+        pool: DbPool,
+        _queue: WriterQueue,
+        handle: attic_storage::WriterQueueHandle,
+    }
+
+    fn make_store() -> StoreFixture {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("incremental_test.db");
+        let (conn, pool) = attic_storage::open_db(&db_path).unwrap();
+        attic_storage::run_migrations(&conn).unwrap();
+        let queue = WriterQueue::new(conn).unwrap();
+        let handle = queue.handle();
+        StoreFixture {
+            dir,
+            db_path,
+            pool,
+            _queue: queue,
+            handle,
+        }
+    }
+
+    fn store(fx: &StoreFixture) -> IndexingStore<'_> {
+        IndexingStore {
+            readers: &fx.pool,
+            writer: &fx.handle,
+        }
+    }
+
+    fn write_file(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    fn search_hits(fx: &StoreFixture, query: &str) -> Vec<attic_storage::FtsSearchResult> {
+        fx.pool
+            .with_reader(|c| {
+                attic_storage::fts_search(
+                    c,
+                    &attic_storage::FtsSearchParams {
+                        query,
+                        repository_id: None,
+                        file_type: None,
+                        language: None,
+                        max_results: 50,
+                    },
+                )
+            })
+            .unwrap()
+    }
+
+    /// `(existence_state, freshness_state)` of the latest occurrence row for `path`.
+    fn latest_occurrence_state(fx: &StoreFixture, path: &str) -> (String, String) {
+        let verify = open_ro(&fx.db_path).unwrap();
+        verify
+            .query_row(
+                "SELECT existence_state, freshness_state
+                   FROM core_file_occurrences
+                  WHERE path = ?1
+                  ORDER BY rowid DESC
+                  LIMIT 1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.4 — file-changed-during-capture detection primitive
+    // -----------------------------------------------------------------------
+
+    /// `file_fingerprint` must change when the file's size/mtime changes, and
+    /// stay identical for an untouched file — the exact property
+    /// `index_changes` relies on to detect an unstable capture between its
+    /// hash read (step 2) and the analyzer's independent re-read (step 5).
+    #[test]
+    fn file_fingerprint_detects_content_change_and_is_stable_when_untouched() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("watched.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+
+        let fp1 = file_fingerprint(&path);
+        let fp2 = file_fingerprint(&path);
+        assert!(fp1.is_some());
+        assert_eq!(fp1, fp2, "an untouched file's fingerprint must be stable");
+
+        // Ensure the mtime actually advances even on coarse filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "fn after_a_real_change() {}\n").unwrap();
+        let fp3 = file_fingerprint(&path);
+        assert!(fp3.is_some());
+        assert_ne!(
+            fp1, fp3,
+            "a changed file's fingerprint must differ (size and/or mtime)"
+        );
+    }
+
+    #[test]
+    fn incremental_add_same_logical_result_as_full_index() {
+        let fx = make_store();
+        write_file(fx.dir.path(), "base.rs", "fn base_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
+
+        write_file(fx.dir.path(), "added.rs", "fn incremental_added_token() {}\n");
+        let changes = ScopedChanges {
+            upserts: vec!["added.rs".to_string()],
+            deletes: vec![],
+            rename_hints: vec![],
+        };
+        let result = index_changes(&s, fx.dir.path(), &policy, &opts, &changes).unwrap();
+        assert_eq!(result.files_published, 1);
+        assert!(!search_hits(&fx, "incremental_added_token").is_empty());
+        assert!(
+            !search_hits(&fx, "base_token").is_empty(),
+            "unrelated existing content must be unaffected"
+        );
+    }
+
+    #[test]
+    fn incremental_modify_old_units_removed() {
+        let fx = make_store();
+        write_file(fx.dir.path(), "m.rs", "fn before_incr_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
+
+        write_file(fx.dir.path(), "m.rs", "fn after_incr_token() {}\n");
+        let changes = ScopedChanges {
+            upserts: vec!["m.rs".to_string()],
+            deletes: vec![],
+            rename_hints: vec![],
+        };
+        index_changes(&s, fx.dir.path(), &policy, &opts, &changes).unwrap();
+
+        assert!(
+            search_hits(&fx, "before_incr_token").is_empty(),
+            "old content must be gone"
+        );
+        assert!(!search_hits(&fx, "after_incr_token").is_empty());
+    }
+
+    #[test]
+    fn incremental_delete_tombstone_and_no_search_result() {
+        let fx = make_store();
+        write_file(fx.dir.path(), "d.rs", "fn incr_delete_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
+        std::fs::remove_file(fx.dir.path().join("d.rs")).unwrap();
+
+        let changes = ScopedChanges {
+            upserts: vec![],
+            deletes: vec!["d.rs".to_string()],
+            rename_hints: vec![],
+        };
+        let result = index_changes(&s, fx.dir.path(), &policy, &opts, &changes).unwrap();
+        assert_eq!(result.files_deleted, 1);
+        assert!(search_hits(&fx, "incr_delete_token").is_empty());
+        let (existence, freshness) = latest_occurrence_state(&fx, "d.rs");
+        assert_eq!(existence, "deleted");
+        assert_eq!(freshness, "INVALID");
+    }
+
+    #[test]
+    fn incremental_binary_change_is_clean_permanent_skip_no_retry_loop() {
+        // P0-7: content changing to binary/invalid UTF-8 is a permanent,
+        // deterministic condition. It must be a clean skip — the scoped
+        // batch must succeed (never abort/retry forever) and the stale
+        // prior content must be retired rather than left stale.
+        let fx = make_store();
+        write_file(fx.dir.path(), "flip.rs", "fn before_flip_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "before_flip_token").is_empty());
+
+        std::fs::write(fx.dir.path().join("flip.rs"), [0xFF, 0xFE, 0x00, 0xD8]).unwrap();
+        let changes = ScopedChanges {
+            upserts: vec!["flip.rs".to_string()],
+            deletes: vec![],
+            rename_hints: vec![],
+        };
+        let result = index_changes(&s, fx.dir.path(), &policy, &opts, &changes)
+            .expect("a permanent binary-content skip must not fail/abort the scoped batch");
+        assert_eq!(
+            result.files_published, 0,
+            "binary content produces no new occurrence"
+        );
+        assert_eq!(result.files_deleted, 1, "the stale prior occurrence must be retired");
+        assert!(
+            search_hits(&fx, "before_flip_token").is_empty(),
+            "stale prior content must be retired, not left searchable"
+        );
+    }
+
+    #[test]
+    fn incremental_binary_new_file_no_prior_occurrence_is_a_silent_noop() {
+        // A file that was never indexed and arrives as binary/unsupported
+        // content: nothing to retire, nothing to publish — just not indexed.
+        let fx = make_store();
+        write_file(fx.dir.path(), "seed.rs", "fn seed_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
+
+        std::fs::write(fx.dir.path().join("new.bin"), [0xFF, 0xFE, 0x00, 0xD8]).unwrap();
+        let changes = ScopedChanges {
+            upserts: vec!["new.bin".to_string()],
+            deletes: vec![],
+            rename_hints: vec![],
+        };
+        let result = index_changes(&s, fx.dir.path(), &policy, &opts, &changes)
+            .expect("a never-indexed binary file must not error");
+        assert_eq!(result.files_published, 0);
+        assert_eq!(result.files_deleted, 0, "there was nothing to retire");
+    }
 }

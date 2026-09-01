@@ -281,10 +281,47 @@ pub fn current_path_hashes_for_repository(
            FROM core_file_occurrences fo
            JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
           WHERE fo.freshness_state = 'CURRENT'
-            AND fo.existence_state != 'DELETED'",
+            AND fo.existence_state != 'deleted'",
     )?;
     let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Latest-per-path occurrence paths that are still `present` (not tombstoned)
+/// in the given repository, regardless of `freshness_state`.
+///
+/// Used by full/authoritative indexing to diff "previously active paths"
+/// against the current discovery run so paths that disappeared (deleted from
+/// disk, or newly excluded/unsupported) can be tombstoned instead of being
+/// left as stale searchable content forever. `STALE`/`PENDING_REFRESH` paths
+/// are intentionally included (unlike [`current_path_hashes_for_repository`],
+/// which only trusts `CURRENT` rows as a hashing baseline) — they are still
+/// "active" from a tombstone-diff point of view.
+pub fn latest_active_paths_for_repository(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+) -> Result<Vec<String>, StorageError> {
+    let mut stmt = conn.prepare(
+        "WITH latest AS (
+             SELECT fo.path AS p, MAX(fo.rowid) AS m
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+              WHERE fi.repository_id = ?1
+              GROUP BY fo.path
+         )
+         SELECT fo.path
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+          WHERE fo.existence_state != 'deleted'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
+        r.get::<_, String>(0)
     })?;
     let mut out = Vec::new();
     for row in rows {

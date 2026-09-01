@@ -67,17 +67,35 @@ pub fn upsert_repository(
 
 /// Return per-repository file and unit counts for all indexed repositories.
 ///
+/// Counts only the **latest, still-`present`** occurrence per path — not
+/// every historical occurrence row (rows are never physically deleted on
+/// reindex, so an unfiltered count grows every time any file is reindexed
+/// and never reflects the current repository state).
+///
 /// Results are ordered by `display_name` ascending.
 /// The query never returns `root_path` — absolute paths are kept server-side.
 pub fn get_repository_stats(conn: &Connection) -> Result<Vec<RepositoryStats>, StorageError> {
+    // The latest-row-per-path determination MUST happen before filtering by
+    // existence_state: a path's newest row (by rowid) may be a `deleted`
+    // tombstone superseding an older `present` row for the same path, and
+    // that tombstone must win — filtering `present` rows first (before
+    // computing MAX(rowid)) would incorrectly resurrect the stale row.
     let sql = "
+        WITH latest AS (
+             SELECT fi.repository_id AS repository_id,
+                    fo.id AS fo_id,
+                    fo.existence_state AS existence_state,
+                    MAX(fo.rowid) AS m
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+              GROUP BY fi.repository_id, fo.path
+        )
         SELECT r.id, r.display_name,
-               COUNT(DISTINCT fo.id) AS files,
-               COUNT(ru.id)          AS units
+               COUNT(DISTINCT CASE WHEN latest.existence_state = 'present' THEN latest.fo_id END) AS files,
+               COUNT(CASE WHEN latest.existence_state = 'present' THEN ru.id END) AS units
           FROM core_repositories r
-          LEFT JOIN core_file_identities  fi ON fi.repository_id = r.id
-          LEFT JOIN core_file_occurrences fo ON fo.file_identity_id = fi.id
-          LEFT JOIN core_retrieval_units  ru ON ru.file_occurrence_id = fo.id
+          LEFT JOIN latest ON latest.repository_id = r.id
+          LEFT JOIN core_retrieval_units ru ON ru.file_occurrence_id = latest.fo_id
          GROUP BY r.id
          ORDER BY r.display_name
     ";

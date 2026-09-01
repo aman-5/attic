@@ -26,7 +26,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use thiserror::Error;
@@ -43,9 +43,9 @@ use attic_core::{
 use attic_discovery::{DiscoveryPolicy, DownstreamClassification, SecretScanDecision};
 use attic_storage::{
     DbPool, IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
-    PublicationRetrievalUnit, StorageError, WriterQueueHandle, lookup_file_identity_by_basis,
-    lookup_latest_file_occurrence_for_path, lookup_repository_by_root_path,
-    submit_index_publication,
+    PublicationRetrievalUnit, StorageError, WriterQueueHandle, latest_active_paths_for_repository,
+    lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    lookup_occurrence_snapshot, lookup_repository_by_root_path, submit_index_publication,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,17 @@ pub enum IndexError {
     PolicyHash(String),
     #[error("repository at {0} has not been bootstrapped; run a full index first")]
     RepositoryNotBootstrapped(String),
+    /// Generation-completeness invariant (Phase 6.4): one or more discovered
+    /// paths hit a transient/retryable failure and never reached a terminal
+    /// state (indexed, intentionally skipped, or removed/excluded) this run.
+    /// The caller MUST treat this exactly like any other failed indexing
+    /// attempt — nothing was published, the previous generation (if any)
+    /// remains untouched and current, and a retry is expected to resolve it.
+    #[error(
+        "indexing generation incomplete: {} file(s) failed with a transient/retryable error and never reached a terminal state; nothing was published, the previous generation remains current",
+        paths.len()
+    )]
+    TransientFailures { paths: Vec<String> },
 }
 
 pub mod incremental;
@@ -166,6 +177,121 @@ struct PendingUnit {
     structural_node_index: Option<usize>,
 }
 
+/// Outcome of preparing/analyzing one file — the single contract shared by
+/// full and incremental indexing so the two pipelines cannot diverge on
+/// Redacted/ScanSkipped handling or security-metadata propagation again.
+///
+/// `Err(IndexError)` from [`analyze_single_file`] is reserved for genuinely
+/// transient conditions (the file may be indexable on a later retry);
+/// permanent, deterministic outcomes are always `Ok(FilePrep::Skip)`.
+pub(crate) enum FilePrep {
+    /// The file was analyzed and produced indexable content (possibly zero
+    /// retrieval units, e.g. an empty file).
+    Indexable {
+        units: Vec<PendingUnit>,
+        captured: Option<structural_pipeline::CapturedFile>,
+        security_state: SecurityState,
+        is_partial_scan: bool,
+    },
+    /// The file is permanently ineligible for indexing this run (excluded,
+    /// or content that cannot be read as text — binary/invalid UTF-8, e.g.
+    /// PDF/DOCX). Terminal for this content: callers must never retry it,
+    /// and must retire (tombstone) any prior occurrence for the same path
+    /// rather than leaving it stale. Always corresponds to
+    /// `SecurityState::Skipped`.
+    Skip,
+}
+
+/// Map a resolved secrets-layer decision to the persisted security state.
+fn security_state_for_decision(decision: &SecretScanDecision) -> SecurityState {
+    match decision {
+        SecretScanDecision::Safe => SecurityState::Clean,
+        SecretScanDecision::Redacted => SecurityState::Flagged,
+        SecretScanDecision::PartialScan => SecurityState::Pending,
+        SecretScanDecision::Excluded => SecurityState::Skipped,
+    }
+}
+
+/// Build a `Deleted`/`Skipped` tombstone occurrence for `repo_relative`.
+///
+/// The single shared tombstone contract for full and incremental indexing —
+/// every call site must go through this so the shape (and fields like
+/// `content_hash`) cannot silently drift between the two pipelines.
+/// `prior_content_hash` should be the best hash available for this path
+/// (the file's current on-disk hash if it still exists but is being retired
+/// as permanently unsupported/excluded, or the last-known hash if the path
+/// is gone entirely); pass `String::new()` only when truly unknown.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tombstone(
+    repo_id: RepositoryId,
+    rev_id: SourceRevisionId,
+    gen_id: IndexGenerationId,
+    identity_id: FileIdentityId,
+    stable_id_basis: String,
+    repo_relative: String,
+    prior_content_hash: String,
+) -> PublicationFile {
+    PublicationFile {
+        identity_id,
+        identity_repository_id: repo_id,
+        stable_id_basis,
+        occurrence: PublicationOccurrence {
+            id: FileOccurrenceId::new_v4(),
+            source_revision_id: rev_id,
+            index_generation_id: Some(gen_id),
+            path: repo_relative,
+            content_hash: prior_content_hash,
+            size_bytes: 0,
+            language: None,
+            file_type: FileType::Other,
+            discovery_class: DiscoveryClass::Vcs,
+            security_state: SecurityState::Skipped,
+            existence_state: ExistenceState::Deleted,
+        },
+    }
+}
+
+/// Retire the current occurrence of `path` (deleted from disk, newly
+/// excluded, or newly permanently unsupported): look up its prior
+/// identity/occurrence/content-hash and, if one exists, schedule the old
+/// occurrence's units/structural rows for deletion and publish a `Deleted`
+/// tombstone occurrence in its place. A genuine no-op (nothing pushed) if
+/// the path has no prior occurrence — there is nothing to retire.
+fn retire_path(
+    store: &IndexingStore<'_>,
+    repo_id: RepositoryId,
+    rev_id: SourceRevisionId,
+    gen_id: IndexGenerationId,
+    repo_relative: &str,
+    stale_occurrences: &mut Vec<String>,
+    tombstones: &mut Vec<PublicationFile>,
+) -> Result<(), IndexError> {
+    let Some(snap) = store
+        .readers
+        .with_reader(|c| lookup_occurrence_snapshot(c, &repo_id, repo_relative))
+        .map_err(IndexError::Storage)?
+    else {
+        // No prior occurrence: genuinely nothing to retire.
+        return Ok(());
+    };
+    stale_occurrences.push(snap.id.clone());
+    let identity_id: FileIdentityId = snap
+        .file_identity_id
+        .parse()
+        .unwrap_or_else(|_| FileIdentityId::new_v4());
+    let repo_id_str = repo_id.to_string_repr();
+    tombstones.push(build_tombstone(
+        repo_id,
+        rev_id,
+        gen_id,
+        identity_id,
+        format!("{repo_id_str}/{repo_relative}"),
+        repo_relative.to_owned(),
+        snap.content_hash,
+    ));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Primary entry point
 // ---------------------------------------------------------------------------
@@ -256,8 +382,43 @@ pub fn index_repository(
     //    on this run's own writes, so pre-publication reads are correct.
     let mut file_records: Vec<FileRecord> = Vec::new();
 
+    // Authoritative reconciliation bookkeeping (P0-4): a full index run must
+    // retire any previously-active path that is no longer part of current
+    // indexable truth (deleted from disk, newly excluded, or newly
+    // permanently unsupported) rather than silently leaving its old
+    // occurrence/units/structural rows as searchable "current" content.
+    // `stale_occurrences` therefore accumulates ids to retire from THREE
+    // sources: (a) a path successfully reindexed (below), (b) a path
+    // permanently skipped this run that had prior content, and (c) a path
+    // that vanished from discovery entirely (handled after this loop).
+    //
+    // Generation-completeness invariant (Phase 6.4): every discovered path
+    // must reach an explicit terminal state — INDEXED, INTENTIONALLY_SKIPPED,
+    // or REMOVED/EXCLUDED — before this run's generation may be published as
+    // authoritative/current. A transient/retryable failure (stat race, I/O
+    // hiccup, unstable read) is none of those; `transient_failed_paths`
+    // collects every such path, and if it is non-empty when the analysis
+    // loop finishes, the ENTIRE run aborts with `IndexError::TransientFailures`
+    // BEFORE `submit_index_publication` is ever called — the previous
+    // generation (if any) is left completely untouched and stays current.
+    // This mirrors the incremental pipeline's existing "no silent fallback,
+    // whole batch aborts for scheduler retry" contract instead of publishing
+    // a generation that mixes verified-current content with content nobody
+    // actually verified this run.
+    let previous_active: HashSet<String> = store
+        .readers
+        .with_reader(|c| latest_active_paths_for_repository(c, &repo_id))
+        .map_err(IndexError::Storage)?
+        .into_iter()
+        .collect();
+    let mut current_entry_paths: HashSet<String> = HashSet::new();
+    let mut stale_occurrences: Vec<String> = Vec::new();
+    let mut tombstones: Vec<PublicationFile> = Vec::new();
+    let mut transient_failed_paths: Vec<String> = Vec::new();
+
     for entry in &discovery.entries {
         result.files_visited += 1;
+        current_entry_paths.insert(entry.repo_relative.clone());
 
         let classification = discovery
             .downstream_classifications
@@ -265,17 +426,51 @@ pub fn index_repository(
             .find(|(p, _)| p == &entry.repo_relative)
             .map(|(_, c)| c);
 
-        if matches!(classification, Some(DownstreamClassification::Excluded)) {
-            debug!(path = %entry.repo_relative, "skipping excluded file");
+        if matches!(
+            classification,
+            Some(DownstreamClassification::Excluded) | Some(DownstreamClassification::ScanSkipped { .. })
+        ) {
+            debug!(path = %entry.repo_relative, classification = ?classification, "skipping excluded/scan-skipped file");
             result.files_skipped += 1;
+            if previous_active.contains(&entry.repo_relative) {
+                retire_path(
+                    store,
+                    repo_id,
+                    rev_id,
+                    gen_id,
+                    &entry.repo_relative,
+                    &mut stale_occurrences,
+                    &mut tombstones,
+                )?;
+            }
+            continue;
+        }
+
+        if let Some(DownstreamClassification::ScanTransientError { reason }) = classification {
+            // NOT a content verdict — never tombstone, never treat as a
+            // permanent skip. Record for the completeness gate below.
+            warn!(
+                path = %entry.repo_relative,
+                reason = %reason,
+                "discovery classification transient error; this run cannot become current until resolved"
+            );
+            transient_failed_paths.push(entry.repo_relative.clone());
             continue;
         }
 
         let file_meta = match std::fs::metadata(&entry.abs_path) {
             Ok(m) => m,
             Err(e) => {
-                warn!(path = %entry.repo_relative, error = %e, "stat failed, skipping");
-                result.files_skipped += 1;
+                // Transient (the path was just discovered on disk moments
+                // ago; a stat failure now is a race, not a permanent
+                // condition). Never falsely tombstone/delete on this — record
+                // it and let the generation-completeness gate below decide.
+                warn!(
+                    path = %entry.repo_relative,
+                    error = %e,
+                    "stat failed (transient); this run cannot become current until resolved"
+                );
+                transient_failed_paths.push(entry.repo_relative.clone());
                 continue;
             }
         };
@@ -327,6 +522,22 @@ pub fn index_repository(
         });
     }
 
+    // 5b. Paths previously active but absent from this run's discovery
+    // entirely (deleted from disk, or newly outside the walk/policy) —
+    // retire them too. This is the other half of P0-4: the loop above only
+    // ever sees paths still present on disk.
+    for path in previous_active.difference(&current_entry_paths) {
+        retire_path(
+            store,
+            repo_id,
+            rev_id,
+            gen_id,
+            path,
+            &mut stale_occurrences,
+            &mut tombstones,
+        )?;
+    }
+
     // 6. Run Phase 1C analysis per file.  Produces pending units only — no
     //    database writes happen during analysis.
     let registry = if opts.structural {
@@ -335,7 +546,6 @@ pub fn index_repository(
         structural_pipeline::generic_only_registry()
     };
     let mut pending_units: Vec<PendingUnit> = Vec::new();
-    let mut stale_occurrences: Vec<String> = Vec::new();
     let mut indexed_records: Vec<FileRecord> = Vec::new();
     let mut pipeline = structural_pipeline::StructuralPipeline::new(
         root,
@@ -347,14 +557,21 @@ pub fn index_repository(
             .collect(),
     );
 
-    for rec in file_records {
+    for mut rec in file_records {
         match analyze_single_file(&rec, &registry, opts) {
-            Ok((mut units, captured)) => {
+            Ok(FilePrep::Indexable {
+                mut units,
+                captured,
+                security_state,
+                is_partial_scan,
+            }) => {
                 if opts.refresh_existing
                     && let Some(old) = rec.old_fo_id.clone()
                 {
                     stale_occurrences.push(old);
                 }
+                rec.security_state = security_state;
+                rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(&rec.repo_relative, &rec.fo_id.to_string_repr());
                 if let Some(captured) = captured {
                     pipeline.record(captured);
@@ -363,19 +580,57 @@ pub fn index_repository(
                 indexed_records.push(rec);
                 result.files_indexed += 1;
             }
+            Ok(FilePrep::Skip) => {
+                // Permanent, deterministic skip discovered only during
+                // analysis (e.g. content changed to binary/invalid-UTF-8
+                // since discovery ran). Retire any prior occurrence — never
+                // leave it advertised as current truth (P0-3/P0-5).
+                debug!(path = %rec.repo_relative, "file permanently skipped during analysis");
+                result.files_skipped += 1;
+                if let Some(old) = rec.old_fo_id.clone() {
+                    stale_occurrences.push(old);
+                    tombstones.push(build_tombstone(
+                        repo_id,
+                        rev_id,
+                        gen_id,
+                        rec.fi_id,
+                        rec.stable_id_basis.clone(),
+                        rec.repo_relative.clone(),
+                        rec.content_hash.clone(),
+                    ));
+                }
+            }
             Err(e) => {
+                // Transient/retryable failure: this path has not reached any
+                // terminal state this run. Do not falsely delete or publish
+                // anything for it — record it for the completeness gate
+                // below, which aborts the whole run rather than publish a
+                // generation that mixes verified content with content nobody
+                // actually verified.
                 warn!(
                     path = %rec.repo_relative,
                     error = %e,
-                    "analysis/unit production failed, skipping"
+                    "analysis failed (transient); this run cannot become current until resolved"
                 );
-                result.files_skipped += 1;
+                transient_failed_paths.push(rec.repo_relative.clone());
             }
         }
     }
 
+    // Generation-completeness gate (Phase 6.4): every discovered path must
+    // have reached INDEXED, INTENTIONALLY_SKIPPED, or REMOVED/EXCLUDED above.
+    // Any transient/retryable failure means this generation is not
+    // authoritative — abort before publication so the previous generation
+    // (if any) remains completely untouched and current; the scheduler is
+    // expected to retry the full index later.
+    if !transient_failed_paths.is_empty() {
+        return Err(IndexError::TransientFailures {
+            paths: transient_failed_paths,
+        });
+    }
+
     // 7. Publish EVERYTHING as one coordinated writer-queue mutation.
-    let publication_files: Vec<PublicationFile> = indexed_records
+    let mut publication_files: Vec<PublicationFile> = indexed_records
         .iter()
         .map(|rec| PublicationFile {
             identity_id: rec.fi_id,
@@ -395,6 +650,16 @@ pub fn index_repository(
                 existence_state: ExistenceState::Present,
             },
         })
+        .collect();
+    publication_files.extend(tombstones);
+
+    // Tombstone rows must never advertise CURRENT freshness (same contract
+    // as the incremental pipeline): flip them to INVALID right after
+    // publication, once their ids are committed.
+    let tombstone_occurrence_ids: Vec<String> = publication_files
+        .iter()
+        .filter(|f| f.occurrence.existence_state == ExistenceState::Deleted)
+        .map(|f| f.occurrence.id.to_string_repr())
         .collect();
 
     let repo_id_str = repo_id.to_string_repr();
@@ -479,6 +744,32 @@ pub fn index_repository(
     )
     .map_err(IndexError::Storage)?;
 
+    // Post-publication follow-up (mirrors the incremental pipeline's
+    // contract): flip newly-committed tombstones to INVALID so they are
+    // never mistaken for CURRENT content (P0-4). Note there is no
+    // transient-failure degrade step here any more (Phase 6.3) — the
+    // generation-completeness gate above already guarantees that if we
+    // reached this point, every discovered path resolved to a terminal
+    // state, so there is nothing left to degrade (Phase 6.4).
+    if !tombstone_occurrence_ids.is_empty() {
+        let tomb = tombstone_occurrence_ids;
+        store
+            .writer
+            .send(move |conn| {
+                for id in &tomb {
+                    conn.execute(
+                        "UPDATE core_file_occurrences
+                            SET freshness_state = 'INVALID'
+                          WHERE id = ?1 AND existence_state = 'deleted'",
+                        [id],
+                    )
+                    .map_err(StorageError::from)?;
+                }
+                Ok(())
+            })
+            .map_err(IndexError::Storage)?;
+    }
+
     result.units_inserted = stats.units_inserted;
     result.units_deleted = stats.units_deleted;
 
@@ -506,14 +797,30 @@ fn analyze_single_file(
     rec: &FileRecord,
     registry: &AnalyzerRegistry,
     opts: &IndexOptions,
-) -> Result<(Vec<PendingUnit>, Option<structural_pipeline::CapturedFile>), IndexError> {
+) -> Result<FilePrep, IndexError> {
     // Preprocess through Phase 1B secrets layer.
-    // I/O failures MUST be propagated — never swallowed with unwrap_or_default.
-    let preprocessed = attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative)
-        .map_err(|source| IndexError::Io {
-            path: rec.repo_relative.clone(),
-            source,
-        })?;
+    // Transient I/O failures MUST be propagated — never swallowed. Content
+    // that cannot be decoded as UTF-8 (binary, e.g. PDF/DOCX) is, by
+    // contrast, a permanent and deterministic condition — it is reported as
+    // a terminal Skip, not an error the caller might retry forever.
+    let preprocessed = match attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative)
+    {
+        Ok(p) => p,
+        Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
+            debug!(
+                path = %rec.repo_relative,
+                error = %source,
+                "skipping: content is not valid UTF-8 / unsupported binary"
+            );
+            return Ok(FilePrep::Skip);
+        }
+        Err(source) => {
+            return Err(IndexError::Io {
+                path: rec.repo_relative.clone(),
+                source,
+            });
+        }
+    };
 
     // Build AnalyzerContent based on the preprocessing decision:
     //
@@ -522,8 +829,12 @@ fn analyze_single_file(
     //  Redacted + SMALL → RedactedBytes(already_safe_bytes)       is_partial_scan = false
     //                     Analyzer preserves safe surrounding context; Phase 1B
     //                     replaces only the secret spans inline — not the whole file.
+    //  Redacted + LARGE → StreamingHandle(Box::new(stream))       is_partial_scan = false
+    //                     Same large-file contract as Safe+LARGE: the stream
+    //                     already has secrets redacted inline; the original
+    //                     file must never be reopened downstream.
     //  PartialScan      → FullBytes(sample_bytes)                 is_partial_scan = true
-    //  Excluded         → skip (return no units)
+    //  Excluded         → skip (terminal, no units)
     let (analyzer_content, is_partial_scan_override) = match preprocessed.decision {
         SecretScanDecision::Excluded => {
             debug!(
@@ -531,20 +842,29 @@ fn analyze_single_file(
                 decision = ?preprocessed.decision,
                 "skipping file per preprocess decision"
             );
-            return Ok((Vec::new(), None));
+            return Ok(FilePrep::Skip);
         }
 
         SecretScanDecision::Redacted => {
-            // content = Some(redacted_string): safe surroundings preserved,
-            // secrets replaced. Feed as RedactedBytes so analyzers can produce
-            // retrieval units for the safe surrounding code regions.
-            let content = preprocessed.content.ok_or_else(|| IndexError::Io {
-                path: rec.repo_relative.clone(),
-                source: std::io::Error::other(
-                    "Redacted decision but content=None (protocol violation)",
-                ),
-            })?;
-            (AnalyzerContent::RedactedBytes(content.into_bytes()), false)
+            if let Some(stream) = preprocessed.stream {
+                // LARGE file (4–50 MiB) with secrets: content=None,
+                // stream=Some(LargeFileStream). Do NOT require content — the
+                // stream already carries the redacted bytes; consume it
+                // exclusively through StreamingHandle, same as Safe+LARGE.
+                (AnalyzerContent::StreamingHandle(Box::new(stream)), false)
+            } else {
+                // SMALL file: content = Some(redacted_string): safe
+                // surroundings preserved, secrets replaced. Feed as
+                // RedactedBytes so analyzers can produce retrieval units for
+                // the safe surrounding code regions.
+                let content = preprocessed.content.ok_or_else(|| IndexError::Io {
+                    path: rec.repo_relative.clone(),
+                    source: std::io::Error::other(
+                        "Redacted decision but content=None and stream=None (protocol violation)",
+                    ),
+                })?;
+                (AnalyzerContent::RedactedBytes(content.into_bytes()), false)
+            }
         }
 
         SecretScanDecision::PartialScan => {
@@ -579,6 +899,7 @@ fn analyze_single_file(
 
     let is_partial_scan = rec.is_partial_scan || is_partial_scan_override;
     let is_redacted = matches!(preprocessed.decision, SecretScanDecision::Redacted);
+    let security_state = security_state_for_decision(&preprocessed.decision);
 
     let fo_id_str = rec.fo_id.to_string_repr();
 
@@ -640,7 +961,12 @@ fn analyze_single_file(
         is_redacted,
         "file analyzed"
     );
-    Ok((units, captured))
+    Ok(FilePrep::Indexable {
+        units,
+        captured,
+        security_state,
+        is_partial_scan,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +983,11 @@ fn classify_security_state(
         Some(DownstreamClassification::PartialScan { .. }) => (SecurityState::Pending, true),
         Some(DownstreamClassification::ScanSkipped { .. }) => (SecurityState::Skipped, false),
         Some(DownstreamClassification::Excluded) => (SecurityState::Skipped, false),
+        // Never actually reached: the caller's entry loop routes
+        // `ScanTransientError` into `transient_failed_paths` and `continue`s
+        // before ever calling this function. Handled defensively so the
+        // match stays exhaustive.
+        Some(DownstreamClassification::ScanTransientError { .. }) => (SecurityState::Pending, false),
         None => (SecurityState::Pending, false),
     }
 }
@@ -1263,5 +1594,603 @@ mod tests {
             bodies.iter().any(|b| b.contains("real_function_name")),
             "indexed units must contain the actual function name"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.3 — full indexing regression/dry-run matrix
+    // -----------------------------------------------------------------------
+
+    fn search_hits(fx: &StoreFixture, query: &str) -> Vec<attic_storage::FtsSearchResult> {
+        fx.pool
+            .with_reader(|c| {
+                attic_storage::fts_search(
+                    c,
+                    &attic_storage::FtsSearchParams {
+                        query,
+                        repository_id: None,
+                        file_type: None,
+                        language: None,
+                        max_results: 50,
+                    },
+                )
+            })
+            .unwrap()
+    }
+
+    /// `(existence_state, freshness_state, security_state)` of the latest
+    /// occurrence row for `path`.
+    fn latest_occurrence_state(fx: &StoreFixture, path: &str) -> (String, String, String) {
+        let verify = verify_conn(fx);
+        verify
+            .query_row(
+                "SELECT existence_state, freshness_state, security_state
+                   FROM core_file_occurrences
+                  WHERE path = ?1
+                  ORDER BY rowid DESC
+                  LIMIT 1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn repo_stats(fx: &StoreFixture, repository_id: &str) -> attic_storage::RepositoryStats {
+        fx.pool
+            .with_reader(attic_storage::get_repository_stats)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == repository_id)
+            .expect("repository stats row must exist")
+    }
+
+    #[test]
+    fn new_clean_repository_all_eligible_files_represented() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "a.rs", "fn a_token() {}\n");
+        write_file(fx._dir.path(), "b.py", "def b_token(): pass\n");
+        write_file(fx._dir.path(), "c.md", "# c_token heading\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(
+            result.files_indexed, 3,
+            "all three eligible files must be indexed"
+        );
+        for token in ["a_token", "b_token", "c_token"] {
+            assert!(!search_hits(&fx, token).is_empty(), "{token} must be searchable");
+        }
+    }
+
+    #[test]
+    fn existing_repo_row_emptied_disk_converges_to_zero_files() {
+        // P0-1/P0-4: a repository row already existing must never itself mean
+        // "bootstrap complete" — reconciling against an emptied disk must
+        // retire all previously-active content.
+        let fx = make_store();
+        write_file(fx._dir.path(), "only.rs", "fn only_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        let r1 = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "only_token").is_empty());
+
+        std::fs::remove_file(fx._dir.path().join("only.rs")).unwrap();
+        let r2 = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(
+            r2.repository_id, r1.repository_id,
+            "the existing repository row is reconciled, not recreated"
+        );
+        assert_eq!(r2.files_indexed, 0);
+        assert!(
+            search_hits(&fx, "only_token").is_empty(),
+            "deleted file's content must not remain searchable"
+        );
+        let stats = repo_stats(&fx, &r1.repository_id);
+        assert_eq!(
+            stats.file_count, 0,
+            "get_repository_stats must reflect zero current files"
+        );
+    }
+
+    #[test]
+    fn existing_partial_repository_converges_to_disk() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "keep.rs", "fn keep_token() {}\n");
+        write_file(fx._dir.path(), "gone.rs", "fn gone_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        std::fs::remove_file(fx._dir.path().join("gone.rs")).unwrap();
+        write_file(fx._dir.path(), "new.rs", "fn new_token() {}\n");
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        assert!(
+            !search_hits(&fx, "keep_token").is_empty(),
+            "unchanged file stays searchable"
+        );
+        assert!(
+            search_hits(&fx, "gone_token").is_empty(),
+            "deleted file's content must be gone"
+        );
+        assert!(
+            !search_hits(&fx, "new_token").is_empty(),
+            "newly added file must be searchable"
+        );
+    }
+
+    #[test]
+    fn repeated_unchanged_full_index_has_no_duplicate_truth() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "stable.rs", "fn stable_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        let r1 = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        let stats = repo_stats(&fx, &r1.repository_id);
+        assert_eq!(
+            stats.file_count, 1,
+            "repeated unchanged indexing must not inflate file_count (P1-1)"
+        );
+        let hits = search_hits(&fx, "stable_token");
+        assert_eq!(
+            hits.len(),
+            1,
+            "must be exactly one current searchable hit, not one per run"
+        );
+    }
+
+    #[test]
+    fn modify_file_new_content_searchable_old_absent() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "m.rs", "fn before_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "before_token").is_empty());
+
+        write_file(fx._dir.path(), "m.rs", "fn after_token() {}\n");
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        assert!(
+            search_hits(&fx, "before_token").is_empty(),
+            "old content must be gone after modify"
+        );
+        assert!(!search_hits(&fx, "after_token").is_empty());
+    }
+
+    #[test]
+    fn delete_file_content_absent_from_search_and_db() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "d.rs", "fn delete_me_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        std::fs::remove_file(fx._dir.path().join("d.rs")).unwrap();
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        assert!(search_hits(&fx, "delete_me_token").is_empty());
+        let (existence, freshness, security) = latest_occurrence_state(&fx, "d.rs");
+        assert_eq!(existence, "deleted");
+        assert_eq!(freshness, "INVALID");
+        assert_eq!(security, "skipped");
+
+        let verify = verify_conn(&fx);
+        let unit_count: i64 = verify
+            .query_row(
+                "SELECT COUNT(*) FROM core_retrieval_units ru
+                   JOIN core_file_occurrences fo ON ru.file_occurrence_id = fo.id
+                  WHERE fo.path = 'd.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unit_count, 0,
+            "no retrieval units may remain pointing at a deleted path"
+        );
+    }
+
+    #[test]
+    fn rename_same_content_file_new_path_correct_old_path_absent() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "old_name.rs", "fn renamed_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        std::fs::rename(
+            fx._dir.path().join("old_name.rs"),
+            fx._dir.path().join("new_name.rs"),
+        )
+        .unwrap();
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+
+        let hits = search_hits(&fx, "renamed_token");
+        assert_eq!(
+            hits.len(),
+            1,
+            "content must be searchable exactly once, under its new path"
+        );
+        assert_eq!(hits[0].path, "new_name.rs");
+        let (existence, _, _) = latest_occurrence_state(&fx, "old_name.rs");
+        assert_eq!(existence, "deleted", "old path must be retired");
+    }
+
+    #[test]
+    fn file_becomes_excluded_old_content_retired() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "excl.rs", "fn excl_token() {}\n");
+        let base_policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &base_policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "excl_token").is_empty());
+
+        let mut excluding_policy = DiscoveryPolicy::default_git();
+        excluding_policy
+            .attic_exclude_rules
+            .push(attic_discovery::GlobRule::exclude("excl.rs"));
+        index_repository(&s, fx._dir.path(), &excluding_policy, &opts).unwrap();
+
+        assert!(
+            search_hits(&fx, "excl_token").is_empty(),
+            "newly-excluded content must not remain searchable (P0-4)"
+        );
+        let (existence, _, _) = latest_occurrence_state(&fx, "excl.rs");
+        assert_eq!(existence, "deleted");
+    }
+
+    #[test]
+    fn known_secret_filename_is_excluded() {
+        let fx = make_store();
+        write_file(fx._dir.path(), ".env", "SECRET_TOKEN_VALUE=doNotIndexThisEnvValue\n");
+        write_file(fx._dir.path(), "app.rs", "fn app_marker_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(
+            result.files_indexed, 1,
+            "only app.rs should be indexed; .env is a known-secrets filename"
+        );
+        assert!(search_hits(&fx, "doNotIndexThisEnvValue").is_empty());
+        assert!(!search_hits(&fx, "app_marker_token").is_empty());
+    }
+
+    #[test]
+    fn empty_file_is_deterministic_non_error() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "empty.rs", "");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(
+            result.files_indexed, 1,
+            "an empty file is a valid, indexed (zero-unit) occurrence"
+        );
+        let (existence, _, security) = latest_occurrence_state(&fx, "empty.rs");
+        assert_eq!(existence, "present");
+        assert_eq!(security, "clean");
+    }
+
+    #[test]
+    fn unicode_content_preserved_correctly() {
+        let fx = make_store();
+        write_file(
+            fx._dir.path(),
+            "unicode.rs",
+            "// café 日本語コメント 😀\nfn unicode_token() {}\n",
+        );
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "unicode_token").is_empty());
+
+        let verify = verify_conn(&fx);
+        let bodies: Vec<String> = {
+            let mut stmt = verify
+                .prepare("SELECT retrieval_text FROM core_retrieval_units")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            bodies.iter().any(|b| b.contains("café") && b.contains('😀')),
+            "unicode content must round-trip exactly, not be mangled"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_small_binary_is_a_clean_skip() {
+        // P0-3: discovery classifies this ScanSkipped; full indexing must
+        // treat it as a terminal clean skip, never re-attempt analysis and
+        // surface "stream did not contain valid UTF-8".
+        let fx = make_store();
+        std::fs::write(
+            fx._dir.path().join("binary.dat"),
+            [0xFF, 0xFE, 0x00, 0xD8, 0x00, 0x01],
+        )
+        .unwrap();
+        write_file(fx._dir.path(), "text.rs", "fn alongside_binary_token() {}\n");
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
+            .expect("a binary file must never abort the whole indexing run");
+        assert_eq!(result.files_indexed, 1, "only the text file is indexed");
+        assert!(
+            result.files_skipped >= 1,
+            "the binary file must be counted as a clean skip"
+        );
+        assert!(!search_hits(&fx, "alongside_binary_token").is_empty());
+    }
+
+    #[test]
+    fn pdf_like_binary_clean_skip_no_repeated_failure_across_runs() {
+        let fx = make_store();
+        let mut pdf_bytes = b"%PDF-1.4\n".to_vec();
+        pdf_bytes.extend_from_slice(&[0x00, 0xFF, 0xC3, 0x28, 0x99, 0x00]);
+        std::fs::write(fx._dir.path().join("doc.pdf"), &pdf_bytes).unwrap();
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        let r1 = index_repository(&s, fx._dir.path(), &policy, &opts)
+            .expect("PDF content must never surface as 'stream did not contain valid UTF-8'");
+        let r2 = index_repository(&s, fx._dir.path(), &policy, &opts).expect(
+            "repeated indexing of the same unsupported binary must stay a clean skip, not fail",
+        );
+        assert_eq!(r1.files_indexed, 0);
+        assert_eq!(r2.files_indexed, 0);
+        assert!(search_hits(&fx, "PDF").is_empty());
+    }
+
+    #[test]
+    fn small_safe_file_has_correct_security_state() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "safe.rs", "fn safe_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        let (existence, _, security) = latest_occurrence_state(&fx, "safe.rs");
+        assert_eq!(existence, "present");
+        assert_eq!(security, "clean");
+    }
+
+    #[test]
+    fn small_redacted_secret_absent_safe_context_searchable() {
+        let fx = make_store();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        write_file(
+            fx._dir.path(),
+            "small_redacted.rs",
+            &format!("fn small_redacted_safe_token() {{}}\n// key: {secret}\n"),
+        );
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert!(!search_hits(&fx, "small_redacted_safe_token").is_empty());
+        assert!(search_hits(&fx, secret).is_empty(), "the raw secret must never be searchable");
+        let (_, _, security) = latest_occurrence_state(&fx, "small_redacted.rs");
+        assert_eq!(security, "flagged");
+    }
+
+    #[test]
+    fn large_safe_file_uses_streaming_path() {
+        let fx = make_store();
+        let filler = "fn filler_line() { let _ = 1; }\n".repeat(200_000);
+        let content = format!("fn large_safe_token() {{}}\n{filler}");
+        assert!(content.len() as u64 > attic_discovery::secrets::SMALL_FILE_THRESHOLD);
+        std::fs::write(fx._dir.path().join("large_safe.rs"), &content).unwrap();
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(result.files_indexed, 1);
+        assert!(!search_hits(&fx, "large_safe_token").is_empty());
+        let (_, _, security) = latest_occurrence_state(&fx, "large_safe.rs");
+        assert_eq!(security, "clean");
+    }
+
+    #[test]
+    fn large_redacted_file_streams_without_protocol_violation() {
+        // P0-2 core regression: a LARGE file with a detected secret has
+        // content=None/stream=Some — analyze_single_file must consume the
+        // stream, never require `content` and error with "Redacted decision
+        // but content=None". The secret is placed straddling a 64 KiB stream
+        // chunk boundary so this also covers boundary-spanning redaction.
+        let fx = make_store();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let chunk = 64 * 1024usize;
+        let mut content = String::new();
+        content.push_str("fn large_redacted_safe_token() {}\n");
+        while content.len() < chunk - secret.len() / 2 {
+            content.push_str("// filler line padding the file out\n");
+        }
+        content.push_str(secret);
+        content.push('\n');
+        while content.len() < 5 * 1024 * 1024 {
+            content.push_str("// more filler padding past the LARGE threshold\n");
+        }
+        std::fs::write(fx._dir.path().join("large_redacted.rs"), &content).unwrap();
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
+            .expect("LARGE+Redacted must stream, not error with content=None (P0-2)");
+        assert_eq!(result.files_indexed, 1);
+        assert!(!search_hits(&fx, "large_redacted_safe_token").is_empty());
+        assert!(search_hits(&fx, secret).is_empty(), "the raw secret must never be searchable");
+        let (_, _, security) = latest_occurrence_state(&fx, "large_redacted.rs");
+        assert_eq!(security, "flagged");
+    }
+
+    #[test]
+    fn very_large_file_partial_scan_only_safe_sample_indexed() {
+        let fx = make_store();
+        let head = b"fn head_sample_token() {}\n";
+        let mid_marker = b"fn midbody_only_token() {}\n";
+        let total_size = 50 * 1024 * 1024 + 4096;
+        let mut body = vec![b'x'; total_size];
+        body[0..head.len()].copy_from_slice(head);
+        let mid_start = total_size / 2;
+        body[mid_start..mid_start + mid_marker.len()].copy_from_slice(mid_marker);
+        std::fs::write(fx._dir.path().join("huge.rs"), &body).unwrap();
+        drop(body);
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(result.files_indexed, 1);
+
+        assert!(
+            !search_hits(&fx, "head_sample_token").is_empty(),
+            "the head sample must be indexed"
+        );
+        assert!(
+            search_hits(&fx, "midbody_only_token").is_empty(),
+            "the mid-body of a VERY_LARGE file must never be scanned/indexed"
+        );
+
+        let (_, _, security) = latest_occurrence_state(&fx, "huge.rs");
+        assert_eq!(
+            security, "pending",
+            "VERY_LARGE partial scan must report an explicit partial state, never silently Clean"
+        );
+    }
+
+    #[test]
+    fn analyze_single_file_invalid_utf8_is_permanent_skip_not_error() {
+        let fx = make_store();
+        let path = fx._dir.path().join("bad.bin");
+        std::fs::write(&path, [0xFF, 0xFE, 0xFD]).unwrap();
+        let rec = FileRecord {
+            fi_id: FileIdentityId::new_v4(),
+            fo_id: FileOccurrenceId::new_v4(),
+            stable_id_basis: "test/bad.bin".to_string(),
+            old_fo_id: None,
+            repo_relative: "bad.bin".to_string(),
+            abs_path: path,
+            content_hash: String::new(),
+            size_bytes: 3,
+            security_state: SecurityState::Pending,
+            file_type: FileType::Other,
+            is_partial_scan: false,
+        };
+        let registry = structural_pipeline::generic_only_registry();
+        let opts = IndexOptions::default();
+        let outcome = analyze_single_file(&rec, &registry, &opts)
+            .expect("invalid UTF-8 must be reported as Ok(Skip), never Err");
+        assert!(
+            matches!(outcome, FilePrep::Skip),
+            "invalid UTF-8 content must be a permanent Skip, not indexed"
+        );
+    }
+
+    #[test]
+    fn analyze_single_file_missing_path_is_transient_not_skip() {
+        let fx = make_store();
+        let path = fx._dir.path().join("does_not_exist.rs");
+        let rec = FileRecord {
+            fi_id: FileIdentityId::new_v4(),
+            fo_id: FileOccurrenceId::new_v4(),
+            stable_id_basis: "test/missing".to_string(),
+            old_fo_id: None,
+            repo_relative: "does_not_exist.rs".to_string(),
+            abs_path: path,
+            content_hash: String::new(),
+            size_bytes: 0,
+            security_state: SecurityState::Pending,
+            file_type: FileType::Rust,
+            is_partial_scan: false,
+        };
+        let registry = structural_pipeline::generic_only_registry();
+        let opts = IndexOptions::default();
+        match analyze_single_file(&rec, &registry, &opts) {
+            Err(IndexError::Io { .. }) => {}
+            Ok(_) => panic!(
+                "a missing file must be a transient error, never a silent Skip/Indexable (P0-5/P0-7)"
+            ),
+            Err(other) => panic!("expected IndexError::Io for a transient I/O failure, got {other}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.4 — generation-completeness invariant
+    // -----------------------------------------------------------------------
+
+    /// A transient/retryable failure on ANY discovered file must abort the
+    /// entire generation — including the files that WOULD have succeeded —
+    /// rather than publish a generation that mixes verified-current content
+    /// with content nobody actually verified this run. The previous
+    /// generation must remain completely untouched and current.
+    ///
+    /// Windows-only: uses `share_mode(0)` (deny all sharing) to force a
+    /// genuine transient I/O error deterministically and portably, without
+    /// mocking. This exercises `index_repository`'s aggregate behavior; the
+    /// underlying fix (bail before publication on any transient failure) is
+    /// itself platform-agnostic and is also covered indirectly by the
+    /// platform-independent `analyze_single_file_missing_path_is_transient_not_skip`
+    /// unit test above.
+    #[cfg(windows)]
+    #[test]
+    fn transient_failure_aborts_whole_generation_old_state_preserved() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fx = make_store();
+        write_file(fx._dir.path(), "good.rs", "fn good_token() {}\n");
+        write_file(fx._dir.path(), "locked.rs", "fn locked_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(search_hits(&fx, "good_token").len(), 1);
+        assert_eq!(search_hits(&fx, "locked_token").len(), 1);
+
+        // Modify both files, then exclusively lock one so this run's read of
+        // it fails with a genuine transient I/O error (never InvalidData).
+        write_file(fx._dir.path(), "good.rs", "fn good_token_v2() {}\n");
+        write_file(fx._dir.path(), "locked.rs", "fn locked_token_v2() {}\n");
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(fx._dir.path().join("locked.rs"))
+            .expect("open with exclusive sharing to simulate a transient lock conflict");
+
+        let result = index_repository(&s, fx._dir.path(), &policy, &opts);
+        drop(_lock);
+
+        match result {
+            Err(IndexError::TransientFailures { paths }) => {
+                assert!(paths.iter().any(|p| p == "locked.rs"));
+            }
+            other => panic!(
+                "a transient read failure must abort the whole generation with \
+                 TransientFailures, not publish a mixed one; got {other:?}"
+            ),
+        }
+
+        // Old generation must remain entirely intact — including good.rs,
+        // which WOULD have analyzed successfully this run.
+        assert_eq!(
+            search_hits(&fx, "good_token").len(),
+            1,
+            "good.rs's OLD content must still be current"
+        );
+        assert!(
+            search_hits(&fx, "good_token_v2").is_empty(),
+            "new content must never be published while the generation is incomplete"
+        );
+        assert_eq!(search_hits(&fx, "locked_token").len(), 1);
     }
 }

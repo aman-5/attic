@@ -336,7 +336,7 @@ pub fn fts_search(
           AND (?4 IS NULL OR fo.language  = ?4)
           AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
           AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
-          AND fo.existence_state != 'DELETED'
+          AND fo.existence_state != 'deleted'
         ORDER BY bm25(fts_retrieval_units) ASC, fts.rowid ASC
         LIMIT ?5
     ";
@@ -407,7 +407,7 @@ pub fn fts_path_lookup(
           AND (?2 IS NULL OR COALESCE(r.repository_id, sr.repository_id) = ?2)
           AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
           AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
-          AND fo.existence_state != 'DELETED'
+          AND fo.existence_state != 'deleted'
         ORDER BY r.start_line ASC, r.rowid ASC
         LIMIT ?3
     ";
