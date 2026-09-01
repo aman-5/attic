@@ -44,6 +44,14 @@ pub struct CachedFileAnalysis {
     /// JSON-serialized structural capture; `None` when the file produced no
     /// structural intelligence.
     pub captured_json: Option<String>,
+    /// Discovery-policy fingerprint used when this analysis was produced.
+    pub discovery_policy_hash: String,
+
+    /// Whether structural analysis was enabled for this cached result.
+    pub structural: bool,
+
+    /// Maximum retrieval units per file used when this analysis was produced.
+    pub max_units_per_file: u64,
 }
 
 /// Bulk-load every cached analysis result for a repository in one query,
