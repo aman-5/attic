@@ -64,8 +64,8 @@ pub use writer::{WriterQueue, WriterQueueHandle};
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{
     NewFileOccurrence, OccurrenceSnapshot, current_path_hashes_for_repository,
-    insert_file_occurrence, lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
-    lookup_occurrence_snapshot, upsert_file_identity,
+    insert_file_occurrence, latest_active_paths_for_repository, lookup_file_identity_by_basis,
+    lookup_latest_file_occurrence_for_path, lookup_occurrence_snapshot, upsert_file_identity,
 };
 pub use repository::identity_links::{
     NewIdentityLink, basis as identity_basis, confidence as identity_confidence,

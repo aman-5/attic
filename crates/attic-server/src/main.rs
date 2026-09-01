@@ -237,14 +237,19 @@ impl AtticServer {
         })
     }
 
+    /// Bootstrap (or reconcile) the repository at `root`.
+    ///
+    /// Always runs a full authoritative [`index_repository`] pass, even when
+    /// a repository row already exists — a repository row proves nothing
+    /// about whether its index converged with the current filesystem state
+    /// (it may have been created by an interrupted/partial prior run, or the
+    /// filesystem may have changed while the service was down). Because
+    /// `index_repository` is itself the authoritative reconciliation
+    /// (paths gone from disk or newly excluded/unsupported are tombstoned;
+    /// unchanged content is simply reproduced), rerunning it is always safe
+    /// and is the only way `Ok` here can mean "the index is complete," not
+    /// merely "a row exists."
     fn bootstrap_workspace(&self, root: &Path) -> Result<String, ServerError> {
-        let root_str = root.to_string_lossy().to_string();
-        if let Some(id) = self
-            .pool
-            .with_reader(|c| lookup_repository_by_root_path(c, &root_str))?
-        {
-            return Ok(id.to_string());
-        }
         // Coordinated-writer indexing: discovery + analysis happen here on the
         // calling thread, then ONE submit_index_publication mutation carries
         // every write through the Phase 1A writer queue inside its ambient
