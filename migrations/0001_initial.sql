@@ -192,7 +192,7 @@ CREATE TABLE core_retrieval_units (
     freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT'
 , analyzer_id TEXT, analyzer_version TEXT, start_line INTEGER, end_line INTEGER, is_redacted INTEGER NOT NULL DEFAULT 0);
 
-CREATE TABLE core_schema_migrations (
+CREATE TABLE IF NOT EXISTS core_schema_migrations (
     id          TEXT    NOT NULL PRIMARY KEY,  -- e.g., "0001_initial"
     applied_at  INTEGER NOT NULL               -- Unix timestamp microseconds (UTC)
 );
