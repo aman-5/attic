@@ -59,9 +59,17 @@ jobs:
     # Automatic release:
     #   CI must have succeeded and must have run for main.
     #
-    # Manual workflow_dispatch is also supported.
+    # Manual workflow_dispatch is also supported, but ONLY when dispatched
+    # against main — otherwise an operator could release an arbitrary
+    # non-main commit as if it were a normal, CI-verified release
+    # (principal-architect audit: manual dispatch bypassing the main-branch
+    # gate). `github.ref` reflects the ref the dispatch was actually run
+    # against.
     if: >
-      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
       (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_branch == 'main'

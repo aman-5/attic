@@ -4,6 +4,8 @@
 //! `core_file_occurrences` tracks a file's presence and metadata within a specific
 //! source revision.
 
+use std::collections::HashMap;
+
 use rusqlite::Connection;
 
 use attic_core::{
@@ -12,6 +14,18 @@ use attic_core::{
 };
 
 use crate::error::StorageError;
+
+/// Shared CTE resolving each path in a repository to its latest occurrence
+/// row (by `rowid`), regardless of freshness/existence state. Every
+/// "latest per path" query below joins against this so the dedup rule
+/// lives in exactly one place.
+const LATEST_OCCURRENCE_PER_PATH_CTE: &str = "WITH latest AS (
+             SELECT fo.path AS p, MAX(fo.rowid) AS m
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+              WHERE fi.repository_id = ?1
+              GROUP BY fo.path
+         )";
 
 // ---------------------------------------------------------------------------
 // core_file_identities
@@ -185,6 +199,63 @@ pub fn lookup_file_identity_by_basis(
     }
 }
 
+/// Bulk-load `stable_id_basis -> file_identity_id` for every identity
+/// already recorded in the given repository, in one query.
+///
+/// Used by the full-index loop to resolve identity reuse in memory instead
+/// of one [`lookup_file_identity_by_basis`] round trip per discovered file
+/// (PR-5: bounded DB-query behavior at scale).
+pub fn bulk_file_identities_for_repository(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+) -> Result<HashMap<String, FileIdentityId>, StorageError> {
+    let mut stmt = conn
+        .prepare("SELECT stable_id_basis, id FROM core_file_identities WHERE repository_id = ?1")?;
+    let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (basis, id_str) = row?;
+        let id = id_str.parse::<FileIdentityId>().map_err(|e| {
+            StorageError::Domain(attic_core::CoreError::UnknownVariant {
+                type_name: "FileIdentityId",
+                value: e.to_string(),
+            })
+        })?;
+        out.insert(basis, id);
+    }
+    Ok(out)
+}
+
+/// Bulk-load `repo_relative_path -> latest file_occurrence_id` for every
+/// path in the given repository, in one query.
+///
+/// Mirrors [`lookup_latest_file_occurrence_for_path`]'s semantics (latest
+/// occurrence by rowid, regardless of freshness/existence state) but
+/// resolves every path at once instead of one round trip per discovered
+/// file (PR-5: bounded DB-query behavior at scale).
+pub fn bulk_latest_occurrence_ids_for_repository(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+) -> Result<HashMap<String, String>, StorageError> {
+    let mut stmt = conn.prepare(&format!(
+        "{LATEST_OCCURRENCE_PER_PATH_CTE}
+         SELECT fo.path, fo.id
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (path, id) = row?;
+        out.insert(path, id);
+    }
+    Ok(out)
+}
+
 /// Look up the most recent file occurrence ID for a given repository and path.
 ///
 /// Returns the `FileOccurrenceId` string of the latest occurrence (by rowid),
@@ -269,20 +340,14 @@ pub fn current_path_hashes_for_repository(
     conn: &Connection,
     repository_id: &RepositoryId,
 ) -> Result<Vec<(String, String)>, StorageError> {
-    let mut stmt = conn.prepare(
-        "WITH latest AS (
-             SELECT fo.path AS p, MAX(fo.rowid) AS m
-               FROM core_file_occurrences fo
-               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
-              WHERE fi.repository_id = ?1
-              GROUP BY fo.path
-         )
+    let mut stmt = conn.prepare(&format!(
+        "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path, fo.content_hash
            FROM core_file_occurrences fo
            JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
           WHERE fo.freshness_state = 'CURRENT'
-            AND fo.existence_state != 'deleted'",
-    )?;
+            AND fo.existence_state != 'deleted'"
+    ))?;
     let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -307,22 +372,49 @@ pub fn latest_active_paths_for_repository(
     conn: &Connection,
     repository_id: &RepositoryId,
 ) -> Result<Vec<String>, StorageError> {
-    let mut stmt = conn.prepare(
-        "WITH latest AS (
-             SELECT fo.path AS p, MAX(fo.rowid) AS m
-               FROM core_file_occurrences fo
-               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
-              WHERE fi.repository_id = ?1
-              GROUP BY fo.path
-         )
+    let mut stmt = conn.prepare(&format!(
+        "{LATEST_OCCURRENCE_PER_PATH_CTE}
          SELECT fo.path
            FROM core_file_occurrences fo
            JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
-          WHERE fo.existence_state != 'deleted'",
-    )?;
+          WHERE fo.existence_state != 'deleted'"
+    ))?;
     let rows = stmt.query_map(rusqlite::params![repository_id.to_string_repr()], |r| {
         r.get::<_, String>(0)
     })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Latest-per-path `(path, file_type)` for every occurrence that is both
+/// `present` and `CURRENT` in the given repository — i.e. the file set of the
+/// current generation, never a superseded one. Optionally filtered to a
+/// single `file_type`.
+///
+/// This is the read backing the MCP `repo_map` tool: directories are never
+/// persisted as their own entity, so a directory tree is derived at read
+/// time from these current-generation active file paths.
+pub fn current_files_for_repo_map(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+    file_type: Option<&str>,
+) -> Result<Vec<(String, String)>, StorageError> {
+    let mut stmt = conn.prepare(&format!(
+        "{LATEST_OCCURRENCE_PER_PATH_CTE}
+         SELECT fo.path, fo.file_type
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m
+          WHERE fo.freshness_state = 'CURRENT'
+            AND fo.existence_state != 'deleted'
+            AND (?2 IS NULL OR fo.file_type = ?2)"
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![repository_id.to_string_repr(), file_type],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -505,5 +597,124 @@ mod tests {
             .unwrap();
         assert_eq!(state, SecretScanState::Clean.as_str());
         assert_eq!(version, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bulk preload functions (PR-5) — must agree exactly with the equivalent
+    // per-path lookups they replace in the full-index hot loop.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bulk_file_identities_matches_single_lookup_for_every_basis() {
+        let conn = migrated_conn();
+        let (repo_id, _) = seed_repo_and_revision(&conn);
+
+        let fid_a = FileIdentityId::new_v4();
+        let fid_b = FileIdentityId::new_v4();
+        upsert_file_identity(&conn, &fid_a, &repo_id, "repo/a.rs").unwrap();
+        upsert_file_identity(&conn, &fid_b, &repo_id, "repo/b.rs").unwrap();
+
+        let bulk = bulk_file_identities_for_repository(&conn, &repo_id).unwrap();
+        assert_eq!(bulk.len(), 2);
+
+        for basis in ["repo/a.rs", "repo/b.rs"] {
+            let single = lookup_file_identity_by_basis(&conn, basis).unwrap();
+            assert_eq!(
+                bulk.get(basis).copied(),
+                single,
+                "bulk and single-lookup identity must agree for '{basis}'"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_file_identities_is_scoped_to_its_repository() {
+        let conn = migrated_conn();
+        let (repo_a, _) = seed_repo_and_revision(&conn);
+        let repo_b = RepositoryId::new_v4();
+        upsert_repository(&conn, &repo_b, "/repo-b", "test-b").unwrap();
+
+        upsert_file_identity(&conn, &FileIdentityId::new_v4(), &repo_a, "shared/path.rs").unwrap();
+        upsert_file_identity(&conn, &FileIdentityId::new_v4(), &repo_b, "shared/path.rs").unwrap();
+
+        let bulk_a = bulk_file_identities_for_repository(&conn, &repo_a).unwrap();
+        let bulk_b = bulk_file_identities_for_repository(&conn, &repo_b).unwrap();
+        assert_eq!(bulk_a.len(), 1);
+        assert_eq!(bulk_b.len(), 1);
+        assert_ne!(
+            bulk_a.get("shared/path.rs"),
+            bulk_b.get("shared/path.rs"),
+            "identical stable_id_basis in different repositories must resolve to different identities"
+        );
+    }
+
+    #[test]
+    fn bulk_latest_occurrence_ids_matches_single_lookup_and_prefers_latest_rowid() {
+        let conn = migrated_conn();
+        let (repo_id, rev_id) = seed_repo_and_revision(&conn);
+        let fid = FileIdentityId::new_v4();
+        upsert_file_identity(&conn, &fid, &repo_id, "blob:main").unwrap();
+
+        // Two occurrences for the same path (simulating a reindex run) — the
+        // bulk map must resolve to the SAME latest-by-rowid row as the
+        // single lookup, not the first one inserted.
+        let occ_old = FileOccurrenceId::new_v4();
+        insert_file_occurrence(
+            &conn,
+            &NewFileOccurrence {
+                id: &occ_old,
+                file_identity_id: &fid,
+                source_revision_id: &rev_id,
+                index_generation_id: None,
+                path: "src/main.rs",
+                content_hash: "blake3:old",
+                size_bytes: 10,
+                language: Some("rust"),
+                file_type: FileType::Rust,
+                discovery_class: DiscoveryClass::Vcs,
+                security_state: SecurityState::Pending,
+                existence_state: ExistenceState::Present,
+            },
+        )
+        .unwrap();
+        let occ_new = FileOccurrenceId::new_v4();
+        insert_file_occurrence(
+            &conn,
+            &NewFileOccurrence {
+                id: &occ_new,
+                file_identity_id: &fid,
+                source_revision_id: &rev_id,
+                index_generation_id: None,
+                path: "src/main.rs",
+                content_hash: "blake3:new",
+                size_bytes: 20,
+                language: Some("rust"),
+                file_type: FileType::Rust,
+                discovery_class: DiscoveryClass::Vcs,
+                security_state: SecurityState::Pending,
+                existence_state: ExistenceState::Present,
+            },
+        )
+        .unwrap();
+
+        let bulk = bulk_latest_occurrence_ids_for_repository(&conn, &repo_id).unwrap();
+        let single = lookup_latest_file_occurrence_for_path(&conn, &repo_id, "src/main.rs")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bulk.get("src/main.rs").cloned(), Some(single.clone()));
+        assert_eq!(
+            single,
+            occ_new.to_string_repr(),
+            "both bulk and single lookup must resolve to the most recently inserted occurrence"
+        );
+    }
+
+    #[test]
+    fn bulk_latest_occurrence_ids_empty_for_repository_with_no_occurrences() {
+        let conn = migrated_conn();
+        let (repo_id, _) = seed_repo_and_revision(&conn);
+        let bulk = bulk_latest_occurrence_ids_for_repository(&conn, &repo_id).unwrap();
+        assert!(bulk.is_empty());
     }
 }

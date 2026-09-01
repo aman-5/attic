@@ -49,7 +49,7 @@ pub(crate) fn generic_only_registry() -> attic_analyzers::AnalyzerRegistry {
 // ---------------------------------------------------------------------------
 
 /// A relationship edge exactly as the analyzer emitted it (pre-resolution).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RawRel {
     rel_type: String,
     target: String,
@@ -59,7 +59,12 @@ struct RawRel {
 }
 
 /// One analyzed file awaiting resolution + publication conversion.
-#[derive(Debug)]
+///
+/// PR-7: also the unit cached by `index_analysis_cache` so a full-index
+/// retry can reuse a file's structural capture instead of re-analyzing it.
+/// `Serialize`/`Deserialize` support that cache; they are not used for any
+/// other persistence path.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CapturedFile {
     file_occurrence_id: String,
     rel_path: String,
@@ -74,6 +79,16 @@ pub(crate) struct CapturedFile {
     symbols: Vec<PublicationSymbolDef>,
     raw_rels: Vec<RawRel>,
     imports: Vec<ImportSpec>,
+}
+
+impl CapturedFile {
+    /// Retarget this capture to the current run's freshly generated
+    /// `file_occurrence_id` (PR-7 cache reuse): a cached capture was
+    /// serialized against a *previous*, never-published attempt's
+    /// occurrence id, which must not leak into this run's publication.
+    pub(crate) fn retarget_file_occurrence_id(&mut self, new_id: String) {
+        self.file_occurrence_id = new_id;
+    }
 }
 
 /// Capture the structural part of an `AnalyzerOutput`.

@@ -306,7 +306,7 @@ pub fn index_changes(
                 rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
                 if let Some(captured) = captured {
-                    pipeline.record(captured);
+                    pipeline.record(*captured);
                 }
                 pending_units.append(&mut units);
                 file_records.push(rec);
@@ -583,7 +583,7 @@ pub fn index_changes(
     })
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -708,7 +708,11 @@ mod tests {
         let s = store(&fx);
         crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
 
-        write_file(fx.dir.path(), "added.rs", "fn incremental_added_token() {}\n");
+        write_file(
+            fx.dir.path(),
+            "added.rs",
+            "fn incremental_added_token() {}\n",
+        );
         let changes = ScopedChanges {
             upserts: vec!["added.rs".to_string()],
             deletes: vec![],
@@ -796,7 +800,10 @@ mod tests {
             result.files_published, 0,
             "binary content produces no new occurrence"
         );
-        assert_eq!(result.files_deleted, 1, "the stale prior occurrence must be retired");
+        assert_eq!(
+            result.files_deleted, 1,
+            "the stale prior occurrence must be retired"
+        );
         assert!(
             search_hits(&fx, "before_flip_token").is_empty(),
             "stale prior content must be retired, not left searchable"

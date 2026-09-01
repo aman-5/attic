@@ -11,6 +11,7 @@
 //! - S6: bounded writer queue
 //! - S7: production resource manager (Phase 7 hardening)
 
+pub mod analysis_cache;
 pub mod connection;
 pub mod crossrepo_ops;
 pub mod error;
@@ -26,6 +27,10 @@ pub mod semantic_reads;
 pub mod server_state;
 pub mod writer;
 
+pub use analysis_cache::{
+    CachedFileAnalysis, bulk_load_analysis_cache, clear_analysis_cache,
+    upsert_analysis_cache_entries,
+};
 pub use connection::{DbPool, open_db};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
@@ -63,9 +68,11 @@ pub use writer::{WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{
-    NewFileOccurrence, OccurrenceSnapshot, current_path_hashes_for_repository,
-    insert_file_occurrence, latest_active_paths_for_repository, lookup_file_identity_by_basis,
-    lookup_latest_file_occurrence_for_path, lookup_occurrence_snapshot, upsert_file_identity,
+    NewFileOccurrence, OccurrenceSnapshot, bulk_file_identities_for_repository,
+    bulk_latest_occurrence_ids_for_repository, current_files_for_repo_map,
+    current_path_hashes_for_repository, insert_file_occurrence, latest_active_paths_for_repository,
+    lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    lookup_occurrence_snapshot, upsert_file_identity,
 };
 pub use repository::identity_links::{
     NewIdentityLink, basis as identity_basis, confidence as identity_confidence,

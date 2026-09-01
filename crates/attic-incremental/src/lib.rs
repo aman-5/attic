@@ -98,41 +98,57 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, attic_storage::StorageError> + Send + 'static,
 {
-    let slot: std::sync::Arc<std::sync::Mutex<Result<Option<T>, String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Ok(None)));
+    // The writer closure's own return value is the *only* signal
+    // `WriterQueueHandle::send` uses to decide COMMIT vs ROLLBACK, so it must
+    // mirror `f`'s own Ok/Err exactly: an `Err` from `f` must come back out
+    // of this closure as `Err`, never be swallowed into `Ok(())`, or a failed
+    // mutation can still commit while the caller is told it failed.
+    //
+    // `slot` exists only to carry the *successful* generic payload `v` out of
+    // the `'static` closure (whose own return type is fixed at
+    // `Result<(), StorageError>`, so `v` cannot travel through it directly).
+    // It must never be used to smuggle an error into a fabricated `Ok(())`.
+    let slot: std::sync::Arc<std::sync::Mutex<Option<T>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let sink = std::sync::Arc::clone(&slot);
 
     writer
-        .send(move |conn| {
-            match f(conn) {
-                Ok(v) => {
-                    if let Ok(mut g) = sink.lock() {
-                        *g = Ok(Some(v));
-                    }
+        .send(move |conn| match f(conn) {
+            Ok(v) => match sink.lock() {
+                Ok(mut guard) => {
+                    *guard = Some(v);
+                    Ok(())
                 }
-                Err(e) => {
-                    if let Ok(mut g) = sink.lock() {
-                        *g = Err(e.to_string());
-                    }
+                Err(_) => {
+                    // `f` already mutated the in-progress transaction, but
+                    // there is no way left to hand `v` back to the caller.
+                    // Committing here would leave the DB holding a change
+                    // the caller can never observe (and may retry,
+                    // duplicating the work), so force a rollback instead.
+                    Err(attic_storage::StorageError::MutexPoisoned(
+                        "run_on_writer result slot poisoned after f(conn) succeeded".into(),
+                    ))
                 }
-            }
-            Ok(())
+            },
+            // Never translate a failing `f` into `Ok(())`: return its
+            // original error so the writer rolls back and the caller
+            // receives the real, untouched failure.
+            Err(e) => Err(e),
         })
         .map_err(IncrementalError::Storage)?;
 
-    let taken = match slot.lock() {
-        Ok(mut g) => std::mem::replace(&mut *g, Ok(None)),
-        Err(_) => Err("writer result slot poisoned".to_owned()),
-    };
-    match taken {
-        Ok(Some(v)) => Ok(v),
-        Ok(None) => Err(IncrementalError::Storage(
-            attic_storage::StorageError::Worker(
-                "writer closure completed without producing a result".into(),
+    // Reached only when the writer closure returned `Ok(())`, i.e. the
+    // mutation committed and `slot` was populated under a healthy lock.
+    match slot.lock() {
+        Ok(mut guard) => guard.take().ok_or_else(|| {
+            IncrementalError::Storage(attic_storage::StorageError::Worker(
+                "writer closure committed without producing a result".into(),
+            ))
+        }),
+        Err(_) => Err(IncrementalError::Storage(
+            attic_storage::StorageError::MutexPoisoned(
+                "run_on_writer result slot poisoned after commit".into(),
             ),
-        )),
-        Err(msg) => Err(IncrementalError::Storage(
-            attic_storage::StorageError::Worker(format!("writer closure failed: {msg}")),
         )),
     }
 }

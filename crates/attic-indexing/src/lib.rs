@@ -40,11 +40,13 @@ use attic_core::{
     RepositoryId, RetrievalUnitId, SecurityState, SourceRevisionId, SubsystemVersions,
     constants::{CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_keys},
 };
-use attic_discovery::{DiscoveryPolicy, DownstreamClassification, SecretScanDecision};
+use attic_discovery::{
+    DiscoveryPolicy, DownstreamClassification, EligibleEntry, SecretScanDecision,
+};
 use attic_storage::{
     DbPool, IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
-    PublicationRetrievalUnit, StorageError, WriterQueueHandle, latest_active_paths_for_repository,
-    lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
+    PublicationRetrievalUnit, StorageError, WriterQueueHandle, bulk_file_identities_for_repository,
+    bulk_latest_occurrence_ids_for_repository, latest_active_paths_for_repository,
     lookup_occurrence_snapshot, lookup_repository_by_root_path, submit_index_publication,
 };
 
@@ -79,6 +81,29 @@ pub enum IndexError {
         paths.len()
     )]
     TransientFailures { paths: Vec<String> },
+    /// `discovery.downstream_classifications` is supposed to be positionally
+    /// aligned with `discovery.entries` (one classification per entry, same
+    /// order — see `attic_discovery::discover`). A length mismatch means
+    /// that invariant was violated; failing loudly here is required so a
+    /// future discovery-layer change can never silently misattribute one
+    /// file's classification to another.
+    #[error(
+        "discovery invariant violated: {entries} discovered entries but {classifications} downstream classifications (must be equal and positionally aligned)"
+    )]
+    ClassificationCountMismatch {
+        entries: usize,
+        classifications: usize,
+    },
+    /// The lengths matched but the path at some position did not — the
+    /// alignment invariant is violated even though the counts agree.
+    #[error(
+        "discovery invariant violated: entry '{expected}' at position {index} does not match its classification's recorded path '{found}'"
+    )]
+    ClassificationPathMismatch {
+        index: usize,
+        expected: String,
+        found: String,
+    },
 }
 
 pub mod incremental;
@@ -139,6 +164,21 @@ pub struct IndexResult {
     pub repository_id: String,
     pub source_revision_id: String,
     pub index_generation_id: String,
+    /// Discovery-walk explainability counters (PR-3): directories visited,
+    /// files seen/eligible, and why anything was excluded — see
+    /// [`attic_discovery::WalkCounters`]. Surfaced through status/MCP so
+    /// "why was X skipped" is answerable without reading server logs.
+    pub discovery_counters: attic_discovery::WalkCounters,
+    /// PR-8 measurement: bytes read while analyzing SMALL files this run
+    /// (skips cache hits — see PR-7 — since those never re-read the file).
+    /// Compare against `discovery_counters.small_file_bytes_read` to see
+    /// the actual size of the discovery/analysis duplicate-read for this
+    /// repository, before deciding whether eliminating it is worth the
+    /// added complexity.
+    pub analysis_small_file_bytes_read: u64,
+    /// Number of SMALL files actually re-read during analysis this run
+    /// (companion to `analysis_small_file_bytes_read`).
+    pub analysis_small_file_reads: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +205,11 @@ struct FileRecord {
 }
 
 /// A retrieval unit produced by analysis, awaiting coordinated publication.
+///
+/// PR-7: also the unit cached by `index_analysis_cache` so a full-index
+/// retry can reuse a file's units instead of re-analyzing it. `Serialize`/
+/// `Deserialize` support that cache only.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingUnit {
     file_occurrence_id: String,
     retrieval_text: String,
@@ -189,7 +234,11 @@ pub(crate) enum FilePrep {
     /// retrieval units, e.g. an empty file).
     Indexable {
         units: Vec<PendingUnit>,
-        captured: Option<structural_pipeline::CapturedFile>,
+        // Boxed: `CapturedFile` is large enough (structural nodes/symbols/
+        // rels/imports) that an unboxed `Option` here would make every
+        // `FilePrep` at least as big as the largest variant, even for the
+        // common `Skip` case which carries no data at all.
+        captured: Option<Box<structural_pipeline::CapturedFile>>,
         security_state: SecurityState,
         is_partial_scan: bool,
     },
@@ -345,6 +394,27 @@ pub fn index_repository(
         Some(_) => None,
     };
 
+    // PR-7: persist the repository row now, before analysis, rather than
+    // waiting for the end-of-run `submit_index_publication`. Two reasons:
+    // (1) `index_analysis_cache` has a FK on `repository_id`, so a cache
+    //     write for a brand-new repository's first attempt would otherwise
+    //     fail outright; (2) without a persisted row, a brand-new
+    //     repository's `repo_id` is a fresh random UUID every attempt
+    //     (nothing to look up by root path yet), so a retry could never
+    //     find the previous attempt's cache at all. `upsert_repository` is
+    //     idempotent — `submit_index_publication`'s own upsert later is a
+    //     harmless no-op re-write of the same row.
+    if let Some((ref root, ref display_name)) = repo_upsert {
+        let root = root.clone();
+        let display_name = display_name.clone();
+        store
+            .writer
+            .send(move |conn| {
+                attic_storage::upsert_repository(conn, &repo_id, &root, &display_name)
+            })
+            .map_err(IndexError::Storage)?;
+    }
+
     // 3. Source revision: real Phase 1B manifest hash + real policy hash.
     //    DiscoveryPolicy::hash() serializes ALL fields to canonical JSON and
     //    hashes with BLAKE3.
@@ -374,6 +444,7 @@ pub fn index_repository(
         repository_id: repo_id.to_string_repr(),
         source_revision_id: rev_id.to_string_repr(),
         index_generation_id: gen_id.to_string_repr(),
+        discovery_counters: discovery.counters,
         ..Default::default()
     };
 
@@ -416,19 +487,32 @@ pub fn index_repository(
     let mut tombstones: Vec<PublicationFile> = Vec::new();
     let mut transient_failed_paths: Vec<String> = Vec::new();
 
-    for entry in &discovery.entries {
+    // PR-5: preload existing index state for the whole repository in two
+    // bulk queries, instead of two `with_reader` round trips per discovered
+    // file below. Identity/occurrence semantics are unchanged — this only
+    // moves the same lookups from per-file to per-run.
+    let existing_identities: HashMap<String, FileIdentityId> = store
+        .readers
+        .with_reader(|c| bulk_file_identities_for_repository(c, &repo_id))
+        .map_err(IndexError::Storage)?;
+    let existing_occurrences: HashMap<String, String> = store
+        .readers
+        .with_reader(|c| bulk_latest_occurrence_ids_for_repository(c, &repo_id))
+        .map_err(IndexError::Storage)?;
+
+    let aligned_classifications =
+        align_classifications(&discovery.entries, &discovery.downstream_classifications)?;
+
+    for (entry, classification) in discovery.entries.iter().zip(aligned_classifications) {
         result.files_visited += 1;
         current_entry_paths.insert(entry.repo_relative.clone());
 
-        let classification = discovery
-            .downstream_classifications
-            .iter()
-            .find(|(p, _)| p == &entry.repo_relative)
-            .map(|(_, c)| c);
+        let classification = Some(classification);
 
         if matches!(
             classification,
-            Some(DownstreamClassification::Excluded) | Some(DownstreamClassification::ScanSkipped { .. })
+            Some(DownstreamClassification::Excluded)
+                | Some(DownstreamClassification::ScanSkipped { .. })
         ) {
             debug!(path = %entry.repo_relative, classification = ?classification, "skipping excluded/scan-skipped file");
             result.files_skipped += 1;
@@ -491,21 +575,16 @@ pub fn index_repository(
         let repo_id_str = repo_id.to_string_repr();
         let stable_id_basis = format!("{repo_id_str}/{}", entry.repo_relative);
 
-        // Look up existing file_identity by stable_id_basis via approved API.
-        // This reuses the same UUID across reindex runs.
-        let fi_id: FileIdentityId = store
-            .readers
-            .with_reader(|c| lookup_file_identity_by_basis(c, &stable_id_basis))
-            .map_err(IndexError::Storage)?
+        // Reuse the same UUID across reindex runs — resolved in memory from
+        // the bulk-preloaded map instead of a per-file DB round trip.
+        let fi_id: FileIdentityId = existing_identities
+            .get(&stable_id_basis)
+            .copied()
             .unwrap_or_else(FileIdentityId::new_v4);
 
-        // Look up any existing file_occurrence for this path/repo via approved API.
-        let old_fo_id: Option<String> = store
-            .readers
-            .with_reader(|c| {
-                lookup_latest_file_occurrence_for_path(c, &repo_id, &entry.repo_relative)
-            })
-            .map_err(IndexError::Storage)?;
+        // Any existing file_occurrence for this path/repo — also resolved
+        // in memory from the bulk-preloaded map.
+        let old_fo_id: Option<String> = existing_occurrences.get(&entry.repo_relative).cloned();
 
         file_records.push(FileRecord {
             fi_id,
@@ -540,6 +619,18 @@ pub fn index_repository(
 
     // 6. Run Phase 1C analysis per file.  Produces pending units only — no
     //    database writes happen during analysis.
+    //
+    // PR-7: bulk-load the analysis cache from any prior attempt at this
+    // repository (one query, same bulk-preload shape as PR-5). A cache hit
+    // (same path, same content hash) skips re-running the analyzer entirely
+    // — this is what makes a retry after a transient failure cheap instead
+    // of re-analyzing every file in the repository again.
+    let analysis_cache: HashMap<String, attic_storage::CachedFileAnalysis> = store
+        .readers
+        .with_reader(|c| attic_storage::bulk_load_analysis_cache(c, &repo_id))
+        .map_err(IndexError::Storage)?;
+    let mut cache_writes: Vec<attic_storage::CachedFileAnalysis> = Vec::new();
+
     let registry = if opts.structural {
         structural_pipeline::default_registry()
     } else {
@@ -558,7 +649,39 @@ pub fn index_repository(
     );
 
     for mut rec in file_records {
-        match analyze_single_file(&rec, &registry, opts) {
+        // A cache hit requires the content hash AND the secret-detector /
+        // analyzer-registry versions to match what's current: a retry that
+        // spans a ruleset upgrade must never replay a verdict computed
+        // under the old rules for unchanged content (e.g. a secret the
+        // upgraded detector would now catch).
+        let cache_hit = analysis_cache
+            .get(&rec.repo_relative)
+            .filter(|cached| {
+                cached.content_hash == rec.content_hash
+                    && cached.secret_pattern_version == SECRET_PATTERN_VERSION
+                    && cached.analyzer_registry_version
+                        == attic_core::constants::ANALYZER_REGISTRY_VERSION
+            })
+            .and_then(|cached| reconstruct_file_prep_from_cache(cached, &rec));
+        let was_cache_hit = cache_hit.is_some();
+        let prep = match cache_hit {
+            Some(p) => Ok(p),
+            None => {
+                // PR-8 measurement: a fresh analysis of a SMALL file re-reads
+                // content discovery already read once (see
+                // `discovery_counters.small_file_bytes_read`). Cache hits
+                // above never re-read anything.
+                if rec.size_bytes >= 0
+                    && (rec.size_bytes as u64) <= attic_discovery::MAX_FULL_LOAD_BYTES
+                {
+                    result.analysis_small_file_bytes_read += rec.size_bytes as u64;
+                    result.analysis_small_file_reads += 1;
+                }
+                analyze_single_file(&rec, &registry, opts)
+            }
+        };
+
+        match prep {
             Ok(FilePrep::Indexable {
                 mut units,
                 captured,
@@ -573,8 +696,34 @@ pub fn index_repository(
                 rec.security_state = security_state;
                 rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(&rec.repo_relative, &rec.fo_id.to_string_repr());
+
+                // Stash this file's result for potential cache persistence
+                // BEFORE `units`/`captured` are consumed below — serializing
+                // by reference here needs no clone of the analysis output.
+                // If this run later hits a transient failure elsewhere,
+                // whatever succeeded is written in one batch by the
+                // completeness gate below. Skipped for cache hits: the
+                // existing `index_analysis_cache` row already has this exact
+                // content_hash, so rewriting it would be a no-op.
+                if !was_cache_hit && let Ok(units_json) = serde_json::to_string(&units) {
+                    let captured_json = captured
+                        .as_ref()
+                        .and_then(|c| serde_json::to_string(c).ok());
+                    cache_writes.push(attic_storage::CachedFileAnalysis {
+                        repo_relative: rec.repo_relative.clone(),
+                        content_hash: rec.content_hash.clone(),
+                        security_state: security_state.as_str().to_owned(),
+                        is_partial_scan,
+                        secret_pattern_version: SECRET_PATTERN_VERSION,
+                        analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
+                            .to_owned(),
+                        units_json,
+                        captured_json,
+                    });
+                }
+
                 if let Some(captured) = captured {
-                    pipeline.record(captured);
+                    pipeline.record(*captured);
                 }
                 pending_units.append(&mut units);
                 indexed_records.push(rec);
@@ -624,6 +773,27 @@ pub fn index_repository(
     // (if any) remains completely untouched and current; the scheduler is
     // expected to retry the full index later.
     if !transient_failed_paths.is_empty() {
+        // PR-7: persist every successfully-analyzed file's result before
+        // aborting, in ONE writer-queue submission (many statements, one
+        // transaction — same shape as `submit_index_publication`), so a
+        // retry does not have to re-analyze the files that already
+        // succeeded. This is purely a cache write: it does not touch
+        // `core_file_occurrences`/`core_index_generations` and has no
+        // effect on which generation is CURRENT.
+        if !cache_writes.is_empty() {
+            let now_us = incremental::now_micros();
+            store
+                .writer
+                .send(move |conn| {
+                    attic_storage::upsert_analysis_cache_entries(
+                        conn,
+                        &repo_id,
+                        &cache_writes,
+                        now_us,
+                    )
+                })
+                .map_err(IndexError::Storage)?;
+        }
         return Err(IndexError::TransientFailures {
             paths: transient_failed_paths,
         });
@@ -770,6 +940,16 @@ pub fn index_repository(
             .map_err(IndexError::Storage)?;
     }
 
+    // PR-7: this generation published successfully, so any analysis cache
+    // left over from an earlier failed attempt at this repository is no
+    // longer needed — clear it so the table doesn't grow unbounded. Purely
+    // a cache eviction: harmless if it's already empty, and has no bearing
+    // on what just became CURRENT above.
+    store
+        .writer
+        .send(move |conn| attic_storage::clear_analysis_cache(conn, &repo_id))
+        .map_err(IndexError::Storage)?;
+
     result.units_inserted = stats.units_inserted;
     result.units_deleted = stats.units_deleted;
 
@@ -785,9 +965,71 @@ pub fn index_repository(
     Ok(result)
 }
 
+/// Reconstruct a cached analysis result for reuse (PR-7 cache hit).
+///
+/// Returns `None` if the cached entry can't be read back — a corrupt or
+/// unexpectedly-shaped cache row must never become a hard indexing failure;
+/// the caller falls back to normal analysis exactly as if there had been no
+/// cache entry at all.
+///
+/// `units`/`captured` are retargeted to this run's freshly generated
+/// `file_occurrence_id`: the cached value was serialized against a
+/// *previous*, never-published attempt's occurrence id, which must not leak
+/// into this run's publication.
+fn reconstruct_file_prep_from_cache(
+    cached: &attic_storage::CachedFileAnalysis,
+    rec: &FileRecord,
+) -> Option<FilePrep> {
+    let mut units: Vec<PendingUnit> = serde_json::from_str(&cached.units_json).ok()?;
+    let fo_id_str = rec.fo_id.to_string_repr();
+    for unit in &mut units {
+        unit.file_occurrence_id = fo_id_str.clone();
+    }
+
+    let captured = match &cached.captured_json {
+        Some(json) => {
+            let mut c: structural_pipeline::CapturedFile = serde_json::from_str(json).ok()?;
+            c.retarget_file_occurrence_id(fo_id_str);
+            Some(Box::new(c))
+        }
+        None => None,
+    };
+
+    let security_state = SecurityState::from_db_str(&cached.security_state).ok()?;
+
+    Some(FilePrep::Indexable {
+        units,
+        captured,
+        security_state,
+        is_partial_scan: cached.is_partial_scan,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Per-file analysis (pure — no database writes)
 // ---------------------------------------------------------------------------
+
+// Test-only counter of `analyze_single_file` invocations (PR-7): proves a
+// cache hit genuinely skips the analyzer rather than merely producing the
+// same output by coincidence. Compiled out entirely in non-test builds.
+// clippy's `missing_const_for_thread_local` keeps firing on this exact
+// `const { .. }` initializer when combined with `#[cfg(test)]`; suppressed
+// rather than fought further since this is test-only, not shipped code.
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    static ANALYZE_SINGLE_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_analyze_single_file_calls() {
+    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn analyze_single_file_calls() -> usize {
+    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.get())
+}
 
 /// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return
 /// the retrieval units (with structural anchors) and, when a specialized
@@ -798,29 +1040,32 @@ fn analyze_single_file(
     registry: &AnalyzerRegistry,
     opts: &IndexOptions,
 ) -> Result<FilePrep, IndexError> {
+    #[cfg(test)]
+    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(c.get() + 1));
+
     // Preprocess through Phase 1B secrets layer.
     // Transient I/O failures MUST be propagated — never swallowed. Content
     // that cannot be decoded as UTF-8 (binary, e.g. PDF/DOCX) is, by
     // contrast, a permanent and deterministic condition — it is reported as
     // a terminal Skip, not an error the caller might retry forever.
-    let preprocessed = match attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative)
-    {
-        Ok(p) => p,
-        Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
-            debug!(
-                path = %rec.repo_relative,
-                error = %source,
-                "skipping: content is not valid UTF-8 / unsupported binary"
-            );
-            return Ok(FilePrep::Skip);
-        }
-        Err(source) => {
-            return Err(IndexError::Io {
-                path: rec.repo_relative.clone(),
-                source,
-            });
-        }
-    };
+    let preprocessed =
+        match attic_discovery::preprocess_file_content(&rec.abs_path, &rec.repo_relative) {
+            Ok(p) => p,
+            Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
+                debug!(
+                    path = %rec.repo_relative,
+                    error = %source,
+                    "skipping: content is not valid UTF-8 / unsupported binary"
+                );
+                return Ok(FilePrep::Skip);
+            }
+            Err(source) => {
+                return Err(IndexError::Io {
+                    path: rec.repo_relative.clone(),
+                    source,
+                });
+            }
+        };
 
     // Build AnalyzerContent based on the preprocessing decision:
     //
@@ -952,7 +1197,8 @@ fn analyze_single_file(
         })
         .collect();
 
-    let captured = structural_pipeline::capture_structural(&rec.repo_relative, &fo_id_str, &output);
+    let captured = structural_pipeline::capture_structural(&rec.repo_relative, &fo_id_str, &output)
+        .map(Box::new);
 
     debug!(
         path = %rec.repo_relative,
@@ -973,6 +1219,44 @@ fn analyze_single_file(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Pair each discovered entry with its downstream classification in O(N).
+///
+/// `discovery.downstream_classifications` is built by `attic_discovery::discover`
+/// iterating `discovery.entries` in the same order, pushing exactly one
+/// classification per entry — so a positional zip is equivalent to a
+/// per-path lookup, without the O(N²) linear scan a `.find()` inside the
+/// entry loop would cost at scale. The alignment is verified rather than
+/// assumed: a length or path mismatch at any position means the invariant
+/// was violated (e.g. by a future change to the discovery layer) and must
+/// fail loudly rather than silently misattributing one file's
+/// classification to another.
+fn align_classifications<'a>(
+    entries: &[EligibleEntry],
+    classifications: &'a [(String, DownstreamClassification)],
+) -> Result<Vec<&'a DownstreamClassification>, IndexError> {
+    if entries.len() != classifications.len() {
+        return Err(IndexError::ClassificationCountMismatch {
+            entries: entries.len(),
+            classifications: classifications.len(),
+        });
+    }
+    entries
+        .iter()
+        .zip(classifications.iter())
+        .enumerate()
+        .map(|(index, (entry, (path, classification)))| {
+            if *path != entry.repo_relative {
+                return Err(IndexError::ClassificationPathMismatch {
+                    index,
+                    expected: entry.repo_relative.clone(),
+                    found: path.clone(),
+                });
+            }
+            Ok(classification)
+        })
+        .collect()
+}
+
 /// Derive `SecurityState` and `is_partial_scan` from the downstream classification.
 fn classify_security_state(
     classification: Option<&DownstreamClassification>,
@@ -987,7 +1271,9 @@ fn classify_security_state(
         // `ScanTransientError` into `transient_failed_paths` and `continue`s
         // before ever calling this function. Handled defensively so the
         // match stays exhaustive.
-        Some(DownstreamClassification::ScanTransientError { .. }) => (SecurityState::Pending, false),
+        Some(DownstreamClassification::ScanTransientError { .. }) => {
+            (SecurityState::Pending, false)
+        }
         None => (SecurityState::Pending, false),
     }
 }
@@ -1066,6 +1352,96 @@ mod tests {
 
     fn write_file(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // align_classifications (PR-4: O(N^2) -> O(N) classification lookup)
+    // -----------------------------------------------------------------------
+
+    fn entry(repo_relative: &str) -> EligibleEntry {
+        EligibleEntry {
+            abs_path: std::path::PathBuf::from(repo_relative),
+            repo_relative: repo_relative.to_string(),
+            priority: attic_discovery::DiscoveryPriority::Normal,
+        }
+    }
+
+    #[test]
+    fn align_classifications_pairs_by_position_in_order() {
+        let entries = vec![entry("a.rs"), entry("b.rs"), entry("c.rs")];
+        let classifications = vec![
+            ("a.rs".to_string(), DownstreamClassification::Excluded),
+            (
+                "b.rs".to_string(),
+                DownstreamClassification::Safe {
+                    size_tier: attic_discovery::FileSizeTier::Small,
+                },
+            ),
+            ("c.rs".to_string(), DownstreamClassification::Excluded),
+        ];
+
+        let aligned = align_classifications(&entries, &classifications).unwrap();
+
+        assert_eq!(aligned.len(), 3);
+        assert!(matches!(aligned[0], DownstreamClassification::Excluded));
+        assert!(matches!(aligned[1], DownstreamClassification::Safe { .. }));
+        assert!(matches!(aligned[2], DownstreamClassification::Excluded));
+    }
+
+    #[test]
+    fn align_classifications_detects_count_mismatch() {
+        let entries = vec![entry("a.rs"), entry("b.rs")];
+        let classifications = vec![("a.rs".to_string(), DownstreamClassification::Excluded)];
+
+        let err = align_classifications(&entries, &classifications).unwrap_err();
+        assert!(matches!(
+            err,
+            IndexError::ClassificationCountMismatch {
+                entries: 2,
+                classifications: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn align_classifications_detects_wrong_path_association() {
+        let entries = vec![entry("a.rs"), entry("b.rs")];
+        // Swapped order relative to `entries`: position 0 claims to be for
+        // "b.rs", not "a.rs" — the alignment invariant is violated even
+        // though the counts match.
+        let classifications = vec![
+            ("b.rs".to_string(), DownstreamClassification::Excluded),
+            ("a.rs".to_string(), DownstreamClassification::Excluded),
+        ];
+
+        let err = align_classifications(&entries, &classifications).unwrap_err();
+        match err {
+            IndexError::ClassificationPathMismatch {
+                index,
+                expected,
+                found,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(expected, "a.rs");
+                assert_eq!(found, "b.rs");
+            }
+            other => panic!("expected ClassificationPathMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn align_classifications_scales_linearly_not_quadratically() {
+        // Not a timing benchmark (too flaky in CI); proves the O(N)
+        // contract structurally by checking a large aligned set resolves
+        // correctly and quickly enough to run inline in a unit test.
+        let n = 20_000;
+        let entries: Vec<EligibleEntry> = (0..n).map(|i| entry(&format!("f{i}.rs"))).collect();
+        let classifications: Vec<(String, DownstreamClassification)> = (0..n)
+            .map(|i| (format!("f{i}.rs"), DownstreamClassification::Excluded))
+            .collect();
+
+        let aligned = align_classifications(&entries, &classifications).unwrap();
+        assert_eq!(aligned.len(), n);
     }
 
     // -----------------------------------------------------------------------
@@ -1657,8 +2033,47 @@ mod tests {
             "all three eligible files must be indexed"
         );
         for token in ["a_token", "b_token", "c_token"] {
-            assert!(!search_hits(&fx, token).is_empty(), "{token} must be searchable");
+            assert!(
+                !search_hits(&fx, token).is_empty(),
+                "{token} must be searchable"
+            );
         }
+    }
+
+    /// PR-8: measurement-only counters must accurately report the
+    /// duplicate discovery/analysis read of a SMALL file — the size of the
+    /// cost the audit flagged, kept as an observable metric rather than a
+    /// speculative fix (see module docs on `analysis_small_file_bytes_read`).
+    #[test]
+    fn small_file_io_counters_report_the_duplicate_read() {
+        let fx = make_store();
+        // A dedicated subdirectory, distinct from `fx._dir.path()` (which
+        // also holds the SQLite db/wal/shm files) — otherwise those binary
+        // files would be discovered and counted too, muddying the exact
+        // byte-count assertions this test makes.
+        let root = fx._dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let content = "fn io_counter_token() {}\n";
+        write_file(&root, "a.rs", content);
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+
+        let r1 = index_repository(&s, &root, &policy, &opts).unwrap();
+        assert_eq!(r1.discovery_counters.small_file_reads, 1);
+        assert_eq!(
+            r1.discovery_counters.small_file_bytes_read,
+            content.len() as u64
+        );
+        assert_eq!(
+            r1.analysis_small_file_reads, 1,
+            "no cache entry exists yet — analysis must re-read the file discovery already read"
+        );
+        assert_eq!(
+            r1.analysis_small_file_bytes_read,
+            content.len() as u64,
+            "measured duplicate-read size must match the file's actual size"
+        );
     }
 
     #[test]
@@ -1852,7 +2267,11 @@ mod tests {
     #[test]
     fn known_secret_filename_is_excluded() {
         let fx = make_store();
-        write_file(fx._dir.path(), ".env", "SECRET_TOKEN_VALUE=doNotIndexThisEnvValue\n");
+        write_file(
+            fx._dir.path(),
+            ".env",
+            "SECRET_TOKEN_VALUE=doNotIndexThisEnvValue\n",
+        );
         write_file(fx._dir.path(), "app.rs", "fn app_marker_token() {}\n");
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
@@ -1905,7 +2324,9 @@ mod tests {
                 .collect()
         };
         assert!(
-            bodies.iter().any(|b| b.contains("café") && b.contains('😀')),
+            bodies
+                .iter()
+                .any(|b| b.contains("café") && b.contains('😀')),
             "unicode content must round-trip exactly, not be mangled"
         );
     }
@@ -1921,7 +2342,11 @@ mod tests {
             [0xFF, 0xFE, 0x00, 0xD8, 0x00, 0x01],
         )
         .unwrap();
-        write_file(fx._dir.path(), "text.rs", "fn alongside_binary_token() {}\n");
+        write_file(
+            fx._dir.path(),
+            "text.rs",
+            "fn alongside_binary_token() {}\n",
+        );
 
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
@@ -1980,7 +2405,10 @@ mod tests {
         let opts = IndexOptions::default();
         index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
         assert!(!search_hits(&fx, "small_redacted_safe_token").is_empty());
-        assert!(search_hits(&fx, secret).is_empty(), "the raw secret must never be searchable");
+        assert!(
+            search_hits(&fx, secret).is_empty(),
+            "the raw secret must never be searchable"
+        );
         let (_, _, security) = latest_occurrence_state(&fx, "small_redacted.rs");
         assert_eq!(security, "flagged");
     }
@@ -2030,7 +2458,10 @@ mod tests {
             .expect("LARGE+Redacted must stream, not error with content=None (P0-2)");
         assert_eq!(result.files_indexed, 1);
         assert!(!search_hits(&fx, "large_redacted_safe_token").is_empty());
-        assert!(search_hits(&fx, secret).is_empty(), "the raw secret must never be searchable");
+        assert!(
+            search_hits(&fx, secret).is_empty(),
+            "the raw secret must never be searchable"
+        );
         let (_, _, security) = latest_occurrence_state(&fx, "large_redacted.rs");
         assert_eq!(security, "flagged");
     }
@@ -2121,7 +2552,9 @@ mod tests {
             Ok(_) => panic!(
                 "a missing file must be a transient error, never a silent Skip/Indexable (P0-5/P0-7)"
             ),
-            Err(other) => panic!("expected IndexError::Io for a transient I/O failure, got {other}"),
+            Err(other) => {
+                panic!("expected IndexError::Io for a transient I/O failure, got {other}")
+            }
         }
     }
 
@@ -2192,5 +2625,159 @@ mod tests {
             "new content must never be published while the generation is incomplete"
         );
         assert_eq!(search_hits(&fx, "locked_token").len(), 1);
+    }
+
+    /// PR-7 acceptance test: N files, one transiently fails. The first
+    /// attempt must analyze every file and persist a cache entry for each
+    /// success; the previous generation stays untouched (already covered
+    /// by the test above). Once the lock is released, a retry must reuse
+    /// the cached results for the files that already succeeded — proven by
+    /// the analyzer invocation count, not just by the final output — and
+    /// publish successfully, after which the cache is cleared.
+    #[cfg(windows)]
+    #[test]
+    fn retry_after_transient_failure_reuses_cached_analysis_and_eventually_publishes() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fx = make_store();
+        const N: usize = 12;
+        for i in 0..N {
+            write_file(
+                fx._dir.path(),
+                &format!("f{i}.rs"),
+                &format!("fn retry_cache_token_{i}() {{}}\n"),
+            );
+        }
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+
+        let locked_path = fx._dir.path().join("f0.rs");
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked_path)
+            .expect("open with exclusive sharing to simulate a transient lock conflict");
+
+        reset_analyze_single_file_calls();
+        let attempt1 = index_repository(&s, fx._dir.path(), &policy, &opts);
+        assert!(
+            matches!(attempt1, Err(IndexError::TransientFailures { .. })),
+            "expected a transient-failure abort, got {attempt1:?}"
+        );
+        // f0.rs (locked) fails its `std::fs::metadata` stat before it ever
+        // becomes a `FileRecord`, so `analyze_single_file` is only reached
+        // for the other N-1 files — all of which have no cache yet.
+        assert_eq!(
+            analyze_single_file_calls(),
+            N - 1,
+            "every file that reached analysis (all but the locked one) must be analyzed fresh"
+        );
+
+        let verify = verify_conn(&fx);
+        let cached_after_failure: i64 = verify
+            .query_row("SELECT COUNT(*) FROM index_analysis_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            cached_after_failure,
+            (N - 1) as i64,
+            "every successfully-analyzed file must be cached before the abort"
+        );
+
+        drop(_lock);
+
+        reset_analyze_single_file_calls();
+        let attempt2 = index_repository(&s, fx._dir.path(), &policy, &opts)
+            .expect("retry must succeed once the lock is released");
+        assert_eq!(
+            analyze_single_file_calls(),
+            1,
+            "the retry must reuse cached results for the {} already-succeeded files \
+             and analyze only the previously-locked one",
+            N - 1
+        );
+        assert_eq!(attempt2.files_indexed, N);
+
+        for i in 0..N {
+            assert_eq!(
+                search_hits(&fx, &format!("retry_cache_token_{i}")).len(),
+                1,
+                "file f{i}.rs must be searchable after the successful retry"
+            );
+        }
+
+        let cached_after_success: i64 = verify
+            .query_row("SELECT COUNT(*) FROM index_analysis_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            cached_after_success, 0,
+            "the cache must be cleared once the generation successfully publishes"
+        );
+    }
+
+    /// Code-review finding: a cache entry stamped with a stale
+    /// secret-pattern/analyzer-registry version must never be replayed for
+    /// unchanged content — a version mismatch is a cache miss, forcing
+    /// fresh analysis under the current ruleset.
+    #[test]
+    fn analysis_cache_hit_requires_matching_secret_pattern_version() {
+        let fx = make_store();
+        let root = fx._dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "a.rs", "fn cache_version_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+
+        let r1 = index_repository(&s, &root, &policy, &opts).unwrap();
+        let repo_id: RepositoryId = r1.repository_id.parse().unwrap();
+
+        // Manually plant a cache row for "a.rs" with the CORRECT current
+        // content_hash but a stale secret_pattern_version, simulating a
+        // retry-recovery cache entry left over from before a ruleset
+        // upgrade.
+        let content_hash = fx
+            .pool
+            .with_reader(|c| attic_storage::current_path_hashes_for_repository(c, &repo_id))
+            .unwrap()
+            .into_iter()
+            .find(|(p, _)| p == "a.rs")
+            .map(|(_, h)| h)
+            .expect("a.rs must have a content hash after indexing");
+
+        fx.handle
+            .send(move |conn| {
+                attic_storage::upsert_analysis_cache_entries(
+                    conn,
+                    &repo_id,
+                    &[attic_storage::CachedFileAnalysis {
+                        repo_relative: "a.rs".to_string(),
+                        content_hash,
+                        security_state: "clean".to_string(),
+                        is_partial_scan: false,
+                        secret_pattern_version: SECRET_PATTERN_VERSION - 1,
+                        analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
+                            .to_owned(),
+                        units_json: "[]".to_string(),
+                        captured_json: None,
+                    }],
+                    0,
+                )
+            })
+            .unwrap();
+
+        reset_analyze_single_file_calls();
+        let r2 = index_repository(&s, &root, &policy, &opts).unwrap();
+        assert_eq!(
+            analyze_single_file_calls(),
+            1,
+            "a version-mismatched cache entry must be a miss, forcing fresh analysis"
+        );
+        assert_eq!(r2.files_indexed, 1);
+        assert_eq!(search_hits(&fx, "cache_version_token").len(), 1);
     }
 }

@@ -29,6 +29,12 @@ const VERSION_0004: &str = "0004_phase6";
 const MIGRATION_0005: &str = include_str!("../../../migrations/0005_workspace_snapshot.sql");
 const VERSION_0005: &str = "0005_workspace_snapshot";
 
+const MIGRATION_0006: &str = include_str!("../../../migrations/0006_index_analysis_cache.sql");
+const VERSION_0006: &str = "0006_index_analysis_cache";
+
+const MIGRATION_0007: &str = include_str!("../../../migrations/0007_analysis_cache_versioning.sql");
+const VERSION_0007: &str = "0007_analysis_cache_versioning";
+
 /// Every migration version this binary knows how to apply/reason about, in
 /// order. Used to detect a downgrade (an older binary opening a database a
 /// newer binary already migrated further) — see `run_migrations`.
@@ -38,6 +44,8 @@ const KNOWN_VERSIONS: &[&str] = &[
     VERSION_0003,
     VERSION_0004,
     VERSION_0005,
+    VERSION_0006,
+    VERSION_0007,
 ];
 
 // ---------------------------------------------------------------------------
@@ -82,6 +90,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     apply_migration(conn, VERSION_0003, MIGRATION_0003)?;
     apply_migration(conn, VERSION_0004, MIGRATION_0004)?;
     apply_migration(conn, VERSION_0005, MIGRATION_0005)?;
+    apply_migration(conn, VERSION_0006, MIGRATION_0006)?;
+    apply_migration(conn, VERSION_0007, MIGRATION_0007)?;
 
     Ok(())
 }
@@ -152,7 +162,11 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(count, 5, "all migration rows expected after first run");
+        assert_eq!(
+            count as usize,
+            KNOWN_VERSIONS.len(),
+            "one row per known migration expected after first run"
+        );
     }
 
     #[test]
@@ -167,8 +181,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            count, 5,
-            "still exactly five migration rows after second run"
+            count as usize,
+            KNOWN_VERSIONS.len(),
+            "still exactly one row per known migration after second run"
         );
     }
 

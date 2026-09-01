@@ -11,8 +11,8 @@ use attic_discovery::{
 use attic_indexing::{IndexError, IndexOptions, IndexingStore, index_repository};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
-    fts_search, get_db_stats, get_repository_path, get_repository_stats,
-    lookup_repository_by_root_path,
+    current_files_for_repo_map, fts_search, get_db_stats, get_repository_path,
+    get_repository_stats, lookup_repository_by_root_path,
     resource_manager::{ResourceConfig, ResourceMonitor},
     run_migrations,
 };
@@ -30,6 +30,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -163,6 +164,12 @@ struct AtticServer {
     db_path: std::path::PathBuf,
     /// Phase 7 resource monitor for foreground/background priority control.
     resource_monitor: Option<Arc<attic_storage::resource_manager::ResourceMonitor>>,
+    /// PR-3 discovery explainability: the most recent walk's counters per
+    /// `repository_id`, populated after every `bootstrap_workspace` run.
+    /// In-memory only — a fresh walk on the next index run replaces it, so
+    /// this always reflects the last actually-observed traversal rather than
+    /// a stale persisted value.
+    last_discovery_counters: Arc<std::sync::RwLock<HashMap<String, attic_discovery::WalkCounters>>>,
 }
 
 impl AtticServer {
@@ -234,6 +241,7 @@ impl AtticServer {
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
             resource_monitor: Some(Arc::new(resource_monitor)),
+            last_discovery_counters: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -261,9 +269,15 @@ impl AtticServer {
         };
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
-        index_repository(&store, root, &policy, &opts)
-            .map(|r| r.repository_id)
-            .map_err(ServerError::Indexing)
+        let result =
+            index_repository(&store, root, &policy, &opts).map_err(ServerError::Indexing)?;
+        // Best-effort: a poisoned lock here must never fail an otherwise
+        // successful bootstrap — these counters are diagnostics, not the
+        // authoritative index state.
+        if let Ok(mut counters) = self.last_discovery_counters.write() {
+            counters.insert(result.repository_id.clone(), result.discovery_counters);
+        }
+        Ok(result.repository_id)
     }
 
     /// Runtime logical-workspace membership management via the `workspace`
@@ -321,99 +335,136 @@ impl AtticServer {
                 .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
         }
 
-        /// Deterministic canonical dedup preserving configuration order.
+        /// Deterministic canonical dedup preserving configuration order,
+        /// comparing via [`root_identity_key`] so a root reached through a
+        /// differently-produced `PathBuf` (see PR-6) is still recognized as
+        /// the same root everywhere, not just at the `remove` call site.
         fn dedup_keep_order(roots: Vec<PathBuf>) -> Vec<PathBuf> {
             let mut seen = HashSet::new();
             let mut out = Vec::new();
             for r in roots {
-                if seen.insert(r.clone()) {
+                if seen.insert(root_identity_key(&r)) {
                     out.push(r);
                 }
             }
             out
         }
 
-        let new_active: Vec<PathBuf> = match action.as_str() {
-            "add" => {
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
-                let canon = validate_root(path)?;
-                let mut active =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-                if !active.contains(&canon) {
-                    active.push(canon);
+        // PR-9: serialize the whole compute → persist → commit sequence by
+        // holding `active_roots`'s own write lock across it, rather than a
+        // separate parallel lock — `active_roots` is already the single
+        // source of truth for membership, so it's the natural single point
+        // of mutual exclusion for mutating it too. Scoped in an explicit
+        // block so the guard is structurally out of scope (not just
+        // manually dropped) before the `.await` below — the async-fn Send
+        // analysis needs that to prove the guard is never held across it.
+        let (new_active, added, removed): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
+            let mut active_guard = lock_or_server_err!(self.active_roots.write(), "active_roots")?;
+
+            let new_active: Vec<PathBuf> = match action.as_str() {
+                "add" => {
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
+                    let canon = validate_root(path)?;
+                    let mut active = active_guard.clone();
+                    if !active
+                        .iter()
+                        .any(|r| root_identity_key(r) == root_identity_key(&canon))
+                    {
+                        active.push(canon);
+                    }
+                    dedup_keep_order(active)
                 }
-                dedup_keep_order(active)
-            }
-            "remove" => {
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for remove".into()))?;
-                let canon = PathBuf::from(path).canonicalize().map_err(|e| {
-                    ServerError::InvalidArg(format!(
-                        "cannot canonicalize removal path '{path}': {e}"
-                    ))
-                })?;
-                let current =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-                dedup_keep_order(
-                    current
-                        .into_iter()
-                        .filter(|r| r.as_path() != canon.as_path())
-                        .collect(),
-                )
-            }
-            "set" => {
-                let paths = args
-                    .get("paths")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| {
-                        ServerError::InvalidArg("missing 'paths' (array) for set".into())
-                    })?
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .ok_or_else(|| ServerError::InvalidArg("paths must be strings".into()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut validated = Vec::new();
-                for p in paths {
-                    validated.push(validate_root(p)?);
+                "remove" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ServerError::InvalidArg("missing 'path' for remove".into())
+                    })?;
+                    let target = PathBuf::from(path);
+                    // Two-path strategy (principal-architect audit A-06): a
+                    // configured root that has been deleted or moved must still
+                    // be removable. `canonicalize()` requires the path to exist,
+                    // so fall back to a lexical (filesystem-free) normalization
+                    // when it doesn't — comparison then goes through the shared
+                    // `root_identity_key` so either form matches the persisted
+                    // canonical root.
+                    let normalized = if target.exists() {
+                        target.canonicalize().map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot canonicalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    } else {
+                        normalize_root_lexically(&target).map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot normalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    };
+                    let target_key = root_identity_key(&normalized);
+                    dedup_keep_order(
+                        active_guard
+                            .iter()
+                            .filter(|r| root_identity_key(r) != target_key)
+                            .cloned()
+                            .collect(),
+                    )
                 }
-                dedup_keep_order(validated)
+                "set" => {
+                    let paths = args
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| {
+                            ServerError::InvalidArg("missing 'paths' (array) for set".into())
+                        })?
+                        .iter()
+                        .map(|v| {
+                            v.as_str().ok_or_else(|| {
+                                ServerError::InvalidArg("paths must be strings".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut validated = Vec::new();
+                    for p in paths {
+                        validated.push(validate_root(p)?);
+                    }
+                    dedup_keep_order(validated)
+                }
+                other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+            };
+
+            // Compute added/removed roots relative to the current live membership.
+            let old_active = active_guard.clone();
+            let added: Vec<PathBuf> = new_active
+                .iter()
+                .filter(|r| !old_active.contains(r))
+                .cloned()
+                .collect();
+            let removed: Vec<PathBuf> = old_active
+                .iter()
+                .filter(|r| !new_active.contains(r))
+                .cloned()
+                .collect();
+
+            // 1. Persist the new membership atomically BEFORE touching live state,
+            //    so a crash still leaves a coherent durable config.
+            if new_active.is_empty() {
+                remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
+            } else {
+                persist_repositories_config(&self.default_config, &new_active)
+                    .map_err(ServerError::InvalidArg)?;
             }
-            other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+
+            // 2. Update in-memory authoritative membership + configured flag.
+            *active_guard = new_active.clone();
+            self.workspace_configured
+                .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
+
+            (new_active, added, removed)
+            // `active_guard` drops here, going out of scope before the `.await`
+            // points below.
         };
-
-        // Compute added/removed roots relative to the current live membership.
-        let old_active = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-        let added: Vec<PathBuf> = new_active
-            .iter()
-            .filter(|r| !old_active.contains(r))
-            .cloned()
-            .collect();
-        let removed: Vec<PathBuf> = old_active
-            .iter()
-            .filter(|r| !new_active.contains(r))
-            .cloned()
-            .collect();
-
-        // 1. Persist the new membership atomically BEFORE touching live state,
-        //    so a crash still leaves a coherent durable config.
-        if new_active.is_empty() {
-            remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
-        } else {
-            persist_repositories_config(&self.default_config, &new_active)
-                .map_err(ServerError::InvalidArg)?;
-        }
-
-        // 2. Update in-memory authoritative membership + configured flag.
-        *lock_or_server_err!(self.active_roots.write(), "active_roots")? = new_active.clone();
-        self.workspace_configured
-            .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
 
         // 3. Reconcile LIVE watchers: stop watchers for removed roots,
         //    start+bootstrap watchers for added roots. Each is isolated so a
@@ -428,6 +479,12 @@ impl AtticServer {
                 .map(|id| id.to_string());
             if let Some(id) = repo_id {
                 self.stop_watcher(&id);
+                // PR-3 counters are keyed by repository_id; a removed root's
+                // entry would otherwise never be cleaned up, growing this
+                // map unboundedly over a long-running process's lifetime.
+                if let Ok(mut counters) = self.last_discovery_counters.write() {
+                    counters.remove(&id);
+                }
                 events.push(format!("stopped watcher for: {}", root.display()));
             } else {
                 events.push(format!("removed (no registered repo): {}", root.display()));
@@ -595,6 +652,80 @@ impl AtticServer {
 }
 
 // ΓöÇΓöÇΓöÇ input validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+/// Normalize a path for identity comparison when it (or a suffix of it) no
+/// longer exists on disk, so `canonicalize()` cannot run directly.
+///
+/// Used as the removal-time fallback when the configured root has been
+/// deleted or moved (principal-architect audit A-06): a stale membership
+/// entry must still be removable by path. The common case is that only the
+/// leaf (the removed root itself) is gone while its parent still exists —
+/// walk up to the longest still-existing ancestor, canonicalize *that*
+/// (recovering Windows short-name/case differences for the part that can
+/// still be resolved), then lexically re-append the missing suffix and
+/// resolve any remaining `.`/`..` components structurally.
+fn normalize_root_lexically(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut existing_prefix = absolute.as_path();
+    while !existing_prefix.exists() {
+        let Some(name) = existing_prefix.file_name() else {
+            break; // reached a filesystem root with no existing ancestor
+        };
+        missing_tail.push(name.to_os_string());
+        match existing_prefix.parent() {
+            Some(parent) => existing_prefix = parent,
+            None => break,
+        }
+    }
+
+    let mut candidate = if existing_prefix.exists() {
+        existing_prefix.canonicalize()?
+    } else {
+        existing_prefix.to_path_buf()
+    };
+    for component in missing_tail.into_iter().rev() {
+        candidate.push(component);
+    }
+
+    // Resolve any remaining `.`/`..` in the (still lexical) missing suffix —
+    // `canonicalize()` already normalized the existing prefix above.
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Comparison key for two workspace-root `PathBuf`s that may have been
+/// produced differently (one via `canonicalize()`, which resolves the
+/// on-disk casing and adds Windows' `\\?\` verbatim prefix; one via
+/// [`normalize_root_lexically`], which can do neither without the path
+/// existing). Strips the verbatim prefix and case-folds on Windows —
+/// mirroring the case-insensitive filename semantics `canonicalize()`
+/// already applies implicitly for existing paths — so a root added with one
+/// casing/prefix can still be recognized as the same root when removed with
+/// another.
+fn root_identity_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    if cfg!(windows) {
+        stripped.to_lowercase()
+    } else {
+        stripped.to_string()
+    }
+}
 
 fn validate_filter(name: &str, value: &str, max_len: usize) -> Result<(), ServerError> {
     if value.len() > max_len {
@@ -1121,10 +1252,78 @@ fn handle_search(
     )]))
 }
 
+/// A directory node in the derived `repo_map` tree. Directories are never a
+/// persisted entity — this tree is rebuilt at read time from the current
+/// generation's active file paths, so an empty directory (or one left empty
+/// by a `file_type` filter) simply never gets a node here.
+///
+/// `dirs`/`files` are kept in separate maps (rather than one map keyed by
+/// name) so serialization can enforce "directories before files, then
+/// lexicographic" regardless of how directory and file names interleave;
+/// `BTreeMap` gives deterministic lexicographic order within each group.
+#[derive(Default)]
+struct RepoMapDirNode {
+    dirs: std::collections::BTreeMap<String, RepoMapDirNode>,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+impl RepoMapDirNode {
+    fn insert(&mut self, components: &[&str], file_type: &str) {
+        match components {
+            [] => {}
+            [name] => {
+                self.files
+                    .insert((*name).to_string(), file_type.to_string());
+            }
+            [dir, rest @ ..] => {
+                self.dirs
+                    .entry((*dir).to_string())
+                    .or_default()
+                    .insert(rest, file_type);
+            }
+        }
+    }
+
+    fn to_json(&self) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.dirs.len() + self.files.len());
+        for (name, node) in &self.dirs {
+            out.push(json!({
+                "name": name,
+                "type": "directory",
+                "children": node.to_json(),
+            }));
+        }
+        for (name, file_type) in &self.files {
+            // Guards against an impossible filesystem shape that stale
+            // (not-yet-tombstoned) occurrence data can produce — e.g. a
+            // leftover row for file "foo" alongside a newer one for
+            // "foo/sub.rs", where "foo" would need to be both a file and a
+            // directory at the same tree level. Directories win
+            // deterministically regardless of insertion order (checked here
+            // rather than in `insert`, since a directory node for this name
+            // may not exist yet at insert time but appear later): the
+            // conflicting file is dropped rather than rendering two sibling
+            // nodes with the same name, which no real filesystem could
+            // produce and which would be a nonsensical tree to hand to a
+            // caller.
+            if self.dirs.contains_key(name) {
+                continue;
+            }
+            out.push(json!({
+                "name": name,
+                "type": "file",
+                "file_type": file_type,
+            }));
+        }
+        out
+    }
+}
+
 fn handle_repo_map(
     pool: &DbPool,
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
+    discovery_counters: &HashMap<String, attic_discovery::WalkCounters>,
 ) -> Result<CallToolResult, ServerError> {
     let repo_id = args
         .get("repository_id")
@@ -1136,10 +1335,33 @@ fn handle_repo_map(
     if let Some(ft) = file_type {
         validate_filter("file_type", ft, 32)?;
     }
+
     let all_stats = pool.with_reader(get_repository_stats)?;
     let stats = all_stats.into_iter().find(|s| s.id == repo_id);
+
+    let parsed_repo_id = repo_id
+        .parse::<attic_core::RepositoryId>()
+        .map_err(|e| ServerError::InvalidArg(format!("invalid repository_id: {e}")))?;
+    let files = pool.with_reader(|c| current_files_for_repo_map(c, &parsed_repo_id, file_type))?;
+
+    let mut root = RepoMapDirNode::default();
+    for (path, ft) in &files {
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        root.insert(&components, ft);
+    }
+
+    // PR-3: last observed discovery-walk counters for this repository, if
+    // any bootstrap/reindex has run this process — answers "why did the
+    // filesystem count and indexed count differ" without server logs.
+    let discovery = discovery_counters.get(repo_id);
+
     Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&json!({ "repository_id": repo_id, "stats": stats }))?,
+        serde_json::to_string_pretty(&json!({
+            "repository_id": repo_id,
+            "stats": stats,
+            "tree": root.to_json(),
+            "discovery": discovery,
+        }))?,
     )]))
 }
 
@@ -1619,7 +1841,13 @@ impl ServerHandler for AtticServer {
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
                 "search" => handle_search(&pool, &args, &active_ids),
-                "repo_map" => handle_repo_map(&pool, &args, &active_ids),
+                "repo_map" => {
+                    let discovery_counters = lock_or_call_err!(
+                        self.last_discovery_counters.read(),
+                        "last_discovery_counters"
+                    );
+                    handle_repo_map(&pool, &args, &active_ids, &discovery_counters)
+                }
                 "status" => {
                     let inc = lock_or_call_err!(incremental.read(), "incremental");
                     let wm = lock_or_call_err!(watch_mode.read(), "watch_mode");
@@ -1790,15 +2018,71 @@ fn serialize_repositories_config(roots: &[PathBuf]) -> String {
 /// so a configured workspace survives process restarts without corruption.
 fn persist_repositories_config(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
     let contents = serialize_repositories_config(roots);
-    let tmp = path.with_extension("config.toml.tmp");
-    std::fs::write(&tmp, &contents)
-        .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+
+    // PR-9 durability hardening: a unique temp filename (PID + monotonic
+    // counter) so two overlapping writers (e.g. a crashed prior process
+    // whose temp file was never cleaned up) can never collide on the same
+    // path; explicit flush + fsync of the temp file's contents before the
+    // atomic rename, so a crash right after this call can never observe a
+    // renamed-but-not-yet-durable file; best-effort fsync of the parent
+    // directory afterward, since on some platforms/filesystems the rename
+    // itself is not guaranteed durable until the containing directory is
+    // flushed too.
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("config.toml.tmp.{}.{unique}", std::process::id()));
+
+    // Any failure from here on must not leave the temp file behind —
+    // repeated fsync/write failures (disk full, AV lock, restricted
+    // filesystem) would otherwise accumulate orphaned
+    // `config.toml.tmp.<pid>.<n>` files in the config directory forever.
+    let write_result: Result<(), String> = (|| {
+        let file = std::fs::File::create(&tmp).map_err(|e| {
+            format!(
+                "failed to create workspace config temp file '{}': {e}",
+                tmp.display()
+            )
+        })?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer
+            .write_all(contents.as_bytes())
+            .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
+        writer
+            .flush()
+            .map_err(|e| format!("failed to flush workspace config '{}': {e}", tmp.display()))?;
+        writer
+            .into_inner()
+            .map_err(|e| format!("failed to flush workspace config '{}': {e}", tmp.display()))?
+            .sync_all()
+            .map_err(|e| format!("failed to fsync workspace config '{}': {e}", tmp.display()))
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
+
+    let rename_result = std::fs::rename(&tmp, path).map_err(|e| {
         format!(
             "failed to finalize workspace config '{}': {e}",
             path.display()
         )
-    })
+    });
+    if rename_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    rename_result?;
+
+    // Best-effort: not every platform/filesystem supports fsync on a
+    // directory handle (notably plain FAT-family filesystems). A failure
+    // here must never turn an otherwise-successful, already-durable-file
+    // config write into a reported error.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Remove an empty workspace config so a workspace reported as configured for
@@ -2643,6 +2927,8 @@ mod tests {
                 IndexError::PolicyHash(_) => {}
                 IndexError::RepositoryNotBootstrapped(_) => {}
                 IndexError::TransientFailures { .. } => {}
+                IndexError::ClassificationCountMismatch { .. } => {}
+                IndexError::ClassificationPathMismatch { .. } => {}
             }
         }
     }
@@ -3274,13 +3560,160 @@ mod tests {
         assert_eq!(v["status"], "ok");
     }
 
+    // handle_workspace — missing-root removal (PR-6, principal-architect
+    // audit A-06): a configured root that has been deleted or moved must
+    // still be removable by path.
+    #[tokio::test]
+    async fn workspace_remove_after_root_deleted_succeeds() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        // Delete the directory entirely — canonicalize() can no longer run
+        // on this path, which is exactly the bug being fixed.
+        fs::remove_dir_all(&root).unwrap();
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root.display().to_string()));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(
+            v["membership_count"], 0,
+            "deleted root must still be removable: {v}"
+        );
+    }
+
+    /// Code-review finding: `last_discovery_counters` must not leak an
+    /// entry forever once its repository is removed from the workspace.
+    #[tokio::test]
+    async fn workspace_remove_prunes_last_discovery_counters() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        let repo_id = srv
+            .pool
+            .with_reader(|c| lookup_repository_by_root_path(c, &canonical_root.to_string_lossy()))
+            .unwrap()
+            .expect("repository must be registered after add")
+            .to_string();
+        assert!(
+            srv.last_discovery_counters
+                .read()
+                .unwrap()
+                .contains_key(&repo_id),
+            "bootstrap must have recorded discovery counters for this repo"
+        );
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&remove_args).await.unwrap();
+
+        assert!(
+            !srv.last_discovery_counters
+                .read()
+                .unwrap()
+                .contains_key(&repo_id),
+            "removing the root must prune its discovery counters entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_remove_missing_root_does_not_affect_similar_prefix_root() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root_a = tmp.path().join("a");
+        let root_ab = tmp.path().join("ab");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_ab).unwrap();
+
+        for root in [&root_a, &root_ab] {
+            let mut add_args = HashMap::new();
+            add_args.insert("action".into(), json!("add"));
+            add_args.insert("path".into(), json!(root.display().to_string()));
+            srv.handle_workspace(&add_args).await.unwrap();
+        }
+
+        fs::remove_dir_all(&root_a).unwrap();
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root_a.display().to_string()));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "only the deleted root must be removed: {v}");
+        assert!(
+            roots[0]
+                .as_str()
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("/ab"),
+            "similar-prefix root 'ab' must survive removal of 'a': {v}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_remove_missing_root_is_case_insensitive_on_windows() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("WsRoot");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+
+        // Remove using different casing than what was added.
+        let differently_cased = root.to_string_lossy().to_lowercase();
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(differently_cased));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(
+            v["membership_count"], 0,
+            "removal must be case-insensitive on Windows for a missing root: {v}"
+        );
+    }
+
     // handle_repo_map
     #[test]
     fn repo_map_missing_repo_id() {
         let tmp = TempDir::new().unwrap();
-        let e = handle_repo_map(&make_server(&tmp).pool, &HashMap::new(), &HashSet::new())
-            .unwrap_err()
-            .to_string();
+        let e = handle_repo_map(
+            &make_server(&tmp).pool,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("repository_id required"), "{e}");
     }
 
@@ -3325,6 +3758,185 @@ mod tests {
         // Second bootstrap is idempotent (same repo id, no duplicate rows).
         let again = srv.bootstrap_workspace(&repo).unwrap();
         assert_eq!(again, repo_id, "existing repository must be reused");
+    }
+
+    // Code-review finding: RepoMapDirNode must not render a file and a
+    // directory with the same name at the same tree level (an impossible
+    // filesystem shape that stale occurrence data could otherwise produce).
+    #[test]
+    fn repo_map_dir_node_directory_wins_over_conflicting_file_name() {
+        let mut root = RepoMapDirNode::default();
+        // Directory inserted first ("foo/sub.rs"), then a conflicting file
+        // leaf named "foo" — the file insert must be dropped, not create a
+        // second sibling node named "foo".
+        root.insert(&["foo", "sub.rs"], "rust");
+        root.insert(&["foo"], "rust");
+
+        let tree = root.to_json();
+        assert_eq!(
+            tree.len(),
+            1,
+            "must not render two nodes named 'foo': {tree:?}"
+        );
+        assert_eq!(tree[0]["name"], "foo");
+        assert_eq!(tree[0]["type"], "directory");
+    }
+
+    #[test]
+    fn repo_map_dir_node_directory_wins_regardless_of_insert_order() {
+        let mut root = RepoMapDirNode::default();
+        // Same conflict, file inserted first this time.
+        root.insert(&["foo"], "rust");
+        root.insert(&["foo", "sub.rs"], "rust");
+
+        let tree = root.to_json();
+        assert_eq!(
+            tree.len(),
+            1,
+            "must not render two nodes named 'foo': {tree:?}"
+        );
+        assert_eq!(tree[0]["name"], "foo");
+        assert_eq!(tree[0]["type"], "directory");
+    }
+
+    // handle_repo_map — derived directory tree
+    #[test]
+    fn repo_map_builds_nested_tree_directories_before_files_lexicographic() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(repo.join("src/app")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join("src/app/main.rs"), "fn app_main() {}").unwrap();
+        fs::write(repo.join("src/lib.rs"), "fn app_lib() {}").unwrap();
+        fs::write(repo.join("docs/guide.md"), "# guide").unwrap();
+        fs::write(repo.join("readme.md"), "# readme").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        // Root: directories ("docs", "src") before the file ("readme.md"),
+        // each group lexicographic.
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["docs", "src", "readme.md"],
+            "root order: {tree:?}"
+        );
+        assert_eq!(tree[0]["type"], "directory");
+        assert_eq!(tree[1]["type"], "directory");
+        assert_eq!(tree[2]["type"], "file");
+
+        // Nested: src/ contains directory "app" before file "lib.rs".
+        let src_children = tree[1]["children"].as_array().expect("src children");
+        let src_names: Vec<&str> = src_children
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(src_names, vec!["app", "lib.rs"]);
+        assert_eq!(src_children[0]["type"], "directory");
+
+        // Leaf file carries a real file_type.
+        let app_children = src_children[0]["children"].as_array().unwrap();
+        assert_eq!(app_children[0]["name"], "main.rs");
+        assert_eq!(app_children[0]["type"], "file");
+        assert!(app_children[0]["file_type"].is_string());
+    }
+
+    #[test]
+    fn repo_map_file_type_filter_actually_filters() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        a.insert("file_type".into(), json!("rust"));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "file_type=rust must exclude Cargo.toml: {tree:?}"
+        );
+    }
+
+    #[test]
+    fn repo_map_is_isolated_per_repository() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo_a = tmp.path().join("a");
+        let repo_b = tmp.path().join("b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("only_in_a.rs"), "fn a() {}").unwrap();
+        fs::write(repo_b.join("only_in_b.rs"), "fn b() {}").unwrap();
+        let repo_id_a = srv.bootstrap_workspace(&repo_a).unwrap();
+        let _repo_id_b = srv.bootstrap_workspace(&repo_b).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id_a));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["only_in_a.rs"],
+            "repo_map must not leak paths from other repositories: {tree:?}"
+        );
+    }
+
+    #[test]
+    fn repo_map_surfaces_discovery_counters_after_bootstrap() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        fs::write(repo.join("node_modules/pkg/index.js"), "module.exports={}").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        // bootstrap_workspace must have recorded counters for this repo_id.
+        let recorded = srv
+            .last_discovery_counters
+            .read()
+            .unwrap()
+            .get(&repo_id)
+            .copied()
+            .expect("bootstrap must record discovery counters");
+        assert_eq!(recorded.files_eligible, 1, "only main.rs is eligible");
+        assert!(
+            recorded.ignored_or_pruned >= 1,
+            "node_modules/pkg/index.js must be counted as pruned: {recorded:?}"
+        );
+
+        // repo_map surfaces exactly those recorded counters under "discovery".
+        let mut discovery_counters = HashMap::new();
+        discovery_counters.insert(repo_id.clone(), recorded);
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &discovery_counters).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["discovery"]["files_eligible"], 1);
+        assert!(v["discovery"]["ignored_or_pruned"].as_u64().unwrap() >= 1);
     }
 
     // ΓöÇΓöÇ MCP child-process tests (supplemental manual JSON-RPC protocol tests).
@@ -4287,6 +4899,94 @@ mod tests {
             msg.contains("failed to write") || msg.contains("config"),
             "error must be descriptive: {msg}"
         );
+    }
+
+    /// PR-9: the hardened write path must still round-trip correctly and
+    /// leave no temp file behind once it completes.
+    #[test]
+    fn persist_repositories_config_round_trips_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        let roots = vec![
+            tmp.path().join("repo a"),
+            tmp.path().join("repo\\b"),
+            tmp.path().join("unicode_δρεπος"),
+        ];
+        for r in &roots {
+            std::fs::create_dir_all(r).unwrap();
+        }
+
+        persist_repositories_config(&cfg, &roots).unwrap();
+        let (_source, loaded) = load_workspace_roots(&cfg).unwrap();
+        assert_eq!(loaded, roots, "round-trip must preserve every root exactly");
+
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp file must remain after a successful write: {leftover:?}"
+        );
+    }
+
+    /// Code-review finding: a failure after the temp file is created (here,
+    /// the final rename failing because the destination is a directory)
+    /// must not leave the temp file behind.
+    #[test]
+    fn persist_repositories_config_cleans_up_temp_file_on_rename_failure() {
+        let tmp = TempDir::new().unwrap();
+        // `cfg` is a directory, not a file — `fs::rename(&tmp_file, &cfg)`
+        // will fail on Windows ("Access is denied" / directory-in-the-way),
+        // exercising the post-write, pre-rename-success failure path.
+        let cfg = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let result = persist_repositories_config(&cfg, &[root]);
+        assert!(result.is_err(), "rename onto a directory must fail");
+
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the temp file must be cleaned up even when the final rename fails: {leftover:?}"
+        );
+    }
+
+    /// PR-9: two overlapping config writes (simulating two racing
+    /// `workspace` tool calls) must not corrupt each other — the unique
+    /// temp filename plus atomic rename means the last one to finish wins
+    /// cleanly, never a truncated/interleaved file.
+    #[test]
+    fn persist_repositories_config_concurrent_writes_never_corrupt_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let cfg_a = cfg.clone();
+        let roots_a = vec![root_a.clone()];
+        let cfg_b = cfg.clone();
+        let roots_b = vec![root_b.clone()];
+        let t1 = std::thread::spawn(move || persist_repositories_config(&cfg_a, &roots_a));
+        let t2 = std::thread::spawn(move || persist_repositories_config(&cfg_b, &roots_b));
+        t1.join().unwrap().unwrap();
+        t2.join().unwrap().unwrap();
+
+        // Whichever wrote last, the result must be a fully valid config
+        // naming exactly one of the two roots — never a mix of both
+        // (interleaved writes) and never a parse failure (truncated write).
+        let (_source, loaded) = load_workspace_roots(&cfg).unwrap();
+        assert_eq!(loaded.len(), 1, "must never interleave into a mixed file");
+        assert!(loaded == vec![root_a] || loaded == vec![root_b]);
     }
 
     /// ┬º37 watcher startup failure: NOT VERIFIED on Windows.

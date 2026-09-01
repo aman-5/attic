@@ -154,7 +154,7 @@ pub struct IndexPublication {
 }
 
 /// One canonical structural node, ready for persistence (Phase 3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublicationNode {
     /// Parent node index within the same file's `nodes` vec.
     pub parent_index: Option<usize>,
@@ -171,7 +171,7 @@ pub struct PublicationNode {
 }
 
 /// One symbol definition occurrence plus its identity tuple (Phase 3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublicationSymbolDef {
     /// Language tag (`java`, `python`, …) for `core_symbol_identities`.
     pub language: String,

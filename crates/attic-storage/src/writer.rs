@@ -414,16 +414,24 @@ fn flush_batch(
         results.push(res);
     }
 
-    if failed_index.is_some() {
+    if let Some(failed_at) = failed_index {
         // ----------------------------------------------------------------
         // Mutation failure path — attempt ROLLBACK
         // ----------------------------------------------------------------
         match finalizer.rollback(conn) {
             Ok(()) => {
-                // ROLLBACK succeeded: known-clean state.
-                // Callers already have their correct results (original error
-                // for the failed mutation, BatchRolledBack for the rest).
-                // Nothing to change — deliver as-is.
+                // ROLLBACK succeeded: known-clean state. Callers after
+                // `failed_at` already have `BatchRolledBack` (pushed by the
+                // `continue` arm above). Callers *before* it currently hold
+                // their real `Ok(())` from when their mutation ran — but
+                // ROLLBACK just undid that write along with everything else
+                // in this transaction, so that `Ok(())` would lie to the
+                // caller about whether its mutation committed. Correct it
+                // to `BatchRolledBack` too, matching the failed mutation's
+                // own error, which callers already receive as-is.
+                for r in results.iter_mut().take(failed_at) {
+                    *r = Err(StorageError::BatchRolledBack);
+                }
             }
             Err(rb_err) => {
                 // ROLLBACK failed: connection state is unknown.  Poison.
@@ -804,6 +812,77 @@ mod tests {
         );
 
         drop(queue);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Code-review finding: an earlier-succeeding batch item's result must be
+    // corrected when a later batch-mate's failure rolls back the whole
+    // transaction, including that earlier item's write.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rollback_corrects_earlier_successful_results_in_the_same_batch() {
+        let (path, writer_conn) = migrated_file_db();
+        let poisoned = Arc::new(AtomicBool::new(false));
+
+        let (tx_a, rx_a) = mpsc::sync_channel(1);
+        let (tx_b, rx_b) = mpsc::sync_channel(1);
+
+        // Item A: a real write that succeeds. Item B: fails outright. Both
+        // execute inside the SAME `flush_batch` call, hence the same
+        // transaction — this is exactly the "different callers coalesced
+        // into one batch" scenario `run_on_writer`'s per-closure rollback
+        // guarantee cannot see, since it only reasons about its own single
+        // closure's Ok/Err.
+        let mut batch: Vec<WorkItem> = vec![
+            WorkItem {
+                f: Box::new(|conn| {
+                    conn.execute(
+                        "INSERT INTO core_repositories \
+                             (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES ('batch-a', 'batch-a', 'batch-a', 1, 1, 0, 0)",
+                        [],
+                    )?;
+                    Ok(())
+                }),
+                result_tx: tx_a,
+            },
+            WorkItem {
+                f: Box::new(|_conn| Err(StorageError::Worker("forced failure for item B".into()))),
+                result_tx: tx_b,
+            },
+        ];
+
+        flush_batch(&writer_conn, &mut batch, &poisoned, &DefaultFinalizer);
+
+        let result_a = rx_a.recv().unwrap();
+        let result_b = rx_b.recv().unwrap();
+
+        assert!(
+            matches!(result_a, Err(StorageError::BatchRolledBack)),
+            "item A succeeded before B failed, but ROLLBACK undid A's write too — \
+             A's caller must be told BatchRolledBack, not Ok(()); got {result_a:?}"
+        );
+        assert!(
+            result_b.is_err(),
+            "item B's own failure must still surface; got {result_b:?}"
+        );
+
+        // And the DB must genuinely not contain A's row — proving the fix
+        // reports reality, not just that the report changed.
+        let count: i64 = writer_conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_repositories WHERE id = 'batch-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "A's write must have been rolled back along with B's failure"
+        );
+
         cleanup(&path);
     }
 
