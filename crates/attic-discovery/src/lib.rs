@@ -143,9 +143,21 @@ pub enum DownstreamClassification {
         /// Secrets detected in the sampled portion (no raw secret values).
         findings: Vec<SecretFinding>,
     },
-    /// Secret scanning was skipped or could not be completed (e.g. unreadable
-    /// file, binary content).  The file must not be indexed until rescanned.
+    /// Secret scanning could not be completed because the content is
+    /// permanently ineligible for text analysis (e.g. binary content, or
+    /// content that is not valid UTF-8). This is a deterministic, terminal
+    /// verdict about the file's *content* — retrying will not change it.
     ScanSkipped {
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// Secret scanning could not be completed because of a transient/
+    /// retryable I/O condition (stat/read failure, sharing violation,
+    /// permission race, the file vanishing mid-walk, etc.) — NOT a verdict
+    /// about the file's content. Unlike [`Self::ScanSkipped`], this must
+    /// never be treated as a permanent terminal state: callers must retry,
+    /// not silently skip forever.
+    ScanTransientError {
         /// Human-readable reason.
         reason: String,
     },
@@ -288,11 +300,14 @@ fn classify_file_for_downstream(
     repo_relative: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> DownstreamClassification {
-    // Stat to determine size tier (no content read yet).
+    // Stat to determine size tier (no content read yet). A stat failure here
+    // is never a content verdict — the file may simply be racing a
+    // concurrent write/delete, or momentarily locked — so it is always
+    // transient/retryable, never a permanent ScanSkipped.
     let size_bytes = match std::fs::metadata(abs_path) {
         Ok(m) => m.len(),
         Err(e) => {
-            return DownstreamClassification::ScanSkipped {
+            return DownstreamClassification::ScanTransientError {
                 reason: format!("stat failed: {e}"),
             };
         }
@@ -305,9 +320,19 @@ fn classify_file_for_downstream(
             // Full content — bounded by MAX_FULL_LOAD_BYTES (4 MiB).
             let content = match std::fs::read_to_string(abs_path) {
                 Ok(s) => s,
-                Err(_) => {
+                // Only "content is not valid UTF-8" is a genuine, permanent
+                // content verdict (binary file). Any other I/O failure
+                // (sharing violation, permission race, vanished mid-walk) is
+                // transient and must be retried, never silently skipped
+                // forever alongside real binary files.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     return DownstreamClassification::ScanSkipped {
-                        reason: "file unreadable or binary".to_string(),
+                        reason: "file content is not valid UTF-8 (binary)".to_string(),
+                    };
+                }
+                Err(e) => {
+                    return DownstreamClassification::ScanTransientError {
+                        reason: format!("file read failed: {e}"),
                     };
                 }
             };
@@ -350,7 +375,11 @@ fn classify_file_for_downstream(
                 Ok((SecretScanDecision::PartialScan, findings, _)) => {
                     DownstreamClassification::PartialScan { findings }
                 }
-                Err(e) => DownstreamClassification::ScanSkipped {
+                // The streaming scanner only ever fails on raw I/O (open/read
+                // errors) — it uses lossy UTF-8 conversion internally and
+                // never rejects content as invalid, so this is always
+                // transient, never a content verdict.
+                Err(e) => DownstreamClassification::ScanTransientError {
                     reason: format!("streaming scan failed: {e}"),
                 },
             }
@@ -361,8 +390,11 @@ fn classify_file_for_downstream(
             // Classification is ALWAYS PartialScan, never Safe.
             let sample = match read_sample(abs_path, MAX_SAMPLE_BYTES) {
                 Ok(s) => s,
+                // `read_sample` only performs raw I/O and lossy UTF-8
+                // conversion (never rejects content) — any failure here is
+                // transient, never a content verdict.
                 Err(e) => {
-                    return DownstreamClassification::ScanSkipped {
+                    return DownstreamClassification::ScanTransientError {
                         reason: format!("sample read failed: {e}"),
                     };
                 }

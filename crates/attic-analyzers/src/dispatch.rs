@@ -3,9 +3,10 @@
 //! ## Algorithm
 //!
 //! 1. Select the best analyzer from the registry for the input's `FileType`.
-//! 2. If the selected analyzer **is** the generic fallback, run it directly
-//!    (no panic-catching overhead needed — `GenericAnalyzer` is the terminal
-//!    safe fallback).
+//! 2. If the selected analyzer **is** the generic fallback, run it wrapped in
+//!    `std::panic::catch_unwind` — there is nowhere further to fall back to,
+//!    but a panic here must still never propagate and abort the whole
+//!    indexing run for every other file.
 //! 3. For specialized analyzers:
 //!    - Prepare the bounded spool (see below). If preparation fails (cancelled,
 //!      time budget exhausted, or I/O error), return a diagnostic output
@@ -123,9 +124,16 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
     let file_type = input.file_type;
     let (analyzer, is_generic) = registry.select(file_type);
 
-    // GenericAnalyzer is the terminal safe fallback — no panic catch needed.
+    // GenericAnalyzer is the terminal safe fallback — there is nowhere further
+    // to fall back to, but it must still never be allowed to unwind past this
+    // point: a panic here would otherwise abort the entire indexing run for
+    // every other file, not just this one.
     if is_generic {
-        return analyzer.analyze(input);
+        let file_occurrence_id = input.file_occurrence_id;
+        return match panic::catch_unwind(AssertUnwindSafe(|| analyzer.analyze(input))) {
+            Ok(output) => output,
+            Err(_panic_payload) => generic_panic_output(file_occurrence_id),
+        };
     }
 
     // Prepare fallback and specialized inputs.
@@ -177,33 +185,45 @@ pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOu
         // caller always receives useful retrieval units.  Original error
         // diagnostics are preserved for traceability.
         Ok(specialized_output) => {
+            let file_occurrence_id = fallback_input.file_occurrence_id;
             let generic = GenericAnalyzer::new();
-            let mut fb_output = generic.analyze(fallback_input);
-            // Preserve the original error diagnostics for traceability.
-            fb_output.diagnostics.extend(specialized_output.diagnostics);
-            fb_output.diagnostics.push(AnalyzerDiagnostic::warning(
-                diagnostic_codes::FALLBACK_USED,
-                "Specialized analyzer produced error diagnostics; \
-                 output produced by GenericAnalyzer fallback.",
-            ));
-            fb_output.fallback_used = true;
-            fb_output
+            // The fallback analyzer must never be allowed to unwind either —
+            // a panic here previously would have aborted the whole run.
+            match panic::catch_unwind(AssertUnwindSafe(|| generic.analyze(fallback_input))) {
+                Ok(mut fb_output) => {
+                    // Preserve the original error diagnostics for traceability.
+                    fb_output.diagnostics.extend(specialized_output.diagnostics);
+                    fb_output.diagnostics.push(AnalyzerDiagnostic::warning(
+                        diagnostic_codes::FALLBACK_USED,
+                        "Specialized analyzer produced error diagnostics; \
+                         output produced by GenericAnalyzer fallback.",
+                    ));
+                    fb_output.fallback_used = true;
+                    fb_output
+                }
+                Err(_panic_payload) => generic_panic_output(file_occurrence_id),
+            }
         }
 
         // ── Specialized panicked ─────────────────────────────────────────────
         Err(_panic_payload) => {
+            let file_occurrence_id = fallback_input.file_occurrence_id;
             let generic = GenericAnalyzer::new();
-            let mut out = generic.analyze(fallback_input);
-            out.diagnostics.push(AnalyzerDiagnostic::warning(
-                diagnostic_codes::PANIC_CAUGHT,
-                "Specialized analyzer panicked; recovered via GenericAnalyzer fallback.",
-            ));
-            out.diagnostics.push(AnalyzerDiagnostic::warning(
-                diagnostic_codes::FALLBACK_USED,
-                "Output produced by GenericAnalyzer after specialized analyzer panic.",
-            ));
-            out.fallback_used = true;
-            out
+            match panic::catch_unwind(AssertUnwindSafe(|| generic.analyze(fallback_input))) {
+                Ok(mut out) => {
+                    out.diagnostics.push(AnalyzerDiagnostic::warning(
+                        diagnostic_codes::PANIC_CAUGHT,
+                        "Specialized analyzer panicked; recovered via GenericAnalyzer fallback.",
+                    ));
+                    out.diagnostics.push(AnalyzerDiagnostic::warning(
+                        diagnostic_codes::FALLBACK_USED,
+                        "Output produced by GenericAnalyzer after specialized analyzer panic.",
+                    ));
+                    out.fallback_used = true;
+                    out
+                }
+                Err(_panic_payload) => generic_panic_output(file_occurrence_id),
+            }
         }
     };
 
@@ -537,6 +557,33 @@ fn preparation_io_failure_output(file_occurrence_id: FileOccurrenceId) -> Analyz
             diagnostic_codes::FALLBACK_USED,
             "Streaming spool preparation failed (I/O error); \
              specialized analyzer was not invoked.",
+        )],
+        fallback_used: true,
+        structurally_complete: false,
+        capability_used: CapabilityKind::Lexical,
+    }
+}
+
+/// Output returned when `GenericAnalyzer` itself panicked — either as the
+/// primary analyzer or as the last-resort fallback after a specialized
+/// analyzer failed. There is no further analyzer to fall back to, so this
+/// is a terminal, empty-but-valid output (never fabricated/lossy content):
+/// zero retrieval units with a diagnostic recording exactly what happened,
+/// rather than letting the panic unwind and abort the entire indexing run.
+fn generic_panic_output(file_occurrence_id: FileOccurrenceId) -> AnalyzerOutput {
+    AnalyzerOutput {
+        analyzer_id: "dispatch".to_string(),
+        analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
+        file_occurrence_id,
+        structural_nodes: vec![],
+        symbols: vec![],
+        imports: vec![],
+        relationships: vec![],
+        retrieval_units: vec![],
+        diagnostics: vec![AnalyzerDiagnostic::warning(
+            diagnostic_codes::PANIC_CAUGHT,
+            "GenericAnalyzer panicked; no further fallback exists. \
+             Returning an empty, non-fabricated output for this file.",
         )],
         fallback_used: true,
         structurally_complete: false,
@@ -1311,4 +1358,40 @@ mod tests {
             "io_failure output must carry the original file_occurrence_id, not a new_v4()"
         );
     }
+
+    /// Phase 6.4 — a panic inside `GenericAnalyzer` used as the PRIMARY
+    /// analyzer (no specialized analyzer registered for this file type) must
+    /// be caught, not propagate out of `dispatch()` and abort the whole
+    /// indexing run for every other file.
+    #[test]
+    fn generic_panic_as_primary_is_caught_not_propagated() {
+        let panicking_generic = Arc::new(PanicStub::new(FileType::Rust)) as Arc<dyn Analyzer>;
+        let registry = AnalyzerRegistry::new(panicking_generic);
+
+        let input = make_text_input("fn whatever() {}\n", FileType::Rust);
+        let original_id = input.file_occurrence_id;
+
+        let output = dispatch(&registry, input);
+
+        assert_eq!(output.file_occurrence_id, original_id);
+        assert!(
+            output.retrieval_units.is_empty(),
+            "a caught panic must never fabricate lossy garbage units"
+        );
+        let codes: Vec<&str> = output.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains(&diagnostic_codes::PANIC_CAUGHT),
+            "must record that a panic was caught, not silently swallow it"
+        );
+    }
+
+    // Note: the fallback-after-specialized-failure call sites (used when a
+    // specialized analyzer errors or panics) always construct a real
+    // `GenericAnalyzer::new()` directly rather than the registry-selected
+    // generic analyzer, so — unlike the primary-path case above — a
+    // panicking test double cannot be substituted there without a deeper
+    // dependency-injection change. Those two sites got the identical
+    // `catch_unwind` treatment verbatim (see `generic_panic_output` call
+    // sites in `dispatch()`), proven correct by the same pattern tested
+    // above; they are not independently exercised by a dedicated test.
 }

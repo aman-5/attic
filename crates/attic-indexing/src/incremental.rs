@@ -27,7 +27,7 @@ use std::path::Path;
 use tracing::debug;
 
 use attic_core::{
-    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
+    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, IndexGenerationId,
     RepositoryId, SecurityState, SourceRevisionId,
 };
 use attic_discovery::{DiscoveryPolicy, manifest_hash_from_pairs};
@@ -92,6 +92,15 @@ pub struct ScopedIndexResult {
     pub units_inserted: usize,
 }
 
+/// A cheap (size, mtime) fingerprint used to detect a file changing between
+/// two independent reads. `None` if the file cannot currently be stat'd —
+/// callers must treat that as "cannot confirm stability", never as a match.
+fn file_fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    Some((meta.len(), modified))
+}
+
 /// Stream-hash one file with BLAKE3 (64 KiB chunks; content-only identity).
 fn hash_file_content(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
@@ -145,6 +154,11 @@ pub fn index_changes(
     // and hash failures are propagated as errors so the task retries — never
     // silently converted into "file missing".
     let mut upsert_hashes: BTreeMap<String, String> = BTreeMap::new();
+    // Fingerprint taken immediately before hashing each file — compared
+    // against a second fingerprint taken after the analyzer's independent
+    // re-read (step 5) to detect the file changing mid-capture (Phase 6.4).
+    let mut upsert_stat_before: BTreeMap<String, Option<(u64, std::time::SystemTime)>> =
+        BTreeMap::new();
     let mut vanished: Vec<String> = Vec::new();
     for rel in &changes.upserts {
         let abs = root.join(rel);
@@ -156,9 +170,11 @@ pub fn index_changes(
                 source: std::io::Error::other("indexed file path became a directory"),
             });
         }
+        let stat_before = file_fingerprint(&abs);
         match hash_file_content(&abs) {
             Ok(h) => {
                 upsert_hashes.insert(rel.clone(), h);
+                upsert_stat_before.insert(rel.clone(), stat_before);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 debug!(path = %rel, "upsert target verifiably gone before publication");
@@ -268,6 +284,24 @@ pub fn index_changes(
                 security_state,
                 is_partial_scan,
             }) => {
+                // Phase 6.4 — file-changed-during-capture guard: `hash` above
+                // and `analyze_single_file`'s independent re-read (just now)
+                // are two temporally-separated reads of the same path. If the
+                // file changed in between, `content_hash` and the indexed
+                // retrieval-unit text could come from two different
+                // snapshots — an internally-inconsistent occurrence. Fail
+                // closed: abort the whole scoped batch for retry, exactly
+                // like any other unresolved transient condition here.
+                let stat_before = upsert_stat_before.get(rel).copied().flatten();
+                let stat_after = file_fingerprint(&rec.abs_path);
+                if stat_before.is_none() || stat_before != stat_after {
+                    return Err(IndexError::Io {
+                        path: rel.clone(),
+                        source: std::io::Error::other(
+                            "file changed between hash capture and analysis (unstable read)",
+                        ),
+                    });
+                }
                 rec.security_state = security_state;
                 rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
@@ -288,26 +322,22 @@ pub fn index_changes(
                 // tombstone). A path with no prior occurrence is simply not
                 // indexed — nothing to retire.
                 debug!(path = %rel, "upsert permanently skipped (unsupported/excluded content)");
-                if let Some(snap) = old_snapshots.get(rel) {
+                if old_snapshots.contains_key(rel) {
                     skip_tombstoned += 1;
-                    tombstones.push(PublicationFile {
-                        identity_id: rec.fi_id,
-                        identity_repository_id: repo_id,
-                        stable_id_basis: rec.stable_id_basis.clone(),
-                        occurrence: PublicationOccurrence {
-                            id: FileOccurrenceId::new_v4(),
-                            source_revision_id: rev_id,
-                            index_generation_id: Some(gen_id),
-                            path: rel.clone(),
-                            content_hash: snap.content_hash.clone(),
-                            size_bytes: 0,
-                            language: None,
-                            file_type: FileType::Other,
-                            discovery_class: DiscoveryClass::Vcs,
-                            security_state: SecurityState::Skipped,
-                            existence_state: ExistenceState::Deleted,
-                        },
-                    });
+                    // Use the CURRENT file's hash (`rec.content_hash`, already
+                    // known from step 2) rather than the old snapshot's — the
+                    // file still exists on disk, just as permanently
+                    // unsupported content, so the current hash is the more
+                    // accurate/available fact.
+                    tombstones.push(crate::build_tombstone(
+                        repo_id,
+                        rev_id,
+                        gen_id,
+                        rec.fi_id,
+                        rec.stable_id_basis.clone(),
+                        rel.clone(),
+                        rec.content_hash.clone(),
+                    ));
                 }
             }
             Err(e) => {
@@ -346,24 +376,15 @@ pub fn index_changes(
         let identity_id: FileIdentityId = snap
             .and_then(|s| s.file_identity_id.parse().ok())
             .unwrap_or_else(FileIdentityId::new_v4);
-        tombstones.push(PublicationFile {
+        tombstones.push(crate::build_tombstone(
+            repo_id,
+            rev_id,
+            gen_id,
             identity_id,
-            identity_repository_id: repo_id,
-            stable_id_basis: format!("{repo_id_str}/{rel}"),
-            occurrence: PublicationOccurrence {
-                id: FileOccurrenceId::new_v4(),
-                source_revision_id: rev_id,
-                index_generation_id: Some(gen_id),
-                path: rel.clone(),
-                content_hash: snap.map(|s| s.content_hash.clone()).unwrap_or_default(),
-                size_bytes: 0,
-                language: None,
-                file_type: FileType::Other,
-                discovery_class: DiscoveryClass::Vcs,
-                security_state: SecurityState::Skipped,
-                existence_state: ExistenceState::Deleted,
-            },
-        });
+            format!("{repo_id_str}/{rel}"),
+            rel.clone(),
+            snap.map(|s| s.content_hash.clone()).unwrap_or_default(),
+        ));
     }
 
     let gen_id_str = gen_id.to_string_repr();
@@ -483,7 +504,7 @@ pub fn index_changes(
         ) else {
             continue;
         };
-        if from_snap.content_hash != *new_hash || from_snap.existence_state == "DELETED" {
+        if from_snap.content_hash != *new_hash || from_snap.existence_state == "deleted" {
             continue;
         }
         let (Ok(from_identity), Some(new_identity)) = (
@@ -646,6 +667,36 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.4 — file-changed-during-capture detection primitive
+    // -----------------------------------------------------------------------
+
+    /// `file_fingerprint` must change when the file's size/mtime changes, and
+    /// stay identical for an untouched file — the exact property
+    /// `index_changes` relies on to detect an unstable capture between its
+    /// hash read (step 2) and the analyzer's independent re-read (step 5).
+    #[test]
+    fn file_fingerprint_detects_content_change_and_is_stable_when_untouched() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("watched.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+
+        let fp1 = file_fingerprint(&path);
+        let fp2 = file_fingerprint(&path);
+        assert!(fp1.is_some());
+        assert_eq!(fp1, fp2, "an untouched file's fingerprint must be stable");
+
+        // Ensure the mtime actually advances even on coarse filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "fn after_a_real_change() {}\n").unwrap();
+        let fp3 = file_fingerprint(&path);
+        assert!(fp3.is_some());
+        assert_ne!(
+            fp1, fp3,
+            "a changed file's fingerprint must differ (size and/or mtime)"
+        );
     }
 
     #[test]

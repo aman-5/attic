@@ -2642,6 +2642,7 @@ mod tests {
                 IndexError::Io { .. } => {}
                 IndexError::PolicyHash(_) => {}
                 IndexError::RepositoryNotBootstrapped(_) => {}
+                IndexError::TransientFailures { .. } => {}
             }
         }
     }
@@ -3965,9 +3966,9 @@ mod tests {
         .unwrap();
 
         // Re-index the dependent repo through the normal production path.
-        // bootstrap_workspace short-circuits if the repo is already registered,
-        // so use index_repository directly to force a fresh index of the updated
-        // manifest.
+        // Use index_repository directly (rather than spawning a full server
+        // round-trip through bootstrap_workspace) purely to keep this test
+        // step synchronous and scoped to indexing.
         {
             let srv =
                 AtticServer::new_with_semantic_opt(&db_path, false).expect("server for re-index");

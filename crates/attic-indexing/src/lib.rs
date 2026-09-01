@@ -45,7 +45,7 @@ use attic_storage::{
     DbPool, IndexPublication, IndexPublicationStats, PublicationFile, PublicationOccurrence,
     PublicationRetrievalUnit, StorageError, WriterQueueHandle, latest_active_paths_for_repository,
     lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
-    lookup_repository_by_root_path, submit_index_publication,
+    lookup_occurrence_snapshot, lookup_repository_by_root_path, submit_index_publication,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,17 @@ pub enum IndexError {
     PolicyHash(String),
     #[error("repository at {0} has not been bootstrapped; run a full index first")]
     RepositoryNotBootstrapped(String),
+    /// Generation-completeness invariant (Phase 6.4): one or more discovered
+    /// paths hit a transient/retryable failure and never reached a terminal
+    /// state (indexed, intentionally skipped, or removed/excluded) this run.
+    /// The caller MUST treat this exactly like any other failed indexing
+    /// attempt — nothing was published, the previous generation (if any)
+    /// remains untouched and current, and a retry is expected to resolve it.
+    #[error(
+        "indexing generation incomplete: {} file(s) failed with a transient/retryable error and never reached a terminal state; nothing was published, the previous generation remains current",
+        paths.len()
+    )]
+    TransientFailures { paths: Vec<String> },
 }
 
 pub mod incremental;
@@ -201,13 +212,51 @@ fn security_state_for_decision(decision: &SecretScanDecision) -> SecurityState {
     }
 }
 
-/// Retire the current occurrence of `path` (deleted from disk, newly
-/// excluded, or newly permanently unsupported): look up its prior file
-/// identity/occurrence and, if one exists, schedule the old occurrence's
-/// units/structural rows for deletion and publish a `Deleted` tombstone
-/// occurrence in its place. A no-op (nothing pushed) if the path has no
-/// prior occurrence — there is nothing to retire.
+/// Build a `Deleted`/`Skipped` tombstone occurrence for `repo_relative`.
+///
+/// The single shared tombstone contract for full and incremental indexing —
+/// every call site must go through this so the shape (and fields like
+/// `content_hash`) cannot silently drift between the two pipelines.
+/// `prior_content_hash` should be the best hash available for this path
+/// (the file's current on-disk hash if it still exists but is being retired
+/// as permanently unsupported/excluded, or the last-known hash if the path
+/// is gone entirely); pass `String::new()` only when truly unknown.
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tombstone(
+    repo_id: RepositoryId,
+    rev_id: SourceRevisionId,
+    gen_id: IndexGenerationId,
+    identity_id: FileIdentityId,
+    stable_id_basis: String,
+    repo_relative: String,
+    prior_content_hash: String,
+) -> PublicationFile {
+    PublicationFile {
+        identity_id,
+        identity_repository_id: repo_id,
+        stable_id_basis,
+        occurrence: PublicationOccurrence {
+            id: FileOccurrenceId::new_v4(),
+            source_revision_id: rev_id,
+            index_generation_id: Some(gen_id),
+            path: repo_relative,
+            content_hash: prior_content_hash,
+            size_bytes: 0,
+            language: None,
+            file_type: FileType::Other,
+            discovery_class: DiscoveryClass::Vcs,
+            security_state: SecurityState::Skipped,
+            existence_state: ExistenceState::Deleted,
+        },
+    }
+}
+
+/// Retire the current occurrence of `path` (deleted from disk, newly
+/// excluded, or newly permanently unsupported): look up its prior
+/// identity/occurrence/content-hash and, if one exists, schedule the old
+/// occurrence's units/structural rows for deletion and publish a `Deleted`
+/// tombstone occurrence in its place. A genuine no-op (nothing pushed) if
+/// the path has no prior occurrence — there is nothing to retire.
 fn retire_path(
     store: &IndexingStore<'_>,
     repo_id: RepositoryId,
@@ -217,38 +266,29 @@ fn retire_path(
     stale_occurrences: &mut Vec<String>,
     tombstones: &mut Vec<PublicationFile>,
 ) -> Result<(), IndexError> {
+    let Some(snap) = store
+        .readers
+        .with_reader(|c| lookup_occurrence_snapshot(c, &repo_id, repo_relative))
+        .map_err(IndexError::Storage)?
+    else {
+        // No prior occurrence: genuinely nothing to retire.
+        return Ok(());
+    };
+    stale_occurrences.push(snap.id.clone());
+    let identity_id: FileIdentityId = snap
+        .file_identity_id
+        .parse()
+        .unwrap_or_else(|_| FileIdentityId::new_v4());
     let repo_id_str = repo_id.to_string_repr();
-    let stable_id_basis = format!("{repo_id_str}/{repo_relative}");
-    let fi_id: FileIdentityId = store
-        .readers
-        .with_reader(|c| lookup_file_identity_by_basis(c, &stable_id_basis))
-        .map_err(IndexError::Storage)?
-        .unwrap_or_else(FileIdentityId::new_v4);
-    if let Some(old) = store
-        .readers
-        .with_reader(|c| lookup_latest_file_occurrence_for_path(c, &repo_id, repo_relative))
-        .map_err(IndexError::Storage)?
-    {
-        stale_occurrences.push(old);
-    }
-    tombstones.push(PublicationFile {
-        identity_id: fi_id,
-        identity_repository_id: repo_id,
-        stable_id_basis,
-        occurrence: PublicationOccurrence {
-            id: FileOccurrenceId::new_v4(),
-            source_revision_id: rev_id,
-            index_generation_id: Some(gen_id),
-            path: repo_relative.to_owned(),
-            content_hash: String::new(),
-            size_bytes: 0,
-            language: None,
-            file_type: FileType::Other,
-            discovery_class: DiscoveryClass::Vcs,
-            security_state: SecurityState::Skipped,
-            existence_state: ExistenceState::Deleted,
-        },
-    });
+    tombstones.push(build_tombstone(
+        repo_id,
+        rev_id,
+        gen_id,
+        identity_id,
+        format!("{repo_id_str}/{repo_relative}"),
+        repo_relative.to_owned(),
+        snap.content_hash,
+    ));
     Ok(())
 }
 
@@ -342,18 +382,29 @@ pub fn index_repository(
     //    on this run's own writes, so pre-publication reads are correct.
     let mut file_records: Vec<FileRecord> = Vec::new();
 
-    // Authoritative reconciliation bookkeeping (P0-4/P0-5): a full index run
-    // must retire any previously-active path that is no longer part of
-    // current indexable truth (deleted from disk, newly excluded, or newly
+    // Authoritative reconciliation bookkeeping (P0-4): a full index run must
+    // retire any previously-active path that is no longer part of current
+    // indexable truth (deleted from disk, newly excluded, or newly
     // permanently unsupported) rather than silently leaving its old
     // occurrence/units/structural rows as searchable "current" content.
     // `stale_occurrences` therefore accumulates ids to retire from THREE
     // sources: (a) a path successfully reindexed (below), (b) a path
     // permanently skipped this run that had prior content, and (c) a path
     // that vanished from discovery entirely (handled after this loop).
-    // Transient failures are handled separately via `degraded_occurrences`:
-    // their prior occurrence is degraded (CURRENT → STALE) but never
-    // deleted, so a retry can still repair it.
+    //
+    // Generation-completeness invariant (Phase 6.4): every discovered path
+    // must reach an explicit terminal state — INDEXED, INTENTIONALLY_SKIPPED,
+    // or REMOVED/EXCLUDED — before this run's generation may be published as
+    // authoritative/current. A transient/retryable failure (stat race, I/O
+    // hiccup, unstable read) is none of those; `transient_failed_paths`
+    // collects every such path, and if it is non-empty when the analysis
+    // loop finishes, the ENTIRE run aborts with `IndexError::TransientFailures`
+    // BEFORE `submit_index_publication` is ever called — the previous
+    // generation (if any) is left completely untouched and stays current.
+    // This mirrors the incremental pipeline's existing "no silent fallback,
+    // whole batch aborts for scheduler retry" contract instead of publishing
+    // a generation that mixes verified-current content with content nobody
+    // actually verified this run.
     let previous_active: HashSet<String> = store
         .readers
         .with_reader(|c| latest_active_paths_for_repository(c, &repo_id))
@@ -363,7 +414,7 @@ pub fn index_repository(
     let mut current_entry_paths: HashSet<String> = HashSet::new();
     let mut stale_occurrences: Vec<String> = Vec::new();
     let mut tombstones: Vec<PublicationFile> = Vec::new();
-    let mut degraded_occurrences: Vec<String> = Vec::new();
+    let mut transient_failed_paths: Vec<String> = Vec::new();
 
     for entry in &discovery.entries {
         result.files_visited += 1;
@@ -395,22 +446,31 @@ pub fn index_repository(
             continue;
         }
 
+        if let Some(DownstreamClassification::ScanTransientError { reason }) = classification {
+            // NOT a content verdict — never tombstone, never treat as a
+            // permanent skip. Record for the completeness gate below.
+            warn!(
+                path = %entry.repo_relative,
+                reason = %reason,
+                "discovery classification transient error; this run cannot become current until resolved"
+            );
+            transient_failed_paths.push(entry.repo_relative.clone());
+            continue;
+        }
+
         let file_meta = match std::fs::metadata(&entry.abs_path) {
             Ok(m) => m,
             Err(e) => {
-                warn!(path = %entry.repo_relative, error = %e, "stat failed, skipping");
-                result.files_skipped += 1;
-                // Transient (the path was just discovered on disk): degrade,
-                // don't tombstone — do not falsely delete on a read race.
-                if let Some(old) = store
-                    .readers
-                    .with_reader(|c| {
-                        lookup_latest_file_occurrence_for_path(c, &repo_id, &entry.repo_relative)
-                    })
-                    .map_err(IndexError::Storage)?
-                {
-                    degraded_occurrences.push(old);
-                }
+                // Transient (the path was just discovered on disk moments
+                // ago; a stat failure now is a race, not a permanent
+                // condition). Never falsely tombstone/delete on this — record
+                // it and let the generation-completeness gate below decide.
+                warn!(
+                    path = %entry.repo_relative,
+                    error = %e,
+                    "stat failed (transient); this run cannot become current until resolved"
+                );
+                transient_failed_paths.push(entry.repo_relative.clone());
                 continue;
             }
         };
@@ -529,42 +589,44 @@ pub fn index_repository(
                 result.files_skipped += 1;
                 if let Some(old) = rec.old_fo_id.clone() {
                     stale_occurrences.push(old);
-                    tombstones.push(PublicationFile {
-                        identity_id: rec.fi_id,
-                        identity_repository_id: repo_id,
-                        stable_id_basis: rec.stable_id_basis.clone(),
-                        occurrence: PublicationOccurrence {
-                            id: FileOccurrenceId::new_v4(),
-                            source_revision_id: rev_id,
-                            index_generation_id: Some(gen_id),
-                            path: rec.repo_relative.clone(),
-                            content_hash: String::new(),
-                            size_bytes: 0,
-                            language: None,
-                            file_type: FileType::Other,
-                            discovery_class: DiscoveryClass::Vcs,
-                            security_state: SecurityState::Skipped,
-                            existence_state: ExistenceState::Deleted,
-                        },
-                    });
+                    tombstones.push(build_tombstone(
+                        repo_id,
+                        rev_id,
+                        gen_id,
+                        rec.fi_id,
+                        rec.stable_id_basis.clone(),
+                        rec.repo_relative.clone(),
+                        rec.content_hash.clone(),
+                    ));
                 }
             }
             Err(e) => {
-                // Transient failure: do not falsely delete. Degrade the
-                // prior occurrence (CURRENT → STALE) so it stays searchable
-                // but is no longer advertised as current truth, and let the
-                // next run retry the replacement (P0-5).
+                // Transient/retryable failure: this path has not reached any
+                // terminal state this run. Do not falsely delete or publish
+                // anything for it — record it for the completeness gate
+                // below, which aborts the whole run rather than publish a
+                // generation that mixes verified content with content nobody
+                // actually verified.
                 warn!(
                     path = %rec.repo_relative,
                     error = %e,
-                    "analysis failed (transient), degrading prior occurrence for retry"
+                    "analysis failed (transient); this run cannot become current until resolved"
                 );
-                result.files_skipped += 1;
-                if let Some(old) = rec.old_fo_id.clone() {
-                    degraded_occurrences.push(old);
-                }
+                transient_failed_paths.push(rec.repo_relative.clone());
             }
         }
+    }
+
+    // Generation-completeness gate (Phase 6.4): every discovered path must
+    // have reached INDEXED, INTENTIONALLY_SKIPPED, or REMOVED/EXCLUDED above.
+    // Any transient/retryable failure means this generation is not
+    // authoritative — abort before publication so the previous generation
+    // (if any) remains completely untouched and current; the scheduler is
+    // expected to retry the full index later.
+    if !transient_failed_paths.is_empty() {
+        return Err(IndexError::TransientFailures {
+            paths: transient_failed_paths,
+        });
     }
 
     // 7. Publish EVERYTHING as one coordinated writer-queue mutation.
@@ -682,11 +744,13 @@ pub fn index_repository(
     )
     .map_err(IndexError::Storage)?;
 
-    // Post-publication follow-ups (mirrors the incremental pipeline's
+    // Post-publication follow-up (mirrors the incremental pipeline's
     // contract): flip newly-committed tombstones to INVALID so they are
-    // never mistaken for CURRENT content, and degrade prior occurrences
-    // whose replacement failed transiently so they stay searchable but are
-    // no longer advertised as current truth (P0-4/P0-5).
+    // never mistaken for CURRENT content (P0-4). Note there is no
+    // transient-failure degrade step here any more (Phase 6.3) — the
+    // generation-completeness gate above already guarantees that if we
+    // reached this point, every discovered path resolved to a terminal
+    // state, so there is nothing left to degrade (Phase 6.4).
     if !tombstone_occurrence_ids.is_empty() {
         let tomb = tombstone_occurrence_ids;
         store
@@ -697,24 +761,6 @@ pub fn index_repository(
                         "UPDATE core_file_occurrences
                             SET freshness_state = 'INVALID'
                           WHERE id = ?1 AND existence_state = 'deleted'",
-                        [id],
-                    )
-                    .map_err(StorageError::from)?;
-                }
-                Ok(())
-            })
-            .map_err(IndexError::Storage)?;
-    }
-    if !degraded_occurrences.is_empty() {
-        let degraded = degraded_occurrences;
-        store
-            .writer
-            .send(move |conn| {
-                for id in &degraded {
-                    conn.execute(
-                        "UPDATE core_file_occurrences
-                            SET freshness_state = 'STALE'
-                          WHERE id = ?1 AND freshness_state = 'CURRENT'",
                         [id],
                     )
                     .map_err(StorageError::from)?;
@@ -937,6 +983,11 @@ fn classify_security_state(
         Some(DownstreamClassification::PartialScan { .. }) => (SecurityState::Pending, true),
         Some(DownstreamClassification::ScanSkipped { .. }) => (SecurityState::Skipped, false),
         Some(DownstreamClassification::Excluded) => (SecurityState::Skipped, false),
+        // Never actually reached: the caller's entry loop routes
+        // `ScanTransientError` into `transient_failed_paths` and `continue`s
+        // before ever calling this function. Handled defensively so the
+        // match stays exhaustive.
+        Some(DownstreamClassification::ScanTransientError { .. }) => (SecurityState::Pending, false),
         None => (SecurityState::Pending, false),
     }
 }
@@ -2072,5 +2123,74 @@ mod tests {
             ),
             Err(other) => panic!("expected IndexError::Io for a transient I/O failure, got {other}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.4 — generation-completeness invariant
+    // -----------------------------------------------------------------------
+
+    /// A transient/retryable failure on ANY discovered file must abort the
+    /// entire generation — including the files that WOULD have succeeded —
+    /// rather than publish a generation that mixes verified-current content
+    /// with content nobody actually verified this run. The previous
+    /// generation must remain completely untouched and current.
+    ///
+    /// Windows-only: uses `share_mode(0)` (deny all sharing) to force a
+    /// genuine transient I/O error deterministically and portably, without
+    /// mocking. This exercises `index_repository`'s aggregate behavior; the
+    /// underlying fix (bail before publication on any transient failure) is
+    /// itself platform-agnostic and is also covered indirectly by the
+    /// platform-independent `analyze_single_file_missing_path_is_transient_not_skip`
+    /// unit test above.
+    #[cfg(windows)]
+    #[test]
+    fn transient_failure_aborts_whole_generation_old_state_preserved() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fx = make_store();
+        write_file(fx._dir.path(), "good.rs", "fn good_token() {}\n");
+        write_file(fx._dir.path(), "locked.rs", "fn locked_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(search_hits(&fx, "good_token").len(), 1);
+        assert_eq!(search_hits(&fx, "locked_token").len(), 1);
+
+        // Modify both files, then exclusively lock one so this run's read of
+        // it fails with a genuine transient I/O error (never InvalidData).
+        write_file(fx._dir.path(), "good.rs", "fn good_token_v2() {}\n");
+        write_file(fx._dir.path(), "locked.rs", "fn locked_token_v2() {}\n");
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(fx._dir.path().join("locked.rs"))
+            .expect("open with exclusive sharing to simulate a transient lock conflict");
+
+        let result = index_repository(&s, fx._dir.path(), &policy, &opts);
+        drop(_lock);
+
+        match result {
+            Err(IndexError::TransientFailures { paths }) => {
+                assert!(paths.iter().any(|p| p == "locked.rs"));
+            }
+            other => panic!(
+                "a transient read failure must abort the whole generation with \
+                 TransientFailures, not publish a mixed one; got {other:?}"
+            ),
+        }
+
+        // Old generation must remain entirely intact — including good.rs,
+        // which WOULD have analyzed successfully this run.
+        assert_eq!(
+            search_hits(&fx, "good_token").len(),
+            1,
+            "good.rs's OLD content must still be current"
+        );
+        assert!(
+            search_hits(&fx, "good_token_v2").is_empty(),
+            "new content must never be published while the generation is incomplete"
+        );
+        assert_eq!(search_hits(&fx, "locked_token").len(), 1);
     }
 }
