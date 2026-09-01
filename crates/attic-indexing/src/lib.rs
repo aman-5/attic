@@ -2733,7 +2733,6 @@ mod tests {
 
         fx.handle
             .send({
-                let repo_id = repo_id;
                 let cached_policy_hash = wrong_policy_hash;
                 move |conn| {
                     attic_storage::upsert_analysis_cache_entries(
@@ -2797,7 +2796,7 @@ mod tests {
             .find(|(p, _)| p == "a.rs")
             .map(|(_, h)| h)
             .expect("a.rs must have a content hash after indexing");
-
+        let policy_for_cache = policy.clone();
         fx.handle
             .send(move |conn| {
                 attic_storage::upsert_analysis_cache_entries(
@@ -2811,7 +2810,7 @@ mod tests {
                         secret_pattern_version: SECRET_PATTERN_VERSION - 1,
                         analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
                             .to_owned(),
-                        discovery_policy_hash: policy.hash().unwrap(),
+                        discovery_policy_hash: policy_for_cache.hash().unwrap(),
                         structural: true,
                         max_units_per_file: 512,
                         units_json: "[]".to_string(),
