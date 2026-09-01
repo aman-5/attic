@@ -23,9 +23,8 @@ pub use domain::{
     enums::{
         ArtifactType, Authority, CompatibilityClass, DependencyBasis, DiscoveryClass,
         ExistenceState, FileType, FreshnessState, InvalidationArtifactType, InvalidationCause,
-        InvalidationReason, LexicalState, RelType, Resolution, ResourcePressure, SecretScanState,
-        SecurityState, SemanticState, SourceType, SymbolKind, TaskState, TaskType,
-        VerificationState,
+        LexicalState, RelType, Resolution, ResourcePressure, SecretScanState, SecurityState,
+        SemanticState, SourceType, SymbolKind, TaskState, TaskType, VerificationState,
     },
     ids::{
         EvidenceId, FileIdentityId, FileOccurrenceId, IndexGenerationId, OpsAuditId, RepositoryId,

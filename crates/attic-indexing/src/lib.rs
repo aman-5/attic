@@ -661,6 +661,9 @@ pub fn index_repository(
                     && cached.secret_pattern_version == SECRET_PATTERN_VERSION
                     && cached.analyzer_registry_version
                         == attic_core::constants::ANALYZER_REGISTRY_VERSION
+                    && cached.discovery_policy_hash == policy_hash
+                    && cached.structural == opts.structural
+                    && cached.max_units_per_file == opts.max_units_per_file as u64
             })
             .and_then(|cached| reconstruct_file_prep_from_cache(cached, &rec));
         let was_cache_hit = cache_hit.is_some();
@@ -717,6 +720,9 @@ pub fn index_repository(
                         secret_pattern_version: SECRET_PATTERN_VERSION,
                         analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
                             .to_owned(),
+                        discovery_policy_hash: policy_hash.clone(),
+                        structural: opts.structural,
+                        max_units_per_file: opts.max_units_per_file as u64,
                         units_json,
                         captured_json,
                     });
@@ -823,15 +829,6 @@ pub fn index_repository(
         .collect();
     publication_files.extend(tombstones);
 
-    // Tombstone rows must never advertise CURRENT freshness (same contract
-    // as the incremental pipeline): flip them to INVALID right after
-    // publication, once their ids are committed.
-    let tombstone_occurrence_ids: Vec<String> = publication_files
-        .iter()
-        .filter(|f| f.occurrence.existence_state == ExistenceState::Deleted)
-        .map(|f| f.occurrence.id.to_string_repr())
-        .collect();
-
     let repo_id_str = repo_id.to_string_repr();
     let gen_id_str = gen_id.to_string_repr();
     let mut retrieval_units: Vec<PublicationRetrievalUnit> = Vec::new();
@@ -914,41 +911,21 @@ pub fn index_repository(
     )
     .map_err(IndexError::Storage)?;
 
-    // Post-publication follow-up (mirrors the incremental pipeline's
-    // contract): flip newly-committed tombstones to INVALID so they are
-    // never mistaken for CURRENT content (P0-4). Note there is no
-    // transient-failure degrade step here any more (Phase 6.3) — the
-    // generation-completeness gate above already guarantees that if we
-    // reached this point, every discovered path resolved to a terminal
-    // state, so there is nothing left to degrade (Phase 6.4).
-    if !tombstone_occurrence_ids.is_empty() {
-        let tomb = tombstone_occurrence_ids;
-        store
-            .writer
-            .send(move |conn| {
-                for id in &tomb {
-                    conn.execute(
-                        "UPDATE core_file_occurrences
-                            SET freshness_state = 'INVALID'
-                          WHERE id = ?1 AND existence_state = 'deleted'",
-                        [id],
-                    )
-                    .map_err(StorageError::from)?;
-                }
-                Ok(())
-            })
-            .map_err(IndexError::Storage)?;
-    }
-
     // PR-7: this generation published successfully, so any analysis cache
     // left over from an earlier failed attempt at this repository is no
     // longer needed — clear it so the table doesn't grow unbounded. Purely
     // a cache eviction: harmless if it's already empty, and has no bearing
     // on what just became CURRENT above.
-    store
+    if let Err(e) = store
         .writer
         .send(move |conn| attic_storage::clear_analysis_cache(conn, &repo_id))
-        .map_err(IndexError::Storage)?;
+    {
+        warn!(
+            repository_id = %repo_id,
+            error = %e,
+            "analysis-cache cleanup failed after successful publication; canonical index remains valid"
+        );
+    }
 
     result.units_inserted = stats.units_inserted;
     result.units_deleted = stats.units_deleted;
@@ -2719,6 +2696,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn analysis_cache_hit_requires_matching_policy_and_options() {
+        let fx = make_store();
+        let root = fx._dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "a.rs", "fn cache_policy_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+
+        let r1 = index_repository(&s, &root, &policy, &opts).unwrap();
+        let repo_id: RepositoryId = r1.repository_id.parse().unwrap();
+        let content_hash = fx
+            .pool
+            .with_reader(|c| attic_storage::current_path_hashes_for_repository(c, &repo_id))
+            .unwrap()
+            .into_iter()
+            .find(|(p, _)| p == "a.rs")
+            .map(|(_, h)| h)
+            .expect("a.rs must have a content hash after indexing");
+
+        let changed_policy = {
+            let mut p = policy.clone();
+            p.scan_exempt_paths.push("examples/**".to_string());
+            p
+        };
+
+        let wrong_policy_hash = policy.hash().unwrap();
+        let wrong_options = IndexOptions {
+            structural: false,
+            max_units_per_file: opts.max_units_per_file + 1,
+            ..opts.clone()
+        };
+        assert_ne!(changed_policy.hash().unwrap(), wrong_policy_hash);
+
+        fx.handle
+            .send({
+                let repo_id = repo_id;
+                let cached_policy_hash = wrong_policy_hash;
+                move |conn| {
+                    attic_storage::upsert_analysis_cache_entries(
+                        conn,
+                        &repo_id,
+                        &[attic_storage::CachedFileAnalysis {
+                            repo_relative: "a.rs".to_string(),
+                            content_hash,
+                            security_state: "clean".to_string(),
+                            is_partial_scan: false,
+                            secret_pattern_version: SECRET_PATTERN_VERSION,
+                            analyzer_registry_version:
+                                attic_core::constants::ANALYZER_REGISTRY_VERSION.to_owned(),
+                            discovery_policy_hash: cached_policy_hash,
+                            structural: wrong_options.structural,
+                            max_units_per_file: wrong_options.max_units_per_file as u64,
+                            units_json: "[]".to_string(),
+                            captured_json: None,
+                        }],
+                        0,
+                    )
+                }
+            })
+            .unwrap();
+
+        reset_analyze_single_file_calls();
+        index_repository(&s, &root, &policy, &opts).unwrap();
+        assert_eq!(
+            analyze_single_file_calls(),
+            1,
+            "cache entry from a different policy/options must be ignored"
+        );
+    }
+
     /// Code-review finding: a cache entry stamped with a stale
     /// secret-pattern/analyzer-registry version must never be replayed for
     /// unchanged content — a version mismatch is a cache miss, forcing
@@ -2762,6 +2811,9 @@ mod tests {
                         secret_pattern_version: SECRET_PATTERN_VERSION - 1,
                         analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
                             .to_owned(),
+                        discovery_policy_hash: policy.hash().unwrap(),
+                        structural: true,
+                        max_units_per_file: 512,
                         units_json: "[]".to_string(),
                         captured_json: None,
                     }],

@@ -12,7 +12,6 @@ members = [
     "crates/attic-incremental",
     "crates/attic-retrieval",
     "crates/attic-server",
-    "crates/attic-test-support",
 ]
 
 # Phase 7: production release profile.  Conservative, well-supported options
@@ -71,7 +70,6 @@ sysinfo            = { version = "0.33", default-features = false, features = ["
 tempfile           = "3"
 attic-core         = { path = "crates/attic-core" }
 attic-storage      = { path = "crates/attic-storage" }
-attic-test-support = { path = "crates/attic-test-support" }
 attic-discovery    = { path = "crates/attic-discovery" }
 attic-analyzers    = { path = "crates/attic-analyzers" }
 attic-indexing     = { path = "crates/attic-indexing" }

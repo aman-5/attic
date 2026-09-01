@@ -293,13 +293,13 @@ safely removes it at any time; it will be regenerated on the next build.
 
 ## Maintenance
 
-- **Schema migration**: `migrations/` holds Attic's ordered SQLite schema
-  migrations, required at every startup. Never delete or rename an
-  already-applied migration — even one whose filename carries historical
-  phase terminology (e.g. `0002_phase1d.sql`); future migrations should use
-  descriptive production names instead. Add a new file, wire it into
-  `run_migrations` (`crates/attic-storage/src/migration.rs`); migrations
-  apply forward-only and are rejected if unrecognized (see Recovery above).
+- **Schema migration**: QA starts from the frozen core baseline
+  `migrations/0001_initial.sql` and semantic baseline
+  `migrations/semantic/0001_initial.sql`. After the first public release,
+  these baselines are immutable: add ordered migrations for future schema
+  changes and wire core migrations into `run_migrations`
+  (`crates/attic-storage/src/migration.rs`). Migrations apply forward-only
+  and unrecognized schema versions are rejected (see Recovery above).
 - **IndexGeneration compatibility**: see
   `crates/attic-core/src/domain/subsystem_versions.rs` — bump the relevant
   subsystem version when changing what an analyzer/generation produces, so

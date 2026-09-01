@@ -21,7 +21,6 @@ tracing.workspace         = true
 thiserror.workspace       = true
 
 [dev-dependencies]
-attic-test-support.workspace = true
 tempfile.workspace           = true
 rusqlite.workspace           = true
 attic-incremental.workspace  = true

@@ -415,18 +415,6 @@ impl ResourceMonitor {
         self.process_rss_mib.load(Ordering::Relaxed)
     }
 
-    /// Compatibility shim: acquire a foreground slot.
-    #[deprecated(since = "0.1.0", note = "use acquire_foreground_slot")]
-    pub fn acquire_cpu_slot(&self) -> bool {
-        self.acquire_foreground_slot()
-    }
-
-    /// Compatibility shim: release a foreground slot.
-    #[deprecated(since = "0.1.0", note = "use release_foreground_slot")]
-    pub fn release_cpu_slot(&self) {
-        self.release_foreground_slot()
-    }
-
     // ── Pressure model ─────────────────────────────────────────────────────
 
     /// Compute the current resource pressure level.

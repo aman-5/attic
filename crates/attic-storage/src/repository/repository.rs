@@ -81,14 +81,17 @@ pub fn get_repository_stats(conn: &Connection) -> Result<Vec<RepositoryStats>, S
     // that tombstone must win — filtering `present` rows first (before
     // computing MAX(rowid)) would incorrectly resurrect the stale row.
     let sql = "
-        WITH latest AS (
+        WITH latest_row AS (
              SELECT fi.repository_id AS repository_id,
-                    fo.id AS fo_id,
-                    fo.existence_state AS existence_state,
-                    MAX(fo.rowid) AS m
+                    fo.path AS path,
+                    MAX(fo.rowid) AS max_rowid
                FROM core_file_occurrences fo
                JOIN core_file_identities fi ON fo.file_identity_id = fi.id
               GROUP BY fi.repository_id, fo.path
+        ), latest AS (
+             SELECT lr.repository_id, fo.id AS fo_id, fo.existence_state
+               FROM latest_row lr
+               JOIN core_file_occurrences fo ON fo.rowid = lr.max_rowid
         )
         SELECT r.id, r.display_name,
                COUNT(DISTINCT CASE WHEN latest.existence_state = 'present' THEN latest.fo_id END) AS files,

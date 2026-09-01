@@ -19,8 +19,9 @@ use attic_core::RepositoryId;
 
 use crate::error::StorageError;
 
-/// One cached analysis result for a single file, keyed by content hash so a
-/// changed file is never served a stale result.
+/// One cached analysis result for a single file. Cache reuse is permitted only
+/// when the content hash, discovery-policy hash, security/analyzer versions,
+/// and analysis options all match the current run.
 #[derive(Debug, Clone)]
 pub struct CachedFileAnalysis {
     /// Workspace-relative normalized path (forward slashes).
@@ -56,6 +57,7 @@ pub fn bulk_load_analysis_cache(
     let mut stmt = conn.prepare(
         "SELECT repo_relative, content_hash, security_state, is_partial_scan,
                 secret_pattern_version, analyzer_registry_version,
+                discovery_policy_hash, structural, max_units_per_file,
                 units_json, captured_json
            FROM index_analysis_cache
           WHERE repository_id = ?1",
@@ -68,8 +70,11 @@ pub fn bulk_load_analysis_cache(
             is_partial_scan: r.get::<_, i64>(3)? != 0,
             secret_pattern_version: r.get(4)?,
             analyzer_registry_version: r.get(5)?,
-            units_json: r.get(6)?,
-            captured_json: r.get(7)?,
+            discovery_policy_hash: r.get(6)?,
+            structural: r.get::<_, i64>(7)? != 0,
+            max_units_per_file: r.get::<_, i64>(8)? as u64,
+            units_json: r.get(9)?,
+            captured_json: r.get(10)?,
         })
     })?;
     let mut out = HashMap::new();
@@ -99,14 +104,18 @@ pub fn upsert_analysis_cache_entries(
         "INSERT INTO index_analysis_cache
              (repository_id, repo_relative, content_hash, security_state,
               is_partial_scan, secret_pattern_version, analyzer_registry_version,
+              discovery_policy_hash, structural, max_units_per_file,
               units_json, captured_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(repository_id, repo_relative) DO UPDATE SET
              content_hash              = excluded.content_hash,
              security_state            = excluded.security_state,
              is_partial_scan           = excluded.is_partial_scan,
              secret_pattern_version    = excluded.secret_pattern_version,
              analyzer_registry_version = excluded.analyzer_registry_version,
+             discovery_policy_hash     = excluded.discovery_policy_hash,
+             structural                = excluded.structural,
+             max_units_per_file        = excluded.max_units_per_file,
              units_json                = excluded.units_json,
              captured_json             = excluded.captured_json,
              created_at                = excluded.created_at",
@@ -121,6 +130,9 @@ pub fn upsert_analysis_cache_entries(
             entry.is_partial_scan as i64,
             entry.secret_pattern_version,
             entry.analyzer_registry_version,
+            entry.discovery_policy_hash,
+            entry.structural as i64,
+            entry.max_units_per_file as i64,
             entry.units_json,
             entry.captured_json,
             now_us,
@@ -174,6 +186,9 @@ mod tests {
             is_partial_scan: false,
             secret_pattern_version: 1,
             analyzer_registry_version: "0.0.0-test".to_string(),
+            discovery_policy_hash: "policy-test".to_string(),
+            structural: true,
+            max_units_per_file: 512,
             units_json: "[]".to_string(),
             captured_json: None,
         }
@@ -194,8 +209,13 @@ mod tests {
 
         let loaded = bulk_load_analysis_cache(&conn, &repo_id).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.get("a.rs").unwrap().content_hash, "hash-a");
-        assert_eq!(loaded.get("b.rs").unwrap().content_hash, "hash-b");
+        let a = loaded.get("a.rs").unwrap();
+        assert_eq!(a.content_hash, "hash-a");
+        assert_eq!(a.discovery_policy_hash, "policy-test");
+        assert!(a.structural);
+        assert_eq!(a.max_units_per_file, 512);
+        let b = loaded.get("b.rs").unwrap();
+        assert_eq!(b.content_hash, "hash-b");
     }
 
     #[test]

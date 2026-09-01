@@ -133,6 +133,22 @@ pub fn insert_file_occurrence(
     Ok(())
 }
 
+/// Insert an occurrence and explicitly set its freshness in the same ambient
+/// transaction. Used by coordinated publication for tombstones, which must
+/// be born `INVALID` rather than briefly becoming `CURRENT`.
+pub fn insert_file_occurrence_with_freshness(
+    conn: &Connection,
+    rec: &NewFileOccurrence<'_>,
+    freshness: attic_core::FreshnessState,
+) -> Result<(), StorageError> {
+    insert_file_occurrence(conn, rec)?;
+    conn.execute(
+        "UPDATE core_file_occurrences SET freshness_state = ?2 WHERE id = ?1",
+        rusqlite::params![rec.id.to_string_repr(), freshness.as_str()],
+    )?;
+    Ok(())
+}
+
 /// Return `true` if a file occurrence with the given `id` exists.
 pub fn exists_file_occurrence(
     conn: &Connection,
@@ -716,5 +732,93 @@ mod tests {
         let (repo_id, _) = seed_repo_and_revision(&conn);
         let bulk = bulk_latest_occurrence_ids_for_repository(&conn, &repo_id).unwrap();
         assert!(bulk.is_empty());
+    }
+
+    #[test]
+    fn repo_map_latest_path_never_resurrects_deleted_history() {
+        let conn = migrated_conn();
+        let (repo_id, rev_id) = seed_repo_and_revision(&conn);
+        let fid = FileIdentityId::new_v4();
+        upsert_file_identity(&conn, &fid, &repo_id, "repo/foo.rs").unwrap();
+
+        let insert = |id: &FileOccurrenceId,
+                      hash: &str,
+                      existence: ExistenceState,
+                      freshness: attic_core::FreshnessState| {
+            insert_file_occurrence_with_freshness(
+                &conn,
+                &NewFileOccurrence {
+                    id,
+                    file_identity_id: &fid,
+                    source_revision_id: &rev_id,
+                    index_generation_id: None,
+                    path: "foo.rs",
+                    content_hash: hash,
+                    size_bytes: 1,
+                    language: Some("rust"),
+                    file_type: FileType::Rust,
+                    discovery_class: DiscoveryClass::Vcs,
+                    security_state: SecurityState::Clean,
+                    existence_state: existence,
+                },
+                freshness,
+            )
+            .unwrap();
+        };
+
+        let a = FileOccurrenceId::new_v4();
+        insert(
+            &a,
+            "a",
+            ExistenceState::Present,
+            attic_core::FreshnessState::Current,
+        );
+        assert_eq!(
+            current_files_for_repo_map(&conn, &repo_id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let b = FileOccurrenceId::new_v4();
+        insert(
+            &b,
+            "b",
+            ExistenceState::Present,
+            attic_core::FreshnessState::Current,
+        );
+        let current = current_files_for_repo_map(&conn, &repo_id, None).unwrap();
+        assert_eq!(
+            current,
+            vec![("foo.rs".to_owned(), FileType::Rust.as_str().to_owned())]
+        );
+
+        let deleted = FileOccurrenceId::new_v4();
+        insert(
+            &deleted,
+            "b",
+            ExistenceState::Deleted,
+            attic_core::FreshnessState::Invalid,
+        );
+        assert!(
+            current_files_for_repo_map(&conn, &repo_id, None)
+                .unwrap()
+                .is_empty(),
+            "latest deleted occurrence must suppress, never resurrect, older CURRENT rows"
+        );
+
+        let recreated = FileOccurrenceId::new_v4();
+        insert(
+            &recreated,
+            "c",
+            ExistenceState::Present,
+            attic_core::FreshnessState::Current,
+        );
+        assert_eq!(
+            current_files_for_repo_map(&conn, &repo_id, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
