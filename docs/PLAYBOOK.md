@@ -95,7 +95,7 @@ live anywhere on disk with no common parent, no symlinks required, and no
 roots stay usable.
 **Do not** run two `attic` processes against the same `attic.db` —
 this is not a supported or tested configuration; give each concurrently
-running instance its own `ATTIC_DATA_DIR`.
+running instance its own `ATTIC_HOME`.
 
 ### Project Knowledge
 
@@ -158,7 +158,7 @@ Quick reference — see the detailed entries below each row for exact checks:
   JSON-RPC and will look empty/silent to a human on failure.
 - **Startup failure (process exits immediately)**: check stderr for a
   fail-closed message. Common causes: corrupted database (try a fresh
-  `ATTIC_DATA_DIR` to isolate), workspace path doesn't exist or isn't
+  `ATTIC_HOME` to isolate), workspace path doesn't exist or isn't
   readable, or invalid `ATTIC_*` resource configuration
   (`ResourceConfig::validate()` rejects self-contradictory overrides).
 - **Repository missing from `search`/`repo_map`**: confirm it is part of
