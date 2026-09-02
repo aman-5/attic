@@ -8,7 +8,9 @@
 use attic_discovery::{
     DiscoveryPolicy, SecretScanDecision, canonicalize_within_root, preprocess_file_content,
 };
-use attic_indexing::{IndexError, IndexOptions, IndexingStore, index_repository};
+#[cfg(test)]
+use attic_indexing::index_repository;
+use attic_indexing::{IndexError, IndexOptions, IndexingStore};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
     current_files_for_repo_map, fts_search, get_db_stats, get_repository_path,
@@ -114,6 +116,12 @@ enum ServerError {
     Retrieval(String),
 }
 
+struct BootstrapJob {
+    root_key: String,
+    cancellation: attic_core::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Clone)]
 struct AtticServer {
     pool: DbPool,
@@ -134,6 +142,11 @@ struct AtticServer {
     /// (not by `main`) so the runtime `workspace` MCP tool can start and stop
     /// watchers for roots that are added/removed while the process is up.
     watches: Arc<std::sync::Mutex<HashMap<String, attic_incremental::IncrementalWatch>>>,
+    /// Server-owned bootstrap jobs. Never detached: shutdown cancels and joins all of them.
+    bootstrap_jobs: Arc<std::sync::Mutex<Vec<BootstrapJob>>>,
+    /// Shared scheduler is owned by the server so background startup can install it
+    /// after MCP serving has already begun, and shutdown can stop it deterministically.
+    scheduler: Arc<std::sync::Mutex<Option<attic_incremental::SchedulerHandle>>>,
     /// Whether the logical workspace is configured (any `ATTIC_CONFIG`, the
     /// persistent default config file, or `ATTIC_WORKSPACE_ROOT`). `false`
     /// (UNCONFIGURED first run) gates query tools and drives status.
@@ -232,6 +245,8 @@ impl AtticServer {
             incremental: Arc::new(std::sync::RwLock::new(HashMap::new())),
             watch_mode: Arc::new(std::sync::RwLock::new(HashMap::new())),
             watches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bootstrap_jobs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            scheduler: Arc::new(std::sync::Mutex::new(None)),
             workspace_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             default_config: db_path.with_file_name("config.toml"),
@@ -257,20 +272,29 @@ impl AtticServer {
     /// unchanged content is simply reproduced), rerunning it is always safe
     /// and is the only way `Ok` here can mean "the index is complete," not
     /// merely "a row exists."
+    #[cfg(test)]
     fn bootstrap_workspace(&self, root: &Path) -> Result<String, ServerError> {
-        // Coordinated-writer indexing: discovery + analysis happen here on the
-        // calling thread, then ONE submit_index_publication mutation carries
-        // every write through the Phase 1A writer queue inside its ambient
-        // transaction.  No secondary connection, no nested transactions, and
-        // attic-indexing never touches a raw rusqlite write connection.
+        self.bootstrap_workspace_cancellable(root, &attic_core::CancellationToken::default())
+    }
+    fn bootstrap_workspace_cancellable(
+        &self,
+        root: &Path,
+        cancellation: &attic_core::CancellationToken,
+    ) -> Result<String, ServerError> {
         let store = IndexingStore {
             readers: &self.pool,
             writer: &self.writer,
         };
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
-        let result =
-            index_repository(&store, root, &policy, &opts).map_err(ServerError::Indexing)?;
+        let result = attic_indexing::index_repository_with_cancellation(
+            &store,
+            root,
+            &policy,
+            &opts,
+            cancellation,
+        )
+        .map_err(ServerError::Indexing)?;
         // Best-effort: a poisoned lock here must never fail an otherwise
         // successful bootstrap — these counters are diagnostics, not the
         // authoritative index state.
@@ -471,6 +495,12 @@ impl AtticServer {
         //    single failure never corrupts the rest of the reconciliation.
         let mut events = Vec::new();
         for root in &removed {
+            let job_key = root_identity_key(root);
+            if let Ok(jobs) = self.bootstrap_jobs.lock() {
+                for job in jobs.iter().filter(|job| job.root_key == job_key) {
+                    job.cancellation.cancel();
+                }
+            }
             let repo_id = self
                 .pool
                 .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
@@ -494,52 +524,67 @@ impl AtticServer {
             let server = self.clone();
             let root = root.clone();
             let root_for_event = root.clone();
+            let cancellation = attic_core::CancellationToken::new();
+            let worker_cancellation = cancellation.clone();
+            let job_key = root_identity_key(&root);
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let bootstrap_root = root.clone();
                 let bootstrap_server = server.clone();
+                let blocking_cancellation = worker_cancellation.clone();
 
-                match tokio::task::spawn_blocking(move || {
-                    bootstrap_server.bootstrap_workspace(&bootstrap_root)
+                let result = tokio::task::spawn_blocking(move || {
+                    bootstrap_server
+                        .bootstrap_workspace_cancellable(&bootstrap_root, &blocking_cancellation)
                 })
-                .await
-                {
-                    Ok(Ok(repo_id)) => {
+                .await;
+
+                match result {
+                    Ok(Ok(repo_id)) if !worker_cancellation.is_cancelled() => {
+                        // Membership may have changed while indexing was running.
+                        let still_active = server.active_roots.read().ok().is_some_and(|roots| {
+                            roots
+                                .iter()
+                                .any(|r| root_identity_key(r) == root_identity_key(&root))
+                        });
+                        if !still_active {
+                            tracing::info!(root = %root.display(), "bootstrap completed after removal; watcher not started");
+                            return;
+                        }
                         if let Ok(mut g) = server.pending_index_failed.lock() {
                             g.remove(&root);
                         }
-
                         let started = server.start_watcher(&root, &repo_id);
-
-                        tracing::info!(
-                            root = %root.display(),
-                            repository_id = %repo_id,
-                            watcher_started = started,
-                            "background workspace bootstrap completed"
-                        );
+                        tracing::info!(root = %root.display(), repository_id = %repo_id, watcher_started = started, "background workspace bootstrap completed");
+                    }
+                    Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => {
+                        tracing::info!(root = %root.display(), "background workspace bootstrap cancelled");
                     }
                     Ok(Err(e)) => {
                         if let Ok(mut g) = server.pending_index_failed.lock() {
                             g.insert(root.clone());
                         }
-
-                        tracing::warn!(
-                            root = %root.display(),
-                            "background workspace bootstrap failed: {e}"
-                        );
+                        tracing::warn!(root = %root.display(), "background workspace bootstrap failed: {e}");
                     }
                     Err(e) => {
                         if let Ok(mut g) = server.pending_index_failed.lock() {
                             g.insert(root.clone());
                         }
-
-                        tracing::warn!(
-                            root = %root.display(),
-                            "background workspace bootstrap task failed: {e}"
-                        );
+                        tracing::warn!(root = %root.display(), "background workspace bootstrap task failed: {e}");
+                    }
+                    Ok(Ok(_)) => {
+                        tracing::info!(root = %root.display(), "background workspace bootstrap cancelled before watcher startup");
                     }
                 }
             });
+
+            if let Ok(mut jobs) = self.bootstrap_jobs.lock() {
+                jobs.push(BootstrapJob {
+                    root_key: job_key,
+                    cancellation,
+                    handle,
+                });
+            }
 
             events.push(format!(
                 "added root; indexing scheduled in background: {}",
@@ -1385,6 +1430,7 @@ fn handle_status(
     configured: bool,
     active_roots: &[PathBuf],
     unavailable_roots: &[(PathBuf, String)],
+    pending_index_roots: &[String],
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
@@ -1505,6 +1551,32 @@ fn handle_status(
             "watcher": watcher_json,
         }));
     }
+    // Configured roots can be indexing before their repository row exists.
+    // Surface them explicitly instead of reporting configured_repository_count=0.
+    for root in active_roots {
+        let key = root_identity_key(root);
+        let has_repo = pool
+            .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_repo
+            && pending_index_roots
+                .iter()
+                .any(|p| p == &key || p == "__startup__")
+        {
+            indexing += 1;
+            repositories.push(json!({
+                "repository_id": Value::Null,
+                "display_name": root.display().to_string(),
+                "file_count": 0,
+                "unit_count": 0,
+                "state": "INDEXING",
+                "watcher": { "mode": "pending", "active": false }
+            }));
+        }
+    }
+
     // ┬º17: configured-but-unavailable roots are reported explicitly so the
     // caller can see the workspace is DEGRADED, never silently dropped from
     // membership or hidden behind an otherwise-current summary.
@@ -1515,7 +1587,7 @@ fn handle_status(
     payload["workspace"] = json!({
         "configured": true,
         "unconfigured": false,
-        "configured_repository_count": active_stats.len(),
+        "configured_repository_count": active_roots.len(),
         "current_repository_count": current,
         "indexing_repository_count": indexing,
         "reconciliation_required_repository_count": reconciliation_required,
@@ -1872,6 +1944,12 @@ impl ServerHandler for AtticServer {
                         }
                     }
                     drop(failed_guard);
+                    let pending_index_roots =
+                        lock_or_call_err!(self.bootstrap_jobs.lock(), "bootstrap_jobs")
+                            .iter()
+                            .filter(|job| !job.handle.is_finished())
+                            .map(|job| job.root_key.clone())
+                            .collect::<Vec<_>>();
                     handle_status(
                         &pool,
                         &inc,
@@ -1880,6 +1958,7 @@ impl ServerHandler for AtticServer {
                         workspace_configured,
                         &active_roots,
                         &combined_unavail,
+                        &pending_index_roots,
                     )
                 }
                 "context" => handle_context(
@@ -2317,8 +2396,6 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
-
     // ΓöÇΓöÇΓöÇ Multi-root workspace bootstrap ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
     // `roots` may be zero (UNCONFIGURED first run ΓÇö watch mode disabled,
@@ -2349,74 +2426,70 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if !roots.is_empty() {
-        // 1. Bootstrap / index every configured root, INDEPENDENTLY.
-        //
-        // Failure isolation (┬º9/┬º14): a repository that fails to index is
-        // logged and skipped ΓÇö it never blocks or corrupts the other
-        // configured repositories. Only when EVERY root fails do we refuse
-        // to serve entirely, since a workspace with zero usable
-        // repositories cannot vouch for anything as CURRENT.
-        let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
-        for root in &roots {
-            let srv = server.clone();
-            let root_for_bootstrap = root.clone();
-            let boot =
-                tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            match evaluate_bootstrap(&boot) {
-                BootstrapAction::Proceed(repository_id) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        "repository bootstrapped"
-                    );
-                    bootstrapped.push((root.clone(), repository_id));
+        // Startup indexing must never delay MCP availability. It is a server-owned
+        // background job, cooperatively cancellable and joined during shutdown.
+        let startup_server = server.clone();
+        let startup_roots = roots.clone();
+        let startup_config_source = config_source.clone();
+        let cancellation = attic_core::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
+
+            for root in startup_roots {
+                if worker_cancellation.is_cancelled() {
+                    return;
                 }
-                BootstrapAction::FailClosed(why) => {
-                    error!(
-                        "repository bootstrap FAILED for {} ΓÇö this repository is degraded/unavailable, \
-                         other configured repositories are unaffected: {why}",
-                        root.display()
-                    );
+                let srv = startup_server.clone();
+                let root_for_bootstrap = root.clone();
+                let token = worker_cancellation.clone();
+                match tokio::task::spawn_blocking(move || {
+                    srv.bootstrap_workspace_cancellable(&root_for_bootstrap, &token)
+                })
+                .await
+                {
+                    Ok(Ok(repository_id)) if !worker_cancellation.is_cancelled() => {
+                        info!(repository_id = %repository_id, root = %root.display(), "background startup repository bootstrap complete");
+                        startup_server.start_watcher(&root, &repository_id);
+                        bootstrapped.push((root, repository_id));
+                    }
+                    Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => return,
+                    Ok(Err(e)) => {
+                        error!(root = %root.display(), "background startup repository bootstrap failed: {e}");
+                        if let Ok(mut failed) = startup_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
+                    Err(e) => {
+                        error!(root = %root.display(), "background startup repository task failed: {e}");
+                        if let Ok(mut failed) = startup_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
+                    Ok(Ok(_)) => return,
                 }
             }
-        }
-        if bootstrapped.is_empty() {
-            error!(
-                "every configured repository root failed to bootstrap ΓÇö refusing to serve (fail-closed)"
-            );
-            return Err(anyhow::anyhow!(
-                "no configured repository could be bootstrapped"
-            ));
-        }
 
-        // Phase 6 cross-repository workspace sync: after all repos are
-        // indexed, resolve cross-repo dependency edges and persist them.
-        //
-        // Membership scoping (§14/§16/§25):
-        //   • Explicit ATTIC_CONFIG / persistent config.toml (multi-root
-        //     workspace): scope sync to ONLY the bootstrapped repositories
-        //     so historical DB repos cannot contaminate the active snapshot.
-        //   • Legacy ATTIC_WORKSPACE_ROOT (single-root hint): the DB may
-        //     contain more repositories than the one configured root (e.g.
-        //     the test pre-seeds all three repos then points at one root to
-        //     trigger cross-repo resolution). In this mode pass None so the
-        //     sync uses ALL DB repos — the single root is just an indexing
-        //     hint, not an authoritative membership boundary.
-        {
-            let writer = server.writer.clone();
-            let pool = server.pool.clone();
-            let active_ids_for_sync: Option<Vec<String>> = match &config_source {
-                ConfigSource::Explicit(_) | ConfigSource::Persistent => {
-                    Some(bootstrapped.iter().map(|(_, id)| id.clone()).collect())
-                }
-                // Legacy single-root or unconfigured: do not restrict scope.
+            if worker_cancellation.is_cancelled() || bootstrapped.is_empty() {
+                return;
+            }
+
+            // Cross-repository sync only after all successful bootstraps.
+            let writer = startup_server.writer.clone();
+            let pool = startup_server.pool.clone();
+            let active_repository_ids = match startup_config_source {
+                ConfigSource::Explicit(_) | ConfigSource::Persistent => Some(
+                    bootstrapped
+                        .iter()
+                        .map(|(_, id)| id.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 ConfigSource::Legacy(_) | ConfigSource::Unconfigured => None,
             };
             match tokio::task::spawn_blocking(move || {
                 let opts = attic_crossrepo::maintenance::WorkspaceSyncOptions {
-                    active_repository_ids: active_ids_for_sync,
+                    active_repository_ids,
                     ..Default::default()
                 };
                 pool.with_reader(|conn| {
@@ -2431,153 +2504,89 @@ async fn main() -> anyhow::Result<()> {
                     info!(
                         repos = result.repository_reports.len(),
                         edges = result.edges_emitted,
-                        "cross-repo workspace sync complete"
+                        "background cross-repo workspace sync complete"
                     );
-                    // Sync succeeded: cross-repo subsystem is healthy.
-                    server
+                    startup_server
                         .crossrepo_degraded
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                Ok(Err(e)) => {
-                    warn!("cross-repo workspace sync failed: {e}");
-                    // Sync failed: cross-repo subsystem remains degraded
-                    // (initialized to true). Cross-repo-dependent answers
-                    // are prevented; local retrieval continues unaffected.
-                }
-                Err(e) => {
-                    warn!("cross-repo workspace sync task failed: {e}");
-                }
+                Ok(Err(e)) => warn!("background cross-repo workspace sync failed: {e}"),
+                Err(e) => warn!("background cross-repo workspace sync task failed: {e}"),
             }
-        }
 
-        // 2. Schedule offline refresh for anything not CURRENT.
-        match attic_incremental::plan_offline_refresh(&server.pool) {
-            Ok(batch) => {
-                for refresh in batch {
-                    let payload = attic_storage::IncrementalTaskPayload {
-                        dedup_key: format!(
-                            "offline-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros())
-                                .unwrap_or_default()
-                        ),
-                        upserts: refresh.upsert_paths,
-                        deletes: vec![],
-                        renames: vec![],
-                        from_reconciliation: true,
-                    };
-                    if let Err(e) = attic_incremental::scheduler::schedule_incremental(
-                        &server.writer,
-                        &refresh.repository_id,
-                        &payload,
-                        attic_incremental::scheduler::PRIORITY_RECONCILE,
-                        4096,
-                        server.resource_monitor.as_ref().map(|m| m.as_ref()),
-                    ) {
-                        warn!("offline refresh scheduling failed: {e}");
-                    }
-                }
+            if worker_cancellation.is_cancelled() {
+                return;
             }
-            Err(e) => warn!("offline refresh planning failed: {e}"),
-        }
 
-        // 3. ONE shared scheduler for the whole process (┬º10: one
-        //    coordinated WriterQueue, not one scheduler/database per
-        //    repository). Its workers resolve each claimed task's OWN
-        //    repository root dynamically from storage; the root passed
-        //    here is only the legacy fallback for repository-less tasks,
-        //    which the multi-root startup path above never produces.
-        //    Fallible: a scheduler that cannot start its workers is never
-        //    silently accepted.
-        let policy = DiscoveryPolicy::default_git();
-        let monitor = server.resource_monitor.clone();
-        match attic_incremental::spawn_scheduler(
-            attic_incremental::SchedulerConfig::default(),
-            server.pool.clone(),
-            server.writer.clone(),
-            bootstrapped[0].0.clone(),
-            policy.clone(),
-            monitor,
-        ) {
-            Ok(sched) => sched_handle = Some(sched),
-            Err(e) => {
-                error!(
-                    "scheduler startup failed ΓÇö incremental mode DISABLED for all repositories: {e}"
-                );
-                // Continue serving WITHOUT incremental claims; status reports
-                // watcher.mode = "disabled" for every configured repository.
-                return serve_until_closed(server, sched_handle, semantic_enricher).await;
+            // Schedule offline refresh after authoritative startup bootstrap.
+            match attic_incremental::plan_offline_refresh(&startup_server.pool) {
+                Ok(batch) => {
+                    for refresh in batch {
+                        if worker_cancellation.is_cancelled() {
+                            return;
+                        }
+                        let payload = attic_storage::IncrementalTaskPayload {
+                            dedup_key: format!(
+                                "offline-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_micros())
+                                    .unwrap_or_default()
+                            ),
+                            upserts: refresh.upsert_paths,
+                            deletes: vec![],
+                            renames: vec![],
+                            from_reconciliation: true,
+                        };
+                        if let Err(e) = attic_incremental::scheduler::schedule_incremental(
+                            &startup_server.writer,
+                            &refresh.repository_id,
+                            &payload,
+                            attic_incremental::scheduler::PRIORITY_RECONCILE,
+                            4096,
+                            startup_server.resource_monitor.as_ref().map(|m| m.as_ref()),
+                        ) {
+                            warn!("offline refresh scheduling failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => warn!("offline refresh planning failed: {e}"),
             }
-        }
 
-        // 4. Change detection ΓÇö one watcher PER successfully bootstrapped
-        //    repository root (┬º12): each retains its own repository
-        //    identity/state, so a change under root A is normalized and
-        //    verified relative to root A alone and can never be
-        //    interpreted against root B's boundary. A watcher failing to
-        //    start for one repository does not affect the others.
-        for (root, repository_id) in &bootstrapped {
-            let service = Arc::new(
-                attic_incremental::IncrementalService::new(root, policy.clone())
-                    .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
-            );
-            match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
-                Ok(watch) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        mode = watch.mode().as_str(),
-                        "incremental change detection started"
-                    );
-                    let mode = watch.mode();
-                    if let Ok(mut g) = server.watch_mode.write() {
-                        g.insert(repository_id.clone(), mode);
-                    } else {
-                        error!(repository_id = %repository_id, "watch_mode lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.incremental.write() {
-                        g.insert(repository_id.clone(), service);
-                    } else {
-                        error!(repository_id = %repository_id, "incremental lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.watches.lock() {
-                        g.insert(repository_id.clone(), watch);
-                    } else {
-                        error!(repository_id = %repository_id, "watches lock poisoned in startup watcher loop");
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "change detection failed to start for {} ({e}) ΓÇö incremental DISABLED for this repository",
-                        root.display()
-                    );
-                }
+            if worker_cancellation.is_cancelled() {
+                return;
             }
+
+            // Start the one shared scheduler after bootstrap; store it on the
+            // server so shutdown can always stop it even though startup is async.
+            let policy = DiscoveryPolicy::default_git();
+            match attic_incremental::spawn_scheduler(
+                attic_incremental::SchedulerConfig::default(),
+                startup_server.pool.clone(),
+                startup_server.writer.clone(),
+                bootstrapped[0].0.clone(),
+                policy,
+                startup_server.resource_monitor.clone(),
+            ) {
+                Ok(sched) => {
+                    if let Ok(mut slot) = startup_server.scheduler.lock() {
+                        *slot = Some(sched);
+                    }
+                }
+                Err(e) => error!("scheduler startup failed - incremental scheduler disabled: {e}"),
+            }
+        });
+
+        if let Ok(mut jobs) = server.bootstrap_jobs.lock() {
+            jobs.push(BootstrapJob {
+                root_key: "__startup__".to_string(),
+                cancellation,
+                handle,
+            });
         }
     }
 
-    serve_until_closed(server, sched_handle, semantic_enricher).await
-}
-
-/// Outcome of the initial workspace indexing decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapAction {
-    /// Indexing succeeded; repository id available.
-    Proceed(String),
-    /// Indexing failed ΓÇö refuse to serve anything as CURRENT (fail-closed).
-    FailClosed(String),
-}
-
-/// Map a bootstrap outcome to the serve/fail-closed decision.
-///
-/// Unit-tested: an `Err` MUST map to [`BootstrapAction::FailClosed`] so the
-/// caller exits instead of serving stale state as CURRENT.
-fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
-    match r {
-        Ok(id) => BootstrapAction::Proceed(id.clone()),
-        Err(e) => BootstrapAction::FailClosed(e.to_string()),
-    }
+    serve_until_closed(server, semantic_enricher).await
 }
 
 /// Serve MCP until the stdio transport closes OR the process receives
@@ -2595,14 +2604,13 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
 ///   7. Close DB resources (pool + writer connection).
 ///   8. Exit.
 ///
-/// `sched_handle`/`watch`/`semantic_enricher` are owned by this function
+/// `watch`/scheduler/`semantic_enricher` are owned by the server lifecycle
 /// (not left to an implicit drop in `main`) specifically so each can be
 /// stopped, in order, deterministically and with a bounded join ΓÇö a
 /// production worker whose shutdown is left to "whatever `main` does last"
 /// is not controlled.
 async fn serve_until_closed(
     server: AtticServer,
-    sched_handle: Option<attic_incremental::SchedulerHandle>,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
 ) -> anyhow::Result<()> {
     // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
@@ -2618,6 +2626,8 @@ async fn serve_until_closed(
     // Clone the watcher handle map BEFORE `server` is consumed by `serve` so
     // shutdown can deterministically stop every live watcher afterwards.
     let watches_for_shutdown = server.watches.clone();
+    let bootstrap_jobs_for_shutdown = server.bootstrap_jobs.clone();
+    let scheduler_for_shutdown = server.scheduler.clone();
     let running = server
         .serve(stdio())
         .await
@@ -2638,7 +2648,25 @@ async fn serve_until_closed(
     ctrl_c_watcher.abort();
     info!("attic server stopped: {reason:?}");
 
-    // 2. Watcher shutdown, then scheduler shutdown.  The watcher only
+    // 2. Cancel and JOIN every server-owned bootstrap before touching watchers,
+    // scheduler, WAL or DB resources. spawn_blocking cannot be force-aborted once
+    // running, so the indexing pipeline cooperatively observes these tokens.
+    let jobs = {
+        let mut guard = bootstrap_jobs_for_shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for job in guard.iter() {
+            job.cancellation.cancel();
+        }
+        std::mem::take(&mut *guard)
+    };
+    for job in jobs {
+        if let Err(e) = job.handle.await {
+            warn!("background bootstrap join failed during shutdown: {e}");
+        }
+    }
+
+    // 3. Watcher shutdown, then scheduler shutdown.  The watcher only
     //    detects changes; the scheduler drains work derived from those
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
@@ -2653,7 +2681,11 @@ async fn serve_until_closed(
         }
     } // MutexGuard is definitely dropped here
 
-    if let Some(sched) = sched_handle {
+    let sched = scheduler_for_shutdown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(sched) = sched {
         sched.shutdown();
     }
 
@@ -2899,29 +2931,6 @@ mod tests {
         let _ = true;
     }
 
-    // compile-time gate: IndexError has no Sqlite variant
-    #[test]
-    fn bootstrap_failure_is_fail_closed() {
-        // Err ΓçÆ FailClosed (never serve stale state as CURRENT).
-        let err: Result<String, ServerError> = Err(ServerError::Indexing(
-            IndexError::RepositoryNotBootstrapped("/ws".into()),
-        ));
-        assert_eq!(
-            evaluate_bootstrap(&err),
-            BootstrapAction::FailClosed(
-                "indexing error: repository at /ws has not been bootstrapped; run a full index first"
-                    .into()
-            )
-        );
-
-        // Ok ΓçÆ Proceed with the repository id.
-        let ok: Result<String, ServerError> = Ok("repo-1".into());
-        assert_eq!(
-            evaluate_bootstrap(&ok),
-            BootstrapAction::Proceed("repo-1".into())
-        );
-    }
-
     #[test]
     fn indexing_uses_writer_abstraction() {
         fn _check(e: IndexError) {
@@ -2934,6 +2943,7 @@ mod tests {
                 IndexError::TransientFailures { .. } => {}
                 IndexError::ClassificationCountMismatch { .. } => {}
                 IndexError::ClassificationPathMismatch { .. } => {}
+                IndexError::Cancelled => {}
             }
         }
     }
@@ -3558,6 +3568,7 @@ mod tests {
             true,
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let t = text_of(&r);
@@ -3782,6 +3793,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+            &[],
             &[],
             &[],
         )
@@ -4449,8 +4461,8 @@ mod tests {
         }
 
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        // Gates 1ΓÇô4: full workspace sync via ATTIC_WORKSPACE_ROOT.
-        // Spawn WITH ATTIC_WORKSPACE_ROOT ΓåÆ triggers sync_workspace ΓåÆ clears
+        // Gates 1ΓÇô4: full workspace sync via explicit multi-root ATTIC_CONFIG.
+        // Spawn WITH ATTIC_CONFIG ΓåÆ triggers sync_workspace ΓåÆ clears
         // degraded flag ΓåÆ cross-repo claims become available.
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let (provider_id_str, dependent_id_str, _unrelated_id_str) = {
@@ -4466,13 +4478,24 @@ mod tests {
             (pid, did, uid)
         };
 
+        let cfg_path = tmp.path().join("crossrepo.conf");
+        fs::write(
+            &cfg_path,
+            format!(
+                "[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n",
+                provider_dir.display(),
+                dependent_dir.display(),
+                unrelated_dir.display(),
+            ),
+        )
+        .unwrap();
+
         let (mut child, mut stdin) = {
             let mut child = Command::new(&bin)
                 .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
-                // Point ATTIC_WORKSPACE_ROOT at provider_dir so the server
-                // bootstraps and then runs sync_workspace over all DB repos.
-                .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
+                .env("ATTIC_CONFIG", cfg_path.to_str().unwrap())
+                .env_remove("ATTIC_WORKSPACE_ROOT")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -4511,14 +4534,35 @@ mod tests {
                 }
             }),
         );
-        let resp = send_recv(&mut child, &mut stdin, &call);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
-        let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
+        // Startup bootstrap + cross-repo sync are intentionally asynchronous.
+        // Poll the real MCP context path until cross-repo sync has completed
+        // instead of racing it immediately after initialize.
+        let (v, full_response, claims_json) = {
+            let mut last_v = json!({});
+            let mut last_full = String::new();
+            let mut last_claims = String::new();
 
-        // Context text and/or claims must mention the provider module.
-        let context_body = v["context"].as_str().unwrap_or("");
-        let claims_json = v["claims"].to_string();
-        let full_response = format!("{context_body} {claims_json} {text}");
+            for _ in 0..200 {
+                let resp = send_recv(&mut child, &mut stdin, &call);
+                let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+                let parsed: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                let context_body = parsed["context"].as_str().unwrap_or("");
+                let claims = parsed["claims"].to_string();
+                let full = format!("{context_body} {claims} {text}");
+
+                let ready = full.contains("example.com/provider")
+                    || full.contains(&provider_id_str);
+                last_v = parsed;
+                last_claims = claims;
+                last_full = full;
+                if ready {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+
+            (last_v, last_full, last_claims)
+        };
 
         // Gate 1: provider is identified in the response.
         assert!(
@@ -4614,7 +4658,7 @@ mod tests {
         //
         // Remove the `require` line from dependent/go.mod, re-index via
         // bootstrap_workspace (same production indexing path), re-spawn
-        // the server with ATTIC_WORKSPACE_ROOT ΓåÆ sync_workspace rebuilds
+        // the server with ATTIC_CONFIG ΓåÆ sync_workspace rebuilds
         // cross-repo edges ΓåÆ provider should no longer be in the response.
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         fs::write(
@@ -4647,7 +4691,8 @@ mod tests {
             let mut child = Command::new(&bin)
                 .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
-                .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
+                .env("ATTIC_CONFIG", cfg_path.to_str().unwrap())
+                .env_remove("ATTIC_WORKSPACE_ROOT")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -4790,21 +4835,28 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         );
 
-        // ΓöÇΓöÇ status: all three repositories configured and CURRENT ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        let status_call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
-        let status_resp = send_recv(&mut child, &mut stdin, &status_call);
-        let status_text = status_resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
-        let status_v: Value = serde_json::from_str(status_text).expect("status is JSON");
-        assert_eq!(status_v["status"], "ok");
+        // Startup bootstrap is intentionally asynchronous. Poll status until all
+        // three repositories are CURRENT instead of assuming initialize blocks.
+        let mut status_v = json!({});
+        for _ in 0..200 {
+            let status_call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
+            let status_resp = send_recv(&mut child, &mut stdin, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            status_v = serde_json::from_str(status_text).expect("status is JSON");
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
         assert_eq!(
             status_v["workspace"]["configured_repository_count"], 3,
-            "expected exactly 3 configured repositories; status={status_v}"
+            "status={status_v}"
         );
         assert_eq!(
             status_v["workspace"]["current_repository_count"], 3,
-            "all 3 unrelated roots must bootstrap+watch successfully in ONE process; status={status_v}"
+            "status={status_v}"
         );
         assert_eq!(status_v["workspace"]["disabled_repository_count"], 0);
 
@@ -5078,5 +5130,49 @@ mod tests {
         let resp = send_recv(&mut child, &mut stdin, &init);
         assert_eq!(resp["jsonrpc"], "2.0", "stdout contains non-JSON: {resp}");
         child.kill().ok();
+    }
+
+    #[test]
+    fn mcp_disconnect_cancels_and_joins_background_bootstrap() {
+        let bin = require_binary();
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("cancel-repo");
+        fs::create_dir_all(&repo).unwrap();
+        // Enough work to ensure the bootstrap is genuinely in flight when stdio closes.
+        for i in 0..500 {
+            fs::write(
+                repo.join(format!("file-{i}.rs")),
+                format!("pub fn f{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
+        let add = mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name": "workspace",
+                "arguments": {"action":"add", "path": repo.display().to_string()}
+            }),
+        );
+        let resp = send_recv(&mut child, &mut stdin, &add);
+        assert_eq!(resp["id"], 2, "workspace add failed: {resp}");
+
+        // Closing MCP stdin is a normal transport disconnect. Attic must cancel
+        // and join owned bootstrap work, then exit by itself; no child.kill().
+        drop(stdin);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                assert!(status.success(), "attic must shut down cleanly: {status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attic stayed alive after MCP disconnect"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }

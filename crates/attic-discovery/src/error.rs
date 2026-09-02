@@ -7,6 +7,10 @@ use thiserror::Error;
 /// Errors that can occur during the discovery pipeline.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
+    /// Discovery/indexing was cooperatively cancelled.
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// The configured workspace root path does not exist or is not a directory.
     #[error("workspace root is not a directory: {0}")]
     RootNotDirectory(PathBuf),

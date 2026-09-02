@@ -277,7 +277,12 @@ pub fn index_changes(
             is_partial_scan: false,
         };
 
-        match analyze_single_file(&rec, &registry, opts) {
+        match analyze_single_file(
+            &rec,
+            &registry,
+            opts,
+            &attic_core::CancellationToken::default(),
+        ) {
             Ok(FilePrep::Indexable {
                 mut units,
                 captured,

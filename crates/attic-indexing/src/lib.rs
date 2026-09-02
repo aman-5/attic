@@ -32,12 +32,11 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use attic_analyzers::{
-    AnalyzerContent, AnalyzerInput, AnalyzerRegistry, CancellationToken, ResourceBudget,
-};
+use attic_analyzers::{AnalyzerContent, AnalyzerInput, AnalyzerRegistry, ResourceBudget};
 use attic_core::{
-    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
-    RepositoryId, RetrievalUnitId, SecurityState, SourceRevisionId, SubsystemVersions,
+    CancellationToken, DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
+    IndexGenerationId, RepositoryId, RetrievalUnitId, SecurityState, SourceRevisionId,
+    SubsystemVersions,
     constants::{CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, subsystem_keys},
 };
 use attic_discovery::{
@@ -56,6 +55,8 @@ use attic_storage::{
 
 #[derive(Debug, Error)]
 pub enum IndexError {
+    #[error("indexing cancelled")]
+    Cancelled,
     #[error("discovery failed: {0}")]
     Discovery(#[from] attic_discovery::DiscoveryError),
     #[error("storage error: {0}")]
@@ -361,8 +362,24 @@ pub fn index_repository(
     policy: &DiscoveryPolicy,
     opts: &IndexOptions,
 ) -> Result<IndexResult, IndexError> {
+    index_repository_with_cancellation(store, root, policy, opts, &CancellationToken::default())
+}
+
+/// Full authoritative indexing with cooperative cancellation. Cancellation is
+/// checked throughout discovery/analysis and immediately before publication,
+/// so a cancelled run can never publish a new CURRENT generation.
+pub fn index_repository_with_cancellation(
+    store: &IndexingStore<'_>,
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    opts: &IndexOptions,
+    cancellation: &CancellationToken,
+) -> Result<IndexResult, IndexError> {
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
     // 1. Phase 1B discovery — real manifest hash, git meta, security classification.
-    let discovery = attic_discovery::discover(root, policy)?;
+    let discovery = attic_discovery::discover_with_cancellation(root, policy, cancellation)?;
 
     info!(
         files = discovery.entries.len(),
@@ -504,6 +521,9 @@ pub fn index_repository(
         align_classifications(&discovery.entries, &discovery.downstream_classifications)?;
 
     for (entry, classification) in discovery.entries.iter().zip(aligned_classifications) {
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         result.files_visited += 1;
         current_entry_paths.insert(entry.repo_relative.clone());
 
@@ -606,6 +626,9 @@ pub fn index_repository(
     // retire them too. This is the other half of P0-4: the loop above only
     // ever sees paths still present on disk.
     for path in previous_active.difference(&current_entry_paths) {
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         retire_path(
             store,
             repo_id,
@@ -649,6 +672,9 @@ pub fn index_repository(
     );
 
     for mut rec in file_records {
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         // A cache hit requires the content hash AND the secret-detector /
         // analyzer-registry versions to match what's current: a retry that
         // spans a ruleset upgrade must never replay a verdict computed
@@ -680,7 +706,7 @@ pub fn index_repository(
                     result.analysis_small_file_bytes_read += rec.size_bytes as u64;
                     result.analysis_small_file_reads += 1;
                 }
-                analyze_single_file(&rec, &registry, opts)
+                analyze_single_file(&rec, &registry, opts, cancellation)
             }
         };
 
@@ -834,6 +860,9 @@ pub fn index_repository(
     let mut retrieval_units: Vec<PublicationRetrievalUnit> = Vec::new();
     let mut unit_links_by_occ: HashMap<String, Vec<(String, usize)>> = HashMap::new();
     for u in pending_units {
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         let unit_id = RetrievalUnitId::new_v4().to_string_repr();
         if let Some(idx) = u.structural_node_index {
             unit_links_by_occ
@@ -886,7 +915,13 @@ pub fn index_repository(
                 .flatten()
         },
     };
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
     let structural_files = pipeline.finish(&deps, &unit_links_by_occ);
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
 
     let stats: IndexPublicationStats = submit_index_publication(
         store.writer,
@@ -1016,6 +1051,7 @@ fn analyze_single_file(
     rec: &FileRecord,
     registry: &AnalyzerRegistry,
     opts: &IndexOptions,
+    cancellation: &CancellationToken,
 ) -> Result<FilePrep, IndexError> {
     #[cfg(test)]
     ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(c.get() + 1));
@@ -1149,7 +1185,7 @@ fn analyze_single_file(
         language_hint: None,
         size_bytes,
         is_partial_scan,
-        cancellation_token: CancellationToken::default(),
+        cancellation_token: cancellation.clone(),
         resource_budget: budget,
     };
 
@@ -2497,7 +2533,7 @@ mod tests {
         };
         let registry = structural_pipeline::generic_only_registry();
         let opts = IndexOptions::default();
-        let outcome = analyze_single_file(&rec, &registry, &opts)
+        let outcome = analyze_single_file(&rec, &registry, &opts, &CancellationToken::default())
             .expect("invalid UTF-8 must be reported as Ok(Skip), never Err");
         assert!(
             matches!(outcome, FilePrep::Skip),
@@ -2524,7 +2560,7 @@ mod tests {
         };
         let registry = structural_pipeline::generic_only_registry();
         let opts = IndexOptions::default();
-        match analyze_single_file(&rec, &registry, &opts) {
+        match analyze_single_file(&rec, &registry, &opts, &CancellationToken::default()) {
             Err(IndexError::Io { .. }) => {}
             Ok(_) => panic!(
                 "a missing file must be a transient error, never a silent Skip/Indexable (P0-5/P0-7)"

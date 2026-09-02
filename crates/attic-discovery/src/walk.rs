@@ -71,6 +71,15 @@ pub struct WalkResult {
 /// The caller is responsible for calling `security::canonicalize_within_root`
 /// before passing `root` here.
 pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, DiscoveryError> {
+    walk_with_cancellation(root, policy, &attic_core::CancellationToken::default())
+}
+
+/// Cancellable repository walk.
+pub fn walk_with_cancellation(
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<WalkResult, DiscoveryError> {
     if !root.is_dir() {
         return Err(DiscoveryError::RootNotDirectory(root.to_path_buf()));
     }
@@ -105,6 +114,7 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
         &tracked_files,
         &mut result,
         &mut seen,
+        cancellation,
         &mut |entry| {
             main_entries.insert(entry.repo_relative.clone());
             Some(entry)
@@ -129,6 +139,7 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
             &tracked_files, // tracked-file filter still applied inside walk_pass
             &mut result,
             &mut seen,
+            cancellation,
             &mut |entry| {
                 if !main_entries.contains(&entry.repo_relative) {
                     main_entries.insert(entry.repo_relative.clone());
@@ -152,6 +163,7 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
             &tracked_files,
             &mut result,
             &mut seen,
+            cancellation,
             &mut |entry| {
                 // Only accept if an attic_include_rule matches this path
                 // and the path was NOT already captured in an earlier pass.
@@ -208,6 +220,7 @@ fn walk_pass<F>(
     tracked_files: &Option<HashSet<String>>,
     result: &mut WalkResult,
     seen: &mut SeenPaths,
+    cancellation: &attic_core::CancellationToken,
     filter: &mut F,
 ) -> Result<(), DiscoveryError>
 where
@@ -234,6 +247,9 @@ where
     let mut submodule_prefixes: Vec<String> = Vec::new();
 
     for entry_result in builder.build() {
+        if cancellation.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
         match entry_result {
             Err(walk_err) => {
                 result.counters.transient_failures += 1;

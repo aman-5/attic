@@ -224,6 +224,18 @@ pub struct DiscoveryOutput {
 /// tracked-file set unavailable).  Non-fatal errors during the walk or
 /// manifest build are captured in diagnostics / `SourceManifest::read_errors`.
 pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput, DiscoveryError> {
+    discover_with_cancellation(root, policy, &attic_core::CancellationToken::default())
+}
+
+/// Discover a repository while cooperatively observing cancellation.
+pub fn discover_with_cancellation(
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<DiscoveryOutput, DiscoveryError> {
+    if cancellation.is_cancelled() {
+        return Err(DiscoveryError::Cancelled);
+    }
     // 1. Canonicalise root — rejects symlink escapes and non-directories.
     let canonical_root = root
         .canonicalize()
@@ -245,13 +257,17 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
     };
 
     // 3-4. Walk + security + classification.
-    let walk_result = walk::walk(&canonical_root, policy)?;
+    let walk_result = walk::walk_with_cancellation(&canonical_root, policy, cancellation)?;
     let mut counters = walk_result.counters;
 
     let mut all_diagnostics = walk_result.diagnostics;
 
     // 5. Build the BLAKE3 manifest using raw (unredacted) bytes.
-    let manifest = manifest::build_manifest(&walk_result.entries, &canonical_root);
+    let manifest = manifest::build_manifest_with_cancellation(
+        &walk_result.entries,
+        &canonical_root,
+        cancellation,
+    )?;
 
     // Collect manifest read errors and unstable capture diagnostics.
     all_diagnostics.extend(manifest.read_errors.clone());
@@ -266,6 +282,9 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
         Vec::with_capacity(walk_result.entries.len());
 
     for entry in &walk_result.entries {
+        if cancellation.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
         let (classification, small_file_bytes) = classify_file_for_downstream(
             &entry.abs_path,
             &entry.repo_relative,
