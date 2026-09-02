@@ -3602,35 +3602,77 @@ mod tests {
     #[tokio::test]
     async fn workspace_remove_prunes_last_discovery_counters() {
         use std::fs;
+
         let tmp = TempDir::new().unwrap();
         let srv = make_server(&tmp);
         let root = tmp.path().join("ws");
+
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
         let mut add_args = HashMap::new();
         add_args.insert("action".into(), json!("add"));
         add_args.insert("path".into(), json!(root.display().to_string()));
+
         srv.handle_workspace(&add_args).await.unwrap();
 
         let canonical_root = root.canonicalize().unwrap();
-        let repo_id = srv
-            .pool
-            .with_reader(|c| lookup_repository_by_root_path(c, &canonical_root.to_string_lossy()))
-            .unwrap()
-            .expect("repository must be registered after add")
-            .to_string();
+
+        // workspace add intentionally bootstraps in the background.
+        // Wait for that asynchronous bootstrap to register the repository.
+        let repo_id = {
+            let mut found = None;
+
+            for _ in 0..100 {
+                found = srv
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &canonical_root.to_string_lossy())
+                    })
+                    .unwrap()
+                    .map(|id| id.to_string());
+
+                if found.is_some() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            found.expect("repository must be registered after background add")
+        };
+
+        // Registration can happen just before bootstrap records the discovery
+        // counters, so wait for those independently as well.
+        let counters_recorded = {
+            let mut recorded = false;
+
+            for _ in 0..100 {
+                recorded = srv
+                    .last_discovery_counters
+                    .read()
+                    .unwrap()
+                    .contains_key(&repo_id);
+
+                if recorded {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            recorded
+        };
+
         assert!(
-            srv.last_discovery_counters
-                .read()
-                .unwrap()
-                .contains_key(&repo_id),
-            "bootstrap must have recorded discovery counters for this repo"
+            counters_recorded,
+            "background bootstrap must record discovery counters for this repo"
         );
 
         let mut remove_args = HashMap::new();
         remove_args.insert("action".into(), json!("remove"));
         remove_args.insert("path".into(), json!(root.display().to_string()));
+
         srv.handle_workspace(&remove_args).await.unwrap();
 
         assert!(
