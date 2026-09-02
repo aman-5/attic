@@ -2317,7 +2317,7 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
+    let sched_handle: Option<attic_incremental::SchedulerHandle> = None;
 
     // ΓöÇΓöÇΓöÇ Multi-root workspace bootstrap ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
@@ -2349,74 +2349,78 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if !roots.is_empty() {
-        // 1. Bootstrap / index every configured root, INDEPENDENTLY.
-        //
-        // Failure isolation (┬º9/┬º14): a repository that fails to index is
-        // logged and skipped ΓÇö it never blocks or corrupts the other
-        // configured repositories. Only when EVERY root fails do we refuse
-        // to serve entirely, since a workspace with zero usable
-        // repositories cannot vouch for anything as CURRENT.
-        let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
-        for root in &roots {
-            let srv = server.clone();
-            let root_for_bootstrap = root.clone();
-            let boot =
-                tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            match evaluate_bootstrap(&boot) {
-                BootstrapAction::Proceed(repository_id) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        "repository bootstrapped"
-                    );
-                    bootstrapped.push((root.clone(), repository_id));
-                }
-                BootstrapAction::FailClosed(why) => {
-                    error!(
-                        "repository bootstrap FAILED for {} ΓÇö this repository is degraded/unavailable, \
-                         other configured repositories are unaffected: {why}",
-                        root.display()
-                    );
+        let bootstrap_server = server.clone();
+        let bootstrap_roots = roots.clone();
+        let bootstrap_config_source = config_source.clone();
+
+        tokio::spawn(async move {
+            let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
+
+            for root in bootstrap_roots {
+                let srv = bootstrap_server.clone();
+                let root_for_bootstrap = root.clone();
+
+                let boot = tokio::task::spawn_blocking(move || {
+                    srv.bootstrap_workspace(&root_for_bootstrap)
+                })
+                .await;
+
+                match boot {
+                    Ok(Ok(repository_id)) => {
+                        info!(
+                            repository_id = %repository_id,
+                            root = %root.display(),
+                            "background startup repository bootstrap complete"
+                        );
+
+                        if let Ok(mut failed) = bootstrap_server.pending_index_failed.lock() {
+                            failed.remove(&root);
+                        }
+
+                        bootstrap_server.start_watcher(&root, &repository_id);
+                        bootstrapped.push((root, repository_id));
+                    }
+                    Ok(Err(e)) => {
+                        error!(
+                            root = %root.display(),
+                            "background startup repository bootstrap failed: {e}"
+                        );
+                        if let Ok(mut failed) = bootstrap_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            root = %root.display(),
+                            "background startup repository bootstrap task failed: {e}"
+                        );
+                        if let Ok(mut failed) = bootstrap_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
                 }
             }
-        }
-        if bootstrapped.is_empty() {
-            error!(
-                "every configured repository root failed to bootstrap ΓÇö refusing to serve (fail-closed)"
-            );
-            return Err(anyhow::anyhow!(
-                "no configured repository could be bootstrapped"
-            ));
-        }
 
-        // Phase 6 cross-repository workspace sync: after all repos are
-        // indexed, resolve cross-repo dependency edges and persist them.
-        //
-        // Membership scoping (§14/§16/§25):
-        //   • Explicit ATTIC_CONFIG / persistent config.toml (multi-root
-        //     workspace): scope sync to ONLY the bootstrapped repositories
-        //     so historical DB repos cannot contaminate the active snapshot.
-        //   • Legacy ATTIC_WORKSPACE_ROOT (single-root hint): the DB may
-        //     contain more repositories than the one configured root (e.g.
-        //     the test pre-seeds all three repos then points at one root to
-        //     trigger cross-repo resolution). In this mode pass None so the
-        //     sync uses ALL DB repos — the single root is just an indexing
-        //     hint, not an authoritative membership boundary.
-        {
-            let writer = server.writer.clone();
-            let pool = server.pool.clone();
-            let active_ids_for_sync: Option<Vec<String>> = match &config_source {
-                ConfigSource::Explicit(_) | ConfigSource::Persistent => {
-                    Some(bootstrapped.iter().map(|(_, id)| id.clone()).collect())
-                }
-                // Legacy single-root or unconfigured: do not restrict scope.
+            if bootstrapped.is_empty() {
+                error!("all background startup repository bootstraps failed");
+                return;
+            }
+
+            let writer = bootstrap_server.writer.clone();
+            let pool = bootstrap_server.pool.clone();
+            let active_repository_ids = match bootstrap_config_source {
+                ConfigSource::Explicit(_) | ConfigSource::Persistent => Some(
+                    bootstrapped
+                        .iter()
+                        .map(|(_, id)| id.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 ConfigSource::Legacy(_) | ConfigSource::Unconfigured => None,
             };
+
             match tokio::task::spawn_blocking(move || {
                 let opts = attic_crossrepo::maintenance::WorkspaceSyncOptions {
-                    active_repository_ids: active_ids_for_sync,
+                    active_repository_ids,
                     ..Default::default()
                 };
                 pool.with_reader(|conn| {
@@ -2431,130 +2435,16 @@ async fn main() -> anyhow::Result<()> {
                     info!(
                         repos = result.repository_reports.len(),
                         edges = result.edges_emitted,
-                        "cross-repo workspace sync complete"
+                        "background cross-repo workspace sync complete"
                     );
-                    // Sync succeeded: cross-repo subsystem is healthy.
-                    server
+                    bootstrap_server
                         .crossrepo_degraded
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                Ok(Err(e)) => {
-                    warn!("cross-repo workspace sync failed: {e}");
-                    // Sync failed: cross-repo subsystem remains degraded
-                    // (initialized to true). Cross-repo-dependent answers
-                    // are prevented; local retrieval continues unaffected.
-                }
-                Err(e) => {
-                    warn!("cross-repo workspace sync task failed: {e}");
-                }
+                Ok(Err(e)) => warn!("background cross-repo workspace sync failed: {e}"),
+                Err(e) => warn!("background cross-repo workspace sync task failed: {e}"),
             }
-        }
-
-        // 2. Schedule offline refresh for anything not CURRENT.
-        match attic_incremental::plan_offline_refresh(&server.pool) {
-            Ok(batch) => {
-                for refresh in batch {
-                    let payload = attic_storage::IncrementalTaskPayload {
-                        dedup_key: format!(
-                            "offline-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros())
-                                .unwrap_or_default()
-                        ),
-                        upserts: refresh.upsert_paths,
-                        deletes: vec![],
-                        renames: vec![],
-                        from_reconciliation: true,
-                    };
-                    if let Err(e) = attic_incremental::scheduler::schedule_incremental(
-                        &server.writer,
-                        &refresh.repository_id,
-                        &payload,
-                        attic_incremental::scheduler::PRIORITY_RECONCILE,
-                        4096,
-                        server.resource_monitor.as_ref().map(|m| m.as_ref()),
-                    ) {
-                        warn!("offline refresh scheduling failed: {e}");
-                    }
-                }
-            }
-            Err(e) => warn!("offline refresh planning failed: {e}"),
-        }
-
-        // 3. ONE shared scheduler for the whole process (┬º10: one
-        //    coordinated WriterQueue, not one scheduler/database per
-        //    repository). Its workers resolve each claimed task's OWN
-        //    repository root dynamically from storage; the root passed
-        //    here is only the legacy fallback for repository-less tasks,
-        //    which the multi-root startup path above never produces.
-        //    Fallible: a scheduler that cannot start its workers is never
-        //    silently accepted.
-        let policy = DiscoveryPolicy::default_git();
-        let monitor = server.resource_monitor.clone();
-        match attic_incremental::spawn_scheduler(
-            attic_incremental::SchedulerConfig::default(),
-            server.pool.clone(),
-            server.writer.clone(),
-            bootstrapped[0].0.clone(),
-            policy.clone(),
-            monitor,
-        ) {
-            Ok(sched) => sched_handle = Some(sched),
-            Err(e) => {
-                error!(
-                    "scheduler startup failed ΓÇö incremental mode DISABLED for all repositories: {e}"
-                );
-                // Continue serving WITHOUT incremental claims; status reports
-                // watcher.mode = "disabled" for every configured repository.
-                return serve_until_closed(server, sched_handle, semantic_enricher).await;
-            }
-        }
-
-        // 4. Change detection ΓÇö one watcher PER successfully bootstrapped
-        //    repository root (┬º12): each retains its own repository
-        //    identity/state, so a change under root A is normalized and
-        //    verified relative to root A alone and can never be
-        //    interpreted against root B's boundary. A watcher failing to
-        //    start for one repository does not affect the others.
-        for (root, repository_id) in &bootstrapped {
-            let service = Arc::new(
-                attic_incremental::IncrementalService::new(root, policy.clone())
-                    .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
-            );
-            match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
-                Ok(watch) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        mode = watch.mode().as_str(),
-                        "incremental change detection started"
-                    );
-                    let mode = watch.mode();
-                    if let Ok(mut g) = server.watch_mode.write() {
-                        g.insert(repository_id.clone(), mode);
-                    } else {
-                        error!(repository_id = %repository_id, "watch_mode lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.incremental.write() {
-                        g.insert(repository_id.clone(), service);
-                    } else {
-                        error!(repository_id = %repository_id, "incremental lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.watches.lock() {
-                        g.insert(repository_id.clone(), watch);
-                    } else {
-                        error!(repository_id = %repository_id, "watches lock poisoned in startup watcher loop");
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "change detection failed to start for {} ({e}) ΓÇö incremental DISABLED for this repository",
-                        root.display()
-                    );
-                }
-            }
-        }
+        });
     }
 
     serve_until_closed(server, sched_handle, semantic_enricher).await
