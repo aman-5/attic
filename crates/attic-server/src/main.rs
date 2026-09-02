@@ -491,55 +491,60 @@ impl AtticServer {
             }
         }
         for root in &added {
-            match tokio::task::spawn_blocking({
-                let server = self.clone();
-                let root = root.clone();
-                move || server.bootstrap_workspace(&root)
-            })
-            .await
-            {
-                Ok(Ok(repo_id)) => {
-                    // ┬º23: clear any prior degraded-add marker for this root.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.remove(root);
+            let server = self.clone();
+            let root = root.clone();
+            let root_for_event = root.clone();
+
+            tokio::spawn(async move {
+                let bootstrap_root = root.clone();
+                let bootstrap_server = server.clone();
+
+                match tokio::task::spawn_blocking(move || {
+                    bootstrap_server.bootstrap_workspace(&bootstrap_root)
+                })
+                .await
+                {
+                    Ok(Ok(repo_id)) => {
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.remove(&root);
+                        }
+
+                        let started = server.start_watcher(&root, &repo_id);
+
+                        tracing::info!(
+                            root = %root.display(),
+                            repository_id = %repo_id,
+                            watcher_started = started,
+                            "background workspace bootstrap completed"
+                        );
                     }
-                    let started = self.start_watcher(root, &repo_id);
-                    events.push(format!(
-                        "added + {} root: {}",
-                        if started {
-                            "started watcher for"
-                        } else {
-                            "indexed"
-                        },
-                        root.display()
-                    ));
-                }
-                Ok(Err(e)) => {
-                    // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
+                    Ok(Err(e)) => {
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.insert(root.clone());
+                        }
+
+                        tracing::warn!(
+                            root = %root.display(),
+                            "background workspace bootstrap failed: {e}"
+                        );
                     }
-                    tracing::warn!(
-                        "bootstrap of newly added root {} failed: {e}",
-                        root.display()
-                    );
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
-                }
-                Err(e) => {
-                    // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
+                    Err(e) => {
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.insert(root.clone());
+                        }
+
+                        tracing::warn!(
+                            root = %root.display(),
+                            "background workspace bootstrap task failed: {e}"
+                        );
                     }
-                    tracing::warn!("bootstrap task for {} failed: {e}", root.display());
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
                 }
-            }
+            });
+
+            events.push(format!(
+                "added root; indexing scheduled in background: {}",
+                root_for_event.display()
+            ));
         }
 
         let payload = json!({
