@@ -54,11 +54,11 @@ pub mod resources {
     /// Total memory budget for all in-index operations (MiB).  When approached,
     /// the system degrades by pausing semantic enrichment, reducing indexing
     /// concurrency, and rejecting expensive tasks.
-    pub const TOTAL_MEMORY_BUDGET_MIB: u64 = 1024;
+    pub const TOTAL_MEMORY_BUDGET_MIB: u64 = 4096;
 
     /// Per-repository memory budget ceiling (MiB).  No single repository may
     /// consume more than this during indexing.
-    pub const PER_REPO_MEMORY_BUDGET_MIB: u64 = 128;
+    pub const PER_REPO_MEMORY_BUDGET_MIB: u64 = 512;
 
     /// Maximum disk I/O operations per second across all workers.  When
     /// exceeded, the system backs off expensive fs operations.
@@ -103,7 +103,7 @@ pub mod resources {
     /// becomes unreachable (Emergency always preempts it first). See
     /// `ResourceConfig::validate` / `resource_manager::safe_min_free_mib`,
     /// which reject or clamp configurations that violate this invariant.
-    pub const MIN_FREE_MEMORY_MIB: u64 = 100;
+    pub const MIN_FREE_MEMORY_MIB: u64 = 400;
 
     /// Backup directory relative to database path (for crash recovery backups).
     pub const BACKUP_RELATIVE_DIR: &str = "backups";
