@@ -962,21 +962,21 @@ fn find_aws_key_matches(text: &str) -> Vec<Match> {
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         {
-                let not_continued = candidate.len() == key_len
-                    || !candidate
-                        .chars()
-                        .nth(key_len)
-                        .map(|c| c.is_ascii_alphanumeric())
-                        .unwrap_or(false);
-                if not_continued {
-                    out.push(Match {
-                        start: pos,
-                        length: key_len,
-                    });
-                    from = pos + key_len;
-                    continue;
-                }
+            let not_continued = candidate.len() == key_len
+                || !candidate
+                    .chars()
+                    .nth(key_len)
+                    .map(|c| c.is_ascii_alphanumeric())
+                    .unwrap_or(false);
+            if not_continued {
+                out.push(Match {
+                    start: pos,
+                    length: key_len,
+                });
+                from = pos + key_len;
+                continue;
             }
+        }
         from = pos + 1;
     }
     out
