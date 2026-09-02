@@ -213,6 +213,7 @@ struct SeenPaths {
 ///
 /// When `filter` is `&mut |entry| entry` (i.e. returns the entry unchanged)
 /// use the `&mut |entry| { ...; entry }` form.
+#[allow(clippy::too_many_arguments)]
 fn walk_pass<F>(
     root: &Path,
     policy: &DiscoveryPolicy,

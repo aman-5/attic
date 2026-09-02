@@ -1422,6 +1422,7 @@ fn handle_repo_map(
 /// actively watching ΓÇö repositories known to storage but absent from these
 /// maps (never configured this run, or a watcher failed to start) are
 /// reported as `DISABLED` rather than silently omitted.
+#[allow(clippy::too_many_arguments)]
 fn handle_status(
     pool: &DbPool,
     incremental: &HashMap<String, Arc<attic_incremental::IncrementalService>>,
@@ -4550,8 +4551,8 @@ mod tests {
                 let claims = parsed["claims"].to_string();
                 let full = format!("{context_body} {claims} {text}");
 
-                let ready = full.contains("example.com/provider")
-                    || full.contains(&provider_id_str);
+                let ready =
+                    full.contains("example.com/provider") || full.contains(&provider_id_str);
                 last_v = parsed;
                 last_claims = claims;
                 last_full = full;
