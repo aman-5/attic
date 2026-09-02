@@ -4354,6 +4354,16 @@ mod tests {
         )
         .unwrap();
 
+        // Canonicalize so every downstream use (pre-seed bootstrap, the ID
+        // readback below, and the `path = "..."` entries written into
+        // `cfg_path`) matches the canonical form `validate_configured_roots`
+        // produces for the real server's own ATTIC_CONFIG-driven sync —
+        // otherwise the two can disagree on Windows (short 8.3 names,
+        // `\\?\` verbatim prefix) and end up as two different repository rows.
+        let provider_dir = provider_dir.canonicalize().unwrap();
+        let dependent_dir = dependent_dir.canonicalize().unwrap();
+        let unrelated_dir = unrelated_dir.canonicalize().unwrap();
+
         let db_path = tmp.path().join("e2e.db");
 
         // ΓöÇΓöÇ Pre-seed DB by indexing all repos in-process ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -4521,9 +4531,40 @@ mod tests {
             (child, stdin)
         };
 
+        // Startup bootstrap + cross-repo sync run in the background. Wait until
+        // all configured repositories are CURRENT before asking the cross-repo
+        // gate question, then allow the immediately-following sync publication
+        // to commit. This avoids racing initialize against startup sync.
+        let mut all_current = false;
+        for poll_id in 10..210 {
+            let status_call = mcp_request(
+                poll_id,
+                "tools/call",
+                json!({"name":"status","arguments":{}}),
+            );
+            let status_resp = send_recv(&mut child, &mut stdin, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            let status_v: Value = serde_json::from_str(status_text).unwrap_or(json!({}));
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                all_current = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            all_current,
+            "cross-repo fixture repositories never became CURRENT"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
         // Gate 1 + Gate 3: query about the dependent's dependencies.
         // The response should identify the provider repository and preserve
-        // confidence information.
+        // confidence information. `current_repository_count == 3` only means
+        // indexing converged — the cross-repo edge publication that follows
+        // it can still be in flight, so retry the real query itself instead
+        // of trusting a fixed sleep to have been long enough.
         let call = mcp_request(
             2,
             "tools/call",
@@ -4531,26 +4572,22 @@ mod tests {
                 "name": "context",
                 "arguments": {
                     "query": "What Go modules does the dependent repository depend on?",
-                    "mode": "NORMAL"
+                    "mode": "NORMAL",
+                    "repository_id": dependent_id_str.clone()
                 }
             }),
         );
-        // Startup bootstrap + cross-repo sync are intentionally asynchronous.
-        // Poll the real MCP context path until cross-repo sync has completed
-        // instead of racing it immediately after initialize.
-        let (v, full_response, claims_json) = {
+        let (v, full_response, _claims_json) = {
             let mut last_v = json!({});
             let mut last_full = String::new();
             let mut last_claims = String::new();
-
-            for _ in 0..200 {
+            for _ in 0..80 {
                 let resp = send_recv(&mut child, &mut stdin, &call);
                 let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
                 let parsed: Value = serde_json::from_str(text).unwrap_or(json!({}));
                 let context_body = parsed["context"].as_str().unwrap_or("");
                 let claims = parsed["claims"].to_string();
                 let full = format!("{context_body} {claims} {text}");
-
                 let ready =
                     full.contains("example.com/provider") || full.contains(&provider_id_str);
                 last_v = parsed;
@@ -4561,7 +4598,6 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-
             (last_v, last_full, last_claims)
         };
 
@@ -4575,15 +4611,38 @@ mod tests {
         );
 
         // Gate 2: unrelated repository is not falsely claimed as a dependency.
-        // The raw context body may legitimately contain any indexed go.mod file
-        // (retrieval surfaces all relevant content).  We therefore check only the
-        // structured claims JSON ΓÇö not the context prose ΓÇö for a false dependency
-        // claim on example.com/unrelated.
+        // This MUST be an unscoped query (no repository_id): the Gate 1/3/4
+        // query above is filtered to `dependent_id_str`, which would exclude
+        // any evidence about example.com/unrelated regardless of whether the
+        // underlying cross-repo logic has a real false-association bug,
+        // making the assertion vacuously true.
+        let unscoped_call = mcp_request(
+            3,
+            "tools/call",
+            json!({
+                "name": "context",
+                "arguments": {
+                    "query": "What Go modules does the dependent repository depend on?",
+                    "mode": "NORMAL"
+                }
+            }),
+        );
+        let unscoped_resp = send_recv(&mut child, &mut stdin, &unscoped_call);
+        let unscoped_text = unscoped_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        let unscoped_claims =
+            serde_json::from_str::<Value>(unscoped_text).unwrap_or(json!({}))["claims"].to_string();
+        // The raw context body may legitimately contain any indexed go.mod
+        // file (retrieval surfaces all relevant content). We therefore check
+        // only the structured claims JSON ΓÇö not the context prose ΓÇö for a
+        // false dependency claim on example.com/unrelated.
         assert!(
-            !claims_json.contains("example.com/unrelated") || claims_json.contains("not depend"),
+            !unscoped_claims.contains("example.com/unrelated")
+                || unscoped_claims.contains("not depend"),
             "gate 2 FAIL: unrelated repository should not appear as a dependency \
              claim; claims={:.400}",
-            claims_json
+            unscoped_claims
         );
 
         // Gate 3: confidence field is present and non-empty (preserved).
@@ -4717,6 +4776,33 @@ mod tests {
             );
             (child, stdin)
         };
+
+        // As above, do not race the Gate 7 assertion against asynchronous
+        // startup bootstrap/sync. The changed manifest must have been consumed
+        // by a completed workspace sync before we inspect the result.
+        let mut all_current_after_change = false;
+        for poll_id in 10..210 {
+            let status_call = mcp_request(
+                poll_id,
+                "tools/call",
+                json!({"name":"status","arguments":{}}),
+            );
+            let status_resp = send_recv(&mut child2, &mut stdin2, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            let status_v: Value = serde_json::from_str(status_text).unwrap_or(json!({}));
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                all_current_after_change = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            all_current_after_change,
+            "post-change cross-repo fixture repositories never became CURRENT"
+        );
+        std::thread::sleep(Duration::from_millis(100));
 
         let call2 = mcp_request(
             2,

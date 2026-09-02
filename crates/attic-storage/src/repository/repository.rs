@@ -157,6 +157,17 @@ pub fn lookup_repository_by_root_path(
     root_path: &str,
 ) -> Result<Option<RepositoryId>, StorageError> {
     use rusqlite::OptionalExtension;
+
+    fn parse_id(s: String) -> Result<RepositoryId, StorageError> {
+        s.parse::<RepositoryId>().map_err(|e| {
+            StorageError::Domain(attic_core::CoreError::UnknownVariant {
+                type_name: "RepositoryId",
+                value: e.to_string(),
+            })
+        })
+    }
+
+    // First try the normal exact lookup.
     let id_str: Option<String> = conn
         .query_row(
             "SELECT id FROM core_repositories WHERE root_path = ?1 LIMIT 1",
@@ -164,18 +175,46 @@ pub fn lookup_repository_by_root_path(
             |r| r.get(0),
         )
         .optional()?;
-    match id_str {
-        Some(s) => {
-            let id = s.parse::<RepositoryId>().map_err(|e| {
-                StorageError::Domain(attic_core::CoreError::UnknownVariant {
-                    type_name: "RepositoryId",
-                    value: e.to_string(),
-                })
-            })?;
-            Ok(Some(id))
-        }
-        None => Ok(None),
+
+    if let Some(id) = id_str {
+        return parse_id(id).map(Some);
     }
+
+    // Windows canonicalize() commonly adds the verbatim `\\?\` prefix.
+    // A repository already stored as `C:\repo` must still match
+    // `\\?\C:\repo`; otherwise Attic creates a second repository ID.
+    #[cfg(windows)]
+    {
+        fn normalize(path: &str) -> String {
+            let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{rest}")
+            } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+                rest.to_owned()
+            } else {
+                path.to_owned()
+            };
+
+            path.replace('/', "\\").to_lowercase()
+        }
+
+        let wanted = normalize(root_path);
+
+        let mut stmt = conn.prepare("SELECT id, root_path FROM core_repositories")?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (id, stored_root) = row?;
+
+            if normalize(&stored_root) == wanted {
+                return parse_id(id).map(Some);
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]

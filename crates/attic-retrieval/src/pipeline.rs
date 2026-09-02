@@ -471,28 +471,40 @@ impl RetrievalService {
             if contract
                 .allowed_fallbacks
                 .contains(&FallbackStrategy::BoundedGraph)
-                && !seed_files.is_empty()
             {
-                ctx.run(
-                    plan,
-                    SubsystemTag::GraphWalk,
-                    "direct_relationship_edges",
-                    "seeds",
-                    |env| RelationshipGenerator::run(env, &seed_files),
-                );
-                // Phase 6: cross-repository dependency edges from other
-                // workspaces the user has added to the catalog.
-                if self.crossrepo_degraded {
-                    tracing::warn!(
-                        "cross-repo subsystem degraded; skipping cross-repo evidence generation"
+                if !seed_files.is_empty() {
+                    ctx.run(
+                        plan,
+                        SubsystemTag::GraphWalk,
+                        "direct_relationship_edges",
+                        "seeds",
+                        |env| RelationshipGenerator::run(env, &seed_files),
                     );
-                } else {
+                }
+
+                // Phase 6 cross-repo edges are workspace-level evidence. A
+                // dependency/cross-repo question must not require a lexical
+                // seed first: CrossRepoGenerator intentionally reads the
+                // bounded workspace edge set and can answer when FTS produced
+                // no seed files for natural-language repository wording.
+                let needs_workspace_crossrepo = matches!(
+                    qt,
+                    QueryType::DependencyQuestion | QueryType::CrossRepoQuestion
+                );
+                if !self.crossrepo_degraded && (!seed_files.is_empty() || needs_workspace_crossrepo)
+                {
                     ctx.run(
                         plan,
                         SubsystemTag::GraphWalk,
                         "cross_repo_dependency_edges",
-                        "seeds",
+                        "workspace",
                         |env| CrossRepoGenerator::run(env, &seed_files),
+                    );
+                } else if self.crossrepo_degraded
+                    && (!seed_files.is_empty() || needs_workspace_crossrepo)
+                {
+                    tracing::warn!(
+                        "cross-repo subsystem degraded; skipping cross-repo evidence generation"
                     );
                 }
             }

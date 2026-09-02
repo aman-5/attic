@@ -72,7 +72,7 @@ pub mod walk;
 
 pub use diagnostics::{Diagnostic, DiagnosticKind, WalkCounters};
 pub use error::DiscoveryError;
-pub use git::GitRepoMeta;
+pub use git::{GitRepoMeta, discover_nested_git_roots};
 pub use manifest::{ManifestEntry, SourceManifest, manifest_hash_from_pairs};
 pub use policy::DiscoveryPriority;
 pub use policy::{DiscoveryPolicy, GlobRule, PriorityRule};

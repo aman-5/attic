@@ -29,6 +29,61 @@ pub fn is_git_root(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Discover Git repository roots below `root`.
+///
+/// If `root` itself is a Git repository, returns only `root`. Otherwise,
+/// recursively finds nested Git repositories without following symlinks or
+/// descending into `.git` metadata directories. Results are canonicalized,
+/// deduplicated, and sorted lexicographically.
+pub fn discover_nested_git_roots(
+    root: &Path,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<Vec<PathBuf>, std::io::Error> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    if is_git_root(root) {
+        return Ok(vec![root.canonicalize()?]);
+    }
+
+    let mut roots = Vec::new();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .hidden(true)
+        .follow_links(false)
+        .threads(1)
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
+
+    for entry in builder.build() {
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "repository discovery cancelled",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("skipping unreadable entry during nested-repo discovery: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) && is_git_root(path)
+        {
+            roots.push(path.canonicalize()?);
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 /// Walk upward from `start` to find the nearest Git repository root.
 ///
 /// Returns `None` when no `.git` is found before hitting the filesystem root.
@@ -300,6 +355,30 @@ mod tests {
         assert!(meta.is_detached);
         assert_eq!(meta.head_sha.as_deref(), Some(sha.as_str()));
         assert!(meta.branch.is_none());
+    }
+
+    #[test]
+    fn discover_nested_git_roots_finds_all_child_repositories() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo_a = root.join("group-a/repo-a");
+        let repo_b = root.join("group-b/repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        make_bare_repo(&repo_a);
+        make_bare_repo(&repo_b);
+        fs::write(root.join("readme.txt"), "container only").unwrap();
+
+        let roots =
+            discover_nested_git_roots(root, &attic_core::CancellationToken::default()).unwrap();
+
+        assert_eq!(
+            roots,
+            vec![
+                repo_a.canonicalize().unwrap(),
+                repo_b.canonicalize().unwrap()
+            ],
+        );
     }
 
     #[test]
