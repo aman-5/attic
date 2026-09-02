@@ -957,11 +957,11 @@ fn find_aws_key_matches(text: &str) -> Vec<Match> {
         };
         let candidate = &text[pos..];
         let key_len = 20;
-        if let Some(key) = candidate.get(..key_len) {
-            if key
+        if let Some(key) = candidate.get(..key_len)
+            && key
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            {
+        {
                 let not_continued = candidate.len() == key_len
                     || !candidate
                         .chars()
@@ -977,7 +977,6 @@ fn find_aws_key_matches(text: &str) -> Vec<Match> {
                     continue;
                 }
             }
-        }
         from = pos + 1;
     }
     out
