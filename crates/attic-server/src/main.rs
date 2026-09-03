@@ -183,6 +183,23 @@ struct AtticServer {
     /// this always reflects the last actually-observed traversal rather than
     /// a stale persisted value.
     last_discovery_counters: Arc<std::sync::RwLock<HashMap<String, attic_discovery::WalkCounters>>>,
+    /// Human-readable counterpart to `last_discovery_counters`: the actual
+    /// `Diagnostic` messages (submodule boundaries, symlink issues, etc.)
+    /// from the most recent walk, per `repository_id`. Same in-memory-only,
+    /// replaced-on-reindex lifecycle as `last_discovery_counters`.
+    last_discovery_diagnostics:
+        Arc<std::sync::RwLock<HashMap<String, Vec<attic_discovery::Diagnostic>>>>,
+    /// Maps a configured root's identity key (`root_identity_key`) to the
+    /// set of effective repository roots it fanned out into. Most entries
+    /// are `[configured_root]` (the 1:1 legacy case); a container directory
+    /// with no top-level `.git` but nested git repos fans out to N entries,
+    /// one per nested root discovered by `discover_nested_git_roots`.
+    container_repo_roots: Arc<std::sync::RwLock<HashMap<String, Vec<PathBuf>>>>,
+    /// Repository ids whose `start_watcher` call failed, with the error
+    /// message. Cleared on a subsequent successful `start_watcher` or on
+    /// `stop_watcher`. Lets `status` report a real reason for `DISABLED`
+    /// instead of silently absorbing the failure into a bare catch-all.
+    watcher_start_failures: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl AtticServer {
@@ -257,6 +274,9 @@ impl AtticServer {
             db_path: db_path.to_path_buf(),
             resource_monitor: Some(Arc::new(resource_monitor)),
             last_discovery_counters: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            last_discovery_diagnostics: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            container_repo_roots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            watcher_start_failures: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -301,7 +321,45 @@ impl AtticServer {
         if let Ok(mut counters) = self.last_discovery_counters.write() {
             counters.insert(result.repository_id.clone(), result.discovery_counters);
         }
+        if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
+            diagnostics.insert(
+                result.repository_id.clone(),
+                result.discovery_diagnostics.clone(),
+            );
+        }
         Ok(result.repository_id)
+    }
+
+    /// Discover nested git roots below `configured_root` (or treat it as
+    /// one root when it has no git boundaries anywhere) and bootstrap each
+    /// effective root independently.
+    ///
+    /// A container directory with no top-level `.git` whose entire content
+    /// lives inside child git repositories previously indexed as a single,
+    /// always-empty repository (every file lives under a pruned submodule
+    /// boundary — see `walk_pass`). This fans the container out into one
+    /// repository per nested `.git` instead.
+    ///
+    /// All-or-nothing: the first bootstrap failure aborts the whole call.
+    /// Rows already committed for earlier roots remain in the DB and are
+    /// harmlessly re-indexed on retry.
+    fn bootstrap_workspace_roots_cancellable(
+        &self,
+        configured_root: &Path,
+        cancellation: &attic_core::CancellationToken,
+    ) -> Result<Vec<(PathBuf, String)>, ServerError> {
+        let nested = attic_discovery::discover_nested_git_roots(configured_root, cancellation)?;
+        let effective_roots: Vec<PathBuf> = if nested.is_empty() {
+            vec![configured_root.to_path_buf()]
+        } else {
+            nested
+        };
+        let mut results = Vec::with_capacity(effective_roots.len());
+        for root in effective_roots {
+            let repo_id = self.bootstrap_workspace_cancellable(&root, cancellation)?;
+            results.push((root, repo_id));
+        }
+        Ok(results)
     }
 
     /// Runtime logical-workspace membership management via the `workspace`
@@ -330,12 +388,28 @@ impl AtticServer {
             let configured = self
                 .workspace_configured
                 .load(std::sync::atomic::Ordering::SeqCst);
+            // Only surface roots that genuinely fanned out into more than
+            // one repository (a container with nested git repos) — the
+            // trivial 1:1 case stays implicit, matching every other
+            // configured root.
+            let root_expansions: HashMap<String, Vec<String>> =
+                lock_or_server_err!(self.container_repo_roots.read(), "container_repo_roots")?
+                    .iter()
+                    .filter(|(_, v)| v.len() != 1)
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.iter().map(|p| p.display().to_string()).collect(),
+                        )
+                    })
+                    .collect();
             let payload = json!({
                 "configured": configured,
                 "unconfigured": !configured,
                 "config_file": self.default_config.display().to_string(),
                 "membership_count": active.len(),
                 "roots": active.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+                "root_expansions": root_expansions,
             });
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&payload)?,
@@ -501,21 +575,47 @@ impl AtticServer {
                     job.cancellation.cancel();
                 }
             }
-            let repo_id = self
-                .pool
-                .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+            // A configured root may have fanned out into N effective
+            // repository roots (container with nested git repos); look up
+            // and clear that mapping so every fanned-out repo's watcher and
+            // diagnostics get cleaned up, not just a single lookup on the
+            // configured root itself (which is never itself a repo row in
+            // the fan-out case).
+            let effective_roots = self
+                .container_repo_roots
+                .write()
                 .ok()
-                .flatten()
-                .map(|id| id.to_string());
-            if let Some(id) = repo_id {
-                self.stop_watcher(&id);
-                // PR-3 counters are keyed by repository_id; a removed root's
-                // entry would otherwise never be cleaned up, growing this
-                // map unboundedly over a long-running process's lifetime.
-                if let Ok(mut counters) = self.last_discovery_counters.write() {
-                    counters.remove(&id);
+                .and_then(|mut g| g.remove(&job_key))
+                .unwrap_or_else(|| vec![root.clone()]);
+            let mut stopped = 0usize;
+            for effective_root in &effective_roots {
+                let repo_id = self
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|id| id.to_string());
+                if let Some(id) = repo_id {
+                    self.stop_watcher(&id);
+                    // PR-3 counters are keyed by repository_id; a removed root's
+                    // entry would otherwise never be cleaned up, growing this
+                    // map unboundedly over a long-running process's lifetime.
+                    if let Ok(mut counters) = self.last_discovery_counters.write() {
+                        counters.remove(&id);
+                    }
+                    if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
+                        diagnostics.remove(&id);
+                    }
+                    stopped += 1;
                 }
-                events.push(format!("stopped watcher for: {}", root.display()));
+            }
+            if stopped > 0 {
+                events.push(format!(
+                    "stopped {stopped} watcher(s) for: {}",
+                    root.display()
+                ));
             } else {
                 events.push(format!("removed (no registered repo): {}", root.display()));
             }
@@ -532,15 +632,18 @@ impl AtticServer {
                 let bootstrap_root = root.clone();
                 let bootstrap_server = server.clone();
                 let blocking_cancellation = worker_cancellation.clone();
+                let job_key = root_identity_key(&root);
 
                 let result = tokio::task::spawn_blocking(move || {
-                    bootstrap_server
-                        .bootstrap_workspace_cancellable(&bootstrap_root, &blocking_cancellation)
+                    bootstrap_server.bootstrap_workspace_roots_cancellable(
+                        &bootstrap_root,
+                        &blocking_cancellation,
+                    )
                 })
                 .await;
 
                 match result {
-                    Ok(Ok(repo_id)) if !worker_cancellation.is_cancelled() => {
+                    Ok(Ok(repo_roots)) if !worker_cancellation.is_cancelled() => {
                         // Membership may have changed while indexing was running.
                         let still_active = server.active_roots.read().ok().is_some_and(|roots| {
                             roots
@@ -554,8 +657,16 @@ impl AtticServer {
                         if let Ok(mut g) = server.pending_index_failed.lock() {
                             g.remove(&root);
                         }
-                        let started = server.start_watcher(&root, &repo_id);
-                        tracing::info!(root = %root.display(), repository_id = %repo_id, watcher_started = started, "background workspace bootstrap completed");
+                        if let Ok(mut g) = server.container_repo_roots.write() {
+                            g.insert(
+                                job_key.clone(),
+                                repo_roots.iter().map(|(p, _)| p.clone()).collect(),
+                            );
+                        }
+                        for (effective_root, repo_id) in &repo_roots {
+                            let started = server.start_watcher(effective_root, repo_id);
+                            tracing::info!(root = %effective_root.display(), container_root = %root.display(), repository_id = %repo_id, watcher_started = started, "background workspace bootstrap completed");
+                        }
                     }
                     Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => {
                         tracing::info!(root = %root.display(), "background workspace bootstrap cancelled");
@@ -631,6 +742,9 @@ impl AtticServer {
         } else {
             error!(repository_id, "watch_mode lock poisoned in stop_watcher");
         }
+        if let Ok(mut g) = self.watcher_start_failures.write() {
+            g.remove(repository_id);
+        }
     }
 
     /// Start a watcher for `root` (already bootstrapped/registered as
@@ -688,6 +802,9 @@ impl AtticServer {
                     mode = mode.as_str(),
                     "runtime-added watcher started"
                 );
+                if let Ok(mut g) = self.watcher_start_failures.write() {
+                    g.remove(repository_id);
+                }
                 true
             }
             Err(e) => {
@@ -695,6 +812,9 @@ impl AtticServer {
                     "change detection failed to start for {} ({e}) ΓÇö incremental DISABLED for this repository",
                     root.display()
                 );
+                if let Ok(mut g) = self.watcher_start_failures.write() {
+                    g.insert(repository_id.to_string(), e.to_string());
+                }
                 false
             }
         }
@@ -774,6 +894,60 @@ fn root_identity_key(path: &Path) -> String {
         stripped.to_lowercase()
     } else {
         stripped.to_string()
+    }
+}
+
+/// Expand configured roots into their fanned-out repository ids.
+///
+/// Most configured roots map to exactly one repository (the legacy 1:1
+/// case, when `container_repo_roots` has no entry for the root's identity
+/// key — every existing single-root workspace behaves byte-for-byte as
+/// before). A container root with nested git repositories fans out into
+/// N repository ids, one per nested root discovered at `add` time.
+///
+/// Returns the flattened set of active repository ids, plus a reverse map
+/// from each repository id to the identity key of the configured root that
+/// owns it (used by `handle_status` to recognize "this repository's
+/// configured root is still bootstrapping" instead of guessing).
+fn expand_active_ids(
+    pool: &DbPool,
+    active_roots: &[PathBuf],
+    container_repo_roots: &HashMap<String, Vec<PathBuf>>,
+) -> (HashSet<String>, HashMap<String, String>) {
+    let mut ids = HashSet::new();
+    let mut owner = HashMap::new();
+    for configured_root in active_roots {
+        let key = root_identity_key(configured_root);
+        let effective_roots = container_repo_roots
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| vec![configured_root.clone()]);
+        for root in &effective_roots {
+            if let Some(id) = pool
+                .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+                .ok()
+                .flatten()
+                .map(|id| id.to_string())
+            {
+                ids.insert(id.clone());
+                owner.insert(id, key.clone());
+            }
+        }
+    }
+    (ids, owner)
+}
+
+/// SCREAMING_SNAKE_CASE label for a discovery diagnostic kind, matching the
+/// existing status-string convention (`"RECONCILIATION_REQUIRED"`, etc.).
+fn diagnostic_kind_str(kind: &attic_discovery::DiagnosticKind) -> &'static str {
+    use attic_discovery::DiagnosticKind::*;
+    match kind {
+        SymlinkEscape => "SYMLINK_ESCAPE",
+        SymlinkCycle => "SYMLINK_CYCLE",
+        UnstableCapture => "UNSTABLE_CAPTURE",
+        IoError => "IO_ERROR",
+        SubmoduleDetected => "SUBMODULE_DETECTED",
+        ExemptionRejected => "EXEMPTION_REJECTED",
     }
 }
 
@@ -1374,6 +1548,7 @@ fn handle_repo_map(
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
     discovery_counters: &HashMap<String, attic_discovery::WalkCounters>,
+    discovery_diagnostics: &HashMap<String, Vec<attic_discovery::Diagnostic>>,
 ) -> Result<CallToolResult, ServerError> {
     let repo_id = args
         .get("repository_id")
@@ -1404,6 +1579,18 @@ fn handle_repo_map(
     // any bootstrap/reindex has run this process — answers "why did the
     // filesystem count and indexed count differ" without server logs.
     let discovery = discovery_counters.get(repo_id);
+    let diagnostics: Vec<Value> = discovery_diagnostics
+        .get(repo_id)
+        .into_iter()
+        .flatten()
+        .map(|d| {
+            json!({
+                "kind": diagnostic_kind_str(&d.kind),
+                "path": d.path.display().to_string(),
+                "message": d.message,
+            })
+        })
+        .collect();
 
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&json!({
@@ -1411,6 +1598,7 @@ fn handle_repo_map(
             "stats": stats,
             "tree": root.to_json(),
             "discovery": discovery,
+            "diagnostics": diagnostics,
         }))?,
     )]))
 }
@@ -1419,9 +1607,16 @@ fn handle_repo_map(
 /// multi-root workspace with one healthy repository and two degraded ones
 /// must never be reported as uniformly "ok". `incremental`/`watch_mode` are
 /// keyed by `repository_id`, one entry per repository this process is
-/// actively watching ΓÇö repositories known to storage but absent from these
-/// maps (never configured this run, or a watcher failed to start) are
-/// reported as `DISABLED` rather than silently omitted.
+/// actively watching. A repository known to storage but absent from these
+/// maps is reported as `DISABLED` UNLESS its configured root is still
+/// bootstrapping (`pending_index_roots`, via `container_repo_roots`'s
+/// root→repository-id ownership), in which case it is `INDEXING`. When it
+/// genuinely is disabled, the reason is `watcher_start_failures`'s recorded
+/// error when available, else an honest `"watcher_not_registered"` label —
+/// never a bare unreasoned catch-all. A configured root may also fan out
+/// into more than one repository id (a container with nested git repos —
+/// see `container_repo_roots`), so this is a container→N-repository
+/// relationship, not 1:1.
 #[allow(clippy::too_many_arguments)]
 fn handle_status(
     pool: &DbPool,
@@ -1432,6 +1627,8 @@ fn handle_status(
     active_roots: &[PathBuf],
     unavailable_roots: &[(PathBuf, String)],
     pending_index_roots: &[String],
+    container_repo_roots: &HashMap<String, Vec<PathBuf>>,
+    watcher_start_failures: &HashMap<String, String>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
@@ -1461,18 +1658,11 @@ fn handle_status(
     // masquerade as active (spec ┬º14-16). When UNCONFIGURED, the active set
     // is empty and status reports "unconfigured" ΓÇö stale DB repos never leak
     // into the response.
-    let active_ids: HashSet<String> = if configured {
-        active_roots
-            .iter()
-            .filter_map(|root| {
-                pool.with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
-                    .ok()
-                    .flatten()
-                    .map(|id| id.to_string())
-            })
-            .collect()
+    let (active_ids, id_owner_root_key): (HashSet<String>, HashMap<String, String>) = if configured
+    {
+        expand_active_ids(pool, active_roots, container_repo_roots)
     } else {
-        HashSet::new()
+        (HashSet::new(), HashMap::new())
     };
     if !configured {
         payload["status"] = json!("unconfigured");
@@ -1535,7 +1725,29 @@ fn handle_status(
                     json!({ "mode": mode.as_str(), "error": e.to_string() }),
                 ),
             },
-            _ => ("DISABLED", json!({ "mode": "disabled", "active": false })),
+            _ => {
+                let bootstrap_in_progress = id_owner_root_key.get(&rs.id).is_some_and(|key| {
+                    pending_index_roots
+                        .iter()
+                        .any(|p| p == key || p == "__startup__")
+                });
+                if bootstrap_in_progress {
+                    (
+                        "INDEXING",
+                        json!({ "mode": "pending", "active": false, "reason": "bootstrap_in_progress" }),
+                    )
+                } else if let Some(err) = watcher_start_failures.get(&rs.id) {
+                    (
+                        "DISABLED",
+                        json!({ "mode": "disabled", "active": false, "error": err }),
+                    )
+                } else {
+                    (
+                        "DISABLED",
+                        json!({ "mode": "disabled", "active": false, "reason": "watcher_not_registered" }),
+                    )
+                }
+            }
         };
         match state {
             "CURRENT" => current += 1,
@@ -1675,6 +1887,11 @@ fn handle_context(
         "insufficient_reason": outcome.insufficient_reason,
         "plan_id": outcome.plan.plan_id,
         "evidence_used": outcome.plan.evidence_used.len(),
+        // RP-INV-4: every piece of considered evidence must be accounted
+        // for — this is the "excluded" half (evidence_used above is the
+        // "included" half), each with a deterministic drop_reason so a
+        // caller can tell why a candidate never reached the answer.
+        "evidence_dropped": outcome.plan.evidence_dropped,
         "claims": outcome.claims.iter().map(|(text, verdict, _)| json!({
             "text": text,
             "verdict": verdict,
@@ -1886,17 +2103,9 @@ impl ServerHandler for AtticServer {
             // use this so historical repositories still present in storage can
             // never leak into active retrieval.
             let active_ids: HashSet<String> = if workspace_configured {
-                active_roots
-                    .iter()
-                    .filter_map(|root| {
-                        pool.with_reader(|c| {
-                            lookup_repository_by_root_path(c, &root.to_string_lossy())
-                        })
-                        .ok()
-                        .flatten()
-                        .map(|id| id.to_string())
-                    })
-                    .collect()
+                let container_repo_roots =
+                    lock_or_call_err!(self.container_repo_roots.read(), "container_repo_roots");
+                expand_active_ids(&pool, &active_roots, &container_repo_roots).0
             } else {
                 HashSet::new()
             };
@@ -1924,7 +2133,17 @@ impl ServerHandler for AtticServer {
                         self.last_discovery_counters.read(),
                         "last_discovery_counters"
                     );
-                    handle_repo_map(&pool, &args, &active_ids, &discovery_counters)
+                    let discovery_diagnostics = lock_or_call_err!(
+                        self.last_discovery_diagnostics.read(),
+                        "last_discovery_diagnostics"
+                    );
+                    handle_repo_map(
+                        &pool,
+                        &args,
+                        &active_ids,
+                        &discovery_counters,
+                        &discovery_diagnostics,
+                    )
                 }
                 "status" => {
                     let inc = lock_or_call_err!(incremental.read(), "incremental");
@@ -1951,6 +2170,12 @@ impl ServerHandler for AtticServer {
                             .filter(|job| !job.handle.is_finished())
                             .map(|job| job.root_key.clone())
                             .collect::<Vec<_>>();
+                    let container_repo_roots =
+                        lock_or_call_err!(self.container_repo_roots.read(), "container_repo_roots");
+                    let watcher_start_failures = lock_or_call_err!(
+                        self.watcher_start_failures.read(),
+                        "watcher_start_failures"
+                    );
                     handle_status(
                         &pool,
                         &inc,
@@ -1960,6 +2185,8 @@ impl ServerHandler for AtticServer {
                         &active_roots,
                         &combined_unavail,
                         &pending_index_roots,
+                        &container_repo_roots,
+                        &watcher_start_failures,
                     )
                 }
                 "context" => handle_context(
@@ -2445,15 +2672,21 @@ async fn main() -> anyhow::Result<()> {
                 let srv = startup_server.clone();
                 let root_for_bootstrap = root.clone();
                 let token = worker_cancellation.clone();
+                let job_key = root_identity_key(&root);
                 match tokio::task::spawn_blocking(move || {
-                    srv.bootstrap_workspace_cancellable(&root_for_bootstrap, &token)
+                    srv.bootstrap_workspace_roots_cancellable(&root_for_bootstrap, &token)
                 })
                 .await
                 {
-                    Ok(Ok(repository_id)) if !worker_cancellation.is_cancelled() => {
-                        info!(repository_id = %repository_id, root = %root.display(), "background startup repository bootstrap complete");
-                        startup_server.start_watcher(&root, &repository_id);
-                        bootstrapped.push((root, repository_id));
+                    Ok(Ok(repo_roots)) if !worker_cancellation.is_cancelled() => {
+                        if let Ok(mut g) = startup_server.container_repo_roots.write() {
+                            g.insert(job_key, repo_roots.iter().map(|(p, _)| p.clone()).collect());
+                        }
+                        for (effective_root, repository_id) in &repo_roots {
+                            info!(repository_id = %repository_id, root = %effective_root.display(), container_root = %root.display(), "background startup repository bootstrap complete");
+                            startup_server.start_watcher(effective_root, repository_id);
+                        }
+                        bootstrapped.extend(repo_roots);
                     }
                     Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => return,
                     Ok(Err(e)) => {
@@ -2507,6 +2740,22 @@ async fn main() -> anyhow::Result<()> {
                         edges = result.edges_emitted,
                         "background cross-repo workspace sync complete"
                     );
+                    // Resolver diagnostics (unresolved/ambiguous cross-repo
+                    // declaration targets) were previously computed and
+                    // silently dropped here — surface them so a repo/
+                    // declaration that fails to resolve is visible in
+                    // server logs instead of only manifesting as a missing
+                    // cross-repo edge with no trace of why.
+                    if !result.diagnostics.is_empty() {
+                        warn!(
+                            missing = result.diagnostics.missing_targets.len(),
+                            ambiguous = result.diagnostics.ambiguous_targets.len(),
+                            skipped_repositories = result.diagnostics.skipped_repositories,
+                            missing_targets = ?result.diagnostics.missing_targets,
+                            ambiguous_targets = ?result.diagnostics.ambiguous_targets,
+                            "background cross-repo workspace sync had unresolved targets"
+                        );
+                    }
                     startup_server
                         .crossrepo_degraded
                         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3291,6 +3540,84 @@ mod tests {
         assert!(e.contains("not found"), "{e}");
     }
 
+    // ΓöÇΓöÇ bootstrap_workspace_roots_cancellable: nested-repo fan-out ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    #[test]
+    fn bootstrap_workspace_roots_container_splits_into_n_repositories() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let container = tmp.path().join("container");
+        let repo_a = container.join("repo-a");
+        let repo_b = container.join("repo-b");
+        fs::create_dir_all(repo_a.join(".git")).unwrap();
+        fs::create_dir_all(repo_b.join(".git")).unwrap();
+        fs::write(repo_a.join("a.txt"), "alpha").unwrap();
+        fs::write(repo_b.join("b.txt"), "beta").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(
+                &container,
+                &attic_core::CancellationToken::default(),
+            )
+            .expect("fan-out bootstrap should succeed");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected one repository per nested .git root"
+        );
+        let ids: HashSet<&str> = results.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "each nested root must get a distinct repository id"
+        );
+
+        let stats = srv.pool.with_reader(get_repository_stats).unwrap();
+        for (_, id) in &results {
+            let s = stats.iter().find(|s| &s.id == id).expect("repo row exists");
+            assert!(
+                s.file_count >= 1,
+                "expected at least one file indexed for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_workspace_roots_single_git_root_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(&repo, &attic_core::CancellationToken::default())
+            .expect("single git root should bootstrap");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn bootstrap_workspace_roots_no_git_anywhere_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("f.txt"), "data").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(
+                &plain,
+                &attic_core::CancellationToken::default(),
+            )
+            .expect("plain non-git dir should bootstrap as one repository (legacy behavior)");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, plain);
+    }
+
     #[test]
     fn file_rejects_overflow_numeric_arguments() {
         let tmp = TempDir::new().unwrap();
@@ -3570,11 +3897,122 @@ mod tests {
             &[],
             &[],
             &[],
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    /// A repository row can exist before its watcher is registered (the
+    /// bootstrap task hasn't reached `start_watcher` yet). This window must
+    /// report `INDEXING`, not a bare `DISABLED` — it isn't actually disabled,
+    /// it just hasn't finished starting up.
+    #[test]
+    fn status_reports_bootstrap_in_progress_not_disabled() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        // Bootstrap via the canonicalized root, matching how production
+        // code always canonicalizes via `validate_root` before bootstrapping
+        // (see `handle_workspace`'s `add` branch) — without ever calling
+        // start_watcher (that only happens via handle_workspace/startup).
+        let canonical_root = repo.canonicalize().unwrap();
+        srv.bootstrap_workspace(&canonical_root).unwrap();
+        let key = root_identity_key(&canonical_root);
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[key],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "INDEXING");
+        assert_eq!(repos[0]["watcher"]["reason"], "bootstrap_in_progress");
+    }
+
+    /// When `start_watcher` genuinely failed, `status` must carry the real
+    /// error instead of a bare unreasoned `DISABLED`.
+    #[test]
+    fn status_reports_watcher_start_failure_reason() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        let canonical_root = repo.canonicalize().unwrap();
+        let repo_id = srv.bootstrap_workspace(&canonical_root).unwrap();
+
+        let mut failures = HashMap::new();
+        failures.insert(repo_id, "synthetic watcher failure".to_string());
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[],
+            &HashMap::new(),
+            &failures,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "DISABLED");
+        assert_eq!(repos[0]["watcher"]["error"], "synthetic watcher failure");
+    }
+
+    /// The residual case (no bootstrap in progress, no recorded watcher
+    /// failure) must still carry an honest label, not silence.
+    #[test]
+    fn status_reports_watcher_not_registered_reason() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        let canonical_root = repo.canonicalize().unwrap();
+        srv.bootstrap_workspace(&canonical_root).unwrap();
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "DISABLED");
+        assert_eq!(repos[0]["watcher"]["reason"], "watcher_not_registered");
     }
 
     // handle_workspace — missing-root removal (PR-6, principal-architect
@@ -3697,6 +4135,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_add_container_with_nested_git_repos_indexes_all_and_remove_prunes_all() {
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let container = tmp.path().join("container");
+        let repo_a = container.join("repo-a");
+        let repo_b = container.join("repo-b");
+        fs::create_dir_all(repo_a.join(".git")).unwrap();
+        fs::create_dir_all(repo_b.join(".git")).unwrap();
+        fs::write(repo_a.join("a.txt"), "alpha").unwrap();
+        fs::write(repo_b.join("b.txt"), "beta").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(container.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        let container_key = root_identity_key(&container.canonicalize().unwrap());
+
+        // workspace add fans out into two repositories in the background;
+        // wait for both to be registered under container_repo_roots.
+        let effective_roots = {
+            let mut found = None;
+            for _ in 0..100 {
+                let v = srv
+                    .container_repo_roots
+                    .read()
+                    .unwrap()
+                    .get(&container_key)
+                    .cloned();
+                if v.as_ref().is_some_and(|v| v.len() == 2) {
+                    found = v;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            found.expect("container must fan out into 2 effective repository roots")
+        };
+        assert_eq!(effective_roots.len(), 2);
+
+        // Both nested repos must actually be indexed (this is the direct
+        // regression check for the "container silently indexes to 0 files"
+        // bug): each has file_count >= 1, and neither is reported DISABLED.
+        for effective_root in &effective_roots {
+            let repo_id = srv
+                .pool
+                .with_reader(|c| {
+                    lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                })
+                .unwrap()
+                .map(|id| id.to_string())
+                .expect("nested repo must be registered");
+            let stats = srv.pool.with_reader(get_repository_stats).unwrap();
+            let s = stats.iter().find(|s| s.id == repo_id).unwrap();
+            assert!(
+                s.file_count >= 1,
+                "expected files indexed for {effective_root:?}"
+            );
+        }
+
+        // The fanned-out repository ids must be recognized as active members
+        // of the configured container root, not just present in storage —
+        // this is what query tools (`file`/`search`/`repo_map`/`context`)
+        // actually gate on via `require_active_member`.
+        {
+            let active_roots = srv.active_roots.read().unwrap().clone();
+            let container_repo_roots = srv.container_repo_roots.read().unwrap().clone();
+            let (active_ids, _owner) =
+                expand_active_ids(&srv.pool, &active_roots, &container_repo_roots);
+            for effective_root in &effective_roots {
+                let repo_id = srv
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                    })
+                    .unwrap()
+                    .map(|id| id.to_string())
+                    .unwrap();
+                assert!(
+                    require_active_member(&active_ids, &repo_id).is_ok(),
+                    "fanned-out repository {repo_id} must be recognized as an active member"
+                );
+            }
+        }
+
+        // Poll status until neither fanned-out repository reports DISABLED
+        // (watchers need a moment to register after bootstrap completes).
+        let mut saw_non_disabled = false;
+        for _ in 0..100 {
+            let inc = srv.incremental.read().unwrap().clone();
+            let wm = srv.watch_mode.read().unwrap().clone();
+            let container_repo_roots = srv.container_repo_roots.read().unwrap().clone();
+            let watcher_start_failures = srv.watcher_start_failures.read().unwrap().clone();
+            let active_roots = srv.active_roots.read().unwrap().clone();
+            let r = handle_status(
+                &srv.pool,
+                &inc,
+                &wm,
+                None,
+                true,
+                &active_roots,
+                &[],
+                &[],
+                &container_repo_roots,
+                &watcher_start_failures,
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+            let repos = v["workspace"]["repositories"].as_array();
+            let none_disabled = repos.is_none_or(|repos| {
+                repos.len() == 2 && repos.iter().all(|r| r["state"] != "DISABLED")
+            });
+            if none_disabled {
+                saw_non_disabled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            saw_non_disabled,
+            "neither fanned-out repository should be reported DISABLED"
+        );
+
+        // `workspace inspect` surfaces the fan-out via root_expansions.
+        let mut inspect_args = HashMap::new();
+        inspect_args.insert("action".into(), json!("inspect"));
+        let inspect_r = srv.handle_workspace(&inspect_args).await.unwrap();
+        let inspect_v: Value = serde_json::from_str(&text_of(&inspect_r)).unwrap();
+        let expansions = inspect_v["root_expansions"]
+            .as_object()
+            .expect("root_expansions object");
+        assert!(
+            expansions.contains_key(&container_key),
+            "inspect must surface the container's fan-out; got {expansions:?}"
+        );
+        assert_eq!(
+            expansions[&container_key].as_array().unwrap().len(),
+            2,
+            "expected 2 nested roots surfaced for the container"
+        );
+
+        // Removing the container must stop both watchers and prune the
+        // container_repo_roots entry.
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(container.display().to_string()));
+        srv.handle_workspace(&remove_args).await.unwrap();
+
+        assert!(
+            !srv.container_repo_roots
+                .read()
+                .unwrap()
+                .contains_key(&container_key),
+            "removing the container must prune container_repo_roots"
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_remove_missing_root_does_not_affect_similar_prefix_root() {
         use std::fs;
         let tmp = TempDir::new().unwrap();
@@ -3770,6 +4367,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap_err()
         .to_string();
@@ -3797,6 +4395,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
@@ -3876,7 +4476,8 @@ mod tests {
 
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id));
-        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         let tree = v["tree"].as_array().expect("tree array");
 
@@ -3922,7 +4523,8 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id));
         a.insert("file_type".into(), json!("rust"));
-        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         let tree = v["tree"].as_array().expect("tree array");
 
@@ -3950,7 +4552,8 @@ mod tests {
 
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id_a));
-        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new()).unwrap();
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         let tree = v["tree"].as_array().expect("tree array");
 
@@ -3993,10 +4596,58 @@ mod tests {
         discovery_counters.insert(repo_id.clone(), recorded);
         let mut a = HashMap::new();
         a.insert("repository_id".into(), json!(repo_id));
-        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &discovery_counters).unwrap();
+        let r = handle_repo_map(
+            &srv.pool,
+            &a,
+            &ids(&srv),
+            &discovery_counters,
+            &HashMap::new(),
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert_eq!(v["discovery"]["files_eligible"], 1);
         assert!(v["discovery"]["ignored_or_pruned"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn repo_map_surfaces_submodule_diagnostic_after_bootstrap() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("root_file.rs"), "fn root() {}").unwrap();
+        let sub = repo.join("sub");
+        fs::create_dir_all(sub.join(".git")).unwrap();
+        fs::write(sub.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(sub.join("sub_file.rs"), "fn sub() {}").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let recorded_diags = srv
+            .last_discovery_diagnostics
+            .read()
+            .unwrap()
+            .get(&repo_id)
+            .cloned()
+            .expect("bootstrap must record discovery diagnostics");
+        assert!(
+            recorded_diags
+                .iter()
+                .any(|d| d.kind == attic_discovery::DiagnosticKind::SubmoduleDetected),
+            "expected a SubmoduleDetected diagnostic; got {recorded_diags:?}"
+        );
+
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(repo_id.clone(), recorded_diags);
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &diagnostics).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let diags = v["diagnostics"].as_array().expect("diagnostics array");
+        assert!(
+            diags.iter().any(|d| d["kind"] == "SUBMODULE_DETECTED"),
+            "expected SUBMODULE_DETECTED in repo_map diagnostics; got {diags:?}"
+        );
     }
 
     // ΓöÇΓöÇ MCP child-process tests (supplemental manual JSON-RPC protocol tests).
@@ -4666,6 +5317,15 @@ mod tests {
         assert!(
             !plan_id.is_null() && plan_id.as_str().map(|s| !s.is_empty()).unwrap_or(true),
             "gate 4 FAIL: plan_id must be set (evidence path ran); got: {v}"
+        );
+
+        // RP-INV-4: evidence_dropped (the "excluded" half of every
+        // considered evidence item, each with a deterministic drop_reason)
+        // must reach the MCP response alongside evidence_used, not be
+        // silently retained only in the internal plan.
+        assert!(
+            v["evidence_dropped"].is_array(),
+            "RP-INV-4 FAIL: evidence_dropped must be present as an array; got: {v}"
         );
 
         // Gate 4b (strengthened): WorkspaceSnapshot provenance must be traceable

@@ -180,6 +180,11 @@ pub struct IndexResult {
     /// Number of SMALL files actually re-read during analysis this run
     /// (companion to `analysis_small_file_bytes_read`).
     pub analysis_small_file_reads: u64,
+    /// Non-fatal discovery-walk diagnostics (submodule boundaries, symlink
+    /// escapes/cycles, IO errors, exemption rejections) — the human-readable
+    /// counterpart to `discovery_counters`, so "why was X skipped" doesn't
+    /// require reading server logs. See [`attic_discovery::Diagnostic`].
+    pub discovery_diagnostics: Vec<attic_discovery::Diagnostic>,
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +467,7 @@ pub fn index_repository_with_cancellation(
         source_revision_id: rev_id.to_string_repr(),
         index_generation_id: gen_id.to_string_repr(),
         discovery_counters: discovery.counters,
+        discovery_diagnostics: discovery.diagnostics.clone(),
         ..Default::default()
     };
 
@@ -1490,6 +1496,31 @@ mod tests {
         assert!(!result.repository_id.is_empty());
         assert!(!result.source_revision_id.is_empty());
         assert!(!result.index_generation_id.is_empty());
+    }
+
+    #[test]
+    fn index_repository_surfaces_submodule_diagnostic() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "root_file.rs", "fn root() {}\n");
+        let sub = fx._dir.path().join("sub");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        std::fs::write(sub.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        write_file(&sub, "sub_file.rs", "fn sub() {}\n");
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
+            .expect("indexing should succeed even with a nested git boundary");
+
+        let has_diag = result
+            .discovery_diagnostics
+            .iter()
+            .any(|d| d.kind == attic_discovery::DiagnosticKind::SubmoduleDetected);
+        assert!(
+            has_diag,
+            "expected SubmoduleDetected diagnostic to survive into IndexResult; got {:?}",
+            result.discovery_diagnostics
+        );
     }
 
     #[test]

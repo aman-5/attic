@@ -118,10 +118,38 @@ fn scoped_workspace_id(repository_ids: &[String]) -> String {
 }
 
 /// Resolve the canonical on-disk root of a repository from the index.
+///
+/// Best-effort: callers use this to gate optional proactive source
+/// verification, never as evidence admission — a `None` here only means
+/// that verification step is skipped for this item. Logged (not silently
+/// dropped) so an operator can tell a malformed id from a storage-layer
+/// failure when verification counts look lower than expected.
 fn repo_root_for(conn: &Connection, repository_id: &str) -> Option<PathBuf> {
     use std::str::FromStr as _;
-    let rid = attic_core::RepositoryId::from_str(repository_id).ok()?;
-    let s = attic_storage::get_repository_path(conn, &rid).ok()??;
+    let rid = match attic_core::RepositoryId::from_str(repository_id) {
+        Ok(rid) => rid,
+        Err(e) => {
+            tracing::warn!(
+                "repo_root_for: malformed repository_id {repository_id:?}, skipping proactive verification: {e}"
+            );
+            return None;
+        }
+    };
+    let s = match attic_storage::get_repository_path(conn, &rid) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::warn!(
+                "repo_root_for: no on-disk root recorded for repository {repository_id}, skipping proactive verification"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "repo_root_for: storage lookup failed for repository {repository_id}, skipping proactive verification: {e}"
+            );
+            return None;
+        }
+    };
     let p = PathBuf::from(&s);
     p.canonicalize().ok().or(Some(p))
 }
