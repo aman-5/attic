@@ -4803,6 +4803,7 @@ mod tests {
             "expected attic in serverInfo, got: {resp}"
         );
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4823,6 +4824,7 @@ mod tests {
         );
         assert!(names.contains(&"status"), "missing status tool: {names:?}");
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4841,6 +4843,7 @@ mod tests {
         // and report UNCONFIGURED (spec ┬º30), never a fabricated empty ok.
         assert_eq!(v["status"], "unconfigured", "unexpected status: {v}");
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4860,6 +4863,7 @@ mod tests {
             "unexpected transport error: {resp}"
         );
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4882,6 +4886,7 @@ mod tests {
             );
         }
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4905,6 +4910,7 @@ mod tests {
             );
         }
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -4942,6 +4948,7 @@ mod tests {
         );
 
         child.kill().ok();
+        child.wait().ok();
     }
 
     /// End-to-end MCP integration test: multi-repository fixture ΓåÆ normal Attic
@@ -5120,6 +5127,7 @@ mod tests {
             );
 
             child.kill().ok();
+            child.wait().ok();
         }
 
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5371,6 +5379,7 @@ mod tests {
         }
 
         child.kill().ok();
+        child.wait().ok();
 
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         // Gate 7: manifest change through Phase 2 production path changes
@@ -5697,6 +5706,7 @@ mod tests {
         );
 
         child.kill().ok();
+        child.wait().ok();
     }
 
     // ΓöÇΓöÇ ┬º37 failure-case unit tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5877,6 +5887,7 @@ mod tests {
         let resp = send_recv(&mut child, &mut stdin, &init);
         assert_eq!(resp["jsonrpc"], "2.0", "stdout contains non-JSON: {resp}");
         child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
