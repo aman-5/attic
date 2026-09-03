@@ -27,10 +27,9 @@ name: Release
 
 on:
   workflow_run:
-    workflows:
-      - CI
-    types:
-      - completed
+    workflow_run:
+      workflows: ["CI"]
+      types: [completed]
 
   workflow_dispatch:
 
@@ -59,9 +58,17 @@ jobs:
     # Automatic release:
     #   CI must have succeeded and must have run for main.
     #
-    # Manual workflow_dispatch is also supported.
+    # Manual workflow_dispatch is also supported, but ONLY when dispatched
+    # against main — otherwise an operator could release an arbitrary
+    # non-main commit as if it were a normal, CI-verified release
+    # (principal-architect audit: manual dispatch bypassing the main-branch
+    # gate). `github.ref` reflects the ref the dispatch was actually run
+    # against.
     if: >
-      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
       (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_branch == 'main'
@@ -97,7 +104,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.source.outputs.sha }}
           fetch-depth: 0
@@ -227,13 +234,13 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 
@@ -368,7 +375,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: attic-${{ matrix.target }}
 
@@ -400,18 +407,18 @@ jobs:
 
     if: needs.prepare.outputs.already_released != 'true'
 
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: x86_64-apple-darwin
 
@@ -471,7 +478,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Upload Intel macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: attic-x86_64-apple-darwin
 
@@ -507,7 +514,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
@@ -521,21 +528,21 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-pc-windows-msvc
           path: dist
 
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-unknown-linux-gnu
           path: dist
 
 
       - name: Download Apple Silicon artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-aarch64-apple-darwin
           path: dist
@@ -661,7 +668,7 @@ jobs:
     steps:
 
       - name: Download Intel macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: attic-x86_64-apple-darwin
           path: dist

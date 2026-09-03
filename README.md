@@ -148,6 +148,7 @@ optional semantic layer, which is disabled by default.
 | `repo_map` | Structural overview of a repository |
 | `context` | Evidence-backed answer to a natural-language question (`FAST` / `NORMAL` / `DEEP` modes) |
 | `status` | Server/indexing health, watcher mode, resource-pressure advisory |
+| `workspace` | Inspect and manage configured repository roots at runtime (`inspect` / `add` / `remove` / `set`), persisted to `<ATTIC_HOME>/config.toml` |
 
 Call `status` any time to check readiness: it reports whether indexing is
 current (`incremental.state`), which watcher mechanism is active
@@ -300,9 +301,18 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
 | `ATTIC_TOTAL_MEMORY_BUDGET_MIB` | Total memory budget enforced by the resource monitor. |
 | `ATTIC_MAX_FOREGROUND_QUERIES` | Concurrent foreground MCP query cap. |
-| `ATTIC_MAX_BACKGROUND_WORKERS` | Concurrent background (indexing/semantic) worker cap. |
+| `ATTIC_MAX_BACKGROUND_WORKERS` | Concurrent background (indexing/semantic) worker admission cap enforced by the resource monitor (`attic-storage::resource_manager`). Distinct from `ATTIC_MAX_INDEXING_WORKERS` below, which bounds the indexing pipeline itself. |
+| `ATTIC_MAX_INDEXING_WORKERS` | Maximum concurrent indexing workers, so indexing never starves foreground queries (`attic-core::config::ProductionConfig`). |
 | `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_manager.rs`. |
 | `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
+| `ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY` / `ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY` | Maximum pending incremental / reconciliation task-queue depth. |
+| `ATTIC_MAX_GRAPH_DEPTH` / `ATTIC_MAX_GRAPH_NODES` | Bounds on graph traversal depth/breadth during evidence expansion. |
+| `ATTIC_MAX_CONTEXT_TOKENS` | Maximum tokens consumed by context building for a single `context` query (default `8192`). |
+| `ATTIC_DEFAULT_TASK_TIMEOUT_MS` | Default timeout for background tasks; tasks exceeding it are cancelled and rescheduled. |
+| `ATTIC_BACKUP_RELATIVE_DIR` / `ATTIC_MAX_BACKUP_RETAIN` | Crash-recovery backup directory (relative to the database path) and how many checkpoints to retain (REC-B2, default 3). |
+| `ATTIC_CHECKPOINT_WAL_FRAMES` / `ATTIC_CHECKPOINT_MINUTES` / `ATTIC_WAL_AUTOCKPT_ENABLED` | WAL checkpoint interval (by frame count or elapsed time, whichever comes first) and whether auto-checkpointing is enabled. |
+| `ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS` | How long the server waits for in-flight tasks to complete on shutdown before force-exiting. |
+| `ATTIC_STARTUP_INTEGRITY_CHECK` / `ATTIC_STARTUP_FOREIGN_KEY_CHECK` | Whether the database integrity check / foreign-key check runs at startup (see Crash recovery in `docs/ARCHITECTURE.md`). |
 
 Home resolution: `ATTIC_HOME` (if set and non-empty) → `~/.attic` (derived
 from the OS user home directory). Setting `ATTIC_HOME` to an empty string is

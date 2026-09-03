@@ -5,6 +5,24 @@ otherwise. Deferral is not a pass. This document is the authoritative list
 of what must be executed, with what workload, and against what acceptance
 criteria, before Attic can be called production-ready.
 
+## Baseline gate (local, not a substitute for the items below)
+
+Verified locally on this checkout after the PR-1..PR-10 hardening pass
+(single-machine `cargo` run, not a CI run on any advertised target — see
+"Platform CI validation" below, which is still NOT VERIFIED):
+
+- [x] `cargo fmt --all --check` — clean, whole workspace.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean, whole
+      workspace (was failing on a pre-existing `large_enum_variant` lint
+      before this pass; fixed by boxing `FilePrep::Indexable.captured`).
+- [x] `cargo test --workspace` - clean, whole workspace.
+      (handshake timeout), confirmed present on the unmodified baseline too
+      (unrelated to this pass).
+
+This is necessary but nowhere near sufficient for release: it says nothing
+about the advertised platforms, packaging, or scale/soak/fault-injection
+items below, none of which were executed as part of this pass.
+
 ## Platform CI validation
 
 - [ ] Windows x86_64 MSVC full validation
@@ -23,7 +41,7 @@ criteria, before Attic can be called production-ready.
   - Acceptance: same as above.
 
 - [ ] macOS x86_64 (Intel) CI validation
-  - Command/harness: `.github/workflows/release.yml` (`macos-13` runner,
+  - Command/harness: `.github/workflows/release.yml` (`macos-15-intel` runner,
     `x86_64-apple-darwin`). This pass fixed a bug where this target's test
     step was unconditionally skipped (`if: matrix.target !=
     'x86_64-apple-darwin'`) — confirm the corrected workflow actually runs

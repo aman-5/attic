@@ -52,12 +52,24 @@ struct ServerHandle {
 
 /// Spawn the attic stdio server and connect an official rmcp client to it.
 async fn connect(bin: &Path, db: &Path, workspace_root: Option<&Path>) -> ServerHandle {
+    let attic_home = db
+        .parent()
+        .expect("test database must have a parent directory")
+        .join("attic-home");
+
+    std::fs::create_dir_all(&attic_home).expect("create isolated ATTIC_HOME");
+
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.env("ATTIC_DB_PATH", db)
+
+    cmd.env("ATTIC_HOME", &attic_home)
+        .env("ATTIC_DB_PATH", db)
+        .env_remove("ATTIC_CONFIG")
+        .env_remove("ATTIC_WORKSPACE_ROOT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+
     if let Some(ws) = workspace_root {
         cmd.env("ATTIC_WORKSPACE_ROOT", ws);
     }

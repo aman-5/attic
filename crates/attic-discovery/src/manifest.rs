@@ -111,17 +111,33 @@ impl FileStat {
 /// `unstable = true` and a [`DiagnosticKind::UnstableCapture`] diagnostic is
 /// appended to [`SourceManifest::unstable_captures`].
 pub fn build_manifest(entries: &[EligibleEntry], root: &Path) -> SourceManifest {
+    build_manifest_with_cancellation(entries, root, &attic_core::CancellationToken::default())
+        .expect("default cancellation token cannot be cancelled")
+}
+
+/// Build a manifest while cooperatively observing cancellation.
+pub fn build_manifest_with_cancellation(
+    entries: &[EligibleEntry],
+    root: &Path,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<SourceManifest, crate::DiscoveryError> {
     let mut manifest_entries: Vec<ManifestEntry> = Vec::with_capacity(entries.len());
     let mut read_errors: Vec<Diagnostic> = Vec::new();
     let mut unstable_captures: Vec<Diagnostic> = Vec::new();
 
     for entry in entries {
+        if cancellation.is_cancelled() {
+            return Err(crate::DiscoveryError::Cancelled);
+        }
         // ── Stat before hashing ──────────────────────────────────────────
         let stat_before = FileStat::read(&entry.abs_path).ok();
 
         // ── Hash raw content ─────────────────────────────────────────────
-        match hash_file_content(&entry.abs_path) {
+        match hash_file_content_cancellable(&entry.abs_path, cancellation) {
             Err(e) => {
+                if cancellation.is_cancelled() {
+                    return Err(crate::DiscoveryError::Cancelled);
+                }
                 read_errors.push(Diagnostic {
                     kind: DiagnosticKind::IoError,
                     path: entry.abs_path.clone(),
@@ -173,12 +189,12 @@ pub fn build_manifest(entries: &[EligibleEntry], root: &Path) -> SourceManifest 
     let manifest_text = serialize_manifest(&manifest_entries);
     let manifest_hash = hash_manifest_text(&manifest_text);
 
-    SourceManifest {
+    Ok(SourceManifest {
         entries: manifest_entries,
         manifest_hash,
         read_errors,
         unstable_captures,
-    }
+    })
 }
 
 /// Compute the working-tree manifest hash from already-known
@@ -222,22 +238,31 @@ impl SourceManifest {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Compute the BLAKE3 hash of a file's raw byte content.
+#[cfg(test)]
 fn hash_file_content(path: &Path) -> std::io::Result<ContentHash> {
+    hash_file_content_cancellable(path, &attic_core::CancellationToken::default())
+}
+
+fn hash_file_content_cancellable(
+    path: &Path,
+    cancellation: &attic_core::CancellationToken,
+) -> std::io::Result<ContentHash> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Hasher::new();
-
-    // Stream in 64 KiB chunks to avoid loading large files into RAM.
     let mut buf = [0u8; 65536];
     loop {
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "operation cancelled",
+            ));
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
-
     Ok(hasher.finalize().to_hex().to_string())
 }
 

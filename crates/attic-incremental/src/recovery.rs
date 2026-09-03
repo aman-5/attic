@@ -174,7 +174,7 @@ pub fn reconcile_repository(
     let rows: Vec<(String, String, String, String)> = pool.with_reader(|conn| {
         let mut stmt = conn.prepare(
             "WITH latest AS (
-                 SELECT fo.path AS p, MAX(fo.rowid) AS m
+                 SELECT fo.path AS p, MAX(fo.occurrence_seq) AS m
                    FROM core_file_occurrences fo
                    JOIN core_file_identities fi ON fo.file_identity_id = fi.id
                   WHERE fi.repository_id = ?1
@@ -182,7 +182,7 @@ pub fn reconcile_repository(
              )
              SELECT fo.path, fo.content_hash, fo.freshness_state, fo.existence_state
                FROM core_file_occurrences fo
-               JOIN latest ON fo.path = latest.p AND fo.rowid = latest.m",
+               JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m",
         )?;
         let mapped = stmt.query_map([repo_id.to_string_repr()], |r| {
             Ok((

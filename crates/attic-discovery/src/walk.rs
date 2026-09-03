@@ -27,7 +27,7 @@ use ignore::WalkBuilder;
 
 use crate::{
     classification::{classify, glob_matches},
-    diagnostics::{Diagnostic, DiagnosticKind},
+    diagnostics::{Diagnostic, DiagnosticKind, WalkCounters},
     error::DiscoveryError,
     policy::{DiscoveryPolicy, DiscoveryPriority},
     security::{assert_within_root, is_security_forbidden, normalize_repo_relative},
@@ -56,6 +56,8 @@ pub struct WalkResult {
     pub entries: Vec<EligibleEntry>,
     /// Non-fatal diagnostics generated during the walk.
     pub diagnostics: Vec<Diagnostic>,
+    /// Explainability counters accumulated across every pass of this walk.
+    pub counters: WalkCounters,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +71,15 @@ pub struct WalkResult {
 /// The caller is responsible for calling `security::canonicalize_within_root`
 /// before passing `root` here.
 pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, DiscoveryError> {
+    walk_with_cancellation(root, policy, &attic_core::CancellationToken::default())
+}
+
+/// Cancellable repository walk.
+pub fn walk_with_cancellation(
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<WalkResult, DiscoveryError> {
     if !root.is_dir() {
         return Err(DiscoveryError::RootNotDirectory(root.to_path_buf()));
     }
@@ -91,6 +102,10 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
     };
 
     // ── Step 2: main walk (gitignore-aware) ────────────────────────────────
+    // Shared across every pass below so a directory/file re-visited by a
+    // later pass (Step 3/4 disable gitignore and re-walk the same tree) is
+    // never counted into `result.counters` more than once.
+    let mut seen = SeenPaths::default();
     let mut main_entries: HashSet<String> = HashSet::new();
     walk_pass(
         root,
@@ -98,6 +113,8 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
         /*respect_gitignore=*/ policy.git_aware,
         &tracked_files,
         &mut result,
+        &mut seen,
+        cancellation,
         &mut |entry| {
             main_entries.insert(entry.repo_relative.clone());
             Some(entry)
@@ -121,6 +138,8 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
             /*respect_gitignore=*/ false,
             &tracked_files, // tracked-file filter still applied inside walk_pass
             &mut result,
+            &mut seen,
+            cancellation,
             &mut |entry| {
                 if !main_entries.contains(&entry.repo_relative) {
                     main_entries.insert(entry.repo_relative.clone());
@@ -143,6 +162,8 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
             /*respect_gitignore=*/ false,
             &tracked_files,
             &mut result,
+            &mut seen,
+            cancellation,
             &mut |entry| {
                 // Only accept if an attic_include_rule matches this path
                 // and the path was NOT already captured in an earlier pass.
@@ -165,6 +186,11 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
         .entries
         .sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
 
+    // Dedup across passes happens in each pass's `filter` closure (only a
+    // genuinely new path is ever pushed), so the final entry count is
+    // exactly the eligible-file count with no double-counting.
+    result.counters.files_eligible = result.entries.len() as u64;
+
     Ok(result)
 }
 
@@ -172,22 +198,39 @@ pub fn walk(root: &Path, policy: &DiscoveryPolicy) -> Result<WalkResult, Discove
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Absolute paths already counted into `WalkResult::counters`, shared
+/// across every pass of one `walk()` call so a directory/file re-visited by
+/// a later pass is never double-counted (bundled into one struct to keep
+/// `walk_pass`'s argument count down).
+#[derive(Default)]
+struct SeenPaths {
+    dirs: HashSet<PathBuf>,
+    files: HashSet<PathBuf>,
+}
+
 /// One walk pass over `root`.  The `filter` closure can transform, accept
 /// (`Some(entry)`) or reject (`None`) each candidate entry.
 ///
 /// When `filter` is `&mut |entry| entry` (i.e. returns the entry unchanged)
 /// use the `&mut |entry| { ...; entry }` form.
+#[allow(clippy::too_many_arguments)]
 fn walk_pass<F>(
     root: &Path,
     policy: &DiscoveryPolicy,
     respect_gitignore: bool,
     tracked_files: &Option<HashSet<String>>,
     result: &mut WalkResult,
+    seen: &mut SeenPaths,
+    cancellation: &attic_core::CancellationToken,
     filter: &mut F,
 ) -> Result<(), DiscoveryError>
 where
     F: FnMut(EligibleEntry) -> Option<EligibleEntry>,
 {
+    let SeenPaths {
+        dirs: seen_dirs,
+        files: seen_files,
+    } = seen;
     let mut builder = WalkBuilder::new(root);
 
     builder
@@ -205,8 +248,12 @@ where
     let mut submodule_prefixes: Vec<String> = Vec::new();
 
     for entry_result in builder.build() {
+        if cancellation.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
         match entry_result {
             Err(walk_err) => {
+                result.counters.transient_failures += 1;
                 result.diagnostics.push(Diagnostic {
                     kind: DiagnosticKind::IoError,
                     path: PathBuf::new(),
@@ -224,19 +271,40 @@ where
                 // ── Submodule boundary detection ───────────────────────────
                 // A non-root directory is a submodule root if it contains a
                 // `.git` file (detached submodule) or `.git/` directory.
+                //
+                // `walk()` can run this pass up to three times over the same
+                // root (gitignore-respecting, tracked-but-gitignored,
+                // attic-include-override). `seen_dirs`/`seen_files` are
+                // shared across all of those calls so a directory/file
+                // re-visited by a later pass is never counted twice — the
+                // submodule_prefixes rebuild below still runs every pass
+                // (it's pass-local and needed for this pass's own filtering
+                // decisions), only the *counters* are deduplicated.
                 if dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let is_new_dir = seen_dirs.insert(abs_path.to_path_buf());
+                    if is_new_dir {
+                        result.counters.directories_visited += 1;
+                    }
                     let has_dot_git = abs_path.join(".git").exists();
                     if has_dot_git && let Some(rel) = normalize_repo_relative(abs_path, root) {
-                        result.diagnostics.push(Diagnostic {
-                            kind: DiagnosticKind::SubmoduleDetected,
-                            path: abs_path.to_path_buf(),
-                            message: format!(
-                                "submodule/nested repository detected at '{rel}'; treating as separate repository"
-                            ),
-                        });
+                        if is_new_dir {
+                            result.counters.nested_repo_boundaries += 1;
+                            result.diagnostics.push(Diagnostic {
+                                kind: DiagnosticKind::SubmoduleDetected,
+                                path: abs_path.to_path_buf(),
+                                message: format!(
+                                    "submodule/nested repository detected at '{rel}'; treating as separate repository"
+                                ),
+                            });
+                        }
                         submodule_prefixes.push(rel + "/");
                     }
                     continue; // never index directory entries themselves
+                }
+
+                let is_new_file = seen_files.insert(abs_path.to_path_buf());
+                if is_new_file {
+                    result.counters.files_seen += 1;
                 }
 
                 // ── Skip files under detected submodule roots ──────────────
@@ -249,6 +317,9 @@ where
                     .iter()
                     .any(|pfx| repo_rel.starts_with(pfx.as_str()))
                 {
+                    if is_new_file {
+                        result.counters.ignored_or_pruned += 1;
+                    }
                     continue;
                 }
 
@@ -256,24 +327,30 @@ where
                 if dent.path_is_symlink() {
                     match abs_path.canonicalize() {
                         Err(_) => {
-                            result.diagnostics.push(Diagnostic {
-                                kind: DiagnosticKind::SymlinkCycle,
-                                path: abs_path.to_path_buf(),
-                                message: "symlink target unresolvable".into(),
-                            });
+                            if is_new_file {
+                                result.counters.symlinks_skipped += 1;
+                                result.diagnostics.push(Diagnostic {
+                                    kind: DiagnosticKind::SymlinkCycle,
+                                    path: abs_path.to_path_buf(),
+                                    message: "symlink target unresolvable".into(),
+                                });
+                            }
                             continue;
                         }
                         Ok(canonical) => {
                             if let Err(_e) = assert_within_root(&canonical, root) {
-                                result.diagnostics.push(Diagnostic {
-                                    kind: DiagnosticKind::SymlinkEscape,
-                                    path: abs_path.to_path_buf(),
-                                    message: format!(
-                                        "symlink escapes root: {} -> {}",
-                                        abs_path.display(),
-                                        canonical.display()
-                                    ),
-                                });
+                                if is_new_file {
+                                    result.counters.symlinks_skipped += 1;
+                                    result.diagnostics.push(Diagnostic {
+                                        kind: DiagnosticKind::SymlinkEscape,
+                                        path: abs_path.to_path_buf(),
+                                        message: format!(
+                                            "symlink escapes root: {} -> {}",
+                                            abs_path.display(),
+                                            canonical.display()
+                                        ),
+                                    });
+                                }
                                 continue;
                             }
                         }
@@ -282,11 +359,17 @@ where
 
                 // Only process regular files.
                 if !dent.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    if is_new_file {
+                        result.counters.ignored_or_pruned += 1;
+                    }
                     continue;
                 }
 
                 // ── Security exclusions (ABSOLUTE) ─────────────────────────
                 if is_security_forbidden(&repo_rel) {
+                    if is_new_file {
+                        result.counters.security_exclusions += 1;
+                    }
                     continue;
                 }
 
@@ -302,6 +385,9 @@ where
                         .iter()
                         .any(|rule| glob_matches(&rule.pattern, &repo_rel));
                     if !is_tracked && !is_explicitly_included {
+                        if is_new_file {
+                            result.counters.ignored_or_pruned += 1;
+                        }
                         continue;
                     }
                 }
@@ -309,6 +395,9 @@ where
                 // ── Apply policy default exclusions + classification ────────
                 let priority = classify(&repo_rel, policy);
                 if priority == DiscoveryPriority::Ignored {
+                    if is_new_file {
+                        result.counters.ignored_or_pruned += 1;
+                    }
                     continue;
                 }
 
@@ -402,6 +491,85 @@ mod tests {
             "expected src/main.rs in {paths:?}"
         );
         assert!(paths.contains(&"src/lib.rs"));
+
+        // Explainability counters (PR-3): every eligible file is both
+        // "seen" and "eligible" when nothing excludes it.
+        assert_eq!(result.counters.files_eligible, result.entries.len() as u64);
+        assert_eq!(result.counters.files_seen, 2);
+        assert!(
+            result.counters.directories_visited >= 1,
+            "src/ itself must be visited"
+        );
+        assert_eq!(result.counters.ignored_or_pruned, 0);
+        assert_eq!(result.counters.security_exclusions, 0);
+    }
+
+    #[test]
+    fn counters_distinguish_ignored_from_eligible() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write(root, "src/keep.rs", "");
+        write(root, "node_modules/pkg/index.js", "");
+
+        let policy = DiscoveryPolicy::default_git();
+        let result = walk(root, &policy).unwrap();
+
+        assert_eq!(result.counters.files_eligible, 1, "only src/keep.rs");
+        assert!(
+            result.counters.files_seen >= 2,
+            "both files must be seen before exclusion: {:?}",
+            result.counters
+        );
+        assert!(
+            result.counters.ignored_or_pruned >= 1,
+            "node_modules/pkg/index.js must be counted as pruned: {:?}",
+            result.counters
+        );
+    }
+
+    #[test]
+    fn counters_count_security_exclusion_separately_from_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write(root, "src/main.rs", "");
+        write(root, "certs/server.pem", "-----BEGIN CERTIFICATE-----");
+
+        let policy = DiscoveryPolicy::default_git();
+        let result = walk(root, &policy).unwrap();
+
+        assert_eq!(result.counters.files_eligible, 1);
+        assert_eq!(
+            result.counters.security_exclusions, 1,
+            "server.pem must be counted as a security exclusion, not a generic prune: {:?}",
+            result.counters
+        );
+    }
+
+    #[test]
+    fn counters_count_nested_repo_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write(root, "src/root_file.rs", "fn root() {}");
+        setup_git_repo(&root.join("vendor/child"));
+        write(root, "vendor/child/lib.rs", "fn nested() {}");
+
+        let policy = DiscoveryPolicy::default_git();
+        let result = walk(root, &policy).unwrap();
+
+        assert_eq!(
+            result.counters.nested_repo_boundaries, 1,
+            "vendor/child must be counted as one detected boundary: {:?}",
+            result.counters
+        );
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
+        assert!(!paths.iter().any(|p| p.starts_with("vendor/child/")));
     }
 
     #[test]
@@ -789,6 +957,51 @@ mod tests {
         assert!(
             paths.contains(&"src/lib.rs"),
             "src/lib.rs should also be present"
+        );
+    }
+
+    /// Code-review finding: `walk()` can invoke `walk_pass` up to three
+    /// times over the same root; explainability counters must not multiply
+    /// with the number of passes. Compares a single-pass run against a
+    /// multi-pass run over the *identical* fixture (the second pass' extra
+    /// include rule matches a file already found by pass one, so it adds
+    /// nothing new — only triggers the extra full re-walk).
+    #[test]
+    fn multi_pass_walk_does_not_multiply_explainability_counters() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write(root, "src/main.rs", "fn main() {}");
+        write(root, "src/lib.rs", "pub fn foo() {}");
+
+        let single_pass_policy = DiscoveryPolicy::default_git();
+        let single = walk(root, &single_pass_policy).unwrap();
+
+        let mut multi_pass_policy = DiscoveryPolicy::default_git();
+        multi_pass_policy
+            .attic_include_rules
+            .push(crate::policy::GlobRule {
+                pattern: "src/main.rs".to_string(),
+                negation: false,
+            });
+        let multi = walk(root, &multi_pass_policy).unwrap();
+
+        assert_eq!(
+            single.entries.len(),
+            multi.entries.len(),
+            "same eligible files either way"
+        );
+        assert_eq!(
+            single.counters.files_seen, multi.counters.files_seen,
+            "a redundant second pass must not double-count files_seen"
+        );
+        assert_eq!(
+            single.counters.directories_visited, multi.counters.directories_visited,
+            "a redundant second pass must not double-count directories_visited"
+        );
+        assert_eq!(
+            single.counters.files_eligible, multi.counters.files_eligible,
+            "files_eligible must match regardless of pass count"
         );
     }
 

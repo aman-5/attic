@@ -61,6 +61,15 @@ if [[ "$MODE" == verify ]]; then
   test "$BIN_COUNT" -eq 1 || { echo "FAIL: exactly one attic-server binary expected (found $BIN_COUNT)"; exit 1; }
   test -f "$DIR/README.md" || { echo "FAIL: README.md missing"; exit 1; }
   test -d "$DIR/docs" || { echo "FAIL: docs/ missing"; exit 1; }
+  test -f "$DIR/LICENSE-MIT" || {
+  echo "FAIL: LICENSE-MIT missing"
+    exit 1
+  }
+
+  test -f "$DIR/LICENSE-APACHE" || {
+    echo "FAIL: LICENSE-APACHE missing"
+    exit 1
+  }
   # Exclusion invariants: no developer artifacts, no logs, no DBs, no target/.
   if find "$DIR" \( -name 'target' -o -name '*.db' -o -name '*.db-*' -o -name '*.log' \
       -o -name 'build_errors*' -o -name '__rsfiles*' -o -name '*.tmp' \

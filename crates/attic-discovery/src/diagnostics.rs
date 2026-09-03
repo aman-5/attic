@@ -33,6 +33,45 @@ pub enum DiagnosticKind {
     ExemptionRejected,
 }
 
+/// Cheap structured counters accumulated during a discovery walk, so callers
+/// can answer "why did the indexed count differ from the filesystem count"
+/// without reading server logs. These are incremented inline at the same
+/// decision points that already produce [`Diagnostic`]s or filter
+/// [`crate::EligibleEntry`]s — no second traversal is performed to compute
+/// them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct WalkCounters {
+    /// Directories the walker descended into (the root itself excluded).
+    pub directories_visited: u64,
+    /// Non-directory entries the walker reached, before any exclusion.
+    pub files_seen: u64,
+    /// Files that passed every filtering stage and became eligible entries.
+    pub files_eligible: u64,
+    /// Files excluded by policy (gitignore, default exclusions, priority
+    /// classification, tracked-file filtering, submodule boundaries) — as
+    /// opposed to an operational failure.
+    pub ignored_or_pruned: u64,
+    /// Submodule / nested-repository roots detected and not descended into.
+    pub nested_repo_boundaries: u64,
+    /// Symlinks skipped (cycle, unresolvable, or escaping the root).
+    pub symlinks_skipped: u64,
+    /// Files excluded by the absolute security-forbidden path policy.
+    pub security_exclusions: u64,
+    /// Operational failures encountered while traversing (e.g. walker IO
+    /// errors) — distinct from a policy exclusion.
+    pub transient_failures: u64,
+    /// PR-8: bytes read while classifying SMALL files for secret scanning
+    /// during discovery. Compared against `attic-indexing`'s own read of
+    /// the same files during analysis, this is the measurable size of the
+    /// duplicate-read the audit flagged — kept as a counter (not fixed by
+    /// caching content across the discovery/indexing boundary) because an
+    /// unbounded repository-wide content cache is explicitly disallowed.
+    pub small_file_bytes_read: u64,
+    /// Number of SMALL files whose content was fully read during discovery
+    /// classification (companion to `small_file_bytes_read`).
+    pub small_file_reads: u64,
+}
+
 /// A single non-fatal observation produced during a discovery walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {

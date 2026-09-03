@@ -70,9 +70,9 @@ pub mod walk;
 // Convenience re-exports
 // ---------------------------------------------------------------------------
 
-pub use diagnostics::{Diagnostic, DiagnosticKind};
+pub use diagnostics::{Diagnostic, DiagnosticKind, WalkCounters};
 pub use error::DiscoveryError;
-pub use git::GitRepoMeta;
+pub use git::{GitRepoMeta, discover_nested_git_roots};
 pub use manifest::{ManifestEntry, SourceManifest, manifest_hash_from_pairs};
 pub use policy::DiscoveryPriority;
 pub use policy::{DiscoveryPolicy, GlobRule, PriorityRule};
@@ -193,6 +193,9 @@ pub struct DiscoveryOutput {
     /// be stat'd or read during classification are represented as
     /// [`DownstreamClassification::ScanSkipped`].
     pub downstream_classifications: Vec<(String, DownstreamClassification)>,
+    /// Explainability counters for the walk (directories visited, files
+    /// seen/eligible, and why anything was excluded) — see [`WalkCounters`].
+    pub counters: WalkCounters,
 }
 
 /// Run the full discovery pipeline over `root`.
@@ -221,6 +224,18 @@ pub struct DiscoveryOutput {
 /// tracked-file set unavailable).  Non-fatal errors during the walk or
 /// manifest build are captured in diagnostics / `SourceManifest::read_errors`.
 pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput, DiscoveryError> {
+    discover_with_cancellation(root, policy, &attic_core::CancellationToken::default())
+}
+
+/// Discover a repository while cooperatively observing cancellation.
+pub fn discover_with_cancellation(
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<DiscoveryOutput, DiscoveryError> {
+    if cancellation.is_cancelled() {
+        return Err(DiscoveryError::Cancelled);
+    }
     // 1. Canonicalise root — rejects symlink escapes and non-directories.
     let canonical_root = root
         .canonicalize()
@@ -242,12 +257,17 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
     };
 
     // 3-4. Walk + security + classification.
-    let walk_result = walk::walk(&canonical_root, policy)?;
+    let walk_result = walk::walk_with_cancellation(&canonical_root, policy, cancellation)?;
+    let mut counters = walk_result.counters;
 
     let mut all_diagnostics = walk_result.diagnostics;
 
     // 5. Build the BLAKE3 manifest using raw (unredacted) bytes.
-    let manifest = manifest::build_manifest(&walk_result.entries, &canonical_root);
+    let manifest = manifest::build_manifest_with_cancellation(
+        &walk_result.entries,
+        &canonical_root,
+        cancellation,
+    )?;
 
     // Collect manifest read errors and unstable capture diagnostics.
     all_diagnostics.extend(manifest.read_errors.clone());
@@ -262,11 +282,21 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
         Vec::with_capacity(walk_result.entries.len());
 
     for entry in &walk_result.entries {
-        let classification = classify_file_for_downstream(
+        if cancellation.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
+        let (classification, small_file_bytes) = classify_file_for_downstream(
             &entry.abs_path,
             &entry.repo_relative,
             &mut all_diagnostics,
         );
+        if let Some(bytes_read) = small_file_bytes {
+            // `Some(0)` (a genuinely empty SMALL file) must still count as
+            // a completed read — only `None` (not a SMALL-tier read, or one
+            // that never completed) is excluded.
+            counters.small_file_bytes_read += bytes_read;
+            counters.small_file_reads += 1;
+        }
         downstream_classifications.push((entry.repo_relative.clone(), classification));
     }
 
@@ -276,11 +306,14 @@ pub fn discover(root: &Path, policy: &DiscoveryPolicy) -> Result<DiscoveryOutput
         git_meta,
         diagnostics: all_diagnostics,
         downstream_classifications,
+        counters,
     })
 }
 
 /// Classify one file's content for downstream use by determining its size
-/// tier and applying the appropriate secret-scanning strategy.
+/// tier and applying the appropriate secret-scanning strategy. Also reports
+/// bytes read for SMALL files (PR-8 measurement), using the bytes actually
+/// read rather than a second `stat()` of the same path.
 ///
 /// **No content is retained after this function returns.**
 ///
@@ -299,7 +332,7 @@ fn classify_file_for_downstream(
     abs_path: &Path,
     repo_relative: &str,
     diagnostics: &mut Vec<Diagnostic>,
-) -> DownstreamClassification {
+) -> (DownstreamClassification, Option<u64>) {
     // Stat to determine size tier (no content read yet). A stat failure here
     // is never a content verdict — the file may simply be racing a
     // concurrent write/delete, or momentarily locked — so it is always
@@ -307,9 +340,12 @@ fn classify_file_for_downstream(
     let size_bytes = match std::fs::metadata(abs_path) {
         Ok(m) => m.len(),
         Err(e) => {
-            return DownstreamClassification::ScanTransientError {
-                reason: format!("stat failed: {e}"),
-            };
+            return (
+                DownstreamClassification::ScanTransientError {
+                    reason: format!("stat failed: {e}"),
+                },
+                None,
+            );
         }
     };
 
@@ -326,20 +362,35 @@ fn classify_file_for_downstream(
                 // transient and must be retried, never silently skipped
                 // forever alongside real binary files.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    return DownstreamClassification::ScanSkipped {
-                        reason: "file content is not valid UTF-8 (binary)".to_string(),
-                    };
+                    return (
+                        DownstreamClassification::ScanSkipped {
+                            reason: "file content is not valid UTF-8 (binary)".to_string(),
+                        },
+                        None,
+                    );
                 }
                 Err(e) => {
-                    return DownstreamClassification::ScanTransientError {
-                        reason: format!("file read failed: {e}"),
-                    };
+                    return (
+                        DownstreamClassification::ScanTransientError {
+                            reason: format!("file read failed: {e}"),
+                        },
+                        None,
+                    );
                 }
             };
+            // The whole file was successfully read at this point, whatever
+            // the classification turns out to be below — this is the real
+            // duplicate-read cost PR-8 measures (see
+            // `attic-indexing::analyze_single_file`, which re-reads the same
+            // SMALL files later via `preprocess_file_content`). `Some(0)`
+            // for a genuinely empty file is a real completed read, distinct
+            // from `None` (not a SMALL-tier read at all, or one that never
+            // completed) — the caller must count it.
+            let bytes_read = Some(content.len() as u64);
             let preprocess = secrets::preprocess(&content, repo_relative);
             // Drop content immediately — do not propagate to caller.
             drop(content);
-            match preprocess.decision {
+            let classification = match preprocess.decision {
                 SecretScanDecision::Excluded => DownstreamClassification::Excluded,
                 SecretScanDecision::Safe => DownstreamClassification::Safe { size_tier },
                 SecretScanDecision::Redacted => DownstreamClassification::Redacted {
@@ -352,16 +403,17 @@ fn classify_file_for_downstream(
                 SecretScanDecision::PartialScan => DownstreamClassification::ScanSkipped {
                     reason: "unexpected PartialScan from full-content preprocess".to_string(),
                 },
-            }
+            };
+            (classification, bytes_read)
         }
 
         FileSizeTier::Large => {
             // Delegate to the single authoritative streaming classifier in secrets.
             // This is the ONLY LARGE-file scanner; there is no duplicate in lib.rs.
             if secrets::is_known_secrets_file(repo_relative) {
-                return DownstreamClassification::Excluded;
+                return (DownstreamClassification::Excluded, None);
             }
-            match secrets::stream_scan_large_file_classify(abs_path) {
+            let classification = match secrets::stream_scan_large_file_classify(abs_path) {
                 Ok((SecretScanDecision::Safe, _, _)) => DownstreamClassification::Safe {
                     size_tier: FileSizeTier::Large,
                 },
@@ -382,7 +434,8 @@ fn classify_file_for_downstream(
                 Err(e) => DownstreamClassification::ScanTransientError {
                     reason: format!("streaming scan failed: {e}"),
                 },
-            }
+            };
+            (classification, None)
         }
 
         FileSizeTier::VeryLarge => {
@@ -394,9 +447,12 @@ fn classify_file_for_downstream(
                 // conversion (never rejects content) — any failure here is
                 // transient, never a content verdict.
                 Err(e) => {
-                    return DownstreamClassification::ScanTransientError {
-                        reason: format!("sample read failed: {e}"),
-                    };
+                    return (
+                        DownstreamClassification::ScanTransientError {
+                            reason: format!("sample read failed: {e}"),
+                        },
+                        None,
+                    );
                 }
             };
 
@@ -417,10 +473,15 @@ fn classify_file_for_downstream(
             drop(sample);
 
             // Regardless of whether findings were detected in the sample,
-            // this is always PartialScan — never Safe.
-            DownstreamClassification::PartialScan {
-                findings: result.findings,
-            }
+            // this is always PartialScan — never Safe. Not counted as a
+            // SMALL-file read (`None`): only the sample was read, not the
+            // whole file.
+            (
+                DownstreamClassification::PartialScan {
+                    findings: result.findings,
+                },
+                None,
+            )
         }
     }
 }
@@ -547,6 +608,27 @@ mod tests {
             .collect();
         assert!(paths.contains(&"src/main.rs"));
         assert!(paths.contains(&"src/lib.rs"));
+    }
+
+    /// Code-review finding: a genuinely empty (0-byte) SMALL file was fully
+    /// read (successfully, to completion) but the old `bytes_read > 0`
+    /// guard skipped counting it, undercounting `small_file_reads` relative
+    /// to its documented meaning.
+    #[test]
+    fn empty_small_file_is_still_counted_as_a_completed_read() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write_file(root, "empty.rs", "");
+
+        let policy = DiscoveryPolicy::default_git();
+        let output = discover(root, &policy).unwrap();
+
+        assert_eq!(
+            output.counters.small_file_reads, 1,
+            "the empty file's content was fully read and must be counted"
+        );
+        assert_eq!(output.counters.small_file_bytes_read, 0);
     }
 
     #[test]

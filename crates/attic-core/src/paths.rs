@@ -82,8 +82,38 @@ impl AtticPaths {
     /// [`resolve_data_root_from`] for the pure resolution logic.
     pub fn resolve() -> Result<Self, PathResolutionError> {
         let attic_home = std::env::var("ATTIC_HOME").ok();
+        let db_override = std::env::var("ATTIC_DB_PATH").ok();
         let user_home = home_dir();
-        let home = resolve_data_root_from(attic_home.as_deref(), user_home)?;
+
+        // ATTIC_DB_PATH is the legacy explicit database override documented by
+        // the public configuration contract. When ATTIC_HOME is absent, its
+        // parent also becomes the Attic home so config/backups/tmp remain
+        // colocated with the explicitly selected database.
+        let derived_home = db_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| PathBuf::from(s).parent().map(PathBuf::from))
+            // A bare filename (no directory component, e.g. "attic.db") has a
+            // `parent()` of `Some("")`, not `None` — filter that out so it
+            // falls through to the normal ATTIC_HOME/user-home resolution
+            // instead of silently treating the empty string as the home dir.
+            .filter(|p| !p.as_os_str().is_empty());
+        let home = match (attic_home.as_deref(), derived_home) {
+            (None, Some(home)) => home,
+            (attic_home, _) => resolve_data_root_from(attic_home, user_home)?,
+        };
+
+        // Validate before any directory is created, so an invalid
+        // ATTIC_DB_PATH fails clean with no filesystem side effects — same
+        // fail-fast contract as the empty-ATTIC_HOME check above.
+        if let Some(raw) = &db_override
+            && raw.trim().is_empty()
+        {
+            return Err(PathResolutionError::new(
+                "ATTIC_DB_PATH is set but empty; provide a database path or unset it",
+            ));
+        }
 
         std::fs::create_dir_all(&home).map_err(|e| {
             PathResolutionError::new(format!(
@@ -105,8 +135,13 @@ impl AtticPaths {
             PathResolutionError::new(format!("failed to create tmp directory {:?}: {}", tmp, e))
         })?;
 
+        let database = match db_override {
+            Some(raw) => PathBuf::from(raw),
+            None => home.join("attic.db"),
+        };
+
         Ok(Self {
-            database: home.join("attic.db"),
+            database,
             config_file: home.join("config.toml"),
             semantic_db: home.join("semantic.db"),
             backups_dir: backups,

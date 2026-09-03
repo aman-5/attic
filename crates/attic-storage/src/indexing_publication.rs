@@ -27,13 +27,15 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 
 use attic_core::{
-    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, IndexGenerationId,
-    RepositoryId, SecurityState, SourceRevisionId, SubsystemVersions,
+    DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType, FreshnessState,
+    IndexGenerationId, RepositoryId, SecurityState, SourceRevisionId, SubsystemVersions,
 };
 
 use crate::error::StorageError;
 use crate::fts::{delete_retrieval_units_for_file, insert_retrieval_unit_with_fts};
-use crate::repository::file_occurrence::{insert_file_occurrence, upsert_file_identity};
+use crate::repository::file_occurrence::{
+    insert_file_occurrence_with_freshness, upsert_file_identity,
+};
 use crate::repository::index_generation::insert_index_generation;
 use crate::repository::repository::upsert_repository;
 use crate::repository::source_revision::insert_source_revision_with_hashes;
@@ -154,7 +156,7 @@ pub struct IndexPublication {
 }
 
 /// One canonical structural node, ready for persistence (Phase 3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublicationNode {
     /// Parent node index within the same file's `nodes` vec.
     pub parent_index: Option<usize>,
@@ -171,7 +173,7 @@ pub struct PublicationNode {
 }
 
 /// One symbol definition occurrence plus its identity tuple (Phase 3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublicationSymbolDef {
     /// Language tag (`java`, `python`, …) for `core_symbol_identities`.
     pub language: String,
@@ -328,23 +330,26 @@ fn execute_index_publication(
             &f.stable_id_basis,
         )?;
         let occ = &f.occurrence;
-        insert_file_occurrence(
-            conn,
-            &crate::repository::file_occurrence::NewFileOccurrence {
-                id: &occ.id,
-                file_identity_id: &f.identity_id,
-                source_revision_id: &occ.source_revision_id,
-                index_generation_id: occ.index_generation_id.as_ref(),
-                path: &occ.path,
-                content_hash: &occ.content_hash,
-                size_bytes: occ.size_bytes,
-                language: occ.language.as_deref(),
-                file_type: occ.file_type,
-                discovery_class: occ.discovery_class,
-                security_state: occ.security_state,
-                existence_state: occ.existence_state,
-            },
-        )?;
+        let occurrence = crate::repository::file_occurrence::NewFileOccurrence {
+            id: &occ.id,
+            file_identity_id: &f.identity_id,
+            source_revision_id: &occ.source_revision_id,
+            index_generation_id: occ.index_generation_id.as_ref(),
+            path: &occ.path,
+            content_hash: &occ.content_hash,
+            size_bytes: occ.size_bytes,
+            language: occ.language.as_deref(),
+            file_type: occ.file_type,
+            discovery_class: occ.discovery_class,
+            security_state: occ.security_state,
+            existence_state: occ.existence_state,
+        };
+        let freshness = if occ.existence_state == ExistenceState::Deleted {
+            FreshnessState::Invalid
+        } else {
+            FreshnessState::Current
+        };
+        insert_file_occurrence_with_freshness(conn, &occurrence, freshness)?;
     }
 
     let mut stats = IndexPublicationStats {
@@ -638,5 +643,69 @@ mod tests {
             })
             .unwrap();
         assert_eq!(unit_count, 1, "exactly the fresh unit must remain");
+    }
+
+    #[test]
+    fn deleted_occurrence_is_born_invalid_in_publication_transaction() {
+        let dir = TempDir::new().unwrap();
+        let (queue, _pool, db_path) = make_queue(&dir);
+        let handle = queue.handle();
+        let mut p = sample_publication();
+        let tombstone_id = p.files[0].occurrence.id.to_string_repr();
+        p.files[0].occurrence.existence_state = ExistenceState::Deleted;
+        p.retrieval_units.clear();
+        submit_index_publication(&handle, p).expect("tombstone publication");
+        drop(handle);
+        drop(queue);
+
+        let verify = crate::connection::open_ro(&db_path).unwrap();
+        let state: (String, String) = verify
+            .query_row(
+                "SELECT existence_state, freshness_state FROM core_file_occurrences WHERE id=?1",
+                [&tombstone_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "deleted");
+        assert_eq!(
+            state.1, "INVALID",
+            "tombstone must commit directly as INVALID"
+        );
+    }
+
+    #[test]
+    fn failed_next_publication_keeps_previous_repo_map_truth() {
+        let dir = TempDir::new().unwrap();
+        let (queue, _pool, db_path) = make_queue(&dir);
+        let handle = queue.handle();
+        let p1 = sample_publication();
+        let repo_id = p1.repository_id;
+        submit_index_publication(&handle, p1.clone()).expect("baseline publication");
+
+        let mut p2 = sample_publication();
+        p2.repository_id = repo_id;
+        p2.repository_upsert = None;
+        p2.files[0].identity_repository_id = repo_id;
+        p2.files[0].occurrence.path = "src/lib.rs".into();
+        let dup = p2.files[0].occurrence.clone();
+        p2.files.push(PublicationFile {
+            identity_id: FileIdentityId::new_v4(),
+            identity_repository_id: repo_id,
+            stable_id_basis: format!("{repo_id}/src/dup.rs"),
+            occurrence: PublicationOccurrence {
+                path: "src/dup.rs".into(),
+                ..dup
+            },
+        });
+        assert!(submit_index_publication(&handle, p2).is_err());
+        drop(handle);
+        drop(queue);
+
+        let verify = crate::connection::open_ro(&db_path).unwrap();
+        let files =
+            crate::repository::file_occurrence::current_files_for_repo_map(&verify, &repo_id, None)
+                .unwrap();
+        assert_eq!(files.len(), 1, "failed N+1 must leave exactly N visible");
+        assert_eq!(files[0].0, "src/lib.rs");
     }
 }

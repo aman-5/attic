@@ -50,7 +50,6 @@ version = "0.1.0"
 dependencies = [
  "attic-core",
  "attic-discovery",
- "attic-test-support",
  "blake3",
  "serde",
  "serde_json",
@@ -103,7 +102,6 @@ name = "attic-discovery"
 version = "0.1.0"
 dependencies = [
  "attic-core",
- "attic-test-support",
  "blake3",
  "ignore",
  "serde",
@@ -152,7 +150,6 @@ dependencies = [
  "attic-discovery",
  "attic-incremental",
  "attic-storage",
- "attic-test-support",
  "blake3",
  "rusqlite",
  "serde",
@@ -230,7 +227,6 @@ name = "attic-storage"
 version = "0.1.0"
 dependencies = [
  "attic-core",
- "attic-test-support",
  "blake3",
  "rusqlite",
  "serde",
@@ -241,16 +237,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "attic-test-support"
-version = "0.1.0"
-dependencies = [
- "attic-core",
- "attic-storage",
- "rusqlite",
- "tracing-subscriber",
 ]
 
 [[package]]

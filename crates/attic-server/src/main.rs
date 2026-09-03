@@ -8,11 +8,13 @@
 use attic_discovery::{
     DiscoveryPolicy, SecretScanDecision, canonicalize_within_root, preprocess_file_content,
 };
-use attic_indexing::{IndexError, IndexOptions, IndexingStore, index_repository};
+#[cfg(test)]
+use attic_indexing::index_repository;
+use attic_indexing::{IndexError, IndexOptions, IndexingStore};
 use attic_storage::{
     DbPool, FtsSearchParams, MAX_SEARCH_RESULTS, StorageError, WriterQueue, WriterQueueHandle,
-    fts_search, get_db_stats, get_repository_path, get_repository_stats,
-    lookup_repository_by_root_path,
+    current_files_for_repo_map, fts_search, get_db_stats, get_repository_path,
+    get_repository_stats, lookup_repository_by_root_path,
     resource_manager::{ResourceConfig, ResourceMonitor},
     run_migrations,
 };
@@ -30,6 +32,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -113,6 +116,12 @@ enum ServerError {
     Retrieval(String),
 }
 
+struct BootstrapJob {
+    root_key: String,
+    cancellation: attic_core::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Clone)]
 struct AtticServer {
     pool: DbPool,
@@ -133,6 +142,11 @@ struct AtticServer {
     /// (not by `main`) so the runtime `workspace` MCP tool can start and stop
     /// watchers for roots that are added/removed while the process is up.
     watches: Arc<std::sync::Mutex<HashMap<String, attic_incremental::IncrementalWatch>>>,
+    /// Server-owned bootstrap jobs. Never detached: shutdown cancels and joins all of them.
+    bootstrap_jobs: Arc<std::sync::Mutex<Vec<BootstrapJob>>>,
+    /// Shared scheduler is owned by the server so background startup can install it
+    /// after MCP serving has already begun, and shutdown can stop it deterministically.
+    scheduler: Arc<std::sync::Mutex<Option<attic_incremental::SchedulerHandle>>>,
     /// Whether the logical workspace is configured (any `ATTIC_CONFIG`, the
     /// persistent default config file, or `ATTIC_WORKSPACE_ROOT`). `false`
     /// (UNCONFIGURED first run) gates query tools and drives status.
@@ -163,6 +177,29 @@ struct AtticServer {
     db_path: std::path::PathBuf,
     /// Phase 7 resource monitor for foreground/background priority control.
     resource_monitor: Option<Arc<attic_storage::resource_manager::ResourceMonitor>>,
+    /// PR-3 discovery explainability: the most recent walk's counters per
+    /// `repository_id`, populated after every `bootstrap_workspace` run.
+    /// In-memory only — a fresh walk on the next index run replaces it, so
+    /// this always reflects the last actually-observed traversal rather than
+    /// a stale persisted value.
+    last_discovery_counters: Arc<std::sync::RwLock<HashMap<String, attic_discovery::WalkCounters>>>,
+    /// Human-readable counterpart to `last_discovery_counters`: the actual
+    /// `Diagnostic` messages (submodule boundaries, symlink issues, etc.)
+    /// from the most recent walk, per `repository_id`. Same in-memory-only,
+    /// replaced-on-reindex lifecycle as `last_discovery_counters`.
+    last_discovery_diagnostics:
+        Arc<std::sync::RwLock<HashMap<String, Vec<attic_discovery::Diagnostic>>>>,
+    /// Maps a configured root's identity key (`root_identity_key`) to the
+    /// set of effective repository roots it fanned out into. Most entries
+    /// are `[configured_root]` (the 1:1 legacy case); a container directory
+    /// with no top-level `.git` but nested git repos fans out to N entries,
+    /// one per nested root discovered by `discover_nested_git_roots`.
+    container_repo_roots: Arc<std::sync::RwLock<HashMap<String, Vec<PathBuf>>>>,
+    /// Repository ids whose `start_watcher` call failed, with the error
+    /// message. Cleared on a subsequent successful `start_watcher` or on
+    /// `stop_watcher`. Lets `status` report a real reason for `DISABLED`
+    /// instead of silently absorbing the failure into a bare catch-all.
+    watcher_start_failures: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl AtticServer {
@@ -225,6 +262,8 @@ impl AtticServer {
             incremental: Arc::new(std::sync::RwLock::new(HashMap::new())),
             watch_mode: Arc::new(std::sync::RwLock::new(HashMap::new())),
             watches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bootstrap_jobs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            scheduler: Arc::new(std::sync::Mutex::new(None)),
             workspace_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             default_config: db_path.with_file_name("config.toml"),
@@ -234,6 +273,10 @@ impl AtticServer {
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
             resource_monitor: Some(Arc::new(resource_monitor)),
+            last_discovery_counters: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            last_discovery_diagnostics: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            container_repo_roots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            watcher_start_failures: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -249,21 +292,74 @@ impl AtticServer {
     /// unchanged content is simply reproduced), rerunning it is always safe
     /// and is the only way `Ok` here can mean "the index is complete," not
     /// merely "a row exists."
+    #[cfg(test)]
     fn bootstrap_workspace(&self, root: &Path) -> Result<String, ServerError> {
-        // Coordinated-writer indexing: discovery + analysis happen here on the
-        // calling thread, then ONE submit_index_publication mutation carries
-        // every write through the Phase 1A writer queue inside its ambient
-        // transaction.  No secondary connection, no nested transactions, and
-        // attic-indexing never touches a raw rusqlite write connection.
+        self.bootstrap_workspace_cancellable(root, &attic_core::CancellationToken::default())
+    }
+    fn bootstrap_workspace_cancellable(
+        &self,
+        root: &Path,
+        cancellation: &attic_core::CancellationToken,
+    ) -> Result<String, ServerError> {
         let store = IndexingStore {
             readers: &self.pool,
             writer: &self.writer,
         };
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
-        index_repository(&store, root, &policy, &opts)
-            .map(|r| r.repository_id)
-            .map_err(ServerError::Indexing)
+        let result = attic_indexing::index_repository_with_cancellation(
+            &store,
+            root,
+            &policy,
+            &opts,
+            cancellation,
+        )
+        .map_err(ServerError::Indexing)?;
+        // Best-effort: a poisoned lock here must never fail an otherwise
+        // successful bootstrap — these counters are diagnostics, not the
+        // authoritative index state.
+        if let Ok(mut counters) = self.last_discovery_counters.write() {
+            counters.insert(result.repository_id.clone(), result.discovery_counters);
+        }
+        if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
+            diagnostics.insert(
+                result.repository_id.clone(),
+                result.discovery_diagnostics.clone(),
+            );
+        }
+        Ok(result.repository_id)
+    }
+
+    /// Discover nested git roots below `configured_root` (or treat it as
+    /// one root when it has no git boundaries anywhere) and bootstrap each
+    /// effective root independently.
+    ///
+    /// A container directory with no top-level `.git` whose entire content
+    /// lives inside child git repositories previously indexed as a single,
+    /// always-empty repository (every file lives under a pruned submodule
+    /// boundary — see `walk_pass`). This fans the container out into one
+    /// repository per nested `.git` instead.
+    ///
+    /// All-or-nothing: the first bootstrap failure aborts the whole call.
+    /// Rows already committed for earlier roots remain in the DB and are
+    /// harmlessly re-indexed on retry.
+    fn bootstrap_workspace_roots_cancellable(
+        &self,
+        configured_root: &Path,
+        cancellation: &attic_core::CancellationToken,
+    ) -> Result<Vec<(PathBuf, String)>, ServerError> {
+        let nested = attic_discovery::discover_nested_git_roots(configured_root, cancellation)?;
+        let effective_roots: Vec<PathBuf> = if nested.is_empty() {
+            vec![configured_root.to_path_buf()]
+        } else {
+            nested
+        };
+        let mut results = Vec::with_capacity(effective_roots.len());
+        for root in effective_roots {
+            let repo_id = self.bootstrap_workspace_cancellable(&root, cancellation)?;
+            results.push((root, repo_id));
+        }
+        Ok(results)
     }
 
     /// Runtime logical-workspace membership management via the `workspace`
@@ -292,12 +388,28 @@ impl AtticServer {
             let configured = self
                 .workspace_configured
                 .load(std::sync::atomic::Ordering::SeqCst);
+            // Only surface roots that genuinely fanned out into more than
+            // one repository (a container with nested git repos) — the
+            // trivial 1:1 case stays implicit, matching every other
+            // configured root.
+            let root_expansions: HashMap<String, Vec<String>> =
+                lock_or_server_err!(self.container_repo_roots.read(), "container_repo_roots")?
+                    .iter()
+                    .filter(|(_, v)| v.len() != 1)
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.iter().map(|p| p.display().to_string()).collect(),
+                        )
+                    })
+                    .collect();
             let payload = json!({
                 "configured": configured,
                 "unconfigured": !configured,
                 "config_file": self.default_config.display().to_string(),
                 "membership_count": active.len(),
                 "roots": active.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+                "root_expansions": root_expansions,
             });
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&payload)?,
@@ -321,168 +433,274 @@ impl AtticServer {
                 .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
         }
 
-        /// Deterministic canonical dedup preserving configuration order.
+        /// Deterministic canonical dedup preserving configuration order,
+        /// comparing via [`root_identity_key`] so a root reached through a
+        /// differently-produced `PathBuf` (see PR-6) is still recognized as
+        /// the same root everywhere, not just at the `remove` call site.
         fn dedup_keep_order(roots: Vec<PathBuf>) -> Vec<PathBuf> {
             let mut seen = HashSet::new();
             let mut out = Vec::new();
             for r in roots {
-                if seen.insert(r.clone()) {
+                if seen.insert(root_identity_key(&r)) {
                     out.push(r);
                 }
             }
             out
         }
 
-        let new_active: Vec<PathBuf> = match action.as_str() {
-            "add" => {
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
-                let canon = validate_root(path)?;
-                let mut active =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-                if !active.contains(&canon) {
-                    active.push(canon);
+        // PR-9: serialize the whole compute → persist → commit sequence by
+        // holding `active_roots`'s own write lock across it, rather than a
+        // separate parallel lock — `active_roots` is already the single
+        // source of truth for membership, so it's the natural single point
+        // of mutual exclusion for mutating it too. Scoped in an explicit
+        // block so the guard is structurally out of scope (not just
+        // manually dropped) before the `.await` below — the async-fn Send
+        // analysis needs that to prove the guard is never held across it.
+        let (new_active, added, removed): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
+            let mut active_guard = lock_or_server_err!(self.active_roots.write(), "active_roots")?;
+
+            let new_active: Vec<PathBuf> = match action.as_str() {
+                "add" => {
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
+                    let canon = validate_root(path)?;
+                    let mut active = active_guard.clone();
+                    if !active
+                        .iter()
+                        .any(|r| root_identity_key(r) == root_identity_key(&canon))
+                    {
+                        active.push(canon);
+                    }
+                    dedup_keep_order(active)
                 }
-                dedup_keep_order(active)
-            }
-            "remove" => {
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ServerError::InvalidArg("missing 'path' for remove".into()))?;
-                let canon = PathBuf::from(path).canonicalize().map_err(|e| {
-                    ServerError::InvalidArg(format!(
-                        "cannot canonicalize removal path '{path}': {e}"
-                    ))
-                })?;
-                let current =
-                    lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-                dedup_keep_order(
-                    current
-                        .into_iter()
-                        .filter(|r| r.as_path() != canon.as_path())
-                        .collect(),
-                )
-            }
-            "set" => {
-                let paths = args
-                    .get("paths")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| {
-                        ServerError::InvalidArg("missing 'paths' (array) for set".into())
-                    })?
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .ok_or_else(|| ServerError::InvalidArg("paths must be strings".into()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut validated = Vec::new();
-                for p in paths {
-                    validated.push(validate_root(p)?);
+                "remove" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ServerError::InvalidArg("missing 'path' for remove".into())
+                    })?;
+                    let target = PathBuf::from(path);
+                    // Two-path strategy (principal-architect audit A-06): a
+                    // configured root that has been deleted or moved must still
+                    // be removable. `canonicalize()` requires the path to exist,
+                    // so fall back to a lexical (filesystem-free) normalization
+                    // when it doesn't — comparison then goes through the shared
+                    // `root_identity_key` so either form matches the persisted
+                    // canonical root.
+                    let normalized = if target.exists() {
+                        target.canonicalize().map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot canonicalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    } else {
+                        normalize_root_lexically(&target).map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot normalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    };
+                    let target_key = root_identity_key(&normalized);
+                    dedup_keep_order(
+                        active_guard
+                            .iter()
+                            .filter(|r| root_identity_key(r) != target_key)
+                            .cloned()
+                            .collect(),
+                    )
                 }
-                dedup_keep_order(validated)
+                "set" => {
+                    let paths = args
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| {
+                            ServerError::InvalidArg("missing 'paths' (array) for set".into())
+                        })?
+                        .iter()
+                        .map(|v| {
+                            v.as_str().ok_or_else(|| {
+                                ServerError::InvalidArg("paths must be strings".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut validated = Vec::new();
+                    for p in paths {
+                        validated.push(validate_root(p)?);
+                    }
+                    dedup_keep_order(validated)
+                }
+                other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+            };
+
+            // Compute added/removed roots relative to the current live membership.
+            let old_active = active_guard.clone();
+            let added: Vec<PathBuf> = new_active
+                .iter()
+                .filter(|r| !old_active.contains(r))
+                .cloned()
+                .collect();
+            let removed: Vec<PathBuf> = old_active
+                .iter()
+                .filter(|r| !new_active.contains(r))
+                .cloned()
+                .collect();
+
+            // 1. Persist the new membership atomically BEFORE touching live state,
+            //    so a crash still leaves a coherent durable config.
+            if new_active.is_empty() {
+                remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
+            } else {
+                persist_repositories_config(&self.default_config, &new_active)
+                    .map_err(ServerError::InvalidArg)?;
             }
-            other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+
+            // 2. Update in-memory authoritative membership + configured flag.
+            *active_guard = new_active.clone();
+            self.workspace_configured
+                .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
+
+            (new_active, added, removed)
+            // `active_guard` drops here, going out of scope before the `.await`
+            // points below.
         };
-
-        // Compute added/removed roots relative to the current live membership.
-        let old_active = lock_or_server_err!(self.active_roots.read(), "active_roots")?.clone();
-        let added: Vec<PathBuf> = new_active
-            .iter()
-            .filter(|r| !old_active.contains(r))
-            .cloned()
-            .collect();
-        let removed: Vec<PathBuf> = old_active
-            .iter()
-            .filter(|r| !new_active.contains(r))
-            .cloned()
-            .collect();
-
-        // 1. Persist the new membership atomically BEFORE touching live state,
-        //    so a crash still leaves a coherent durable config.
-        if new_active.is_empty() {
-            remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
-        } else {
-            persist_repositories_config(&self.default_config, &new_active)
-                .map_err(ServerError::InvalidArg)?;
-        }
-
-        // 2. Update in-memory authoritative membership + configured flag.
-        *lock_or_server_err!(self.active_roots.write(), "active_roots")? = new_active.clone();
-        self.workspace_configured
-            .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
 
         // 3. Reconcile LIVE watchers: stop watchers for removed roots,
         //    start+bootstrap watchers for added roots. Each is isolated so a
         //    single failure never corrupts the rest of the reconciliation.
         let mut events = Vec::new();
         for root in &removed {
-            let repo_id = self
-                .pool
-                .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+            let job_key = root_identity_key(root);
+            if let Ok(jobs) = self.bootstrap_jobs.lock() {
+                for job in jobs.iter().filter(|job| job.root_key == job_key) {
+                    job.cancellation.cancel();
+                }
+            }
+            // A configured root may have fanned out into N effective
+            // repository roots (container with nested git repos); look up
+            // and clear that mapping so every fanned-out repo's watcher and
+            // diagnostics get cleaned up, not just a single lookup on the
+            // configured root itself (which is never itself a repo row in
+            // the fan-out case).
+            let effective_roots = self
+                .container_repo_roots
+                .write()
                 .ok()
-                .flatten()
-                .map(|id| id.to_string());
-            if let Some(id) = repo_id {
-                self.stop_watcher(&id);
-                events.push(format!("stopped watcher for: {}", root.display()));
+                .and_then(|mut g| g.remove(&job_key))
+                .unwrap_or_else(|| vec![root.clone()]);
+            let mut stopped = 0usize;
+            for effective_root in &effective_roots {
+                let repo_id = self
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|id| id.to_string());
+                if let Some(id) = repo_id {
+                    self.stop_watcher(&id);
+                    // PR-3 counters are keyed by repository_id; a removed root's
+                    // entry would otherwise never be cleaned up, growing this
+                    // map unboundedly over a long-running process's lifetime.
+                    if let Ok(mut counters) = self.last_discovery_counters.write() {
+                        counters.remove(&id);
+                    }
+                    if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
+                        diagnostics.remove(&id);
+                    }
+                    stopped += 1;
+                }
+            }
+            if stopped > 0 {
+                events.push(format!(
+                    "stopped {stopped} watcher(s) for: {}",
+                    root.display()
+                ));
             } else {
                 events.push(format!("removed (no registered repo): {}", root.display()));
             }
         }
         for root in &added {
-            match tokio::task::spawn_blocking({
-                let server = self.clone();
-                let root = root.clone();
-                move || server.bootstrap_workspace(&root)
-            })
-            .await
-            {
-                Ok(Ok(repo_id)) => {
-                    // ┬º23: clear any prior degraded-add marker for this root.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.remove(root);
+            let server = self.clone();
+            let root = root.clone();
+            let root_for_event = root.clone();
+            let cancellation = attic_core::CancellationToken::new();
+            let worker_cancellation = cancellation.clone();
+            let job_key = root_identity_key(&root);
+
+            let handle = tokio::spawn(async move {
+                let bootstrap_root = root.clone();
+                let bootstrap_server = server.clone();
+                let blocking_cancellation = worker_cancellation.clone();
+                let job_key = root_identity_key(&root);
+
+                let result = tokio::task::spawn_blocking(move || {
+                    bootstrap_server.bootstrap_workspace_roots_cancellable(
+                        &bootstrap_root,
+                        &blocking_cancellation,
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(repo_roots)) if !worker_cancellation.is_cancelled() => {
+                        // Membership may have changed while indexing was running.
+                        let still_active = server.active_roots.read().ok().is_some_and(|roots| {
+                            roots
+                                .iter()
+                                .any(|r| root_identity_key(r) == root_identity_key(&root))
+                        });
+                        if !still_active {
+                            tracing::info!(root = %root.display(), "bootstrap completed after removal; watcher not started");
+                            return;
+                        }
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.remove(&root);
+                        }
+                        if let Ok(mut g) = server.container_repo_roots.write() {
+                            g.insert(
+                                job_key.clone(),
+                                repo_roots.iter().map(|(p, _)| p.clone()).collect(),
+                            );
+                        }
+                        for (effective_root, repo_id) in &repo_roots {
+                            let started = server.start_watcher(effective_root, repo_id);
+                            tracing::info!(root = %effective_root.display(), container_root = %root.display(), repository_id = %repo_id, watcher_started = started, "background workspace bootstrap completed");
+                        }
                     }
-                    let started = self.start_watcher(root, &repo_id);
-                    events.push(format!(
-                        "added + {} root: {}",
-                        if started {
-                            "started watcher for"
-                        } else {
-                            "indexed"
-                        },
-                        root.display()
-                    ));
-                }
-                Ok(Err(e)) => {
-                    // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
+                    Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => {
+                        tracing::info!(root = %root.display(), "background workspace bootstrap cancelled");
                     }
-                    tracing::warn!(
-                        "bootstrap of newly added root {} failed: {e}",
-                        root.display()
-                    );
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
-                }
-                Err(e) => {
-                    // ┬º23: mark this root as degraded/pending so status surfaces it.
-                    if let Ok(mut g) = self.pending_index_failed.lock() {
-                        g.insert(root.clone());
+                    Ok(Err(e)) => {
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.insert(root.clone());
+                        }
+                        tracing::warn!(root = %root.display(), "background workspace bootstrap failed: {e}");
                     }
-                    tracing::warn!("bootstrap task for {} failed: {e}", root.display());
-                    events.push(format!(
-                        "failed to index added root {}: {e}",
-                        root.display()
-                    ));
+                    Err(e) => {
+                        if let Ok(mut g) = server.pending_index_failed.lock() {
+                            g.insert(root.clone());
+                        }
+                        tracing::warn!(root = %root.display(), "background workspace bootstrap task failed: {e}");
+                    }
+                    Ok(Ok(_)) => {
+                        tracing::info!(root = %root.display(), "background workspace bootstrap cancelled before watcher startup");
+                    }
                 }
+            });
+
+            if let Ok(mut jobs) = self.bootstrap_jobs.lock() {
+                jobs.push(BootstrapJob {
+                    root_key: job_key,
+                    cancellation,
+                    handle,
+                });
             }
+
+            events.push(format!(
+                "added root; indexing scheduled in background: {}",
+                root_for_event.display()
+            ));
         }
 
         let payload = json!({
@@ -523,6 +741,9 @@ impl AtticServer {
             g.remove(repository_id);
         } else {
             error!(repository_id, "watch_mode lock poisoned in stop_watcher");
+        }
+        if let Ok(mut g) = self.watcher_start_failures.write() {
+            g.remove(repository_id);
         }
     }
 
@@ -581,6 +802,9 @@ impl AtticServer {
                     mode = mode.as_str(),
                     "runtime-added watcher started"
                 );
+                if let Ok(mut g) = self.watcher_start_failures.write() {
+                    g.remove(repository_id);
+                }
                 true
             }
             Err(e) => {
@@ -588,6 +812,9 @@ impl AtticServer {
                     "change detection failed to start for {} ({e}) ΓÇö incremental DISABLED for this repository",
                     root.display()
                 );
+                if let Ok(mut g) = self.watcher_start_failures.write() {
+                    g.insert(repository_id.to_string(), e.to_string());
+                }
                 false
             }
         }
@@ -595,6 +822,134 @@ impl AtticServer {
 }
 
 // ΓöÇΓöÇΓöÇ input validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+/// Normalize a path for identity comparison when it (or a suffix of it) no
+/// longer exists on disk, so `canonicalize()` cannot run directly.
+///
+/// Used as the removal-time fallback when the configured root has been
+/// deleted or moved (principal-architect audit A-06): a stale membership
+/// entry must still be removable by path. The common case is that only the
+/// leaf (the removed root itself) is gone while its parent still exists —
+/// walk up to the longest still-existing ancestor, canonicalize *that*
+/// (recovering Windows short-name/case differences for the part that can
+/// still be resolved), then lexically re-append the missing suffix and
+/// resolve any remaining `.`/`..` components structurally.
+fn normalize_root_lexically(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut existing_prefix = absolute.as_path();
+    while !existing_prefix.exists() {
+        let Some(name) = existing_prefix.file_name() else {
+            break; // reached a filesystem root with no existing ancestor
+        };
+        missing_tail.push(name.to_os_string());
+        match existing_prefix.parent() {
+            Some(parent) => existing_prefix = parent,
+            None => break,
+        }
+    }
+
+    let mut candidate = if existing_prefix.exists() {
+        existing_prefix.canonicalize()?
+    } else {
+        existing_prefix.to_path_buf()
+    };
+    for component in missing_tail.into_iter().rev() {
+        candidate.push(component);
+    }
+
+    // Resolve any remaining `.`/`..` in the (still lexical) missing suffix —
+    // `canonicalize()` already normalized the existing prefix above.
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Comparison key for two workspace-root `PathBuf`s that may have been
+/// produced differently (one via `canonicalize()`, which resolves the
+/// on-disk casing and adds Windows' `\\?\` verbatim prefix; one via
+/// [`normalize_root_lexically`], which can do neither without the path
+/// existing). Strips the verbatim prefix and case-folds on Windows —
+/// mirroring the case-insensitive filename semantics `canonicalize()`
+/// already applies implicitly for existing paths — so a root added with one
+/// casing/prefix can still be recognized as the same root when removed with
+/// another.
+fn root_identity_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    if cfg!(windows) {
+        stripped.to_lowercase()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// Expand configured roots into their fanned-out repository ids.
+///
+/// Most configured roots map to exactly one repository (the legacy 1:1
+/// case, when `container_repo_roots` has no entry for the root's identity
+/// key — every existing single-root workspace behaves byte-for-byte as
+/// before). A container root with nested git repositories fans out into
+/// N repository ids, one per nested root discovered at `add` time.
+///
+/// Returns the flattened set of active repository ids, plus a reverse map
+/// from each repository id to the identity key of the configured root that
+/// owns it (used by `handle_status` to recognize "this repository's
+/// configured root is still bootstrapping" instead of guessing).
+fn expand_active_ids(
+    pool: &DbPool,
+    active_roots: &[PathBuf],
+    container_repo_roots: &HashMap<String, Vec<PathBuf>>,
+) -> (HashSet<String>, HashMap<String, String>) {
+    let mut ids = HashSet::new();
+    let mut owner = HashMap::new();
+    for configured_root in active_roots {
+        let key = root_identity_key(configured_root);
+        let effective_roots = container_repo_roots
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| vec![configured_root.clone()]);
+        for root in &effective_roots {
+            if let Some(id) = pool
+                .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+                .ok()
+                .flatten()
+                .map(|id| id.to_string())
+            {
+                ids.insert(id.clone());
+                owner.insert(id, key.clone());
+            }
+        }
+    }
+    (ids, owner)
+}
+
+/// SCREAMING_SNAKE_CASE label for a discovery diagnostic kind, matching the
+/// existing status-string convention (`"RECONCILIATION_REQUIRED"`, etc.).
+fn diagnostic_kind_str(kind: &attic_discovery::DiagnosticKind) -> &'static str {
+    use attic_discovery::DiagnosticKind::*;
+    match kind {
+        SymlinkEscape => "SYMLINK_ESCAPE",
+        SymlinkCycle => "SYMLINK_CYCLE",
+        UnstableCapture => "UNSTABLE_CAPTURE",
+        IoError => "IO_ERROR",
+        SubmoduleDetected => "SUBMODULE_DETECTED",
+        ExemptionRejected => "EXEMPTION_REJECTED",
+    }
+}
 
 fn validate_filter(name: &str, value: &str, max_len: usize) -> Result<(), ServerError> {
     if value.len() > max_len {
@@ -1121,10 +1476,79 @@ fn handle_search(
     )]))
 }
 
+/// A directory node in the derived `repo_map` tree. Directories are never a
+/// persisted entity — this tree is rebuilt at read time from the current
+/// generation's active file paths, so an empty directory (or one left empty
+/// by a `file_type` filter) simply never gets a node here.
+///
+/// `dirs`/`files` are kept in separate maps (rather than one map keyed by
+/// name) so serialization can enforce "directories before files, then
+/// lexicographic" regardless of how directory and file names interleave;
+/// `BTreeMap` gives deterministic lexicographic order within each group.
+#[derive(Default)]
+struct RepoMapDirNode {
+    dirs: std::collections::BTreeMap<String, RepoMapDirNode>,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+impl RepoMapDirNode {
+    fn insert(&mut self, components: &[&str], file_type: &str) {
+        match components {
+            [] => {}
+            [name] => {
+                self.files
+                    .insert((*name).to_string(), file_type.to_string());
+            }
+            [dir, rest @ ..] => {
+                self.dirs
+                    .entry((*dir).to_string())
+                    .or_default()
+                    .insert(rest, file_type);
+            }
+        }
+    }
+
+    fn to_json(&self) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.dirs.len() + self.files.len());
+        for (name, node) in &self.dirs {
+            out.push(json!({
+                "name": name,
+                "type": "directory",
+                "children": node.to_json(),
+            }));
+        }
+        for (name, file_type) in &self.files {
+            // Guards against an impossible filesystem shape that stale
+            // (not-yet-tombstoned) occurrence data can produce — e.g. a
+            // leftover row for file "foo" alongside a newer one for
+            // "foo/sub.rs", where "foo" would need to be both a file and a
+            // directory at the same tree level. Directories win
+            // deterministically regardless of insertion order (checked here
+            // rather than in `insert`, since a directory node for this name
+            // may not exist yet at insert time but appear later): the
+            // conflicting file is dropped rather than rendering two sibling
+            // nodes with the same name, which no real filesystem could
+            // produce and which would be a nonsensical tree to hand to a
+            // caller.
+            if self.dirs.contains_key(name) {
+                continue;
+            }
+            out.push(json!({
+                "name": name,
+                "type": "file",
+                "file_type": file_type,
+            }));
+        }
+        out
+    }
+}
+
 fn handle_repo_map(
     pool: &DbPool,
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
+    discovery_counters: &HashMap<String, attic_discovery::WalkCounters>,
+    discovery_diagnostics: &HashMap<String, Vec<attic_discovery::Diagnostic>>,
 ) -> Result<CallToolResult, ServerError> {
     let repo_id = args
         .get("repository_id")
@@ -1136,10 +1560,46 @@ fn handle_repo_map(
     if let Some(ft) = file_type {
         validate_filter("file_type", ft, 32)?;
     }
+
     let all_stats = pool.with_reader(get_repository_stats)?;
     let stats = all_stats.into_iter().find(|s| s.id == repo_id);
+
+    let parsed_repo_id = repo_id
+        .parse::<attic_core::RepositoryId>()
+        .map_err(|e| ServerError::InvalidArg(format!("invalid repository_id: {e}")))?;
+    let files = pool.with_reader(|c| current_files_for_repo_map(c, &parsed_repo_id, file_type))?;
+
+    let mut root = RepoMapDirNode::default();
+    for (path, ft) in &files {
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        root.insert(&components, ft);
+    }
+
+    // PR-3: last observed discovery-walk counters for this repository, if
+    // any bootstrap/reindex has run this process — answers "why did the
+    // filesystem count and indexed count differ" without server logs.
+    let discovery = discovery_counters.get(repo_id);
+    let diagnostics: Vec<Value> = discovery_diagnostics
+        .get(repo_id)
+        .into_iter()
+        .flatten()
+        .map(|d| {
+            json!({
+                "kind": diagnostic_kind_str(&d.kind),
+                "path": d.path.display().to_string(),
+                "message": d.message,
+            })
+        })
+        .collect();
+
     Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&json!({ "repository_id": repo_id, "stats": stats }))?,
+        serde_json::to_string_pretty(&json!({
+            "repository_id": repo_id,
+            "stats": stats,
+            "tree": root.to_json(),
+            "discovery": discovery,
+            "diagnostics": diagnostics,
+        }))?,
     )]))
 }
 
@@ -1147,9 +1607,17 @@ fn handle_repo_map(
 /// multi-root workspace with one healthy repository and two degraded ones
 /// must never be reported as uniformly "ok". `incremental`/`watch_mode` are
 /// keyed by `repository_id`, one entry per repository this process is
-/// actively watching ΓÇö repositories known to storage but absent from these
-/// maps (never configured this run, or a watcher failed to start) are
-/// reported as `DISABLED` rather than silently omitted.
+/// actively watching. A repository known to storage but absent from these
+/// maps is reported as `DISABLED` UNLESS its configured root is still
+/// bootstrapping (`pending_index_roots`, via `container_repo_roots`'s
+/// root→repository-id ownership), in which case it is `INDEXING`. When it
+/// genuinely is disabled, the reason is `watcher_start_failures`'s recorded
+/// error when available, else an honest `"watcher_not_registered"` label —
+/// never a bare unreasoned catch-all. A configured root may also fan out
+/// into more than one repository id (a container with nested git repos —
+/// see `container_repo_roots`), so this is a container→N-repository
+/// relationship, not 1:1.
+#[allow(clippy::too_many_arguments)]
 fn handle_status(
     pool: &DbPool,
     incremental: &HashMap<String, Arc<attic_incremental::IncrementalService>>,
@@ -1158,6 +1626,9 @@ fn handle_status(
     configured: bool,
     active_roots: &[PathBuf],
     unavailable_roots: &[(PathBuf, String)],
+    pending_index_roots: &[String],
+    container_repo_roots: &HashMap<String, Vec<PathBuf>>,
+    watcher_start_failures: &HashMap<String, String>,
 ) -> Result<CallToolResult, ServerError> {
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
@@ -1187,18 +1658,11 @@ fn handle_status(
     // masquerade as active (spec ┬º14-16). When UNCONFIGURED, the active set
     // is empty and status reports "unconfigured" ΓÇö stale DB repos never leak
     // into the response.
-    let active_ids: HashSet<String> = if configured {
-        active_roots
-            .iter()
-            .filter_map(|root| {
-                pool.with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
-                    .ok()
-                    .flatten()
-                    .map(|id| id.to_string())
-            })
-            .collect()
+    let (active_ids, id_owner_root_key): (HashSet<String>, HashMap<String, String>) = if configured
+    {
+        expand_active_ids(pool, active_roots, container_repo_roots)
     } else {
-        HashSet::new()
+        (HashSet::new(), HashMap::new())
     };
     if !configured {
         payload["status"] = json!("unconfigured");
@@ -1261,7 +1725,29 @@ fn handle_status(
                     json!({ "mode": mode.as_str(), "error": e.to_string() }),
                 ),
             },
-            _ => ("DISABLED", json!({ "mode": "disabled", "active": false })),
+            _ => {
+                let bootstrap_in_progress = id_owner_root_key.get(&rs.id).is_some_and(|key| {
+                    pending_index_roots
+                        .iter()
+                        .any(|p| p == key || p == "__startup__")
+                });
+                if bootstrap_in_progress {
+                    (
+                        "INDEXING",
+                        json!({ "mode": "pending", "active": false, "reason": "bootstrap_in_progress" }),
+                    )
+                } else if let Some(err) = watcher_start_failures.get(&rs.id) {
+                    (
+                        "DISABLED",
+                        json!({ "mode": "disabled", "active": false, "error": err }),
+                    )
+                } else {
+                    (
+                        "DISABLED",
+                        json!({ "mode": "disabled", "active": false, "reason": "watcher_not_registered" }),
+                    )
+                }
+            }
         };
         match state {
             "CURRENT" => current += 1,
@@ -1278,6 +1764,32 @@ fn handle_status(
             "watcher": watcher_json,
         }));
     }
+    // Configured roots can be indexing before their repository row exists.
+    // Surface them explicitly instead of reporting configured_repository_count=0.
+    for root in active_roots {
+        let key = root_identity_key(root);
+        let has_repo = pool
+            .with_reader(|c| lookup_repository_by_root_path(c, &root.to_string_lossy()))
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_repo
+            && pending_index_roots
+                .iter()
+                .any(|p| p == &key || p == "__startup__")
+        {
+            indexing += 1;
+            repositories.push(json!({
+                "repository_id": Value::Null,
+                "display_name": root.display().to_string(),
+                "file_count": 0,
+                "unit_count": 0,
+                "state": "INDEXING",
+                "watcher": { "mode": "pending", "active": false }
+            }));
+        }
+    }
+
     // ┬º17: configured-but-unavailable roots are reported explicitly so the
     // caller can see the workspace is DEGRADED, never silently dropped from
     // membership or hidden behind an otherwise-current summary.
@@ -1288,7 +1800,7 @@ fn handle_status(
     payload["workspace"] = json!({
         "configured": true,
         "unconfigured": false,
-        "configured_repository_count": active_stats.len(),
+        "configured_repository_count": active_roots.len(),
         "current_repository_count": current,
         "indexing_repository_count": indexing,
         "reconciliation_required_repository_count": reconciliation_required,
@@ -1375,6 +1887,11 @@ fn handle_context(
         "insufficient_reason": outcome.insufficient_reason,
         "plan_id": outcome.plan.plan_id,
         "evidence_used": outcome.plan.evidence_used.len(),
+        // RP-INV-4: every piece of considered evidence must be accounted
+        // for — this is the "excluded" half (evidence_used above is the
+        // "included" half), each with a deterministic drop_reason so a
+        // caller can tell why a candidate never reached the answer.
+        "evidence_dropped": outcome.plan.evidence_dropped,
         "claims": outcome.claims.iter().map(|(text, verdict, _)| json!({
             "text": text,
             "verdict": verdict,
@@ -1586,17 +2103,9 @@ impl ServerHandler for AtticServer {
             // use this so historical repositories still present in storage can
             // never leak into active retrieval.
             let active_ids: HashSet<String> = if workspace_configured {
-                active_roots
-                    .iter()
-                    .filter_map(|root| {
-                        pool.with_reader(|c| {
-                            lookup_repository_by_root_path(c, &root.to_string_lossy())
-                        })
-                        .ok()
-                        .flatten()
-                        .map(|id| id.to_string())
-                    })
-                    .collect()
+                let container_repo_roots =
+                    lock_or_call_err!(self.container_repo_roots.read(), "container_repo_roots");
+                expand_active_ids(&pool, &active_roots, &container_repo_roots).0
             } else {
                 HashSet::new()
             };
@@ -1619,7 +2128,23 @@ impl ServerHandler for AtticServer {
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
                 "search" => handle_search(&pool, &args, &active_ids),
-                "repo_map" => handle_repo_map(&pool, &args, &active_ids),
+                "repo_map" => {
+                    let discovery_counters = lock_or_call_err!(
+                        self.last_discovery_counters.read(),
+                        "last_discovery_counters"
+                    );
+                    let discovery_diagnostics = lock_or_call_err!(
+                        self.last_discovery_diagnostics.read(),
+                        "last_discovery_diagnostics"
+                    );
+                    handle_repo_map(
+                        &pool,
+                        &args,
+                        &active_ids,
+                        &discovery_counters,
+                        &discovery_diagnostics,
+                    )
+                }
                 "status" => {
                     let inc = lock_or_call_err!(incremental.read(), "incremental");
                     let wm = lock_or_call_err!(watch_mode.read(), "watch_mode");
@@ -1639,6 +2164,18 @@ impl ServerHandler for AtticServer {
                         }
                     }
                     drop(failed_guard);
+                    let pending_index_roots =
+                        lock_or_call_err!(self.bootstrap_jobs.lock(), "bootstrap_jobs")
+                            .iter()
+                            .filter(|job| !job.handle.is_finished())
+                            .map(|job| job.root_key.clone())
+                            .collect::<Vec<_>>();
+                    let container_repo_roots =
+                        lock_or_call_err!(self.container_repo_roots.read(), "container_repo_roots");
+                    let watcher_start_failures = lock_or_call_err!(
+                        self.watcher_start_failures.read(),
+                        "watcher_start_failures"
+                    );
                     handle_status(
                         &pool,
                         &inc,
@@ -1647,6 +2184,9 @@ impl ServerHandler for AtticServer {
                         workspace_configured,
                         &active_roots,
                         &combined_unavail,
+                        &pending_index_roots,
+                        &container_repo_roots,
+                        &watcher_start_failures,
                     )
                 }
                 "context" => handle_context(
@@ -1790,15 +2330,71 @@ fn serialize_repositories_config(roots: &[PathBuf]) -> String {
 /// so a configured workspace survives process restarts without corruption.
 fn persist_repositories_config(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
     let contents = serialize_repositories_config(roots);
-    let tmp = path.with_extension("config.toml.tmp");
-    std::fs::write(&tmp, &contents)
-        .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+
+    // PR-9 durability hardening: a unique temp filename (PID + monotonic
+    // counter) so two overlapping writers (e.g. a crashed prior process
+    // whose temp file was never cleaned up) can never collide on the same
+    // path; explicit flush + fsync of the temp file's contents before the
+    // atomic rename, so a crash right after this call can never observe a
+    // renamed-but-not-yet-durable file; best-effort fsync of the parent
+    // directory afterward, since on some platforms/filesystems the rename
+    // itself is not guaranteed durable until the containing directory is
+    // flushed too.
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("config.toml.tmp.{}.{unique}", std::process::id()));
+
+    // Any failure from here on must not leave the temp file behind —
+    // repeated fsync/write failures (disk full, AV lock, restricted
+    // filesystem) would otherwise accumulate orphaned
+    // `config.toml.tmp.<pid>.<n>` files in the config directory forever.
+    let write_result: Result<(), String> = (|| {
+        let file = std::fs::File::create(&tmp).map_err(|e| {
+            format!(
+                "failed to create workspace config temp file '{}': {e}",
+                tmp.display()
+            )
+        })?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer
+            .write_all(contents.as_bytes())
+            .map_err(|e| format!("failed to write workspace config '{}': {e}", tmp.display()))?;
+        writer
+            .flush()
+            .map_err(|e| format!("failed to flush workspace config '{}': {e}", tmp.display()))?;
+        writer
+            .into_inner()
+            .map_err(|e| format!("failed to flush workspace config '{}': {e}", tmp.display()))?
+            .sync_all()
+            .map_err(|e| format!("failed to fsync workspace config '{}': {e}", tmp.display()))
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
+
+    let rename_result = std::fs::rename(&tmp, path).map_err(|e| {
         format!(
             "failed to finalize workspace config '{}': {e}",
             path.display()
         )
-    })
+    });
+    if rename_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    rename_result?;
+
+    // Best-effort: not every platform/filesystem supports fsync on a
+    // directory handle (notably plain FAT-family filesystems). A failure
+    // here must never turn an otherwise-successful, already-durable-file
+    // config write into a reported error.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Remove an empty workspace config so a workspace reported as configured for
@@ -2028,8 +2624,6 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut sched_handle: Option<attic_incremental::SchedulerHandle> = None;
-
     // ΓöÇΓöÇΓöÇ Multi-root workspace bootstrap ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
     // `roots` may be zero (UNCONFIGURED first run ΓÇö watch mode disabled,
@@ -2060,74 +2654,76 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if !roots.is_empty() {
-        // 1. Bootstrap / index every configured root, INDEPENDENTLY.
-        //
-        // Failure isolation (┬º9/┬º14): a repository that fails to index is
-        // logged and skipped ΓÇö it never blocks or corrupts the other
-        // configured repositories. Only when EVERY root fails do we refuse
-        // to serve entirely, since a workspace with zero usable
-        // repositories cannot vouch for anything as CURRENT.
-        let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
-        for root in &roots {
-            let srv = server.clone();
-            let root_for_bootstrap = root.clone();
-            let boot =
-                tokio::task::spawn_blocking(move || srv.bootstrap_workspace(&root_for_bootstrap))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            match evaluate_bootstrap(&boot) {
-                BootstrapAction::Proceed(repository_id) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        "repository bootstrapped"
-                    );
-                    bootstrapped.push((root.clone(), repository_id));
+        // Startup indexing must never delay MCP availability. It is a server-owned
+        // background job, cooperatively cancellable and joined during shutdown.
+        let startup_server = server.clone();
+        let startup_roots = roots.clone();
+        let startup_config_source = config_source.clone();
+        let cancellation = attic_core::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut bootstrapped: Vec<(PathBuf, String)> = Vec::new();
+
+            for root in startup_roots {
+                if worker_cancellation.is_cancelled() {
+                    return;
                 }
-                BootstrapAction::FailClosed(why) => {
-                    error!(
-                        "repository bootstrap FAILED for {} ΓÇö this repository is degraded/unavailable, \
-                         other configured repositories are unaffected: {why}",
-                        root.display()
-                    );
+                let srv = startup_server.clone();
+                let root_for_bootstrap = root.clone();
+                let token = worker_cancellation.clone();
+                let job_key = root_identity_key(&root);
+                match tokio::task::spawn_blocking(move || {
+                    srv.bootstrap_workspace_roots_cancellable(&root_for_bootstrap, &token)
+                })
+                .await
+                {
+                    Ok(Ok(repo_roots)) if !worker_cancellation.is_cancelled() => {
+                        if let Ok(mut g) = startup_server.container_repo_roots.write() {
+                            g.insert(job_key, repo_roots.iter().map(|(p, _)| p.clone()).collect());
+                        }
+                        for (effective_root, repository_id) in &repo_roots {
+                            info!(repository_id = %repository_id, root = %effective_root.display(), container_root = %root.display(), "background startup repository bootstrap complete");
+                            startup_server.start_watcher(effective_root, repository_id);
+                        }
+                        bootstrapped.extend(repo_roots);
+                    }
+                    Ok(Err(ServerError::Indexing(IndexError::Cancelled))) => return,
+                    Ok(Err(e)) => {
+                        error!(root = %root.display(), "background startup repository bootstrap failed: {e}");
+                        if let Ok(mut failed) = startup_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
+                    Err(e) => {
+                        error!(root = %root.display(), "background startup repository task failed: {e}");
+                        if let Ok(mut failed) = startup_server.pending_index_failed.lock() {
+                            failed.insert(root);
+                        }
+                    }
+                    Ok(Ok(_)) => return,
                 }
             }
-        }
-        if bootstrapped.is_empty() {
-            error!(
-                "every configured repository root failed to bootstrap ΓÇö refusing to serve (fail-closed)"
-            );
-            return Err(anyhow::anyhow!(
-                "no configured repository could be bootstrapped"
-            ));
-        }
 
-        // Phase 6 cross-repository workspace sync: after all repos are
-        // indexed, resolve cross-repo dependency edges and persist them.
-        //
-        // Membership scoping (§14/§16/§25):
-        //   • Explicit ATTIC_CONFIG / persistent config.toml (multi-root
-        //     workspace): scope sync to ONLY the bootstrapped repositories
-        //     so historical DB repos cannot contaminate the active snapshot.
-        //   • Legacy ATTIC_WORKSPACE_ROOT (single-root hint): the DB may
-        //     contain more repositories than the one configured root (e.g.
-        //     the test pre-seeds all three repos then points at one root to
-        //     trigger cross-repo resolution). In this mode pass None so the
-        //     sync uses ALL DB repos — the single root is just an indexing
-        //     hint, not an authoritative membership boundary.
-        {
-            let writer = server.writer.clone();
-            let pool = server.pool.clone();
-            let active_ids_for_sync: Option<Vec<String>> = match &config_source {
-                ConfigSource::Explicit(_) | ConfigSource::Persistent => {
-                    Some(bootstrapped.iter().map(|(_, id)| id.clone()).collect())
-                }
-                // Legacy single-root or unconfigured: do not restrict scope.
+            if worker_cancellation.is_cancelled() || bootstrapped.is_empty() {
+                return;
+            }
+
+            // Cross-repository sync only after all successful bootstraps.
+            let writer = startup_server.writer.clone();
+            let pool = startup_server.pool.clone();
+            let active_repository_ids = match startup_config_source {
+                ConfigSource::Explicit(_) | ConfigSource::Persistent => Some(
+                    bootstrapped
+                        .iter()
+                        .map(|(_, id)| id.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 ConfigSource::Legacy(_) | ConfigSource::Unconfigured => None,
             };
             match tokio::task::spawn_blocking(move || {
                 let opts = attic_crossrepo::maintenance::WorkspaceSyncOptions {
-                    active_repository_ids: active_ids_for_sync,
+                    active_repository_ids,
                     ..Default::default()
                 };
                 pool.with_reader(|conn| {
@@ -2142,153 +2738,105 @@ async fn main() -> anyhow::Result<()> {
                     info!(
                         repos = result.repository_reports.len(),
                         edges = result.edges_emitted,
-                        "cross-repo workspace sync complete"
+                        "background cross-repo workspace sync complete"
                     );
-                    // Sync succeeded: cross-repo subsystem is healthy.
-                    server
+                    // Resolver diagnostics (unresolved/ambiguous cross-repo
+                    // declaration targets) were previously computed and
+                    // silently dropped here — surface them so a repo/
+                    // declaration that fails to resolve is visible in
+                    // server logs instead of only manifesting as a missing
+                    // cross-repo edge with no trace of why.
+                    if !result.diagnostics.is_empty() {
+                        warn!(
+                            missing = result.diagnostics.missing_targets.len(),
+                            ambiguous = result.diagnostics.ambiguous_targets.len(),
+                            skipped_repositories = result.diagnostics.skipped_repositories,
+                            missing_targets = ?result.diagnostics.missing_targets,
+                            ambiguous_targets = ?result.diagnostics.ambiguous_targets,
+                            "background cross-repo workspace sync had unresolved targets"
+                        );
+                    }
+                    startup_server
                         .crossrepo_degraded
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                Ok(Err(e)) => {
-                    warn!("cross-repo workspace sync failed: {e}");
-                    // Sync failed: cross-repo subsystem remains degraded
-                    // (initialized to true). Cross-repo-dependent answers
-                    // are prevented; local retrieval continues unaffected.
-                }
-                Err(e) => {
-                    warn!("cross-repo workspace sync task failed: {e}");
-                }
+                Ok(Err(e)) => warn!("background cross-repo workspace sync failed: {e}"),
+                Err(e) => warn!("background cross-repo workspace sync task failed: {e}"),
             }
-        }
 
-        // 2. Schedule offline refresh for anything not CURRENT.
-        match attic_incremental::plan_offline_refresh(&server.pool) {
-            Ok(batch) => {
-                for refresh in batch {
-                    let payload = attic_storage::IncrementalTaskPayload {
-                        dedup_key: format!(
-                            "offline-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros())
-                                .unwrap_or_default()
-                        ),
-                        upserts: refresh.upsert_paths,
-                        deletes: vec![],
-                        renames: vec![],
-                        from_reconciliation: true,
-                    };
-                    if let Err(e) = attic_incremental::scheduler::schedule_incremental(
-                        &server.writer,
-                        &refresh.repository_id,
-                        &payload,
-                        attic_incremental::scheduler::PRIORITY_RECONCILE,
-                        4096,
-                        server.resource_monitor.as_ref().map(|m| m.as_ref()),
-                    ) {
-                        warn!("offline refresh scheduling failed: {e}");
-                    }
-                }
+            if worker_cancellation.is_cancelled() {
+                return;
             }
-            Err(e) => warn!("offline refresh planning failed: {e}"),
-        }
 
-        // 3. ONE shared scheduler for the whole process (┬º10: one
-        //    coordinated WriterQueue, not one scheduler/database per
-        //    repository). Its workers resolve each claimed task's OWN
-        //    repository root dynamically from storage; the root passed
-        //    here is only the legacy fallback for repository-less tasks,
-        //    which the multi-root startup path above never produces.
-        //    Fallible: a scheduler that cannot start its workers is never
-        //    silently accepted.
-        let policy = DiscoveryPolicy::default_git();
-        let monitor = server.resource_monitor.clone();
-        match attic_incremental::spawn_scheduler(
-            attic_incremental::SchedulerConfig::default(),
-            server.pool.clone(),
-            server.writer.clone(),
-            bootstrapped[0].0.clone(),
-            policy.clone(),
-            monitor,
-        ) {
-            Ok(sched) => sched_handle = Some(sched),
-            Err(e) => {
-                error!(
-                    "scheduler startup failed ΓÇö incremental mode DISABLED for all repositories: {e}"
-                );
-                // Continue serving WITHOUT incremental claims; status reports
-                // watcher.mode = "disabled" for every configured repository.
-                return serve_until_closed(server, sched_handle, semantic_enricher).await;
+            // Schedule offline refresh after authoritative startup bootstrap.
+            match attic_incremental::plan_offline_refresh(&startup_server.pool) {
+                Ok(batch) => {
+                    for refresh in batch {
+                        if worker_cancellation.is_cancelled() {
+                            return;
+                        }
+                        let payload = attic_storage::IncrementalTaskPayload {
+                            dedup_key: format!(
+                                "offline-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_micros())
+                                    .unwrap_or_default()
+                            ),
+                            upserts: refresh.upsert_paths,
+                            deletes: vec![],
+                            renames: vec![],
+                            from_reconciliation: true,
+                        };
+                        if let Err(e) = attic_incremental::scheduler::schedule_incremental(
+                            &startup_server.writer,
+                            &refresh.repository_id,
+                            &payload,
+                            attic_incremental::scheduler::PRIORITY_RECONCILE,
+                            4096,
+                            startup_server.resource_monitor.as_ref().map(|m| m.as_ref()),
+                        ) {
+                            warn!("offline refresh scheduling failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => warn!("offline refresh planning failed: {e}"),
             }
-        }
 
-        // 4. Change detection ΓÇö one watcher PER successfully bootstrapped
-        //    repository root (┬º12): each retains its own repository
-        //    identity/state, so a change under root A is normalized and
-        //    verified relative to root A alone and can never be
-        //    interpreted against root B's boundary. A watcher failing to
-        //    start for one repository does not affect the others.
-        for (root, repository_id) in &bootstrapped {
-            let service = Arc::new(
-                attic_incremental::IncrementalService::new(root, policy.clone())
-                    .with_quiet_period_ms(attic_incremental::DEFAULT_QUIET_MS),
-            );
-            match service.start_incremental_watch(server.pool.clone(), server.writer.clone()) {
-                Ok(watch) => {
-                    info!(
-                        repository_id = %repository_id,
-                        root = %root.display(),
-                        mode = watch.mode().as_str(),
-                        "incremental change detection started"
-                    );
-                    let mode = watch.mode();
-                    if let Ok(mut g) = server.watch_mode.write() {
-                        g.insert(repository_id.clone(), mode);
-                    } else {
-                        error!(repository_id = %repository_id, "watch_mode lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.incremental.write() {
-                        g.insert(repository_id.clone(), service);
-                    } else {
-                        error!(repository_id = %repository_id, "incremental lock poisoned in startup watcher loop");
-                    }
-                    if let Ok(mut g) = server.watches.lock() {
-                        g.insert(repository_id.clone(), watch);
-                    } else {
-                        error!(repository_id = %repository_id, "watches lock poisoned in startup watcher loop");
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "change detection failed to start for {} ({e}) ΓÇö incremental DISABLED for this repository",
-                        root.display()
-                    );
-                }
+            if worker_cancellation.is_cancelled() {
+                return;
             }
+
+            // Start the one shared scheduler after bootstrap; store it on the
+            // server so shutdown can always stop it even though startup is async.
+            let policy = DiscoveryPolicy::default_git();
+            match attic_incremental::spawn_scheduler(
+                attic_incremental::SchedulerConfig::default(),
+                startup_server.pool.clone(),
+                startup_server.writer.clone(),
+                bootstrapped[0].0.clone(),
+                policy,
+                startup_server.resource_monitor.clone(),
+            ) {
+                Ok(sched) => {
+                    if let Ok(mut slot) = startup_server.scheduler.lock() {
+                        *slot = Some(sched);
+                    }
+                }
+                Err(e) => error!("scheduler startup failed - incremental scheduler disabled: {e}"),
+            }
+        });
+
+        if let Ok(mut jobs) = server.bootstrap_jobs.lock() {
+            jobs.push(BootstrapJob {
+                root_key: "__startup__".to_string(),
+                cancellation,
+                handle,
+            });
         }
     }
 
-    serve_until_closed(server, sched_handle, semantic_enricher).await
-}
-
-/// Outcome of the initial workspace indexing decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapAction {
-    /// Indexing succeeded; repository id available.
-    Proceed(String),
-    /// Indexing failed ΓÇö refuse to serve anything as CURRENT (fail-closed).
-    FailClosed(String),
-}
-
-/// Map a bootstrap outcome to the serve/fail-closed decision.
-///
-/// Unit-tested: an `Err` MUST map to [`BootstrapAction::FailClosed`] so the
-/// caller exits instead of serving stale state as CURRENT.
-fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
-    match r {
-        Ok(id) => BootstrapAction::Proceed(id.clone()),
-        Err(e) => BootstrapAction::FailClosed(e.to_string()),
-    }
+    serve_until_closed(server, semantic_enricher).await
 }
 
 /// Serve MCP until the stdio transport closes OR the process receives
@@ -2306,14 +2854,13 @@ fn evaluate_bootstrap(r: &Result<String, ServerError>) -> BootstrapAction {
 ///   7. Close DB resources (pool + writer connection).
 ///   8. Exit.
 ///
-/// `sched_handle`/`watch`/`semantic_enricher` are owned by this function
+/// `watch`/scheduler/`semantic_enricher` are owned by the server lifecycle
 /// (not left to an implicit drop in `main`) specifically so each can be
 /// stopped, in order, deterministically and with a bounded join ΓÇö a
 /// production worker whose shutdown is left to "whatever `main` does last"
 /// is not controlled.
 async fn serve_until_closed(
     server: AtticServer,
-    sched_handle: Option<attic_incremental::SchedulerHandle>,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
 ) -> anyhow::Result<()> {
     // 1. Stop accepting new MCP work.  `running` owns the ONLY remaining
@@ -2329,6 +2876,8 @@ async fn serve_until_closed(
     // Clone the watcher handle map BEFORE `server` is consumed by `serve` so
     // shutdown can deterministically stop every live watcher afterwards.
     let watches_for_shutdown = server.watches.clone();
+    let bootstrap_jobs_for_shutdown = server.bootstrap_jobs.clone();
+    let scheduler_for_shutdown = server.scheduler.clone();
     let running = server
         .serve(stdio())
         .await
@@ -2349,7 +2898,25 @@ async fn serve_until_closed(
     ctrl_c_watcher.abort();
     info!("attic server stopped: {reason:?}");
 
-    // 2. Watcher shutdown, then scheduler shutdown.  The watcher only
+    // 2. Cancel and JOIN every server-owned bootstrap before touching watchers,
+    // scheduler, WAL or DB resources. spawn_blocking cannot be force-aborted once
+    // running, so the indexing pipeline cooperatively observes these tokens.
+    let jobs = {
+        let mut guard = bootstrap_jobs_for_shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for job in guard.iter() {
+            job.cancellation.cancel();
+        }
+        std::mem::take(&mut *guard)
+    };
+    for job in jobs {
+        if let Err(e) = job.handle.await {
+            warn!("background bootstrap join failed during shutdown: {e}");
+        }
+    }
+
+    // 3. Watcher shutdown, then scheduler shutdown.  The watcher only
     //    detects changes; the scheduler drains work derived from those
     //    changes, so stopping detection first bounds how much new work the
     //    scheduler can still be asked to do. Both joins are bounded (worker
@@ -2364,7 +2931,11 @@ async fn serve_until_closed(
         }
     } // MutexGuard is definitely dropped here
 
-    if let Some(sched) = sched_handle {
+    let sched = scheduler_for_shutdown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(sched) = sched {
         sched.shutdown();
     }
 
@@ -2610,29 +3181,6 @@ mod tests {
         let _ = true;
     }
 
-    // compile-time gate: IndexError has no Sqlite variant
-    #[test]
-    fn bootstrap_failure_is_fail_closed() {
-        // Err ΓçÆ FailClosed (never serve stale state as CURRENT).
-        let err: Result<String, ServerError> = Err(ServerError::Indexing(
-            IndexError::RepositoryNotBootstrapped("/ws".into()),
-        ));
-        assert_eq!(
-            evaluate_bootstrap(&err),
-            BootstrapAction::FailClosed(
-                "indexing error: repository at /ws has not been bootstrapped; run a full index first"
-                    .into()
-            )
-        );
-
-        // Ok ΓçÆ Proceed with the repository id.
-        let ok: Result<String, ServerError> = Ok("repo-1".into());
-        assert_eq!(
-            evaluate_bootstrap(&ok),
-            BootstrapAction::Proceed("repo-1".into())
-        );
-    }
-
     #[test]
     fn indexing_uses_writer_abstraction() {
         fn _check(e: IndexError) {
@@ -2643,6 +3191,9 @@ mod tests {
                 IndexError::PolicyHash(_) => {}
                 IndexError::RepositoryNotBootstrapped(_) => {}
                 IndexError::TransientFailures { .. } => {}
+                IndexError::ClassificationCountMismatch { .. } => {}
+                IndexError::ClassificationPathMismatch { .. } => {}
+                IndexError::Cancelled => {}
             }
         }
     }
@@ -2989,6 +3540,84 @@ mod tests {
         assert!(e.contains("not found"), "{e}");
     }
 
+    // ΓöÇΓöÇ bootstrap_workspace_roots_cancellable: nested-repo fan-out ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    #[test]
+    fn bootstrap_workspace_roots_container_splits_into_n_repositories() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let container = tmp.path().join("container");
+        let repo_a = container.join("repo-a");
+        let repo_b = container.join("repo-b");
+        fs::create_dir_all(repo_a.join(".git")).unwrap();
+        fs::create_dir_all(repo_b.join(".git")).unwrap();
+        fs::write(repo_a.join("a.txt"), "alpha").unwrap();
+        fs::write(repo_b.join("b.txt"), "beta").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(
+                &container,
+                &attic_core::CancellationToken::default(),
+            )
+            .expect("fan-out bootstrap should succeed");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected one repository per nested .git root"
+        );
+        let ids: HashSet<&str> = results.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "each nested root must get a distinct repository id"
+        );
+
+        let stats = srv.pool.with_reader(get_repository_stats).unwrap();
+        for (_, id) in &results {
+            let s = stats.iter().find(|s| &s.id == id).expect("repo row exists");
+            assert!(
+                s.file_count >= 1,
+                "expected at least one file indexed for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_workspace_roots_single_git_root_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(&repo, &attic_core::CancellationToken::default())
+            .expect("single git root should bootstrap");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn bootstrap_workspace_roots_no_git_anywhere_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("f.txt"), "data").unwrap();
+
+        let results = srv
+            .bootstrap_workspace_roots_cancellable(
+                &plain,
+                &attic_core::CancellationToken::default(),
+            )
+            .expect("plain non-git dir should bootstrap as one repository (legacy behavior)");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, plain);
+    }
+
     #[test]
     fn file_rejects_overflow_numeric_arguments() {
         let tmp = TempDir::new().unwrap();
@@ -3267,6 +3896,9 @@ mod tests {
             true,
             &[],
             &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         let t = text_of(&r);
@@ -3274,13 +3906,471 @@ mod tests {
         assert_eq!(v["status"], "ok");
     }
 
+    /// A repository row can exist before its watcher is registered (the
+    /// bootstrap task hasn't reached `start_watcher` yet). This window must
+    /// report `INDEXING`, not a bare `DISABLED` — it isn't actually disabled,
+    /// it just hasn't finished starting up.
+    #[test]
+    fn status_reports_bootstrap_in_progress_not_disabled() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        // Bootstrap via the canonicalized root, matching how production
+        // code always canonicalizes via `validate_root` before bootstrapping
+        // (see `handle_workspace`'s `add` branch) — without ever calling
+        // start_watcher (that only happens via handle_workspace/startup).
+        let canonical_root = repo.canonicalize().unwrap();
+        srv.bootstrap_workspace(&canonical_root).unwrap();
+        let key = root_identity_key(&canonical_root);
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[key],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "INDEXING");
+        assert_eq!(repos[0]["watcher"]["reason"], "bootstrap_in_progress");
+    }
+
+    /// When `start_watcher` genuinely failed, `status` must carry the real
+    /// error instead of a bare unreasoned `DISABLED`.
+    #[test]
+    fn status_reports_watcher_start_failure_reason() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        let canonical_root = repo.canonicalize().unwrap();
+        let repo_id = srv.bootstrap_workspace(&canonical_root).unwrap();
+
+        let mut failures = HashMap::new();
+        failures.insert(repo_id, "synthetic watcher failure".to_string());
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[],
+            &HashMap::new(),
+            &failures,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "DISABLED");
+        assert_eq!(repos[0]["watcher"]["error"], "synthetic watcher failure");
+    }
+
+    /// The residual case (no bootstrap in progress, no recorded watcher
+    /// failure) must still carry an honest label, not silence.
+    #[test]
+    fn status_reports_watcher_not_registered_reason() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        let canonical_root = repo.canonicalize().unwrap();
+        srv.bootstrap_workspace(&canonical_root).unwrap();
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[canonical_root],
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let repos = v["workspace"]["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["state"], "DISABLED");
+        assert_eq!(repos[0]["watcher"]["reason"], "watcher_not_registered");
+    }
+
+    // handle_workspace — missing-root removal (PR-6, principal-architect
+    // audit A-06): a configured root that has been deleted or moved must
+    // still be removable by path.
+    #[tokio::test]
+    async fn workspace_remove_after_root_deleted_succeeds() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        // Delete the directory entirely — canonicalize() can no longer run
+        // on this path, which is exactly the bug being fixed.
+        fs::remove_dir_all(&root).unwrap();
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root.display().to_string()));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(
+            v["membership_count"], 0,
+            "deleted root must still be removable: {v}"
+        );
+    }
+
+    /// Code-review finding: `last_discovery_counters` must not leak an
+    /// entry forever once its repository is removed from the workspace.
+    #[tokio::test]
+    async fn workspace_remove_prunes_last_discovery_counters() {
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("ws");
+
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+
+        // workspace add intentionally bootstraps in the background.
+        // Wait for that asynchronous bootstrap to register the repository.
+        let repo_id = {
+            let mut found = None;
+
+            for _ in 0..100 {
+                found = srv
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &canonical_root.to_string_lossy())
+                    })
+                    .unwrap()
+                    .map(|id| id.to_string());
+
+                if found.is_some() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            found.expect("repository must be registered after background add")
+        };
+
+        // Registration can happen just before bootstrap records the discovery
+        // counters, so wait for those independently as well.
+        let counters_recorded = {
+            let mut recorded = false;
+
+            for _ in 0..100 {
+                recorded = srv
+                    .last_discovery_counters
+                    .read()
+                    .unwrap()
+                    .contains_key(&repo_id);
+
+                if recorded {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            recorded
+        };
+
+        assert!(
+            counters_recorded,
+            "background bootstrap must record discovery counters for this repo"
+        );
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root.display().to_string()));
+
+        srv.handle_workspace(&remove_args).await.unwrap();
+
+        assert!(
+            !srv.last_discovery_counters
+                .read()
+                .unwrap()
+                .contains_key(&repo_id),
+            "removing the root must prune its discovery counters entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_add_container_with_nested_git_repos_indexes_all_and_remove_prunes_all() {
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let container = tmp.path().join("container");
+        let repo_a = container.join("repo-a");
+        let repo_b = container.join("repo-b");
+        fs::create_dir_all(repo_a.join(".git")).unwrap();
+        fs::create_dir_all(repo_b.join(".git")).unwrap();
+        fs::write(repo_a.join("a.txt"), "alpha").unwrap();
+        fs::write(repo_b.join("b.txt"), "beta").unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(container.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        let container_key = root_identity_key(&container.canonicalize().unwrap());
+
+        // workspace add fans out into two repositories in the background;
+        // wait for both to be registered under container_repo_roots.
+        let effective_roots = {
+            let mut found = None;
+            for _ in 0..100 {
+                let v = srv
+                    .container_repo_roots
+                    .read()
+                    .unwrap()
+                    .get(&container_key)
+                    .cloned();
+                if v.as_ref().is_some_and(|v| v.len() == 2) {
+                    found = v;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            found.expect("container must fan out into 2 effective repository roots")
+        };
+        assert_eq!(effective_roots.len(), 2);
+
+        // Both nested repos must actually be indexed (this is the direct
+        // regression check for the "container silently indexes to 0 files"
+        // bug): each has file_count >= 1, and neither is reported DISABLED.
+        for effective_root in &effective_roots {
+            let repo_id = srv
+                .pool
+                .with_reader(|c| {
+                    lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                })
+                .unwrap()
+                .map(|id| id.to_string())
+                .expect("nested repo must be registered");
+            let stats = srv.pool.with_reader(get_repository_stats).unwrap();
+            let s = stats.iter().find(|s| s.id == repo_id).unwrap();
+            assert!(
+                s.file_count >= 1,
+                "expected files indexed for {effective_root:?}"
+            );
+        }
+
+        // The fanned-out repository ids must be recognized as active members
+        // of the configured container root, not just present in storage —
+        // this is what query tools (`file`/`search`/`repo_map`/`context`)
+        // actually gate on via `require_active_member`.
+        {
+            let active_roots = srv.active_roots.read().unwrap().clone();
+            let container_repo_roots = srv.container_repo_roots.read().unwrap().clone();
+            let (active_ids, _owner) =
+                expand_active_ids(&srv.pool, &active_roots, &container_repo_roots);
+            for effective_root in &effective_roots {
+                let repo_id = srv
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                    })
+                    .unwrap()
+                    .map(|id| id.to_string())
+                    .unwrap();
+                assert!(
+                    require_active_member(&active_ids, &repo_id).is_ok(),
+                    "fanned-out repository {repo_id} must be recognized as an active member"
+                );
+            }
+        }
+
+        // Poll status until neither fanned-out repository reports DISABLED
+        // (watchers need a moment to register after bootstrap completes).
+        let mut saw_non_disabled = false;
+        for _ in 0..100 {
+            let inc = srv.incremental.read().unwrap().clone();
+            let wm = srv.watch_mode.read().unwrap().clone();
+            let container_repo_roots = srv.container_repo_roots.read().unwrap().clone();
+            let watcher_start_failures = srv.watcher_start_failures.read().unwrap().clone();
+            let active_roots = srv.active_roots.read().unwrap().clone();
+            let r = handle_status(
+                &srv.pool,
+                &inc,
+                &wm,
+                None,
+                true,
+                &active_roots,
+                &[],
+                &[],
+                &container_repo_roots,
+                &watcher_start_failures,
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+            let repos = v["workspace"]["repositories"].as_array();
+            let none_disabled = repos.is_none_or(|repos| {
+                repos.len() == 2 && repos.iter().all(|r| r["state"] != "DISABLED")
+            });
+            if none_disabled {
+                saw_non_disabled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            saw_non_disabled,
+            "neither fanned-out repository should be reported DISABLED"
+        );
+
+        // `workspace inspect` surfaces the fan-out via root_expansions.
+        let mut inspect_args = HashMap::new();
+        inspect_args.insert("action".into(), json!("inspect"));
+        let inspect_r = srv.handle_workspace(&inspect_args).await.unwrap();
+        let inspect_v: Value = serde_json::from_str(&text_of(&inspect_r)).unwrap();
+        let expansions = inspect_v["root_expansions"]
+            .as_object()
+            .expect("root_expansions object");
+        assert!(
+            expansions.contains_key(&container_key),
+            "inspect must surface the container's fan-out; got {expansions:?}"
+        );
+        assert_eq!(
+            expansions[&container_key].as_array().unwrap().len(),
+            2,
+            "expected 2 nested roots surfaced for the container"
+        );
+
+        // Removing the container must stop both watchers and prune the
+        // container_repo_roots entry.
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(container.display().to_string()));
+        srv.handle_workspace(&remove_args).await.unwrap();
+
+        assert!(
+            !srv.container_repo_roots
+                .read()
+                .unwrap()
+                .contains_key(&container_key),
+            "removing the container must prune container_repo_roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_remove_missing_root_does_not_affect_similar_prefix_root() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root_a = tmp.path().join("a");
+        let root_ab = tmp.path().join("ab");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_ab).unwrap();
+
+        for root in [&root_a, &root_ab] {
+            let mut add_args = HashMap::new();
+            add_args.insert("action".into(), json!("add"));
+            add_args.insert("path".into(), json!(root.display().to_string()));
+            srv.handle_workspace(&add_args).await.unwrap();
+        }
+
+        fs::remove_dir_all(&root_a).unwrap();
+
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(root_a.display().to_string()));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "only the deleted root must be removed: {v}");
+        assert!(
+            roots[0]
+                .as_str()
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("/ab"),
+            "similar-prefix root 'ab' must survive removal of 'a': {v}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_remove_missing_root_is_case_insensitive_on_windows() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let root = tmp.path().join("WsRoot");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("action".into(), json!("add"));
+        add_args.insert("path".into(), json!(root.display().to_string()));
+        srv.handle_workspace(&add_args).await.unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+
+        // Remove using different casing than what was added.
+        let differently_cased = root.to_string_lossy().to_lowercase();
+        let mut remove_args = HashMap::new();
+        remove_args.insert("action".into(), json!("remove"));
+        remove_args.insert("path".into(), json!(differently_cased));
+        let r = srv.handle_workspace(&remove_args).await.unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(
+            v["membership_count"], 0,
+            "removal must be case-insensitive on Windows for a missing root: {v}"
+        );
+    }
+
     // handle_repo_map
     #[test]
     fn repo_map_missing_repo_id() {
         let tmp = TempDir::new().unwrap();
-        let e = handle_repo_map(&make_server(&tmp).pool, &HashMap::new(), &HashSet::new())
-            .unwrap_err()
-            .to_string();
+        let e = handle_repo_map(
+            &make_server(&tmp).pool,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("repository_id required"), "{e}");
     }
 
@@ -3304,6 +4394,9 @@ mod tests {
             true,
             &[],
             &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
@@ -3325,6 +4418,236 @@ mod tests {
         // Second bootstrap is idempotent (same repo id, no duplicate rows).
         let again = srv.bootstrap_workspace(&repo).unwrap();
         assert_eq!(again, repo_id, "existing repository must be reused");
+    }
+
+    // Code-review finding: RepoMapDirNode must not render a file and a
+    // directory with the same name at the same tree level (an impossible
+    // filesystem shape that stale occurrence data could otherwise produce).
+    #[test]
+    fn repo_map_dir_node_directory_wins_over_conflicting_file_name() {
+        let mut root = RepoMapDirNode::default();
+        // Directory inserted first ("foo/sub.rs"), then a conflicting file
+        // leaf named "foo" — the file insert must be dropped, not create a
+        // second sibling node named "foo".
+        root.insert(&["foo", "sub.rs"], "rust");
+        root.insert(&["foo"], "rust");
+
+        let tree = root.to_json();
+        assert_eq!(
+            tree.len(),
+            1,
+            "must not render two nodes named 'foo': {tree:?}"
+        );
+        assert_eq!(tree[0]["name"], "foo");
+        assert_eq!(tree[0]["type"], "directory");
+    }
+
+    #[test]
+    fn repo_map_dir_node_directory_wins_regardless_of_insert_order() {
+        let mut root = RepoMapDirNode::default();
+        // Same conflict, file inserted first this time.
+        root.insert(&["foo"], "rust");
+        root.insert(&["foo", "sub.rs"], "rust");
+
+        let tree = root.to_json();
+        assert_eq!(
+            tree.len(),
+            1,
+            "must not render two nodes named 'foo': {tree:?}"
+        );
+        assert_eq!(tree[0]["name"], "foo");
+        assert_eq!(tree[0]["type"], "directory");
+    }
+
+    // handle_repo_map — derived directory tree
+    #[test]
+    fn repo_map_builds_nested_tree_directories_before_files_lexicographic() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(repo.join("src/app")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join("src/app/main.rs"), "fn app_main() {}").unwrap();
+        fs::write(repo.join("src/lib.rs"), "fn app_lib() {}").unwrap();
+        fs::write(repo.join("docs/guide.md"), "# guide").unwrap();
+        fs::write(repo.join("readme.md"), "# readme").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        // Root: directories ("docs", "src") before the file ("readme.md"),
+        // each group lexicographic.
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["docs", "src", "readme.md"],
+            "root order: {tree:?}"
+        );
+        assert_eq!(tree[0]["type"], "directory");
+        assert_eq!(tree[1]["type"], "directory");
+        assert_eq!(tree[2]["type"], "file");
+
+        // Nested: src/ contains directory "app" before file "lib.rs".
+        let src_children = tree[1]["children"].as_array().expect("src children");
+        let src_names: Vec<&str> = src_children
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(src_names, vec!["app", "lib.rs"]);
+        assert_eq!(src_children[0]["type"], "directory");
+
+        // Leaf file carries a real file_type.
+        let app_children = src_children[0]["children"].as_array().unwrap();
+        assert_eq!(app_children[0]["name"], "main.rs");
+        assert_eq!(app_children[0]["type"], "file");
+        assert!(app_children[0]["file_type"].is_string());
+    }
+
+    #[test]
+    fn repo_map_file_type_filter_actually_filters() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        a.insert("file_type".into(), json!("rust"));
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "file_type=rust must exclude Cargo.toml: {tree:?}"
+        );
+    }
+
+    #[test]
+    fn repo_map_is_isolated_per_repository() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo_a = tmp.path().join("a");
+        let repo_b = tmp.path().join("b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("only_in_a.rs"), "fn a() {}").unwrap();
+        fs::write(repo_b.join("only_in_b.rs"), "fn b() {}").unwrap();
+        let repo_id_a = srv.bootstrap_workspace(&repo_a).unwrap();
+        let _repo_id_b = srv.bootstrap_workspace(&repo_b).unwrap();
+
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id_a));
+        let r =
+            handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &HashMap::new()).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let tree = v["tree"].as_array().expect("tree array");
+
+        let names: Vec<&str> = tree.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["only_in_a.rs"],
+            "repo_map must not leak paths from other repositories: {tree:?}"
+        );
+    }
+
+    #[test]
+    fn repo_map_surfaces_discovery_counters_after_bootstrap() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        fs::write(repo.join("node_modules/pkg/index.js"), "module.exports={}").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        // bootstrap_workspace must have recorded counters for this repo_id.
+        let recorded = srv
+            .last_discovery_counters
+            .read()
+            .unwrap()
+            .get(&repo_id)
+            .copied()
+            .expect("bootstrap must record discovery counters");
+        assert_eq!(recorded.files_eligible, 1, "only main.rs is eligible");
+        assert!(
+            recorded.ignored_or_pruned >= 1,
+            "node_modules/pkg/index.js must be counted as pruned: {recorded:?}"
+        );
+
+        // repo_map surfaces exactly those recorded counters under "discovery".
+        let mut discovery_counters = HashMap::new();
+        discovery_counters.insert(repo_id.clone(), recorded);
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r = handle_repo_map(
+            &srv.pool,
+            &a,
+            &ids(&srv),
+            &discovery_counters,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["discovery"]["files_eligible"], 1);
+        assert!(v["discovery"]["ignored_or_pruned"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn repo_map_surfaces_submodule_diagnostic_after_bootstrap() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("ws");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("root_file.rs"), "fn root() {}").unwrap();
+        let sub = repo.join("sub");
+        fs::create_dir_all(sub.join(".git")).unwrap();
+        fs::write(sub.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(sub.join("sub_file.rs"), "fn sub() {}").unwrap();
+        let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let recorded_diags = srv
+            .last_discovery_diagnostics
+            .read()
+            .unwrap()
+            .get(&repo_id)
+            .cloned()
+            .expect("bootstrap must record discovery diagnostics");
+        assert!(
+            recorded_diags
+                .iter()
+                .any(|d| d.kind == attic_discovery::DiagnosticKind::SubmoduleDetected),
+            "expected a SubmoduleDetected diagnostic; got {recorded_diags:?}"
+        );
+
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(repo_id.clone(), recorded_diags);
+        let mut a = HashMap::new();
+        a.insert("repository_id".into(), json!(repo_id));
+        let r = handle_repo_map(&srv.pool, &a, &ids(&srv), &HashMap::new(), &diagnostics).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let diags = v["diagnostics"].as_array().expect("diagnostics array");
+        assert!(
+            diags.iter().any(|d| d["kind"] == "SUBMODULE_DETECTED"),
+            "expected SUBMODULE_DETECTED in repo_map diagnostics; got {diags:?}"
+        );
     }
 
     // ΓöÇΓöÇ MCP child-process tests (supplemental manual JSON-RPC protocol tests).
@@ -3682,6 +5005,16 @@ mod tests {
         )
         .unwrap();
 
+        // Canonicalize so every downstream use (pre-seed bootstrap, the ID
+        // readback below, and the `path = "..."` entries written into
+        // `cfg_path`) matches the canonical form `validate_configured_roots`
+        // produces for the real server's own ATTIC_CONFIG-driven sync —
+        // otherwise the two can disagree on Windows (short 8.3 names,
+        // `\\?\` verbatim prefix) and end up as two different repository rows.
+        let provider_dir = provider_dir.canonicalize().unwrap();
+        let dependent_dir = dependent_dir.canonicalize().unwrap();
+        let unrelated_dir = unrelated_dir.canonicalize().unwrap();
+
         let db_path = tmp.path().join("e2e.db");
 
         // ΓöÇΓöÇ Pre-seed DB by indexing all repos in-process ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -3790,8 +5123,8 @@ mod tests {
         }
 
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        // Gates 1ΓÇô4: full workspace sync via ATTIC_WORKSPACE_ROOT.
-        // Spawn WITH ATTIC_WORKSPACE_ROOT ΓåÆ triggers sync_workspace ΓåÆ clears
+        // Gates 1ΓÇô4: full workspace sync via explicit multi-root ATTIC_CONFIG.
+        // Spawn WITH ATTIC_CONFIG ΓåÆ triggers sync_workspace ΓåÆ clears
         // degraded flag ΓåÆ cross-repo claims become available.
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let (provider_id_str, dependent_id_str, _unrelated_id_str) = {
@@ -3807,13 +5140,24 @@ mod tests {
             (pid, did, uid)
         };
 
+        let cfg_path = tmp.path().join("crossrepo.conf");
+        fs::write(
+            &cfg_path,
+            format!(
+                "[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n\n[[repositories]]\npath = \"{}\"\n",
+                provider_dir.display(),
+                dependent_dir.display(),
+                unrelated_dir.display(),
+            ),
+        )
+        .unwrap();
+
         let (mut child, mut stdin) = {
             let mut child = Command::new(&bin)
                 .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
-                // Point ATTIC_WORKSPACE_ROOT at provider_dir so the server
-                // bootstraps and then runs sync_workspace over all DB repos.
-                .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
+                .env("ATTIC_CONFIG", cfg_path.to_str().unwrap())
+                .env_remove("ATTIC_WORKSPACE_ROOT")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -3838,9 +5182,40 @@ mod tests {
             (child, stdin)
         };
 
+        // Startup bootstrap + cross-repo sync run in the background. Wait until
+        // all configured repositories are CURRENT before asking the cross-repo
+        // gate question, then allow the immediately-following sync publication
+        // to commit. This avoids racing initialize against startup sync.
+        let mut all_current = false;
+        for poll_id in 10..210 {
+            let status_call = mcp_request(
+                poll_id,
+                "tools/call",
+                json!({"name":"status","arguments":{}}),
+            );
+            let status_resp = send_recv(&mut child, &mut stdin, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            let status_v: Value = serde_json::from_str(status_text).unwrap_or(json!({}));
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                all_current = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            all_current,
+            "cross-repo fixture repositories never became CURRENT"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
         // Gate 1 + Gate 3: query about the dependent's dependencies.
         // The response should identify the provider repository and preserve
-        // confidence information.
+        // confidence information. `current_repository_count == 3` only means
+        // indexing converged — the cross-repo edge publication that follows
+        // it can still be in flight, so retry the real query itself instead
+        // of trusting a fixed sleep to have been long enough.
         let call = mcp_request(
             2,
             "tools/call",
@@ -3848,18 +5223,34 @@ mod tests {
                 "name": "context",
                 "arguments": {
                     "query": "What Go modules does the dependent repository depend on?",
-                    "mode": "NORMAL"
+                    "mode": "NORMAL",
+                    "repository_id": dependent_id_str.clone()
                 }
             }),
         );
-        let resp = send_recv(&mut child, &mut stdin, &call);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
-        let v: Value = serde_json::from_str(text).unwrap_or(json!({}));
-
-        // Context text and/or claims must mention the provider module.
-        let context_body = v["context"].as_str().unwrap_or("");
-        let claims_json = v["claims"].to_string();
-        let full_response = format!("{context_body} {claims_json} {text}");
+        let (v, full_response, _claims_json) = {
+            let mut last_v = json!({});
+            let mut last_full = String::new();
+            let mut last_claims = String::new();
+            for _ in 0..80 {
+                let resp = send_recv(&mut child, &mut stdin, &call);
+                let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+                let parsed: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                let context_body = parsed["context"].as_str().unwrap_or("");
+                let claims = parsed["claims"].to_string();
+                let full = format!("{context_body} {claims} {text}");
+                let ready =
+                    full.contains("example.com/provider") || full.contains(&provider_id_str);
+                last_v = parsed;
+                last_claims = claims;
+                last_full = full;
+                if ready {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            (last_v, last_full, last_claims)
+        };
 
         // Gate 1: provider is identified in the response.
         assert!(
@@ -3871,15 +5262,38 @@ mod tests {
         );
 
         // Gate 2: unrelated repository is not falsely claimed as a dependency.
-        // The raw context body may legitimately contain any indexed go.mod file
-        // (retrieval surfaces all relevant content).  We therefore check only the
-        // structured claims JSON ΓÇö not the context prose ΓÇö for a false dependency
-        // claim on example.com/unrelated.
+        // This MUST be an unscoped query (no repository_id): the Gate 1/3/4
+        // query above is filtered to `dependent_id_str`, which would exclude
+        // any evidence about example.com/unrelated regardless of whether the
+        // underlying cross-repo logic has a real false-association bug,
+        // making the assertion vacuously true.
+        let unscoped_call = mcp_request(
+            3,
+            "tools/call",
+            json!({
+                "name": "context",
+                "arguments": {
+                    "query": "What Go modules does the dependent repository depend on?",
+                    "mode": "NORMAL"
+                }
+            }),
+        );
+        let unscoped_resp = send_recv(&mut child, &mut stdin, &unscoped_call);
+        let unscoped_text = unscoped_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        let unscoped_claims =
+            serde_json::from_str::<Value>(unscoped_text).unwrap_or(json!({}))["claims"].to_string();
+        // The raw context body may legitimately contain any indexed go.mod
+        // file (retrieval surfaces all relevant content). We therefore check
+        // only the structured claims JSON ΓÇö not the context prose ΓÇö for a
+        // false dependency claim on example.com/unrelated.
         assert!(
-            !claims_json.contains("example.com/unrelated") || claims_json.contains("not depend"),
+            !unscoped_claims.contains("example.com/unrelated")
+                || unscoped_claims.contains("not depend"),
             "gate 2 FAIL: unrelated repository should not appear as a dependency \
              claim; claims={:.400}",
-            claims_json
+            unscoped_claims
         );
 
         // Gate 3: confidence field is present and non-empty (preserved).
@@ -3903,6 +5317,15 @@ mod tests {
         assert!(
             !plan_id.is_null() && plan_id.as_str().map(|s| !s.is_empty()).unwrap_or(true),
             "gate 4 FAIL: plan_id must be set (evidence path ran); got: {v}"
+        );
+
+        // RP-INV-4: evidence_dropped (the "excluded" half of every
+        // considered evidence item, each with a deterministic drop_reason)
+        // must reach the MCP response alongside evidence_used, not be
+        // silently retained only in the internal plan.
+        assert!(
+            v["evidence_dropped"].is_array(),
+            "RP-INV-4 FAIL: evidence_dropped must be present as an array; got: {v}"
         );
 
         // Gate 4b (strengthened): WorkspaceSnapshot provenance must be traceable
@@ -3955,7 +5378,7 @@ mod tests {
         //
         // Remove the `require` line from dependent/go.mod, re-index via
         // bootstrap_workspace (same production indexing path), re-spawn
-        // the server with ATTIC_WORKSPACE_ROOT ΓåÆ sync_workspace rebuilds
+        // the server with ATTIC_CONFIG ΓåÆ sync_workspace rebuilds
         // cross-repo edges ΓåÆ provider should no longer be in the response.
         // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         fs::write(
@@ -3988,7 +5411,8 @@ mod tests {
             let mut child = Command::new(&bin)
                 .env("ATTIC_HOME", tmp.path())
                 .env("ATTIC_DB_PATH", db_path.to_str().unwrap())
-                .env("ATTIC_WORKSPACE_ROOT", provider_dir.to_str().unwrap())
+                .env("ATTIC_CONFIG", cfg_path.to_str().unwrap())
+                .env_remove("ATTIC_WORKSPACE_ROOT")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -4012,6 +5436,33 @@ mod tests {
             );
             (child, stdin)
         };
+
+        // As above, do not race the Gate 7 assertion against asynchronous
+        // startup bootstrap/sync. The changed manifest must have been consumed
+        // by a completed workspace sync before we inspect the result.
+        let mut all_current_after_change = false;
+        for poll_id in 10..210 {
+            let status_call = mcp_request(
+                poll_id,
+                "tools/call",
+                json!({"name":"status","arguments":{}}),
+            );
+            let status_resp = send_recv(&mut child2, &mut stdin2, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            let status_v: Value = serde_json::from_str(status_text).unwrap_or(json!({}));
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                all_current_after_change = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            all_current_after_change,
+            "post-change cross-repo fixture repositories never became CURRENT"
+        );
+        std::thread::sleep(Duration::from_millis(100));
 
         let call2 = mcp_request(
             2,
@@ -4102,6 +5553,7 @@ mod tests {
 
         let db_dir = TempDir::new().unwrap();
         let mut child = Command::new(&bin)
+            .env("ATTIC_HOME", db_dir.path())
             .env(
                 "ATTIC_DB_PATH",
                 db_dir.path().join("multiroot.db").to_str().unwrap(),
@@ -4130,21 +5582,28 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         );
 
-        // ΓöÇΓöÇ status: all three repositories configured and CURRENT ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-        let status_call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
-        let status_resp = send_recv(&mut child, &mut stdin, &status_call);
-        let status_text = status_resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
-        let status_v: Value = serde_json::from_str(status_text).expect("status is JSON");
-        assert_eq!(status_v["status"], "ok");
+        // Startup bootstrap is intentionally asynchronous. Poll status until all
+        // three repositories are CURRENT instead of assuming initialize blocks.
+        let mut status_v = json!({});
+        for _ in 0..200 {
+            let status_call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
+            let status_resp = send_recv(&mut child, &mut stdin, &status_call);
+            let status_text = status_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            status_v = serde_json::from_str(status_text).expect("status is JSON");
+            if status_v["workspace"]["current_repository_count"] == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
         assert_eq!(
             status_v["workspace"]["configured_repository_count"], 3,
-            "expected exactly 3 configured repositories; status={status_v}"
+            "status={status_v}"
         );
         assert_eq!(
             status_v["workspace"]["current_repository_count"], 3,
-            "all 3 unrelated roots must bootstrap+watch successfully in ONE process; status={status_v}"
+            "status={status_v}"
         );
         assert_eq!(status_v["workspace"]["disabled_repository_count"], 0);
 
@@ -4289,6 +5748,94 @@ mod tests {
         );
     }
 
+    /// PR-9: the hardened write path must still round-trip correctly and
+    /// leave no temp file behind once it completes.
+    #[test]
+    fn persist_repositories_config_round_trips_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        let roots = vec![
+            tmp.path().join("repo a"),
+            tmp.path().join("repo\\b"),
+            tmp.path().join("unicode_δρεπος"),
+        ];
+        for r in &roots {
+            std::fs::create_dir_all(r).unwrap();
+        }
+
+        persist_repositories_config(&cfg, &roots).unwrap();
+        let (_source, loaded) = load_workspace_roots(&cfg).unwrap();
+        assert_eq!(loaded, roots, "round-trip must preserve every root exactly");
+
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp file must remain after a successful write: {leftover:?}"
+        );
+    }
+
+    /// Code-review finding: a failure after the temp file is created (here,
+    /// the final rename failing because the destination is a directory)
+    /// must not leave the temp file behind.
+    #[test]
+    fn persist_repositories_config_cleans_up_temp_file_on_rename_failure() {
+        let tmp = TempDir::new().unwrap();
+        // `cfg` is a directory, not a file — `fs::rename(&tmp_file, &cfg)`
+        // will fail on Windows ("Access is denied" / directory-in-the-way),
+        // exercising the post-write, pre-rename-success failure path.
+        let cfg = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let result = persist_repositories_config(&cfg, &[root]);
+        assert!(result.is_err(), "rename onto a directory must fail");
+
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the temp file must be cleaned up even when the final rename fails: {leftover:?}"
+        );
+    }
+
+    /// PR-9: two overlapping config writes (simulating two racing
+    /// `workspace` tool calls) must not corrupt each other — the unique
+    /// temp filename plus atomic rename means the last one to finish wins
+    /// cleanly, never a truncated/interleaved file.
+    #[test]
+    fn persist_repositories_config_concurrent_writes_never_corrupt_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let cfg_a = cfg.clone();
+        let roots_a = vec![root_a.clone()];
+        let cfg_b = cfg.clone();
+        let roots_b = vec![root_b.clone()];
+        let t1 = std::thread::spawn(move || persist_repositories_config(&cfg_a, &roots_a));
+        let t2 = std::thread::spawn(move || persist_repositories_config(&cfg_b, &roots_b));
+        t1.join().unwrap().unwrap();
+        t2.join().unwrap().unwrap();
+
+        // Whichever wrote last, the result must be a fully valid config
+        // naming exactly one of the two roots — never a mix of both
+        // (interleaved writes) and never a parse failure (truncated write).
+        let (_source, loaded) = load_workspace_roots(&cfg).unwrap();
+        assert_eq!(loaded.len(), 1, "must never interleave into a mixed file");
+        assert!(loaded == vec![root_a] || loaded == vec![root_b]);
+    }
+
     /// ┬º37 watcher startup failure: NOT VERIFIED on Windows.
     ///
     /// `start_watcher` calls `IncrementalService::start_incremental_watch`
@@ -4330,5 +5877,49 @@ mod tests {
         let resp = send_recv(&mut child, &mut stdin, &init);
         assert_eq!(resp["jsonrpc"], "2.0", "stdout contains non-JSON: {resp}");
         child.kill().ok();
+    }
+
+    #[test]
+    fn mcp_disconnect_cancels_and_joins_background_bootstrap() {
+        let bin = require_binary();
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("cancel-repo");
+        fs::create_dir_all(&repo).unwrap();
+        // Enough work to ensure the bootstrap is genuinely in flight when stdio closes.
+        for i in 0..500 {
+            fs::write(
+                repo.join(format!("file-{i}.rs")),
+                format!("pub fn f{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
+        let add = mcp_request(
+            2,
+            "tools/call",
+            json!({
+                "name": "workspace",
+                "arguments": {"action":"add", "path": repo.display().to_string()}
+            }),
+        );
+        let resp = send_recv(&mut child, &mut stdin, &add);
+        assert_eq!(resp["id"], 2, "workspace add failed: {resp}");
+
+        // Closing MCP stdin is a normal transport disconnect. Attic must cancel
+        // and join owned bootstrap work, then exit by itself; no child.kill().
+        drop(stdin);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                assert!(status.success(), "attic must shut down cleanly: {status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attic stayed alive after MCP disconnect"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }

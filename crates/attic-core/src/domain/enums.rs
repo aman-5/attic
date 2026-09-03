@@ -201,24 +201,6 @@ str_enum! {
 }
 
 str_enum! {
-    /// Reason a symbol occurrence was invalidated.
-    ///
-    /// Legacy Phase 0 vocabulary; retained for compatibility.  New code should
-    /// prefer [`InvalidationCause`] which matches the
-    /// `core_invalidation_records.reason` column values.
-    InvalidationReason {
-        /// Source file was modified.
-        FileModified    => "file_modified",
-        /// Source file was deleted.
-        FileDeleted     => "file_deleted",
-        /// Index generation expired.
-        GenerationExpired => "generation_expired",
-        /// Manually invalidated.
-        Manual          => "manual",
-    }
-}
-
-str_enum! {
     /// Artifact type recorded in `core_invalidation_records.artifact_type`.
     ///
     /// Values fixed by `migrations/0001_initial.sql` and the invalidation

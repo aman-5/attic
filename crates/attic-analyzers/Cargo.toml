@@ -27,7 +27,6 @@ tree-sitter-javascript = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 
 [dev-dependencies]
-attic-test-support = { workspace = true }
 tempfile           = { workspace = true }
 attic-core         = { workspace = true }
 uuid               = { workspace = true }

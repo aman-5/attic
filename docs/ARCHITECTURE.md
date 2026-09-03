@@ -488,9 +488,9 @@ pins the entire application home: config + database + backups + scratch.
 Attic speaks MCP exclusively over stdio: **stdout carries only the MCP
 JSON-RPC protocol; every log line goes to stderr** (`tracing`, controlled by
 `ATTIC_LOG`/`RUST_LOG`). This has been verified by a smoke test that spawns
-the release binary and inspects both streams directly. The five registered
-tools (`file`, `search`, `repo_map`, `status`, `context`) are documented in
-the README; their exact schemas are defined once in
+the release binary and inspects both streams directly. The six registered
+tools (`file`, `search`, `repo_map`, `status`, `context`, `workspace`) are
+documented in the README; their exact schemas are defined once in
 `crates/attic-server/src/main.rs::make_tools()` and returned verbatim via
 `tools/list` — that function is the single source of truth for the tool
 surface.

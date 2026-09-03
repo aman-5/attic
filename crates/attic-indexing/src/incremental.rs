@@ -277,7 +277,12 @@ pub fn index_changes(
             is_partial_scan: false,
         };
 
-        match analyze_single_file(&rec, &registry, opts) {
+        match analyze_single_file(
+            &rec,
+            &registry,
+            opts,
+            &attic_core::CancellationToken::default(),
+        ) {
             Ok(FilePrep::Indexable {
                 mut units,
                 captured,
@@ -306,7 +311,7 @@ pub fn index_changes(
                 rec.is_partial_scan = is_partial_scan;
                 pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
                 if let Some(captured) = captured {
-                    pipeline.record(captured);
+                    pipeline.record(*captured);
                 }
                 pending_units.append(&mut units);
                 file_records.push(rec);
@@ -440,15 +445,9 @@ pub fn index_changes(
     let mut files = publication_files;
     files.extend(tombstones);
 
-    // Tombstone rows must never advertise CURRENT freshness (contract:
-    // deleted state is never exposed as CURRENT); they are flipped to
-    // INVALID right after publication.
-    let tombstone_occ_ids: Vec<String> = files
-        .iter()
-        .filter(|f| f.occurrence.existence_state == ExistenceState::Deleted)
-        .map(|f| f.occurrence.id.to_string_repr())
-        .collect();
-
+    // Tombstone rows are inserted directly with INVALID freshness by the
+    // coordinated publication transaction; no post-publication state fix-up
+    // is required.
     // ── 7. ONE coordinated mutation (atomic with FTS synchronisation) ───────
     let stats = submit_index_publication(
         store.writer,
@@ -539,28 +538,6 @@ pub fn index_changes(
             .map_err(IndexError::Storage)?;
     }
 
-    // ── 9. Tombstone occurrences must never advertise CURRENT freshness ────
-    // (audit-record closure for replaced artifacts already happened inside
-    // the publication transaction, while the old rows still existed.)
-    if !tombstone_occ_ids.is_empty() {
-        let tomb = tombstone_occ_ids.clone();
-        store
-            .writer
-            .send(move |conn| {
-                for t in &tomb {
-                    conn.execute(
-                        "UPDATE core_file_occurrences
-                            SET freshness_state = 'INVALID'
-                          WHERE id = ?1 AND existence_state = 'deleted'",
-                        [t],
-                    )
-                    .map_err(attic_storage::StorageError::from)?;
-                }
-                Ok(())
-            })
-            .map_err(IndexError::Storage)?;
-    }
-
     let deleted_count = changes.deletes.len() + vanished.len() + skip_tombstoned;
     debug!(
         revision = %rev_id,
@@ -583,7 +560,7 @@ pub fn index_changes(
     })
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -708,7 +685,11 @@ mod tests {
         let s = store(&fx);
         crate::index_repository(&s, fx.dir.path(), &policy, &opts).unwrap();
 
-        write_file(fx.dir.path(), "added.rs", "fn incremental_added_token() {}\n");
+        write_file(
+            fx.dir.path(),
+            "added.rs",
+            "fn incremental_added_token() {}\n",
+        );
         let changes = ScopedChanges {
             upserts: vec!["added.rs".to_string()],
             deletes: vec![],
@@ -796,7 +777,10 @@ mod tests {
             result.files_published, 0,
             "binary content produces no new occurrence"
         );
-        assert_eq!(result.files_deleted, 1, "the stale prior occurrence must be retired");
+        assert_eq!(
+            result.files_deleted, 1,
+            "the stale prior occurrence must be retired"
+        );
         assert!(
             search_hits(&fx, "before_flip_token").is_empty(),
             "stale prior content must be retired, not left searchable"
