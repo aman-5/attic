@@ -8,9 +8,9 @@
 /// Cooperative cancellation primitives shared by long-running Attic operations.
 pub mod cancellation;
 
-/// Configuration model for the Attic MCP server, reading defaults from
-/// `crates/attic-core/src/constants.rs::resources` and allowing override via
-/// environment variables.
+/// `attic.toml` configuration model (resource/embedding tunables). Pure
+/// parsing only — see `attic_storage::resource_policy` for hardware
+/// detection, baseline resolution, and env-var override layering.
 pub mod config;
 
 /// Shared Attic constants and resource configuration values.
@@ -25,7 +25,10 @@ pub mod error;
 /// Phase 7 runtime path policy for data roots, backups, and temporary files.
 pub mod paths;
 
-pub use config::ProductionConfig;
+pub use config::{
+    ATTIC_TOML_TEMPLATE, AtticConfig, ConfigError, EmbeddingOverride, IndexingOverride,
+    ResourceModeSetting, ResourceOverrides,
+};
 pub use constants::{
     ANALYZER_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, resources,
     subsystem_keys,

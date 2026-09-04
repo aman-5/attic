@@ -30,6 +30,7 @@ pub mod contradiction;
 pub mod error;
 pub mod fuse;
 pub mod graph;
+pub mod hybrid;
 pub mod manager;
 pub mod mode;
 pub mod pipeline;
@@ -41,6 +42,10 @@ pub mod validate;
 pub mod verify;
 
 pub use error::RetrievalError;
+pub use hybrid::{
+    HybridSearchOptions, HybridSearchResponse, HybridSearchResult, HybridSearcher, MatchType,
+    SemanticDegradationReason,
+};
 pub use mode::{AnswerMode, AnswerModePolicy};
 pub use pipeline::{AnswerOutcome, AnswerRequest, RetrievalService};
 pub use query::{Classification, QueryType, classify};

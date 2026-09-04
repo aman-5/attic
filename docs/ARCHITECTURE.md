@@ -404,12 +404,17 @@ this system needs to not accidentally break.
 ## Semantic layer (optional, default-disabled)
 
 Semantic (embedding-based) retrieval is **disabled by default** and only
-activates when `ATTIC_SEMANTIC=1` is set. The currently shipped embedder
-(`HashingEmbedder`) is a deterministic hashing baseline — an experimental
-placeholder, not a validated neural embedding model. When disabled or
-degraded, canonical (lexical/structural) retrieval is entirely unaffected;
-the semantic layer never gates or blocks an answer (ADR-014, decision D1).
-See ADR-013/ADR-014 for the full rationale.
+activates when `ATTIC_SEMANTIC=1` is set. When enabled, `BgeEmbedder` — a
+real, Candle-backed neural embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — is the
+default provider; `HashingEmbedder`, a deterministic feature-hashing
+baseline, remains available as an explicit `attic.toml` `[embedding]`
+override and is what CI/tests use to stay offline and byte-deterministic.
+See `docs/PROBLEM_STATEMENT.md` for the full embedding-profile/resource
+design (`EmbeddingProfile` persistence, `ResourceMode`/`ResourcePolicy`,
+hybrid search). When disabled or degraded, canonical (lexical/structural)
+retrieval is entirely unaffected; the semantic layer never gates or blocks
+an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
+rationale.
 
 ## Resource management
 

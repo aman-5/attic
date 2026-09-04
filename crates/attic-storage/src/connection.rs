@@ -198,10 +198,28 @@ pub fn run_maintenance(
 // PRAGMA configuration
 // ---------------------------------------------------------------------------
 
-/// Apply all required PRAGMAs to a freshly opened connection.
+/// Default `PRAGMA cache_size` (negative = KiB): 32 MiB.
+pub const DEFAULT_CACHE_PAGES: i64 = -32768;
+/// Default `PRAGMA mmap_size`, in bytes: 512 MiB.
+pub const DEFAULT_MMAP_BYTES: u64 = 536_870_912;
+
+/// Apply all required PRAGMAs to a freshly opened connection, using the
+/// fixed defaults above.
 ///
 /// Must be called on **every** connection (writer and readers alike).
 pub fn configure_connection(conn: &Connection) -> Result<(), StorageError> {
+    configure_connection_with_pragmas(conn, DEFAULT_CACHE_PAGES, DEFAULT_MMAP_BYTES)
+}
+
+/// Apply all required PRAGMAs to a freshly opened connection, with
+/// `cache_size`/`mmap_size` driven by
+/// `attic_storage::resource_policy::EffectiveResourceConfig` (Phase 8)
+/// instead of the fixed defaults.
+pub fn configure_connection_with_pragmas(
+    conn: &Connection,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<(), StorageError> {
     conn.execute_batch(
         "
         PRAGMA journal_mode       = WAL;
@@ -209,11 +227,11 @@ pub fn configure_connection(conn: &Connection) -> Result<(), StorageError> {
         PRAGMA synchronous        = NORMAL;
         PRAGMA foreign_keys       = ON;
         PRAGMA busy_timeout       = 5000;
-        PRAGMA cache_size         = -32768;
         PRAGMA temp_store         = MEMORY;
-        PRAGMA mmap_size          = 536870912;
         ",
     )?;
+    conn.pragma_update(None, "cache_size", cache_pages)?;
+    conn.pragma_update(None, "mmap_size", mmap_bytes as i64)?;
     Ok(())
 }
 
@@ -235,6 +253,33 @@ pub fn open_ro(path: &Path) -> Result<Connection, StorageError> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     configure_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Open a read-write connection at `path` with explicit `cache_size`/
+/// `mmap_size` pragmas (Phase 8: driven by `EffectiveResourceConfig`).
+pub fn open_rw_with_pragmas(
+    path: &Path,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<Connection, StorageError> {
+    let conn = Connection::open(path)?;
+    configure_connection_with_pragmas(&conn, cache_pages, mmap_bytes)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection at `path` with explicit `cache_size`/
+/// `mmap_size` pragmas (Phase 8: driven by `EffectiveResourceConfig`).
+pub fn open_ro_with_pragmas(
+    path: &Path,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<Connection, StorageError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure_connection_with_pragmas(&conn, cache_pages, mmap_bytes)?;
     Ok(conn)
 }
 
@@ -304,6 +349,9 @@ impl Drop for PoolGuard {
 pub struct DbPool {
     path: Arc<std::path::PathBuf>,
     inner: Arc<Mutex<PoolInner>>,
+    /// Explicit `(cache_pages, mmap_bytes)` pragma override for lazily-opened
+    /// readers (Phase 8). `None` uses the fixed defaults.
+    pragmas: Option<(i64, u64)>,
 }
 
 impl DbPool {
@@ -314,6 +362,31 @@ impl DbPool {
                 idle: Vec::with_capacity(POOL_MAX_READERS),
                 in_use: 0,
             })),
+            pragmas: None,
+        }
+    }
+
+    fn new_with_pragmas(
+        path: impl Into<std::path::PathBuf>,
+        cache_pages: i64,
+        mmap_bytes: u64,
+    ) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+            inner: Arc::new(Mutex::new(PoolInner {
+                idle: Vec::with_capacity(POOL_MAX_READERS),
+                in_use: 0,
+            })),
+            pragmas: Some((cache_pages, mmap_bytes)),
+        }
+    }
+
+    fn open_reader(&self) -> Result<Connection, StorageError> {
+        match self.pragmas {
+            Some((cache_pages, mmap_bytes)) => {
+                open_ro_with_pragmas(&self.path, cache_pages, mmap_bytes)
+            }
+            None => open_ro(&self.path),
         }
     }
 
@@ -348,7 +421,7 @@ impl DbPool {
                     pool_inner: Arc::clone(&self.inner),
                 }
             } else if lock.in_use < POOL_MAX_READERS {
-                let c = open_ro(&self.path)?;
+                let c = self.open_reader()?;
                 lock.in_use += 1;
                 PoolGuard {
                     conn: Some(c),
@@ -402,6 +475,20 @@ pub fn open_db(path: impl AsRef<Path>) -> Result<(Connection, DbPool), StorageEr
     let path = path.as_ref().to_path_buf();
     let writer = open_rw(&path)?;
     let pool = DbPool::new(path);
+    Ok((writer, pool))
+}
+
+/// Same as [`open_db`], but with explicit `cache_size`/`mmap_size` pragmas
+/// (Phase 8) applied to the writer connection AND every reader the pool
+/// subsequently opens — not just the first connection.
+pub fn open_db_with_pragmas(
+    path: impl AsRef<Path>,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<(Connection, DbPool), StorageError> {
+    let path = path.as_ref().to_path_buf();
+    let writer = open_rw_with_pragmas(&path, cache_pages, mmap_bytes)?;
+    let pool = DbPool::new_with_pragmas(path, cache_pages, mmap_bytes);
     Ok((writer, pool))
 }
 

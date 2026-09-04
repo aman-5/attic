@@ -37,8 +37,13 @@ impl Default for SelectionConfig {
     fn default() -> Self {
         Self {
             min_score: 0.30,
-            max_units_per_repo: 512,
-            max_units_total: 20_000,
+            // Scaled by the same 5x as `max_units_total` below, so a
+            // multi-repo workspace's per-repo fairness ratio is preserved —
+            // raising only the global cap would do nothing for a workspace
+            // with few repos, since each would still stop at the old 512
+            // long before the (now much higher) global cap is ever reached.
+            max_units_per_repo: 2_560,
+            max_units_total: 100_000,
             max_input_bytes: 16_384,
         }
     }

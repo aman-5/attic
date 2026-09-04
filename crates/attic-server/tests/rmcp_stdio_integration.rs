@@ -63,6 +63,7 @@ async fn connect(bin: &Path, db: &Path, workspace_root: Option<&Path>) -> Server
 
     cmd.env("ATTIC_HOME", &attic_home)
         .env("ATTIC_DB_PATH", db)
+        .env("ATTIC_SEMANTIC", "0")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
         .stdin(Stdio::piped())
@@ -98,6 +99,22 @@ impl Drop for ServerHandle {
     fn drop(&mut self) {
         // Deterministic teardown even on assertion failure.
         let _ = self.child.start_kill();
+        // [FIX] `start_kill()` only signals termination — it does not wait
+        // for the OS to actually reclaim the process (and release its
+        // `attic.lock`). Several tests reuse the same database path across
+        // sequential `connect()` calls (e.g. pre-seeding multiple repos, or
+        // simulating a restart); without this bounded wait, the next
+        // `connect()` can race the still-exiting previous process and be
+        // correctly refused by the single-instance lock, surfacing as a
+        // spurious "connection closed" failure rather than a real bug.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -569,6 +586,7 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
     fn spawn(bin: &Path, home: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.env("ATTIC_HOME", home)
+            .env("ATTIC_SEMANTIC", "0")
             .env_remove("ATTIC_DB_PATH")
             .env_remove("ATTIC_CONFIG")
             .env_remove("ATTIC_WORKSPACE_ROOT")

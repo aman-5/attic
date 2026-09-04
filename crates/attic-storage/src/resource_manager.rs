@@ -652,52 +652,6 @@ pub struct ResourceConfig {
 }
 
 impl ResourceConfig {
-    /// Load the resource configuration, applying environment variable overrides.
-    ///
-    /// Environment variables (all optional, prefixed with `ATTIC_`):
-    /// - `ATTIC_TOTAL_MEMORY_BUDGET_MIB`
-    /// - `ATTIC_PER_REPO_MEMORY_BUDGET_MIB`
-    /// - `ATTIC_MIN_FREE_MEMORY_MIB`
-    /// - `ATTIC_MAX_FOREGROUND_QUERIES`
-    /// - `ATTIC_MAX_BACKGROUND_WORKERS`
-    /// - `ATTIC_MAX_INDEXING_WORKERS`
-    /// - `ATTIC_MAX_SEMANTIC_WORKERS`
-    /// - `ATTIC_MAX_IO_OPS_PER_SEC`
-    /// - `ATTIC_WRITER_QUEUE_CAPACITY`
-    /// - `ATTIC_WRITER_BATCH_SIZE`
-    /// - `ATTIC_WRITER_FLUSH_INTERVAL_MS`
-    pub fn load() -> Self {
-        Self {
-            total_memory_budget_mib: std::env::var("ATTIC_TOTAL_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            min_free_memory_mib: std::env::var("ATTIC_MIN_FREE_MEMORY_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_foreground_queries: std::env::var("ATTIC_MAX_FOREGROUND_QUERIES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_io_ops_per_sec: std::env::var("ATTIC_MAX_IO_OPS_PER_SEC")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_queue_capacity: std::env::var("ATTIC_WRITER_QUEUE_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_batch_size: std::env::var("ATTIC_WRITER_BATCH_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_flush_interval_ms: std::env::var("ATTIC_WRITER_FLUSH_INTERVAL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-        }
-    }
-
     /// Validate this configuration before it is applied.
     ///
     /// Rejects invalid or internally-inconsistent overrides so the server
@@ -1091,21 +1045,6 @@ mod tests {
             ),
             "expected degraded/emergency/pause advisory under high pressure, got {advisory:?}"
         );
-    }
-
-    #[test]
-    fn resource_config_load() {
-        let config = ResourceConfig::load();
-        // All fields should be None by default (no env vars set in test).
-        assert!(config.total_memory_budget_mib.is_none());
-        assert!(config.per_repo_memory_budget_mib.is_none());
-        assert!(config.min_free_memory_mib.is_none());
-        assert!(config.max_foreground_queries.is_none());
-        assert!(config.max_background_workers.is_none());
-        assert!(config.max_io_ops_per_sec.is_none());
-        assert!(config.writer_queue_capacity.is_none());
-        assert!(config.writer_batch_size.is_none());
-        assert!(config.writer_flush_interval_ms.is_none());
     }
 
     #[test]

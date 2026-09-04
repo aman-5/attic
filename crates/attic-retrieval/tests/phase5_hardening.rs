@@ -199,6 +199,7 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
                 max_attempts: 3,
             },
             &CancelFlag::new(),
+            attic_semantic::EmbeddingIntentSource::Recommendation,
         )
         .unwrap();
     }

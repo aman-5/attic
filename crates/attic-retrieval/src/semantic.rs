@@ -21,6 +21,19 @@ use crate::candidates::{
 use crate::error::RetrievalError;
 use crate::mode::AnswerModePolicy;
 
+/// Truncate `s` to at most `max_bytes` bytes, cutting on a char boundary.
+pub(crate) fn truncate_to_byte_limit(s: &str, max_bytes: usize) -> String {
+    let mut s = s.to_owned();
+    if s.len() > max_bytes {
+        let mut cut = max_bytes;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    s
+}
+
 /// Everything semantic queries need. Cheap to clone/share.
 #[derive(Clone)]
 pub struct SemanticStack {
@@ -168,15 +181,7 @@ impl SemanticCandidateGenerator {
         }
 
         // ── Embed the query (single item; input bounded like enrichment) ───
-        let max_in = stack.provider.max_input_bytes();
-        let mut q = query_text.to_owned();
-        if q.len() > max_in {
-            let mut cut = max_in;
-            while cut > 0 && !q.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            q.truncate(cut);
-        }
+        let q = truncate_to_byte_limit(query_text, stack.provider.max_input_bytes());
         // ── Query embedding under the mode's time budget (§14/§20) ─────────
         let deadline = t0 + std::time::Duration::from_millis(policy.semantic_time_budget_ms);
         if std::time::Instant::now() >= deadline || !env.budget.candidates_available() {
@@ -344,6 +349,16 @@ pub fn enrich_to_completion(
     let _report = attic_semantic::reconcile(conn, &stack.store, stack.provider.as_ref(), &sel_cfg)
         .map_err(|e| e.to_string())?;
     let cancel = attic_semantic::CancelFlag::new();
-    attic_semantic::drive(conn, &stack.store, stack.provider.as_ref(), cfg, &cancel)
-        .map_err(|e| e.to_string())
+    // Test/bootstrap convenience — no explicit override provenance is
+    // relevant here, so this always claims (if applicable) as a
+    // Recommendation, matching the provider's own default identity.
+    attic_semantic::drive(
+        conn,
+        &stack.store,
+        stack.provider.as_ref(),
+        cfg,
+        &cancel,
+        attic_semantic::EmbeddingIntentSource::Recommendation,
+    )
+    .map_err(|e| e.to_string())
 }

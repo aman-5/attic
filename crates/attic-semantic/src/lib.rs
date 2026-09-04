@@ -15,6 +15,9 @@
 //! Every type here is safe to delete; FTS, symbols, structure, evidence and
 //! verification continue to work untouched.
 
+pub mod bge_embedder;
+pub mod embedding_policy;
+pub mod embedding_profile;
 pub mod enrich;
 pub mod error;
 pub mod identity;
@@ -24,6 +27,12 @@ pub mod providers;
 pub mod selection;
 pub mod store;
 
+pub use bge_embedder::BgeEmbedder;
+pub use embedding_policy::{EmbeddingPolicy, EmbeddingRecommendation};
+pub use embedding_profile::{
+    ClaimOutcome, EmbeddingIntentSource, EmbeddingProfile, EmbeddingSpaceDescriptor,
+    PoolingStrategy, ProfileCheck, TruncationPolicy, check_requested_profile,
+};
 pub use enrich::{BackgroundEnricher, EnrichStats, EnrichmentConfig, drive};
 pub use error::SemanticError;
 pub use identity::{SemanticUnitIdentity, content_hash};

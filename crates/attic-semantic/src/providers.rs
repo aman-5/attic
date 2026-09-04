@@ -4,10 +4,13 @@
 //! test/conformance provider — NOT validated neural semantic retrieval.
 //! It is pure Rust, zero model downloads, fully offline, and byte-
 //! deterministic, which is what makes the Phase 5 benchmark gate and all
-//! §22 tests reproducible. Production semantic retrieval is opt-in
-//! (`ATTIC_SEMANTIC=1`) precisely because no neural provider is shipped
-//! yet; a neural backend (e.g. fastembed + bge-small-en-v1.5) is the
-//! sanctioned first swap-in behind the unchanged trait.
+//! §22 tests reproducible, and remains the default for `cargo test
+//! --workspace` (never touches the network). A real neural provider,
+//! `BgeEmbedder` (Phase 9, `crate::bge_embedder`), now exists behind the
+//! same unchanged `SemanticProvider` trait — `attic-server` selects between
+//! the two at startup based on the persisted `EmbeddingProfile` (or the
+//! configured/recommended provider when none is persisted yet); see
+//! `resolve_semantic_provider` in `attic-server`'s `main.rs`.
 
 use std::time::Instant;
 

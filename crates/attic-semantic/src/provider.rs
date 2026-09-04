@@ -11,6 +11,7 @@
 //!   items may still be returned alongside the error.
 //! * Resource accounting is observable, never hidden inside the provider.
 
+use crate::embedding_profile::EmbeddingSpaceDescriptor;
 use crate::error::SemanticError;
 
 /// Cooperative cancellation flag shared between coordinator and provider.
@@ -80,6 +81,16 @@ pub trait SemanticProvider: Send + Sync {
     /// Cheap availability probe (model files present, endpoint reachable…).
     fn available(&self) -> bool {
         true
+    }
+
+    /// The resolved, immutable vector-space identity this provider actually
+    /// produces (Low-Level Design §3) — `None` for providers with no
+    /// persisted-identity concept (e.g. `HashingEmbedder`, test doubles).
+    /// Only a `Some` return causes the enrichment worker to claim/compare an
+    /// `EmbeddingProfile` before real embedding work; a provider that never
+    /// overrides this default never participates in profile claiming at all.
+    fn embedding_descriptor(&self) -> Option<EmbeddingSpaceDescriptor> {
+        None
     }
 
     /// Embed a batch under an ENFORCEABLE time contract (§20): `deadline`

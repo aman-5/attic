@@ -27,7 +27,7 @@ strip         = "symbols"
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors      = ["Attic Contributors"]
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/aman-5/attic"
@@ -39,7 +39,8 @@ serde              = { version = "1.0.219", features = ["derive"] }
 serde_json         = "1.0.140"
 uuid               = { version = "1.11.0",  features = ["v4", "v5", "serde"] }
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3",     features = ["env-filter"] }
+tracing-subscriber = { version = "0.3",     features = ["env-filter", "registry"] }
+tracing-appender   = "0.2"
 # Phase 1B: gitignore-aware walking (ripgrep/ignore, MSRV 1.88, Unlicense OR MIT)
 ignore             = "0.4.33"
 # Phase 1B: BLAKE3 hashing required by source_revision contract
@@ -68,6 +69,29 @@ anyhow             = "1"
 sysinfo            = { version = "0.33", default-features = false, features = ["system"] }
 # Test utilities
 tempfile           = "3"
+# Phase 8: attic.toml resource/embedding tunables (pure parsing, no I/O)
+toml               = "1"
+# Phase 9: BgeEmbedder — real neural semantic embeddings (BAAI/bge-base-en-v1.5, 768d).
+# Pinned to 0.9.1, NOT the newer 0.10.0+/0.11.0 releases: starting at 0.10.0,
+# candle-core unconditionally depends on `tokenizers` with the `onig` feature
+# (a C library requiring a C compiler toolchain) on every non-wasm target —
+# confirmed by diffing candle-core's Cargo.toml across releases and by
+# `cargo tree -i onig`, which showed onig/onig_sys disappearing entirely once
+# pinned to 0.9.1. Verified functionally equivalent for our use: attic-semantic
+# compiles unchanged (zero code changes) and the real network+inference
+# reference-compatibility test (cosine >=0.999 against sentence-transformers
+# output) still passes on 0.9.1. CPU-only (no cuda/mkl/metal features) to
+# match the "no exotic backend" release profile above.
+candle-core        = "0.9.1"
+candle-nn          = "0.9.1"
+candle-transformers = "0.9.1"
+# `fancy-regex` (pure Rust), NOT `onig` (a C library requiring a C compiler
+# toolchain) — the tokenizers crate requires one of the two; BGE's WordPiece
+# tokenizer needs neither's advanced regex features, so the pure-Rust option
+# is strictly better here and keeps this dependency C-toolchain-free, matching
+# the reason Candle was chosen over ONNX-based alternatives in the first place.
+tokenizers         = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+hf-hub             = { version = "1.0.0", default-features = false, features = ["blocking"] }
 attic-core         = { path = "crates/attic-core" }
 attic-storage      = { path = "crates/attic-storage" }
 attic-discovery    = { path = "crates/attic-discovery" }

@@ -48,6 +48,22 @@ struct ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        // [FIX] `start_kill()` only signals termination — it does not wait
+        // for the OS to actually reclaim the process (and release its
+        // `attic.lock`). These are restart tests: a new server is spawned
+        // against the same `ATTIC_HOME` right after the previous one is
+        // dropped. Without this bounded wait, that next spawn can race the
+        // still-exiting previous process and be correctly refused by the
+        // single-instance lock, surfacing as a spurious "connection closed"
+        // failure rather than a real bug.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -57,6 +73,7 @@ impl Drop for ServerHandle {
 async fn connect_home(bin: &Path, home: &Path) -> ServerHandle {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.env("ATTIC_HOME", home)
+        .env("ATTIC_SEMANTIC", "0")
         .env_remove("ATTIC_DB_PATH")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
