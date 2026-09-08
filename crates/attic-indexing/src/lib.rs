@@ -1188,7 +1188,7 @@ fn analyze_single_file(
         path: rec.abs_path.clone(),
         content: analyzer_content,
         file_type: rec.file_type,
-        language_hint: None,
+        language_hint: infer_language_hint(&rec.abs_path).map(str::to_string),
         size_bytes,
         is_partial_scan,
         cancellation_token: cancellation.clone(),
@@ -1314,6 +1314,49 @@ fn infer_file_type(path: &Path) -> FileType {
     }
 }
 
+/// Infer the fine-grained language tag used by `attic_analyzers::AnalyzerRegistry`'s
+/// language-hint lookup (`AnalyzerInput::language_hint`), additive to — and
+/// finer-grained than — `infer_file_type`'s broad `FileType` classification.
+///
+/// This is the mechanism that lets `.tsx` route to the JSX-aware TypeScript
+/// grammar while `.ts` keeps the plain one (both share `FileType::TypeScript`,
+/// which cannot itself distinguish them), and lets tier-2 tags.scm-based
+/// languages (which have no `FileType` variant at all, e.g. Ruby/C#/Scala/
+/// PHP/Swift/Lua/Dockerfile) be selected without widening `attic-core`'s
+/// domain enum. Returns `None` for anything not handled by a registered
+/// language-specific analyzer; such files still get generic full-text
+/// coverage via `infer_file_type`'s existing fallback path.
+///
+/// Tag strings here MUST match the tags used to register analyzers in
+/// `attic_analyzers::structural::default_registry` exactly.
+fn infer_language_hint(path: &Path) -> Option<&'static str> {
+    // Filename-based match (checked before extension-based, same convention
+    // `infer_file_type` would use if it needed one): Dockerfiles are
+    // conventionally named `Dockerfile`/`dockerfile` with no extension.
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.eq_ignore_ascii_case("dockerfile")
+    {
+        return Some("dockerfile");
+    }
+
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("tsx") => Some("tsx"),
+        Some("ts") => Some("typescript"),
+        Some("rs") => Some("rust"),
+        Some("c") | Some("h") => Some("c"),
+        Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("h++")
+        | Some("hxx") => Some("cpp"),
+        Some("rb") => Some("ruby"),
+        Some("cs") => Some("csharp"),
+        Some("scala") | Some("sc") => Some("scala"),
+        Some("php") => Some("php"),
+        Some("swift") => Some("swift"),
+        Some("lua") => Some("lua"),
+        Some("dockerfile") => Some("dockerfile"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1324,6 +1367,75 @@ mod tests {
     use attic_discovery::DiscoveryPolicy;
     use attic_storage::{WriterQueue, connection::open_ro};
     use tempfile::TempDir;
+
+    /// Bug fix regression: nothing previously cross-checked that every tag
+    /// string `infer_language_hint` can produce is actually a tag the
+    /// analyzer registry recognizes — only a doc comment on
+    /// `infer_language_hint` asserted "MUST match exactly" between this crate
+    /// and `attic-analyzers`'s tier-2 table / `default_registry`. This test
+    /// fails loudly the moment the two crates' tag strings drift.
+    ///
+    /// One sample path per `infer_language_hint` match arm (kept in sync with
+    /// that function manually, since its match arms aren't otherwise
+    /// enumerable from the outside).
+    #[test]
+    fn infer_language_hint_tags_are_registered_in_analyzer_registry() {
+        let samples: &[&str] = &[
+            "Dockerfile",
+            "x.tsx",
+            "x.ts",
+            "x.rs",
+            "x.c",
+            "x.h",
+            "x.cpp",
+            "x.cc",
+            "x.cxx",
+            "x.hpp",
+            "x.hh",
+            "x.h++",
+            "x.hxx",
+            "x.rb",
+            "x.cs",
+            "x.scala",
+            "x.sc",
+            "x.php",
+            "x.swift",
+            "x.lua",
+            "x.dockerfile",
+        ];
+        let produced: HashSet<&'static str> = samples
+            .iter()
+            .filter_map(|s| infer_language_hint(Path::new(s)))
+            .collect();
+        assert!(
+            !produced.is_empty(),
+            "sample path list above must actually exercise infer_language_hint's match arms"
+        );
+
+        let registry = attic_analyzers::structural::default_registry();
+        let known = registry.known_language_tags();
+
+        for tag in &produced {
+            // `"typescript"` is a documented exception: plain `.ts` sources
+            // are dispatched via the `FileType::TypeScript` map (see
+            // `TypeScriptSpec` in attic-analyzers), not via
+            // `register_for_language`, so `"typescript"` never appears in
+            // `known_language_tags()` even though the hint is correct —
+            // `AnalyzerRegistry::select` falls through to the FileType-keyed
+            // entry whenever a language-hint lookup misses, so this is safe
+            // rather than a real drift.
+            if *tag == "typescript" {
+                continue;
+            }
+            assert!(
+                known.contains(tag),
+                "infer_language_hint can produce tag {tag:?}, but default_registry() has no \
+                 analyzer registered under that language tag — attic-analyzers's tier-2 table \
+                 (or the tsx registration) in structural/mod.rs / tags_generic.rs has drifted \
+                 from infer_language_hint's match arms"
+            );
+        }
+    }
 
     /// File-backed store fixture: open_db → migrations → WriterQueue.
     ///

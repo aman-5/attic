@@ -22,6 +22,7 @@ pub mod migration;
 pub mod ops_tasks;
 pub mod repository;
 pub mod resource_manager;
+pub mod resource_policy;
 pub mod retrieval_reads;
 pub mod semantic_reads;
 pub mod server_state;
@@ -31,7 +32,7 @@ pub use analysis_cache::{
     CachedFileAnalysis, bulk_load_analysis_cache, clear_analysis_cache,
     upsert_analysis_cache_entries,
 };
-pub use connection::{DbPool, open_db};
+pub use connection::{DbPool, open_db, open_db_with_pragmas};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
     all_catalog_entries, all_repository_ids, catalog_entry, create_workspace_snapshot,
@@ -63,8 +64,13 @@ pub use ops_tasks::{
     enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
 };
 pub use resource_manager::{ResourceAdvisory, ResourceConfig, ResourceMonitor};
+pub use resource_policy::{
+    EffectiveResourceConfig, HardwareSnapshot, ResourceDetectionError, ResourceMode,
+    ResourceModeSource, ResourcePolicy, ResourceResolution, detect_resource_mode,
+    env_resource_overrides, resolve_effective_config,
+};
 pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
-pub use writer::{WriterQueue, WriterQueueHandle};
+pub use writer::{WriterConfig, WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{

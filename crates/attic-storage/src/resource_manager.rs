@@ -281,11 +281,16 @@ impl ResourceMonitor {
             })
             .ok();
 
-        // Announce pressure change downward.
-        let current = self.memory_used.load(Ordering::Relaxed);
-        let pressure = self.compute_pressure(current);
+        // Announce pressure change downward. Compute the "new" pressure from
+        // the EFFECTIVE memory usage (same basis `self.pressure()` uses,
+        // i.e. max(accounted, real RSS)) instead of the raw worker-accounted
+        // counter — otherwise this comparison mixes two different bases and
+        // can spuriously fire (or fail to fire) `announce_pressure_change`
+        // even when the effective pressure tier hasn't actually changed.
+        let effective = self.effective_memory_used();
+        let pressure = self.compute_pressure(effective);
         if pressure != self.pressure() {
-            self.announce_pressure_change(pressure, current);
+            self.announce_pressure_change(pressure, effective);
         }
     }
 
@@ -598,11 +603,18 @@ pub fn current_advisory(monitor: &ResourceMonitor) -> ResourceAdvisory {
     let pressure = monitor.pressure();
     let used = monitor.effective_memory_used();
     let max = monitor.max_memory_mib();
+    // Use the SAME threshold that `compute_pressure` uses to decide the
+    // Warning tier (`PRESSURE_WARNING_PCT`), instead of a separately
+    // hardcoded 75% gate. Previously the two disagreed, so usage in the
+    // 70-75% band read `ResourcePressure::Warning` from `pressure()` but
+    // still `ResourceAdvisory::Normal` here, leaving a gap where no
+    // backpressure was applied despite genuine Warning-tier pressure.
+    let pct = used.saturating_mul(100).checked_div(max).unwrap_or(0);
 
     match pressure {
         ResourcePressure::Normal => ResourceAdvisory::Normal,
         ResourcePressure::Warning => {
-            if used > max * 3 / 4 {
+            if pct >= PRESSURE_WARNING_PCT {
                 ResourceAdvisory::Degraded
             } else {
                 ResourceAdvisory::Normal
@@ -652,52 +664,6 @@ pub struct ResourceConfig {
 }
 
 impl ResourceConfig {
-    /// Load the resource configuration, applying environment variable overrides.
-    ///
-    /// Environment variables (all optional, prefixed with `ATTIC_`):
-    /// - `ATTIC_TOTAL_MEMORY_BUDGET_MIB`
-    /// - `ATTIC_PER_REPO_MEMORY_BUDGET_MIB`
-    /// - `ATTIC_MIN_FREE_MEMORY_MIB`
-    /// - `ATTIC_MAX_FOREGROUND_QUERIES`
-    /// - `ATTIC_MAX_BACKGROUND_WORKERS`
-    /// - `ATTIC_MAX_INDEXING_WORKERS`
-    /// - `ATTIC_MAX_SEMANTIC_WORKERS`
-    /// - `ATTIC_MAX_IO_OPS_PER_SEC`
-    /// - `ATTIC_WRITER_QUEUE_CAPACITY`
-    /// - `ATTIC_WRITER_BATCH_SIZE`
-    /// - `ATTIC_WRITER_FLUSH_INTERVAL_MS`
-    pub fn load() -> Self {
-        Self {
-            total_memory_budget_mib: std::env::var("ATTIC_TOTAL_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            min_free_memory_mib: std::env::var("ATTIC_MIN_FREE_MEMORY_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_foreground_queries: std::env::var("ATTIC_MAX_FOREGROUND_QUERIES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_io_ops_per_sec: std::env::var("ATTIC_MAX_IO_OPS_PER_SEC")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_queue_capacity: std::env::var("ATTIC_WRITER_QUEUE_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_batch_size: std::env::var("ATTIC_WRITER_BATCH_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            writer_flush_interval_ms: std::env::var("ATTIC_WRITER_FLUSH_INTERVAL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-        }
-    }
-
     /// Validate this configuration before it is applied.
     ///
     /// Rejects invalid or internally-inconsistent overrides so the server
@@ -1094,18 +1060,87 @@ mod tests {
     }
 
     #[test]
-    fn resource_config_load() {
-        let config = ResourceConfig::load();
-        // All fields should be None by default (no env vars set in test).
-        assert!(config.total_memory_budget_mib.is_none());
-        assert!(config.per_repo_memory_budget_mib.is_none());
-        assert!(config.min_free_memory_mib.is_none());
-        assert!(config.max_foreground_queries.is_none());
-        assert!(config.max_background_workers.is_none());
-        assert!(config.max_io_ops_per_sec.is_none());
-        assert!(config.writer_queue_capacity.is_none());
-        assert!(config.writer_batch_size.is_none());
-        assert!(config.writer_flush_interval_ms.is_none());
+    fn current_advisory_is_not_normal_in_70_to_75_band() {
+        // Regression test for Bug 16: `pressure()` enters `Warning` at 70%
+        // (`PRESSURE_WARNING_PCT`), but `current_advisory` used to only
+        // escalate past a separately hardcoded 75% gate, leaving a gap band
+        // (70-75%) where genuine Warning-tier pressure still reported a
+        // plain `Normal` advisory to background workers.
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(10_000),
+            min_free_memory_mib: Some(100),
+            ..ResourceConfig::default()
+        };
+        let monitor = ResourceMonitor::from_config(&config);
+
+        // 72%: within the Warning tier but below the old 75% escalation gate.
+        monitor.record_memory_increase(7_200);
+        assert_eq!(monitor.pressure(), attic_core::ResourcePressure::Warning);
+        assert_ne!(
+            current_advisory(&monitor),
+            ResourceAdvisory::Normal,
+            "70-75% band must not report a Normal advisory"
+        );
+    }
+
+    #[test]
+    fn record_memory_decrease_no_spurious_announcement_when_effective_tier_unchanged() {
+        // Regression test for Bug 17: `record_memory_decrease` used to
+        // compare a pressure computed from the RAW worker-accounted counter
+        // against `self.pressure()` (which uses the EFFECTIVE, RSS-inclusive
+        // basis). Here we size the budget so the sampled RSS alone already
+        // puts the effective usage above the Warning threshold while the raw
+        // accounted counter stays at 0 (Normal) throughout — the exact
+        // mismatched-basis scenario that used to trigger a spurious
+        // `announce_pressure_change` even though the effective tier never
+        // changed.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        struct CountingLayer(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for CountingLayer {
+            fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let monitor = ResourceMonitor::new();
+        monitor.refresh_process_memory();
+        let rss = monitor.process_rss_mib();
+        assert!(rss > 0, "expected a real nonzero RSS sample");
+
+        // Budget sized so RSS alone is comfortably >= PRESSURE_WARNING_PCT,
+        // with enough headroom (`gap`) above min_free to avoid Emergency.
+        let gap = (rss / 10).max(2);
+        let budget = rss + gap;
+        let config = ResourceConfig {
+            total_memory_budget_mib: Some(budget),
+            min_free_memory_mib: Some(1),
+            ..ResourceConfig::default()
+        };
+        config.apply_to(&monitor);
+
+        assert_eq!(monitor.memory_used_mib(), 0);
+        assert_ne!(
+            monitor.pressure(),
+            attic_core::ResourcePressure::Normal,
+            "effective pressure should be driven by RSS, not the (still zero) raw counter"
+        );
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountingLayer(Arc::clone(&counter)));
+        tracing::subscriber::with_default(subscriber, || {
+            // Raw counter is already 0 (saturating), so this must be a no-op
+            // with respect to the (unchanged) effective pressure tier.
+            monitor.record_memory_decrease(0);
+        });
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "no pressure-change should be announced when the effective tier hasn't changed"
+        );
     }
 
     #[test]

@@ -59,9 +59,19 @@
 //! - [`QUEUE_CAPACITY`]: 512 pending mutations before backpressure
 //! - [`BATCH_SIZE`]: flush after 256 mutations
 //! - [`FLUSH_INTERVAL`]: flush at least every 50 ms
+//!
+//! ## Commit-rate throttle (`max_io_ops_per_sec`)
+//! [`WriterConfig::max_io_ops_per_sec`] bounds the worker's `COMMIT` rate —
+//! one `flush_batch` call is throttled to at most this many per second, by
+//! sleeping just before each flush if committing now would exceed the rate.
+//! Never applied while shutting down, so shutdown stays deterministic and
+//! never abandons a write mid-flight waiting on a rate limit. This is
+//! honestly scoped to the writer's own commit cadence — not "all disk
+//! I/O" (reads, WAL checkpoints, and backups are outside this queue's
+//! visibility).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -84,6 +94,42 @@ pub const BATCH_SIZE: usize = 256;
 
 /// Maximum time between flushes even when `BATCH_SIZE` is not reached.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Runtime-tunable writer parameters (Phase 8). Defaults match the
+/// module-level constants above exactly, so [`WriterQueue::new`] behaves
+/// identically to before this type existed; production startup instead uses
+/// [`WriterQueue::new_with_config`] with values derived from
+/// `attic_storage::resource_policy::EffectiveResourceConfig`.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterConfig {
+    /// Bounded channel capacity before `send` returns `QueueFull`.
+    pub queue_capacity: usize,
+    /// Flush a batch after this many mutations.
+    pub batch_size: usize,
+    /// Maximum time between flushes even when `batch_size` is not reached.
+    pub flush_interval: Duration,
+    /// [FIX] Real enforcement for `attic.toml`'s `max_io_ops_per_sec` —
+    /// previously parsed/validated/surfaced in `status` but genuinely
+    /// unenforced anywhere. Scoped honestly to what this component can
+    /// actually see and control: the writer's own `COMMIT` rate (one
+    /// `flush_batch` call = one real disk I/O commit/fsync via SQLite WAL)
+    /// — NOT "all disk I/O" (reads, WAL checkpoints, backups are outside
+    /// this queue's visibility). `u32::MAX` (the `Default` value) means
+    /// effectively unthrottled, preserving `WriterQueue::new()`'s original
+    /// behavior for direct/test callers that don't specify a config.
+    pub max_io_ops_per_sec: u32,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: QUEUE_CAPACITY,
+            batch_size: BATCH_SIZE,
+            flush_interval: FLUSH_INTERVAL,
+            max_io_ops_per_sec: u32::MAX,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MutationFn type alias
@@ -145,6 +191,14 @@ pub struct WriterQueueHandle {
     /// Shared with the worker.  When `true`, the writer connection is in an
     /// unknown state and no further mutations may be enqueued.
     poisoned: Arc<AtomicBool>,
+    /// Shared with the worker. Incremented once per successfully committed
+    /// (non-empty) batch — a cheap, always-correct "something in the
+    /// canonical index just changed" signal. Lets consumers (e.g. the
+    /// semantic background enricher) react to real writes instead of
+    /// polling on a timer, since every canonical mutation — bootstrap,
+    /// incremental, watcher-triggered, present or future — is already
+    /// serialized through this single writer.
+    generation: Arc<AtomicU64>,
 }
 
 impl WriterQueueHandle {
@@ -196,6 +250,12 @@ impl WriterQueueHandle {
 
         result_rx.recv().unwrap_or(Err(StorageError::QueueShutdown))
     }
+
+    /// Clone of the shared commit-generation counter (see
+    /// [`WriterQueueHandle::generation`] field docs).
+    pub fn generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.generation)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +285,18 @@ impl WriterQueue {
         Self::new_with_finalizer(conn, DefaultFinalizer)
     }
 
+    /// Create a new `WriterQueue` with explicit [`WriterConfig`] (Phase 8:
+    /// production startup derives `config` from
+    /// `attic_storage::resource_policy::EffectiveResourceConfig` instead of
+    /// the compile-time constants).
+    pub fn new_with_config(conn: Connection, config: WriterConfig) -> Result<Self, StorageError> {
+        Self::new_with_finalizer_and_config(conn, DefaultFinalizer, config)
+    }
+
     /// Create a new `WriterQueue` with a custom [`TransactionFinalizer`].
     ///
-    /// Intended for testing; production code should use [`WriterQueue::new`].
+    /// Intended for testing; production code should use [`WriterQueue::new`]
+    /// or [`WriterQueue::new_with_config`].
     pub(crate) fn new_with_finalizer<F>(
         conn: Connection,
         finalizer: F,
@@ -235,11 +304,26 @@ impl WriterQueue {
     where
         F: TransactionFinalizer,
     {
-        let (tx, rx) = mpsc::sync_channel::<WorkItem>(QUEUE_CAPACITY);
+        Self::new_with_finalizer_and_config(conn, finalizer, WriterConfig::default())
+    }
+
+    /// Create a new `WriterQueue` with both a custom [`TransactionFinalizer`]
+    /// and explicit [`WriterConfig`].
+    pub(crate) fn new_with_finalizer_and_config<F>(
+        conn: Connection,
+        finalizer: F,
+        config: WriterConfig,
+    ) -> Result<Self, StorageError>
+    where
+        F: TransactionFinalizer,
+    {
+        let (tx, rx) = mpsc::sync_channel::<WorkItem>(config.queue_capacity);
         let poisoned = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
         let handle = WriterQueueHandle {
             tx,
             poisoned: Arc::clone(&poisoned),
+            generation: Arc::clone(&generation),
         };
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -248,7 +332,15 @@ impl WriterQueue {
         let worker = thread::Builder::new()
             .name("attic-writer".into())
             .spawn(move || {
-                worker_loop(conn, rx, shutdown_flag, poisoned_flag, Box::new(finalizer));
+                worker_loop(
+                    conn,
+                    rx,
+                    shutdown_flag,
+                    poisoned_flag,
+                    generation,
+                    Box::new(finalizer),
+                    config,
+                );
             })
             .map_err(|e| StorageError::ThreadSpawn(e.to_string()))?;
 
@@ -292,10 +384,21 @@ fn worker_loop(
     rx: mpsc::Receiver<WorkItem>,
     shutdown: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     finalizer: Box<dyn TransactionFinalizer>,
+    config: WriterConfig,
 ) {
-    let mut batch: Vec<WorkItem> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<WorkItem> = Vec::with_capacity(config.batch_size);
     let mut last_flush = Instant::now();
+    // [FIX] Separate from `last_flush` (which also gates the FLUSH_INTERVAL
+    // trigger) so throttling never changes when a flush is *decided*, only
+    // adds a wait immediately before it *executes*.
+    let mut last_commit = Instant::now();
+    let min_commit_interval = if config.max_io_ops_per_sec == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / config.max_io_ops_per_sec as f64)
+    };
 
     loop {
         // If the writer is poisoned, drain the channel sending WriterPoisoned
@@ -319,7 +422,7 @@ fn worker_loop(
             match rx.try_recv() {
                 Ok(item) => {
                     batch.push(item);
-                    if batch.len() >= BATCH_SIZE {
+                    if batch.len() >= config.batch_size {
                         break;
                     }
                 }
@@ -330,13 +433,29 @@ fn worker_loop(
 
         // Flush if the batch is full, the timer has expired, or we're shutting down.
         let should_flush = !batch.is_empty()
-            && (batch.len() >= BATCH_SIZE
-                || last_flush.elapsed() >= FLUSH_INTERVAL
+            && (batch.len() >= config.batch_size
+                || last_flush.elapsed() >= config.flush_interval
                 || shutting_down);
 
         if should_flush {
-            flush_batch(&conn, &mut batch, &poisoned, finalizer.as_ref());
+            // Throttle to at most `max_io_ops_per_sec` commits/sec — never
+            // while shutting down, so shutdown stays deterministic and never
+            // abandons a write mid-flight waiting on a rate limit.
+            if !shutting_down {
+                let elapsed = last_commit.elapsed();
+                if elapsed < min_commit_interval {
+                    thread::sleep(min_commit_interval - elapsed);
+                }
+            }
+            flush_batch(
+                &conn,
+                &mut batch,
+                &poisoned,
+                &generation,
+                finalizer.as_ref(),
+            );
             last_flush = Instant::now();
+            last_commit = Instant::now();
             // If flush_batch poisoned the writer, the top-of-loop check
             // will drain remaining items and exit on the next iteration.
         }
@@ -347,7 +466,13 @@ fn worker_loop(
                 batch.push(item);
             }
             if !batch.is_empty() {
-                flush_batch(&conn, &mut batch, &poisoned, finalizer.as_ref());
+                flush_batch(
+                    &conn,
+                    &mut batch,
+                    &poisoned,
+                    &generation,
+                    finalizer.as_ref(),
+                );
             }
             debug!("attic-writer: shut down cleanly");
             break;
@@ -368,6 +493,7 @@ fn flush_batch(
     conn: &Connection,
     batch: &mut Vec<WorkItem>,
     poisoned: &Arc<AtomicBool>,
+    generation: &Arc<AtomicU64>,
     finalizer: &dyn TransactionFinalizer,
 ) {
     if batch.is_empty() {
@@ -452,7 +578,10 @@ fn flush_batch(
         // ----------------------------------------------------------------
         match finalizer.commit(conn) {
             Ok(()) => {
-                // COMMIT succeeded: all results are already Ok(()).
+                // COMMIT succeeded: all results are already Ok(()). Bump the
+                // generation counter so consumers watching for canonical
+                // changes (e.g. the semantic enricher) see this batch.
+                generation.fetch_add(1, Ordering::Release);
             }
             Err(commit_err) => {
                 // COMMIT failed.  Attempt ROLLBACK to restore known-clean state.
@@ -739,7 +868,12 @@ mod tests {
         // Use a tiny channel directly to simulate full queue without a real DB.
         let (tx, _rx) = mpsc::sync_channel::<WorkItem>(2);
         let poisoned = Arc::new(AtomicBool::new(false));
-        let handle = WriterQueueHandle { tx, poisoned };
+        let generation = Arc::new(AtomicU64::new(0));
+        let handle = WriterQueueHandle {
+            tx,
+            poisoned,
+            generation,
+        };
 
         // Fill the queue.
         let (dummy_tx1, _) = mpsc::sync_channel(1);
@@ -769,7 +903,12 @@ mod tests {
     fn poisoned_handle_rejects_send() {
         let (tx, _rx) = mpsc::sync_channel::<WorkItem>(16);
         let poisoned = Arc::new(AtomicBool::new(true)); // pre-poisoned
-        let handle = WriterQueueHandle { tx, poisoned };
+        let generation = Arc::new(AtomicU64::new(0));
+        let handle = WriterQueueHandle {
+            tx,
+            poisoned,
+            generation,
+        };
 
         let result = handle.send(|_| Ok(()));
         assert!(
@@ -825,6 +964,7 @@ mod tests {
     fn rollback_corrects_earlier_successful_results_in_the_same_batch() {
         let (path, writer_conn) = migrated_file_db();
         let poisoned = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
 
         let (tx_a, rx_a) = mpsc::sync_channel(1);
         let (tx_b, rx_b) = mpsc::sync_channel(1);
@@ -854,7 +994,13 @@ mod tests {
             },
         ];
 
-        flush_batch(&writer_conn, &mut batch, &poisoned, &DefaultFinalizer);
+        flush_batch(
+            &writer_conn,
+            &mut batch,
+            &poisoned,
+            &generation,
+            &DefaultFinalizer,
+        );
 
         let result_a = rx_a.recv().unwrap();
         let result_b = rx_b.recv().unwrap();
@@ -994,6 +1140,87 @@ mod tests {
         assert!(
             queue.is_ok(),
             "WriterQueue::new should return Ok for a valid connection"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // max_io_ops_per_sec — real enforcement (writer commit-rate throttle)
+    // -----------------------------------------------------------------------
+
+    fn insert_n_rows(handle: &WriterQueueHandle, n: usize, prefix: &str) {
+        for i in 0..n {
+            let id = format!("{prefix}{i}");
+            let result = handle.send(move |conn| {
+                conn.execute(
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES (?1, ?1, ?1, 1, 1, 0, 0)",
+                    [&id],
+                )?;
+                Ok(())
+            });
+            assert!(result.is_ok(), "insert {i} failed: {result:?}");
+        }
+    }
+
+    #[test]
+    fn max_io_ops_per_sec_actually_throttles_commit_rate() {
+        let (path, writer_conn) = migrated_file_db();
+        // batch_size: 1 so every insert is its own COMMIT (one throttled
+        // "IO op" per row) — isolates the throttle from batching effects.
+        let queue = WriterQueue::new_with_config(
+            writer_conn,
+            WriterConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(1),
+                max_io_ops_per_sec: 5, // 200ms minimum between commits
+                ..WriterConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = queue.handle();
+
+        let t0 = Instant::now();
+        insert_n_rows(&handle, 4, "throttled_");
+        let elapsed = t0.elapsed();
+        drop(queue);
+        cleanup(&path);
+
+        // 4 commits at 5/sec ⇒ 3 gaps of ~200ms ⇒ >= ~600ms. Generous lower
+        // bound (400ms) to absorb scheduling jitter without the assertion
+        // becoming meaningless.
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "throttle had no effect: 4 commits at max_io_ops_per_sec=5 took only {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn default_writer_config_is_not_throttled() {
+        let (path, writer_conn) = migrated_file_db();
+        let queue = WriterQueue::new_with_config(
+            writer_conn,
+            WriterConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(1),
+                ..WriterConfig::default() // max_io_ops_per_sec: u32::MAX
+            },
+        )
+        .unwrap();
+        let handle = queue.handle();
+
+        let t0 = Instant::now();
+        insert_n_rows(&handle, 4, "unthrottled_");
+        let elapsed = t0.elapsed();
+        drop(queue);
+        cleanup(&path);
+
+        // Same workload, no throttle configured: must be dramatically
+        // faster than the throttled case above — proves the field actually
+        // changes behavior, not just that slow is possible.
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "unthrottled commits took {elapsed:?} — suspiciously close to the throttled case"
         );
     }
 }

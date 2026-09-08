@@ -178,7 +178,7 @@ fn capabilities_are_independent_not_ordinal() {
     }
 
     reg.register_specialized(Arc::new(NoRefs(NoRefs::descriptor_value())));
-    let selected = reg.select(FileType::Json).0;
+    let selected = reg.select(FileType::Json, None).0;
     let caps = selected.descriptor().capabilities.clone();
     assert_eq!(
         caps.level_for(CapabilityKind::StructuralParse),

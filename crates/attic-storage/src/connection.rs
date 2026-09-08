@@ -173,6 +173,20 @@ pub fn checkpoint_wal(conn: &Connection) -> Result<(i64, i64, i64), StorageError
 /// * `vacuum` — rebuild the database to reclaim space and defragment.
 ///   VACUUM must NOT run while a transaction is open on the connection; it
 ///   is intended for shutdown/idle maintenance windows only.
+///
+/// This is the intended **production maintenance entry point** for
+/// `attic.db`: it is meant to be invoked periodically (e.g. from an idle
+/// maintenance task) or once during a clean server shutdown — never from
+/// inside a writer-queue transaction closure. It must be called on the
+/// **writer** connection with `vacuum: true` at least occasionally, or the
+/// database file will never shrink after deletes (`VACUUM` is otherwise
+/// nothing more than a capability nobody exercises).
+///
+/// Passing `vacuum: true` while a transaction is open on `conn` would
+/// otherwise surface as an opaque SQLite error ("cannot VACUUM from within a
+/// transaction"); this function checks [`Connection::is_autocommit`] up
+/// front and fails closed with a clear [`StorageError::Worker`] instead, so
+/// callers get an actionable error rather than a raw SQLite message.
 pub fn run_maintenance(
     conn: &Connection,
     wal_checkpoint: bool,
@@ -188,6 +202,12 @@ pub fn run_maintenance(
         }
     }
     if vacuum {
+        if !conn.is_autocommit() {
+            return Err(StorageError::Worker(
+                "run_maintenance: VACUUM requested while a transaction is open on this connection"
+                    .to_string(),
+            ));
+        }
         conn.execute_batch("VACUUM")?;
     }
     violations.extend(verify_connection(conn)?);
@@ -198,10 +218,28 @@ pub fn run_maintenance(
 // PRAGMA configuration
 // ---------------------------------------------------------------------------
 
-/// Apply all required PRAGMAs to a freshly opened connection.
+/// Default `PRAGMA cache_size` (negative = KiB): 32 MiB.
+pub const DEFAULT_CACHE_PAGES: i64 = -32768;
+/// Default `PRAGMA mmap_size`, in bytes: 512 MiB.
+pub const DEFAULT_MMAP_BYTES: u64 = 536_870_912;
+
+/// Apply all required PRAGMAs to a freshly opened connection, using the
+/// fixed defaults above.
 ///
 /// Must be called on **every** connection (writer and readers alike).
 pub fn configure_connection(conn: &Connection) -> Result<(), StorageError> {
+    configure_connection_with_pragmas(conn, DEFAULT_CACHE_PAGES, DEFAULT_MMAP_BYTES)
+}
+
+/// Apply all required PRAGMAs to a freshly opened connection, with
+/// `cache_size`/`mmap_size` driven by
+/// `attic_storage::resource_policy::EffectiveResourceConfig` (Phase 8)
+/// instead of the fixed defaults.
+pub fn configure_connection_with_pragmas(
+    conn: &Connection,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<(), StorageError> {
     conn.execute_batch(
         "
         PRAGMA journal_mode       = WAL;
@@ -209,11 +247,11 @@ pub fn configure_connection(conn: &Connection) -> Result<(), StorageError> {
         PRAGMA synchronous        = NORMAL;
         PRAGMA foreign_keys       = ON;
         PRAGMA busy_timeout       = 5000;
-        PRAGMA cache_size         = -32768;
         PRAGMA temp_store         = MEMORY;
-        PRAGMA mmap_size          = 536870912;
         ",
     )?;
+    conn.pragma_update(None, "cache_size", cache_pages)?;
+    conn.pragma_update(None, "mmap_size", mmap_bytes as i64)?;
     Ok(())
 }
 
@@ -235,6 +273,33 @@ pub fn open_ro(path: &Path) -> Result<Connection, StorageError> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     configure_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Open a read-write connection at `path` with explicit `cache_size`/
+/// `mmap_size` pragmas (Phase 8: driven by `EffectiveResourceConfig`).
+pub fn open_rw_with_pragmas(
+    path: &Path,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<Connection, StorageError> {
+    let conn = Connection::open(path)?;
+    configure_connection_with_pragmas(&conn, cache_pages, mmap_bytes)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection at `path` with explicit `cache_size`/
+/// `mmap_size` pragmas (Phase 8: driven by `EffectiveResourceConfig`).
+pub fn open_ro_with_pragmas(
+    path: &Path,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<Connection, StorageError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure_connection_with_pragmas(&conn, cache_pages, mmap_bytes)?;
     Ok(conn)
 }
 
@@ -304,6 +369,9 @@ impl Drop for PoolGuard {
 pub struct DbPool {
     path: Arc<std::path::PathBuf>,
     inner: Arc<Mutex<PoolInner>>,
+    /// Explicit `(cache_pages, mmap_bytes)` pragma override for lazily-opened
+    /// readers (Phase 8). `None` uses the fixed defaults.
+    pragmas: Option<(i64, u64)>,
 }
 
 impl DbPool {
@@ -314,6 +382,31 @@ impl DbPool {
                 idle: Vec::with_capacity(POOL_MAX_READERS),
                 in_use: 0,
             })),
+            pragmas: None,
+        }
+    }
+
+    fn new_with_pragmas(
+        path: impl Into<std::path::PathBuf>,
+        cache_pages: i64,
+        mmap_bytes: u64,
+    ) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+            inner: Arc::new(Mutex::new(PoolInner {
+                idle: Vec::with_capacity(POOL_MAX_READERS),
+                in_use: 0,
+            })),
+            pragmas: Some((cache_pages, mmap_bytes)),
+        }
+    }
+
+    fn open_reader(&self) -> Result<Connection, StorageError> {
+        match self.pragmas {
+            Some((cache_pages, mmap_bytes)) => {
+                open_ro_with_pragmas(&self.path, cache_pages, mmap_bytes)
+            }
+            None => open_ro(&self.path),
         }
     }
 
@@ -348,7 +441,7 @@ impl DbPool {
                     pool_inner: Arc::clone(&self.inner),
                 }
             } else if lock.in_use < POOL_MAX_READERS {
-                let c = open_ro(&self.path)?;
+                let c = self.open_reader()?;
                 lock.in_use += 1;
                 PoolGuard {
                     conn: Some(c),
@@ -402,6 +495,20 @@ pub fn open_db(path: impl AsRef<Path>) -> Result<(Connection, DbPool), StorageEr
     let path = path.as_ref().to_path_buf();
     let writer = open_rw(&path)?;
     let pool = DbPool::new(path);
+    Ok((writer, pool))
+}
+
+/// Same as [`open_db`], but with explicit `cache_size`/`mmap_size` pragmas
+/// (Phase 8) applied to the writer connection AND every reader the pool
+/// subsequently opens — not just the first connection.
+pub fn open_db_with_pragmas(
+    path: impl AsRef<Path>,
+    cache_pages: i64,
+    mmap_bytes: u64,
+) -> Result<(Connection, DbPool), StorageError> {
+    let path = path.as_ref().to_path_buf();
+    let writer = open_rw_with_pragmas(&path, cache_pages, mmap_bytes)?;
+    let pool = DbPool::new_with_pragmas(path, cache_pages, mmap_bytes);
     Ok((writer, pool))
 }
 
@@ -657,6 +764,85 @@ mod tests {
                 violations.is_empty(),
                 "no violations on healthy db: {violations:?}"
             );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// Dedicated coverage for the `vacuum: true` production path (Bug 13):
+    /// churn enough rows to give VACUUM real work, then confirm it succeeds
+    /// cleanly and the file does not grow as a result.
+    #[test]
+    fn run_maintenance_with_vacuum_true_succeeds_and_does_not_grow_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_vacuum_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let (writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+            for i in 0..200 {
+                writer
+                    .execute(
+                        "INSERT INTO core_repositories \
+                             (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, 1, 1, 0, 0)",
+                        rusqlite::params![
+                            uuid::Uuid::new_v4().to_string(),
+                            format!("/tmp/vacuum-fixture-{i}"),
+                            format!("repo-{i}")
+                        ],
+                    )
+                    .unwrap();
+            }
+            // Delete most rows so VACUUM has real free space to reclaim.
+            writer
+                .execute(
+                    "DELETE FROM core_repositories WHERE root_path LIKE '/tmp/%'",
+                    [],
+                )
+                .unwrap();
+            checkpoint_wal(&writer).unwrap();
+
+            let size_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let violations =
+                run_maintenance(&writer, true, true).expect("maintenance with vacuum must succeed");
+            assert!(
+                violations.is_empty(),
+                "no violations expected on a healthy db: {violations:?}"
+            );
+            let size_after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                size_after <= size_before,
+                "VACUUM must not grow the file: before={size_before} after={size_after}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// VACUUM must never silently run mid-transaction (see the safety
+    /// comment on `run_maintenance`); confirm the precondition check rejects
+    /// it with a clear error instead of surfacing SQLite's own message.
+    #[test]
+    fn run_maintenance_vacuum_rejected_inside_open_transaction() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_vacuum_txn_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let (mut writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+
+            let tx = writer.transaction().unwrap();
+            let result = run_maintenance(&tx, false, true);
+            assert!(
+                matches!(result, Err(StorageError::Worker(_))),
+                "expected a Worker error rejecting VACUUM mid-transaction, got {result:?}"
+            );
+            tx.rollback().unwrap();
         }
 
         let _ = std::fs::remove_file(&path);

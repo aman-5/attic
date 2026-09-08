@@ -197,8 +197,10 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
                 budget_ms: 300,
                 batch_size: 4,
                 max_attempts: 3,
+                embedding_worker_count: 1,
             },
             &CancelFlag::new(),
+            attic_semantic::EmbeddingIntentSource::Recommendation,
         )
         .unwrap();
     }

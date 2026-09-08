@@ -40,8 +40,11 @@ flowchart TD
   submodule or plain independent checkout — becomes one `core_repositories`
   entry each (ADR-006).
 - **Analyzers** (`attic-analyzers`) — `GenericAnalyzer` (universal
-  fallback, every text file searchable) plus structural (tree-sitter)
-  analyzers for Java, Python, Go, JavaScript, TypeScript.
+  fallback, every text file searchable) plus two structural tiers: full
+  hand-written tree-sitter analyzers (Java, Python, Go, JavaScript,
+  TypeScript) and a generic `tags.scm`-driven engine (symbols + intra-file
+  references only) covering ten more languages — see
+  [Language support](#language-support) below.
 - **Canonical index** (`attic-storage`, SQLite + FTS5) — files, retrieval
   units, structural nodes, symbols, relationships. One coordinated
   `WriterQueue` (single writer, serialized transactions); a `DbPool` of
@@ -109,16 +112,34 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
 ## Process and ownership model
 
-- **One `attic` process owns one logical workspace.** (The binary is built
-  from the `attic-server` crate — hence that crate/component name
-  elsewhere in this doc — but the executable itself is named `attic`; see
-  README Quick Start.) A single process holds the one SQLite writer
-  (`WriterQueue`), one MCP stdio transport, and one filesystem watcher
-  **per configured repository**, all for a given database file. This is
-  not a configuration choice — `run_startup_recovery`, the watcher epoch,
-  and `ops_server_state` all assume single-process ownership. Attic does
-  **not** support multiple processes concurrently writing to the same
-  database.
+- **One `attic` daemon owns one logical workspace — per database, not per
+  process launch.** (The binary is built from the `attic-server` crate —
+  hence that crate/component name elsewhere in this doc — but the
+  executable itself is named `attic`; see README Quick Start.) The first
+  `attic` launch for a given database wins an advisory `attic.lock` and
+  becomes that database's daemon: it alone holds the one SQLite writer
+  (`WriterQueue`), one filesystem watcher **per configured repository**,
+  and runs startup recovery, for as long as it stays up. This single-owner
+  invariant is not a configuration choice — `run_startup_recovery`, the
+  watcher epoch, and `ops_server_state` all assume it — it is simply no
+  longer tied to "one process launch"; it is now tied to "one daemon per
+  database". Every later `attic` launch against the same database fails
+  that same `try_lock()` and instead becomes a thin relay: it discovers the
+  daemon's local-socket address (`interprocess::local_socket`, published to
+  a sibling `attic.ipc` file only after the daemon's listener is bound) and
+  splices its own MCP stdio transport to that socket byte-for-byte, so
+  multiple windows on the same project run genuinely concurrently against
+  the one shared live state — there is no second writer, watcher, or
+  recovery pass to reconcile. The daemon shuts down on an idle timeout once
+  every connection (its own original caller's included) has disconnected,
+  or on SIGINT; a crashed daemon's `attic.lock` is released automatically
+  by the OS, so the next launch re-elects cleanly. See
+  `crates/attic-server/src/daemon.rs` for the election/relay/accept-loop
+  implementation. Attic still does **not** support multiple *daemons*
+  concurrently writing to the same database — only one process is ever the
+  daemon for a given database at a time; setting `ATTIC_NO_DAEMON=1`
+  reproduces the older, stricter behavior where a second launch simply
+  refuses to start instead of relaying.
 - **Multi-root workspaces**: the logical workspace is the SET of
   configured repository roots, not one filesystem directory — roots may
   live anywhere on disk with no common parent, no symlinks, and no Git
@@ -133,9 +154,9 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
   ```text
   Logical Workspace
-  ├── repo A (C:\Users\<username>\Desktop\Dump)      ─┐
-  ├── repo B (C:\Users\<username>\Path1)             ─┼─ each keeps independent
-  └── repo C (C:\Users\<username>\Path3)    ─┘  source/index state (own
+  ├── repo A (C:\Users\<username>\projects\repo-a)      ─┐
+  ├── repo B (C:\Users\<username>\projects\repo-b)       ─┼─ each keeps independent
+  └── repo C (C:\Users\<username>\projects\repo-c)  ─┘  source/index state (own
                  core_repositories row, own SourceRevisions, own watcher) —
                  sync_workspace resolves edges BETWEEN them and records
                  provenance back to the WorkspaceSnapshot (parent hash)
@@ -163,22 +184,51 @@ same file without blocking the writer or each other. There is no second
 writer path anywhere in the codebase — `attic-indexing`, `attic-incremental`,
 and `attic-crossrepo` all route mutations through the same `WriterQueueHandle`.
 
+### Database lifecycle and retention
+
+Deleted-file tombstones, invalidation-audit records, and terminal
+(completed/failed/cancelled) task rows are not kept forever:
+`prune_old_tombstones`, `prune_old_invalidation_records`, and
+`prune_terminal_tasks` (default retention 90/90/30 days respectively) run as
+part of `run_maintenance`, which also issues `VACUUM` against both
+`attic.db` and `semantic.db`. `run_maintenance` is wired into the shutdown
+sequence for both databases and runs on every clean shutdown — process
+exit, SIGINT, and a daemon's idle-timeout exit alike — so on-disk file size
+is expected to shrink after deletes rather than growing unbounded across
+the lifetime of a long-running daemon.
+
 ## Language support
 
-Rich structural analysis (symbols, definitions, relationships) is currently
-implemented for **Java, Python, Go, JavaScript, and TypeScript** via
-tree-sitter grammars. Every other text-based language or format — Rust,
-Swift, C++, Kotlin, config files, docs, build files, anything not on that
-list — is **not** unsupported: it falls back to `GenericAnalyzer`, which
+Structural analysis is now a **three-tier model**. Tier 1 — full symbols,
+definitions, imports, and relationships — is hand-written per language via
+tree-sitter grammars, for **Java, Python, Go, JavaScript, and TypeScript**
+(`crates/attic-analyzers/src/structural/`; `.tsx` files specifically use the
+JSX-aware `LANGUAGE_TSX` grammar rather than the JSX-blind
+`LANGUAGE_TYPESCRIPT` one, a previously-existing bug fixed alongside this
+tier). Tier 2 — symbol definitions and intra-file references only, no
+import or relationship resolution — is a single generic engine
+(`crates/attic-analyzers/src/structural/tags_generic.rs`) driven by
+tree-sitter's `tags.scm` convention (the same mechanism GitHub/Neovim/Helix
+use for cross-language "go to definition"), covering **C, C++, Ruby, C#,
+Scala, PHP, Swift, Lua, Rust, and Dockerfile** without any hand-written
+per-language AST-walking code; the capability gap versus tier 1 is
+declared explicitly in code (`ImportExtraction=None`,
+`RelationshipResolution=None`), not silently overclaimed. Every other
+text-based language or format not on either list — Kotlin, config files,
+docs, build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
 still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
-gate on usability.
+gate on usability. A file's language hint (`AnalyzerInput.language_hint`,
+populated by `attic-indexing`'s `infer_language_hint`) is tried against the
+tier-2 table before falling back to the existing `FileType`-keyed
+registry lookup, so tier-1 languages are never shadowed by a tier-2 entry.
 
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
-| Java / Python / Go / JS / TS | Structural (tree-sitter) | Symbols, definitions, relationships |
-| Rust / Swift / C++ / Kotlin / etc. | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later without changing the pipeline |
+| Java / Python / Go / JS / TS (incl. `.tsx`) | Tier 1 — hand-written tree-sitter | Full symbols, definitions, imports, relationships |
+| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Tier 2 — generic tags.scm | Symbol definitions + intra-file references only |
+| Everything else (Kotlin, etc.) | Tier 3 — `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later without changing the pipeline |
 
 ## Project Knowledge authority model
 
@@ -404,12 +454,25 @@ this system needs to not accidentally break.
 ## Semantic layer (optional, default-disabled)
 
 Semantic (embedding-based) retrieval is **disabled by default** and only
-activates when `ATTIC_SEMANTIC=1` is set. The currently shipped embedder
-(`HashingEmbedder`) is a deterministic hashing baseline — an experimental
-placeholder, not a validated neural embedding model. When disabled or
-degraded, canonical (lexical/structural) retrieval is entirely unaffected;
-the semantic layer never gates or blocks an answer (ADR-014, decision D1).
-See ADR-013/ADR-014 for the full rationale.
+activates when `ATTIC_SEMANTIC=1` is set. When enabled, `BgeEmbedder` — a
+real, Candle-backed neural embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — is the
+default provider; `HashingEmbedder`, a deterministic feature-hashing
+baseline, remains available as an explicit `attic.toml` `[embedding]`
+override and is what CI/tests use to stay offline and byte-deterministic.
+See `docs/PROBLEM_STATEMENT.md` for the full embedding-profile/resource
+design (`EmbeddingProfile` persistence, `ResourceMode`/`ResourcePolicy`,
+hybrid search). When disabled or degraded, canonical (lexical/structural)
+retrieval is entirely unaffected; the semantic layer never gates or blocks
+an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
+rationale.
+
+The background embedding worker (`crates/attic-semantic/src/enrich.rs`)
+runs a resource-tier-scaled number of threads — 1 on `low`, 3 on
+`balanced`/`performance` (`crates/attic-storage/src/resource_policy.rs`) —
+rather than exactly one thread always. A shared reconcile-coordination
+gate prevents the (expensive) rescan from running redundantly per thread,
+an atomic queue-claim prevents two threads from claiming the same unit,
+and backoff sleeps are jittered to avoid thundering-herd wakeups.
 
 ## Resource management
 

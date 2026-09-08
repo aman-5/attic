@@ -15,11 +15,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::embedding_profile::{
+    ClaimOutcome, EmbeddingIntentSource, EmbeddingProfile, EmbeddingSpaceDescriptor,
+};
 use crate::error::SemanticError;
 use crate::provider::CancelFlag;
 use rusqlite::{Connection, params};
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
+const SEMANTIC_MIGRATION_0002: &str =
+    include_str!("../../../migrations/semantic/0002_embedding_profile.sql");
 
 /// One stored embedding with full lineage.
 #[derive(Debug, Clone)]
@@ -172,6 +177,7 @@ impl SemanticStore {
         // under migrations/ makes the complete persistent schema auditable
         // without contaminating the canonical database with semantic tables.
         conn.execute_batch(SEMANTIC_MIGRATION_0001)?;
+        conn.execute_batch(SEMANTIC_MIGRATION_0002)?;
         Ok(())
     }
 
@@ -180,6 +186,80 @@ impl SemanticStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+
+    // ── embedding profile (Phase 8) ──────────────────────────────────────
+
+    fn row_to_profile(id: String, json: String) -> Result<EmbeddingProfile, SemanticError> {
+        let config: EmbeddingSpaceDescriptor = serde_json::from_str(&json).map_err(|e| {
+            SemanticError::StoreUnavailable(format!("corrupt embedding profile: {e}"))
+        })?;
+        Ok(EmbeddingProfile { id, config })
+    }
+
+    /// Read the persisted `EmbeddingProfile`, if one has been claimed.
+    /// Cheap, local, no network — safe on the ordinary startup/`status`
+    /// path (never resolves or claims anything).
+    pub fn read_embedding_profile(&self) -> Result<Option<EmbeddingProfile>, SemanticError> {
+        let conn = self.guard()?;
+        let result = conn.query_row(
+            "SELECT profile_id, config_json FROM sem_embedding_profile WHERE singleton_guard = 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        );
+        match result {
+            Ok((id, json)) => Ok(Some(Self::row_to_profile(id, json)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Atomically claim `requested` as the active `EmbeddingProfile` if none
+    /// exists yet. Uses `INSERT ... ON CONFLICT(singleton_guard) DO NOTHING`
+    /// then reads back whichever row won, so concurrent callers always
+    /// observe the same result. See [`ClaimOutcome`] for how a lost race is
+    /// handled depending on `source`.
+    pub fn claim_embedding_profile_if_absent(
+        &self,
+        requested: EmbeddingSpaceDescriptor,
+        source: EmbeddingIntentSource,
+    ) -> Result<ClaimOutcome, SemanticError> {
+        let id = requested.profile_id();
+        let json = serde_json::to_string(&requested).map_err(|e| {
+            SemanticError::StoreUnavailable(format!("failed to encode embedding profile: {e}"))
+        })?;
+        let now = Self::now_ms();
+        let conn = self.guard()?;
+        let changed = conn.execute(
+            "INSERT INTO sem_embedding_profile (singleton_guard, profile_id, config_json, claimed_at_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton_guard) DO NOTHING",
+            params![id, json, now],
+        )?;
+        let (winning_id, winning_json): (String, String) = conn.query_row(
+            "SELECT profile_id, config_json FROM sem_embedding_profile WHERE singleton_guard = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let winning = Self::row_to_profile(winning_id, winning_json)?;
+
+        // `changed > 0` means OUR OWN insert won (empty slot or genuine race
+        // win) — distinct from a conflict that merely happens to match our
+        // request (an idempotent re-claim of an identical descriptor).
+        if changed > 0 {
+            return Ok(ClaimOutcome::Claimed(winning));
+        }
+        if winning.id == id {
+            return Ok(ClaimOutcome::ExistingMatched(winning));
+        }
+        if source.is_explicit() {
+            Ok(ClaimOutcome::Conflict {
+                requested,
+                adopted: winning,
+            })
+        } else {
+            Ok(ClaimOutcome::AdoptedRace { adopted: winning })
+        }
     }
 
     // ── embeddings ─────────────────────────────────────────────────────────
@@ -453,39 +533,39 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// Take up to `limit` PENDING items (priority DESC, FIFO within equal
-    /// priority) and mark them INFLIGHT.
+    /// Atomically claim up to `limit` PENDING items (priority DESC, FIFO
+    /// within equal priority) and mark them INFLIGHT in one statement.
+    ///
+    /// [FIX] Previously a two-phase SELECT-then-UPDATE-loop: the guard was
+    /// released between the read and the write, so two threads racing this
+    /// call could both SELECT the same PENDING rows before either UPDATE
+    /// landed, double-claiming the same work. A single `UPDATE ... RETURNING`
+    /// statement, executed while holding one `guard()` acquisition for the
+    /// whole call, makes the claim atomic — SQLite's own serialization of
+    /// writers means no other connection can observe or claim these rows
+    /// between the SELECT-subquery and the UPDATE.
     pub fn queue_take_batch(&self, limit: usize) -> Result<Vec<QueueItem>, SemanticError> {
-        // Read phase: guard scoped so it is DEFINITELY dropped before the
-        // write phase below (std Mutex is not reentrant — holding it across
-        // the update loop would self-deadlock).
-        let items: Vec<QueueItem> = {
-            let conn = self.guard()?;
-            let mut stmt = conn.prepare(
-                "SELECT retrieval_unit_id, priority, attempts FROM sem_queue
-                  WHERE state=?1
+        let conn = self.guard()?;
+        let mut stmt = conn.prepare(
+            "UPDATE sem_queue SET state = ?1
+              WHERE retrieval_unit_id IN (
+                  SELECT retrieval_unit_id FROM sem_queue
+                  WHERE state = ?2
                   ORDER BY priority DESC, enqueued_at_ms ASC, retrieval_unit_id ASC
-                  LIMIT ?2",
-            )?;
-            let mut out = Vec::new();
-            let mut rows = stmt.query(params![Q_PENDING, limit as i64])?;
-            while let Some(r) = rows.next()? {
-                out.push(QueueItem {
-                    retrieval_unit_id: r.get(0)?,
-                    priority: r.get(1)?,
-                    attempts: r.get::<_, i64>(2)? as u32,
-                });
-            }
-            out
-        };
-        // Write phase: guard reacquired per statement.
-        for it in &items {
-            self.guard()?.execute(
-                "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
-                params![it.retrieval_unit_id, Q_INFLIGHT],
-            )?;
+                  LIMIT ?3
+              )
+              RETURNING retrieval_unit_id, priority, attempts",
+        )?;
+        let mut out = Vec::new();
+        let mut rows = stmt.query(params![Q_INFLIGHT, Q_PENDING, limit as i64])?;
+        while let Some(r) = rows.next()? {
+            out.push(QueueItem {
+                retrieval_unit_id: r.get(0)?,
+                priority: r.get(1)?,
+                attempts: r.get::<_, i64>(2)? as u32,
+            });
         }
-        Ok(items)
+        Ok(out)
     }
 
     pub fn queue_mark_done(&self, unit_id: &str) -> Result<(), SemanticError> {
@@ -553,18 +633,28 @@ impl SemanticStore {
     }
 
     /// Drop queue entries for units no longer selected/existing.
+    ///
+    /// [FIX] Guarded with `AND state != Q_INFLIGHT` (both branches) so this
+    /// never deletes a row another thread currently owns mid-embedding —
+    /// without this, a concurrent `drive()` claim (INFLIGHT via
+    /// `queue_take_batch`) racing a `reconcile()` call here could have its
+    /// row deleted out from under it; the later `queue_mark_done`/
+    /// `queue_mark_failed`/`queue_reset` would then silently affect zero
+    /// rows instead of the claimed item.
     pub fn queue_retain_only(&self, keep: &[String]) -> Result<usize, SemanticError> {
         use rusqlite::ToSql;
         let n = if keep.is_empty() {
-            self.conn
-                .lock()
-                .expect("semantic store mutex")
-                .execute("DELETE FROM sem_queue", [])?
+            self.conn.lock().expect("semantic store mutex").execute(
+                "DELETE FROM sem_queue WHERE state != ?1",
+                params![Q_INFLIGHT],
+            )?
         } else {
-            let paramslice: Vec<&dyn ToSql> = keep.iter().map(|s| s as &dyn ToSql).collect();
+            let mut paramslice: Vec<&dyn ToSql> = keep.iter().map(|s| s as &dyn ToSql).collect();
+            paramslice.push(&Q_INFLIGHT as &dyn ToSql);
             let placeholders = vec!["?"; keep.len()].join(",");
-            let sql =
-                format!("DELETE FROM sem_queue WHERE retrieval_unit_id NOT IN ({placeholders})");
+            let sql = format!(
+                "DELETE FROM sem_queue WHERE retrieval_unit_id NOT IN ({placeholders}) AND state != ?"
+            );
             self.conn
                 .lock()
                 .expect("semantic store mutex")
@@ -618,6 +708,41 @@ impl SemanticStore {
     /// Approximate on-disk size of the semantic layer (observability §21/§23).
     pub fn file_size_bytes(path: &Path) -> u64 {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    // ── maintenance ──────────────────────────────────────────────────────
+
+    /// Run `semantic.db` production maintenance: an explicit WAL TRUNCATE
+    /// checkpoint plus an optional `VACUUM`, mirroring
+    /// `attic_storage::connection::run_maintenance` for the canonical
+    /// database. Like that counterpart, this is intended to be called
+    /// periodically or at clean shutdown — never from inside a held
+    /// [`SemanticStore::guard`] elsewhere in the same call stack.
+    ///
+    /// `semantic.db` accumulates free pages from `delete`,
+    /// `purge_inactive_models`, `purge_model`, and `queue_prune_done`;
+    /// without an occasional `vacuum: true` call the file never shrinks.
+    ///
+    /// `VACUUM` must NOT run while a transaction is open on the underlying
+    /// connection. This function checks `Connection::is_autocommit()` first
+    /// and fails closed with [`SemanticError::StoreUnavailable`] instead of
+    /// letting SQLite raise its own "cannot VACUUM from within a
+    /// transaction" error.
+    pub fn run_maintenance(&self, vacuum: bool) -> Result<(), SemanticError> {
+        let conn = self.guard()?;
+        // Explicit TRUNCATE checkpoint: flush WAL content into the main file
+        // and truncate the WAL to zero length.
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))?;
+        if vacuum {
+            if !conn.is_autocommit() {
+                return Err(SemanticError::StoreUnavailable(
+                    "run_maintenance: VACUUM requested while a transaction is open on the semantic store connection"
+                        .to_string(),
+                ));
+            }
+            conn.execute_batch("VACUUM")?;
+        }
+        Ok(())
     }
 }
 
@@ -765,5 +890,165 @@ mod tests {
             let counts = s.queue_counts().unwrap();
             assert_eq!(counts.get(Q_FAILED), Some(&1));
         }
+    }
+
+    fn test_descriptor(model_revision: &str) -> EmbeddingSpaceDescriptor {
+        EmbeddingSpaceDescriptor {
+            schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
+            provider: "bge".into(),
+            model: "bge-small-en-v1.5".into(),
+            model_revision: model_revision.into(),
+            tokenizer_revision: "tok-abc".into(),
+            pooling: crate::embedding_profile::PoolingStrategy::Cls,
+            normalize: true,
+            truncation: crate::embedding_profile::TruncationPolicy::Truncate,
+            max_tokens: 512,
+        }
+    }
+
+    #[test]
+    fn read_embedding_profile_absent_by_default() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        assert!(s.read_embedding_profile().unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_embedding_profile_first_claim_wins() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let desc = test_descriptor("rev1");
+        let outcome = s
+            .claim_embedding_profile_if_absent(desc.clone(), EmbeddingIntentSource::Recommendation)
+            .unwrap();
+        assert!(matches!(outcome, ClaimOutcome::Claimed(_)));
+        let persisted = s.read_embedding_profile().unwrap().unwrap();
+        assert_eq!(persisted.config, desc);
+        assert_eq!(persisted.id, desc.profile_id());
+    }
+
+    #[test]
+    fn claim_embedding_profile_existing_matched_is_idempotent() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let desc = test_descriptor("rev1");
+        s.claim_embedding_profile_if_absent(desc.clone(), EmbeddingIntentSource::Recommendation)
+            .unwrap();
+        let outcome = s
+            .claim_embedding_profile_if_absent(desc, EmbeddingIntentSource::Recommendation)
+            .unwrap();
+        assert!(matches!(outcome, ClaimOutcome::ExistingMatched(_)));
+    }
+
+    #[test]
+    fn claim_embedding_profile_recommendation_adopts_race_loss() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        s.claim_embedding_profile_if_absent(
+            test_descriptor("rev1"),
+            EmbeddingIntentSource::Recommendation,
+        )
+        .unwrap();
+        let outcome = s
+            .claim_embedding_profile_if_absent(
+                test_descriptor("rev2"),
+                EmbeddingIntentSource::Recommendation,
+            )
+            .unwrap();
+        match outcome {
+            ClaimOutcome::AdoptedRace { adopted } => {
+                assert_eq!(adopted.config, test_descriptor("rev1"));
+            }
+            other => panic!("expected AdoptedRace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_embedding_profile_explicit_request_conflicts_on_race_loss() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        s.claim_embedding_profile_if_absent(
+            test_descriptor("rev1"),
+            EmbeddingIntentSource::Recommendation,
+        )
+        .unwrap();
+        let outcome = s
+            .claim_embedding_profile_if_absent(
+                test_descriptor("rev2"),
+                EmbeddingIntentSource::TomlOverride,
+            )
+            .unwrap();
+        match outcome {
+            ClaimOutcome::Conflict { requested, adopted } => {
+                assert_eq!(requested, test_descriptor("rev2"));
+                assert_eq!(adopted.config, test_descriptor("rev1"));
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // The previous profile keeps serving — never silently discarded.
+        let persisted = s.read_embedding_profile().unwrap().unwrap();
+        assert_eq!(persisted.config, test_descriptor("rev1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Maintenance (Bug 14: semantic.db had zero VACUUM capability)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_maintenance_without_vacuum_succeeds_on_fresh_store() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        s.run_maintenance(false).unwrap();
+    }
+
+    #[test]
+    fn run_maintenance_with_vacuum_succeeds_and_does_not_grow_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("semantic.db");
+        let s = SemanticStore::open(&path).unwrap();
+
+        // Generate some churn so VACUUM has real (if modest) free space to
+        // reclaim, then check the on-disk size sanity: it must not GROW as a
+        // result of running maintenance.
+        for i in 0..20 {
+            s.put(&rec(&format!("u{i}"), vec![1.0, 0.0])).unwrap();
+        }
+        for i in 0..20 {
+            s.delete(&format!("u{i}"), None, None).unwrap();
+        }
+
+        // Checkpoint first (no vacuum) so the "before" size reflects the main
+        // db file with all WAL content already flushed in — otherwise, in
+        // WAL mode, most of this data still lives in the `-wal` file and the
+        // main file looks artificially tiny, making the very act of
+        // checkpointing (which `run_maintenance` also does) look like
+        // "growth" caused by VACUUM.
+        s.run_maintenance(false).unwrap();
+        let size_before = SemanticStore::file_size_bytes(&path);
+        s.run_maintenance(true)
+            .expect("maintenance with vacuum must succeed against a fresh semantic db");
+        let size_after = SemanticStore::file_size_bytes(&path);
+        assert!(
+            size_after <= size_before,
+            "VACUUM must not grow the file: before={size_before} after={size_after}"
+        );
+    }
+
+    #[test]
+    fn run_maintenance_vacuum_rejected_inside_open_transaction() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        {
+            // Hold the guard and open a transaction directly on the
+            // underlying connection to simulate the unsafe precondition;
+            // `run_maintenance` takes its own guard, so this must be dropped
+            // before calling it (the mutex is not reentrant).
+            let conn = s.guard().unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+        }
+        // NOTE: the transaction above is scoped to the guard's lifetime only
+        // in the sense of when we release the lock; the underlying SQLite
+        // connection itself remains mid-transaction until COMMIT/ROLLBACK.
+        let result = s.run_maintenance(true);
+        assert!(
+            matches!(result, Err(SemanticError::StoreUnavailable(_))),
+            "expected StoreUnavailable rejecting VACUUM mid-transaction, got {result:?}"
+        );
+        // Clean up: end the transaction so the connection can be dropped
+        // cleanly.
+        s.guard().unwrap().execute_batch("ROLLBACK").unwrap();
     }
 }

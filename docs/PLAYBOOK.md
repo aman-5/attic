@@ -81,9 +81,9 @@ paths:[...]}` authoritatively replaces the whole membership;
 
 ### Multi-repository operation
 
-See `docs/ARCHITECTURE.md#process-and-ownership-model`. One process, one
-logical workspace, any number of configured repository roots. Configuration
-precedence: `ATTIC_CONFIG` (explicit config file with one
+See `docs/ARCHITECTURE.md#process-and-ownership-model`. One logical
+workspace per database, any number of configured repository roots.
+Configuration precedence: `ATTIC_CONFIG` (explicit config file with one
 `[[repositories]] path = "..."` entry per root) → the persistent
 `<ATTIC_HOME>/config.toml` (default `~/.attic/config.toml`, written by the
 `workspace` MCP tool) → `ATTIC_WORKSPACE_ROOT` (legacy single repository) →
@@ -93,9 +93,20 @@ live anywhere on disk with no common parent, no symlinks required, and no
 (e.g. an unmounted external drive) are reported by `status` under
 `workspace.unavailable_repositories` with `degraded: true` — the remaining
 roots stay usable.
-**Do not** run two `attic` processes against the same `attic.db` —
-this is not a supported or tested configuration; give each concurrently
-running instance its own `ATTIC_HOME`.
+
+**Multiple windows/launches against the same `ATTIC_HOME` are supported**:
+the first launch for a given database self-elects as the daemon (owns the
+SQLite writer, watcher, and startup recovery); every later launch against
+the same database becomes a thin relay that splices its MCP stdio to the
+daemon over a local socket/named pipe, so multiple windows genuinely run
+concurrently against one shared live state — there is still only ever one
+writer. The daemon shuts down after an idle timeout (~90s with zero
+connections); a crashed daemon's lock is released automatically so the next
+launch re-elects cleanly. Set `ATTIC_NO_DAEMON=1` to force the older,
+stricter behavior where a second launch against the same database simply
+refuses to start instead of relaying. See
+`docs/ARCHITECTURE.md#process-and-ownership-model` for the full election/
+relay design.
 
 ### Project Knowledge
 
@@ -133,7 +144,11 @@ Practical guidance:
 
 Disabled by default. Enable with `ATTIC_SEMANTIC=1`. Disabling again (unset
 or `0`) at any time is safe — delete `semantic.db` if you also want to
-reclaim disk; canonical retrieval never depends on it.
+reclaim disk; canonical retrieval never depends on it. The background
+embedding worker runs a resource-tier-scaled number of threads (1 on `low`,
+3 on `balanced`/`performance`) with a shared reconcile-coordination gate, so
+the initial backlog on a large corpus drains faster on higher tiers without
+redundant rescans.
 
 ## Troubleshooting
 
@@ -208,7 +223,12 @@ Quick reference — see the detailed entries below each row for exact checks:
   enabled), and `backups/` (last 3 retained) live under the data directory
   (see README). Disk growth tracks indexed content volume, not workspace
   size directly (structural/relationship data adds overhead beyond raw
-  file bytes).
+  file bytes). On every clean shutdown (including a daemon's idle-timeout
+  exit, not just process exit), Attic prunes deleted-file tombstones and
+  invalidation-audit records older than their default retention window
+  (90/90/30 days respectively) and runs `VACUUM` against both `attic.db`
+  and `semantic.db`, so on-disk size does shrink over time after deletes —
+  it is not expected to grow unbounded.
 
 ## Recovery
 
@@ -319,11 +339,22 @@ safely removes it at any time; it will be regenerated on the next build.
   `LICENSE-APACHE`) before adding it, and prefer a crate with genuine
   Linux/macOS/Windows support over one with platform-specific gaps.
 - **Adding a language**: unsupported languages already work via
-  `GenericAnalyzer` (full-text search only). To add structural richness,
-  add a `tree-sitter-<language>` grammar dependency and a new analyzer under
-  `crates/attic-analyzers/src/structural/`, registered in the analyzer
-  dispatch table — see the existing Java/Python/Go/JS/TS analyzers as the
-  reference shape.
+  `GenericAnalyzer` (full-text search only). Two paths to structural
+  richness, depending on ambition:
+  - **Full (hand-written) analyzer** — add a `tree-sitter-<language>`
+    grammar dependency and a new analyzer under
+    `crates/attic-analyzers/src/structural/`, registered in the analyzer
+    dispatch table — see the existing Java/Python/Go/JS/TS analyzers as the
+    reference shape. Full symbols, imports, and relationships.
+  - **Generic tags.scm-based analyzer** (lower effort, lower fidelity) — if
+    the grammar crate ships a `tags.scm` query (tree-sitter's standard
+    "go to definition" convention), add one row to the data-driven
+    registration table in `crates/attic-analyzers/src/structural/
+    tags_generic.rs` instead of writing a bespoke analyzer. This yields
+    symbol definitions and intra-file references only (no import
+    resolution or cross-file relationships — an honestly-declared gap, not
+    silently overclaimed); see the C/C++/Ruby/C#/Scala/PHP/Swift/Lua/Rust/
+    Dockerfile entries already registered there for the reference shape.
 - **Retrieval changes**: modify the Query Evidence Contract or candidate
   generation in `crates/attic-retrieval`; re-run the relevant benchmark in
   `benchmarks/` against its baseline before merging (see

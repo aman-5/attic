@@ -286,6 +286,52 @@ pub fn recover_interrupted_tasks(conn: &Connection) -> Result<u64, StorageError>
     Ok(n as u64)
 }
 
+/// Default retention window, in days, for terminal (`DONE` / `FAILED` /
+/// `CANCELLED`) `ops_tasks` rows before [`prune_terminal_tasks`] considers
+/// them eligible for deletion.
+pub const DEFAULT_TERMINAL_TASK_RETENTION_DAYS: u32 = 30;
+
+/// Microseconds in one day (matches the `*_at` column unit used throughout
+/// this schema).
+const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or_default()
+}
+
+/// Permanently delete terminal `ops_tasks` rows older than the retention
+/// window, mirroring the precedent at
+/// `attic_semantic::store::SemanticStore::queue_prune_done` ("Remove DONE
+/// rows entirely (bounded queue; done work needs no history)") — except here
+/// three states are terminal (`DONE`, `FAILED`, `CANCELLED`; see
+/// `migrations/0001_initial.sql`'s `ops_tasks.state` comment) rather than
+/// just one.
+///
+/// `completed_at` is set by [`finish_task`] on every terminal transition (all
+/// three [`TaskOutcome`] branches, and [`cancel_pending_task`]), so it is
+/// used directly as the age basis. Non-terminal rows (`PENDING` / `RUNNING`)
+/// are never touched, regardless of how old `created_at` is — only rows
+/// already in a terminal state are eligible.
+///
+/// Returns the number of rows actually deleted.
+pub fn prune_terminal_tasks(
+    conn: &Connection,
+    older_than_days: u32,
+) -> Result<usize, StorageError> {
+    let cutoff_us = now_us() - i64::from(older_than_days) * DAY_US;
+    let n = conn.execute(
+        "DELETE FROM ops_tasks
+          WHERE state IN ('DONE', 'FAILED', 'CANCELLED')
+            AND completed_at IS NOT NULL
+            AND completed_at < ?1",
+        rusqlite::params![cutoff_us],
+    )?;
+    Ok(n)
+}
+
 /// Count tasks per state for the MCP status tool.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct TaskCounts {
@@ -520,5 +566,157 @@ mod tests {
             .unwrap();
         assert_eq!(state, "PENDING");
         assert_eq!(started, None);
+    }
+
+    #[test]
+    fn prune_terminal_tasks_prunes_only_old_terminal_rows() {
+        let conn = migrated_conn();
+        let old_cutoff_us =
+            now_us() - (i64::from(DEFAULT_TERMINAL_TASK_RETENTION_DAYS) + 1) * DAY_US;
+
+        // Old DONE row: must be pruned.
+        enqueue_task(
+            &conn,
+            "t-old-done",
+            None,
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"a\"}",
+            1,
+        )
+        .unwrap();
+        let old_done = claim_next_pending_task(&conn, 1).unwrap().unwrap();
+        finish_task(&conn, &old_done.id, &TaskOutcome::Done, old_cutoff_us).unwrap();
+
+        // Old FAILED (retries exhausted) row: must be pruned.
+        enqueue_task(
+            &conn,
+            "t-old-failed",
+            None,
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"b\"}",
+            1,
+        )
+        .unwrap();
+        let mut failing = claim_next_pending_task(&conn, 1).unwrap().unwrap();
+        for _ in 0..4 {
+            finish_task(
+                &conn,
+                &failing.id,
+                &TaskOutcome::Failed {
+                    error: "boom".into(),
+                },
+                old_cutoff_us,
+            )
+            .unwrap();
+            if let Some(t) = claim_next_pending_task(&conn, old_cutoff_us).unwrap() {
+                failing = t;
+            }
+        }
+        let old_failed_state: String = conn
+            .query_row(
+                "SELECT state FROM ops_tasks WHERE id = ?1",
+                [&failing.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_failed_state, "FAILED",
+            "fixture must actually reach FAILED"
+        );
+
+        // Old CANCELLED row: must be pruned.
+        enqueue_task(
+            &conn,
+            "t-old-cancelled",
+            None,
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"c\"}",
+            1,
+        )
+        .unwrap();
+        let old_cancelled = claim_next_pending_task(&conn, 1).unwrap().unwrap();
+        finish_task(
+            &conn,
+            &old_cancelled.id,
+            &TaskOutcome::Cancelled,
+            old_cutoff_us,
+        )
+        .unwrap();
+
+        // Recent DONE row: must survive.
+        enqueue_task(
+            &conn,
+            "t-recent-done",
+            None,
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"d\"}",
+            1,
+        )
+        .unwrap();
+        let recent_done = claim_next_pending_task(&conn, 1).unwrap().unwrap();
+        finish_task(&conn, &recent_done.id, &TaskOutcome::Done, now_us()).unwrap();
+
+        // Non-terminal PENDING row: must never be touched, regardless of age.
+        enqueue_task(
+            &conn,
+            "t-pending",
+            None,
+            TASK_RECONCILIATION,
+            50,
+            "{\"dedup_key\":\"pending\"}",
+            old_cutoff_us,
+        )
+        .unwrap();
+
+        // Non-terminal RUNNING row: must never be touched, regardless of age.
+        enqueue_task(
+            &conn,
+            "t-running",
+            None,
+            TASK_RECONCILIATION,
+            90,
+            "{\"dedup_key\":\"running\"}",
+            old_cutoff_us,
+        )
+        .unwrap();
+        let running = claim_next_pending_task(&conn, old_cutoff_us)
+            .unwrap()
+            .unwrap();
+
+        let total_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ops_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_before, 6);
+
+        let pruned = prune_terminal_tasks(&conn, DEFAULT_TERMINAL_TASK_RETENTION_DAYS).unwrap();
+        assert_eq!(
+            pruned, 3,
+            "old DONE + old FAILED + old CANCELLED must be pruned"
+        );
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM ops_tasks ORDER BY id")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            remaining.len(),
+            3,
+            "recent DONE + pending + running must survive"
+        );
+        assert!(remaining.contains(&recent_done.id));
+        assert!(remaining.contains(&running.id));
+        assert!(
+            remaining
+                .iter()
+                .any(|id| id != &recent_done.id && id != &running.id),
+            "the still-PENDING row must also survive"
+        );
     }
 }

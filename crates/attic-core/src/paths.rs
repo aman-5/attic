@@ -65,6 +65,9 @@ pub struct AtticPaths {
     pub database: PathBuf,
     /// Persistent workspace configuration file (`<home>/config.toml`).
     pub config_file: PathBuf,
+    /// Resource/embedding tunables file (`<home>/attic.toml`). A second,
+    /// separate file from `config_file` — never merged with it.
+    pub runtime_config: PathBuf,
     /// Semantic layer database (`<home>/semantic.db`).
     pub semantic_db: PathBuf,
     /// Crash-recovery backup directory (`<home>/backups/`).
@@ -143,6 +146,7 @@ impl AtticPaths {
         Ok(Self {
             database,
             config_file: home.join("config.toml"),
+            runtime_config: home.join("attic.toml"),
             semantic_db: home.join("semantic.db"),
             backups_dir: backups,
             temp_dir: tmp,
@@ -295,6 +299,7 @@ mod tests {
         let paths = AtticPaths {
             database: home.join("attic.db"),
             config_file: home.join("config.toml"),
+            runtime_config: home.join("attic.toml"),
             semantic_db: home.join("semantic.db"),
             backups_dir: home.join("backups"),
             temp_dir: home.join("tmp"),

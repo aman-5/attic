@@ -58,9 +58,9 @@ Attic connects even with nothing configured, then you configure it by simply
 telling your AI client:
 
 > Configure Attic with these repositories:
-> `C:\Users\me\Desktop\Dump`
-> `C:\work\HDFC`
-> `D:\repos\HDFC-Bank-on-prem`
+> `C:\Users\<username>\projects\repo-a`
+> `C:\work\repo-b`
+> `D:\repos\repo-c`
 
 The AI invokes Attic's `workspace` MCP tool; Attic validates the roots,
 persists them atomically to `~/.attic/config.toml` (override the location
@@ -180,9 +180,9 @@ rarely one directory tree — repositories often live in unrelated
 locations with no common parent, e.g.:
 
 ```text
-C:\Users\<username>\Desktop\Dump
-C:\Users\<username>\Path1
-C:\Users\<username>\Path3
+C:\Users\<username>\projects\repo-a
+C:\Users\<username>\projects\repo-b
+C:\Users\<username>\projects\repo-c
 ```
 
 Set `ATTIC_CONFIG` to a small config file listing each root explicitly —
@@ -191,13 +191,13 @@ submodules, and no additional MCP entries/databases:
 
 ```text
 [[repositories]]
-path = "C:\Users\<username>\Desktop\Dump"
+path = "C:\Users\<username>\projects\repo-a"
 
 [[repositories]]
-path = "C:\Users\<username>\Path1"
+path = "C:\Users\<username>\projects\repo-b"
 
 [[repositories]]
-path = "C:\Users\<username>\Path3"
+path = "C:\Users\<username>\projects\repo-c"
 ```
 
 ```sh
@@ -216,11 +216,21 @@ shared auth package" from each repository's own manifests (`package.json`,
 `pom.xml`, `go.mod`, `.gitmodules`, etc.) — arbitrary, unrelated roots work
 exactly like repositories that happen to share a parent directory.
 
-A **single** `attic` process owns one logical workspace and one
-database: one coordinated writer queue, one MCP transport, one watcher
-per configured repository. Attic does **not** support multiple `attic-server` processes writing to the same database
-concurrently — give each concurrently running instance its own
-`ATTIC_HOME`.
+One logical workspace, one database, one coordinated writer queue, one
+watcher per configured repository — but not necessarily one process. The
+first `attic` launch for a given database self-elects as its **daemon**
+(owns the writer, watchers, and startup recovery); every later launch
+against the same database becomes a thin **relay** that splices its own
+MCP stdio to the daemon over a local socket/named pipe, so multiple
+windows on the same project run genuinely concurrently against one shared
+live state — there is still only ever one writer. The daemon shuts down
+after an idle timeout (~90s with zero connections); set `ATTIC_NO_DAEMON=1`
+to force the older, stricter behavior where a second launch against the
+same database simply refuses to start instead of relaying. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#process-and-ownership-model)
+for the full election/relay design. Attic still does **not** support
+multiple *daemons* concurrently writing to the same database — give each
+concurrently running *daemon* its own `ATTIC_HOME`.
 
 ## Project Knowledge
 
@@ -259,8 +269,9 @@ this repository for a ready-to-copy template.
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
-| Java / Python / Go / JavaScript / TypeScript | Structural (tree-sitter) | Symbols, definitions, relationships |
-| Rust / Swift / C++ / Kotlin / etc. | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later |
+| Java / Python / Go / JavaScript / TypeScript (incl. `.tsx`) | Structural (hand-written tree-sitter) | Full symbols, definitions, imports, relationships |
+| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Structural (generic tags.scm) | Symbol definitions + intra-file references only — no import/relationship resolution (honestly declared, not overclaimed) |
+| Everything else (Kotlin, etc.) | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later |
 
 Rich language support is additive, not a gate on usability — every
 text-based file in your workspace is searchable from the first index,
@@ -298,12 +309,12 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_HOME` | Overrides the Attic application home directory (default: `~/.attic`). Config, database, and runtime state all derive from this location. An empty `ATTIC_HOME` is a startup error — unset it or provide a valid path. |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
 | `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer — see [Semantic search](#semantic-search-optional). |
+| `ATTIC_MODEL_CACHE_DIR` | Directory `BgeEmbedder` downloads/caches model files into (default: alongside the database, in a `models` subdirectory). Point this at a pre-populated cache for offline/airgapped use — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
+| `ATTIC_RESOURCE_MODE` | Force `low` / `balanced` / `performance` resource tuning instead of hardware-detected `auto` (see `attic.toml`'s `[resources]` table for the same override, and the `status` tool's `resource_mode_source` field). |
 | `ATTIC_TOTAL_MEMORY_BUDGET_MIB` | Total memory budget enforced by the resource monitor. |
 | `ATTIC_MAX_FOREGROUND_QUERIES` | Concurrent foreground MCP query cap. |
-| `ATTIC_MAX_BACKGROUND_WORKERS` | Concurrent background (indexing/semantic) worker admission cap enforced by the resource monitor (`attic-storage::resource_manager`). Distinct from `ATTIC_MAX_INDEXING_WORKERS` below, which bounds the indexing pipeline itself. |
-| `ATTIC_MAX_INDEXING_WORKERS` | Maximum concurrent indexing workers, so indexing never starves foreground queries (`attic-core::config::ProductionConfig`). |
-| `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_manager.rs`. |
+| `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_policy.rs`. |
 | `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
 | `ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY` / `ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY` | Maximum pending incremental / reconciliation task-queue depth. |
 | `ATTIC_MAX_GRAPH_DEPTH` / `ATTIC_MAX_GRAPH_NODES` | Bounds on graph traversal depth/breadth during evidence expansion. |
@@ -313,6 +324,7 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_CHECKPOINT_WAL_FRAMES` / `ATTIC_CHECKPOINT_MINUTES` / `ATTIC_WAL_AUTOCKPT_ENABLED` | WAL checkpoint interval (by frame count or elapsed time, whichever comes first) and whether auto-checkpointing is enabled. |
 | `ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS` | How long the server waits for in-flight tasks to complete on shutdown before force-exiting. |
 | `ATTIC_STARTUP_INTEGRITY_CHECK` / `ATTIC_STARTUP_FOREIGN_KEY_CHECK` | Whether the database integrity check / foreign-key check runs at startup (see Crash recovery in `docs/ARCHITECTURE.md`). |
+| `ATTIC_NO_DAEMON` | Set to `1` to disable the daemon/relay architecture and force the older single-process behavior, where a second launch against the same database refuses to start instead of relaying (see [Workspaces & Multiple Repositories](#workspaces--multiple-repositories)). |
 
 Home resolution: `ATTIC_HOME` (if set and non-empty) → `~/.attic` (derived
 from the OS user home directory). Setting `ATTIC_HOME` to an empty string is
@@ -323,11 +335,59 @@ Attic home directory.
 
 ### Semantic search (optional)
 
-Disabled by default (`ATTIC_SEMANTIC=1` to opt in). The shipped embedder
-(`HashingEmbedder`) is a deterministic hashing baseline — an experimental
-placeholder, not a validated neural embedding model; real neural-embedding
-support is tracked in `docs/FINAL_VALIDATION_TODO.md`, not implied by this
-flag. Canonical (lexical/structural) retrieval never depends on it.
+Disabled by default (`ATTIC_SEMANTIC=1` to opt in). When enabled, `search`
+and `context` are backed by `BgeEmbedder` — a real, Candle-backed neural
+embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — by default; `HashingEmbedder`, a
+deterministic feature-hashing baseline, remains available as an explicit
+`[embedding]` override in `attic.toml` (see below) and is what CI/tests use
+to stay fully offline and byte-deterministic. Canonical (lexical/structural)
+retrieval never depends on either. The `status` tool reports which provider
+is actually active (`embedding_recommendation`, `active_embedding_profile`,
+`semantic_health`, `re_index_recommended`) — a model/provider change never
+silently takes effect on an existing corpus; it surfaces "re-index
+recommended" instead.
+
+**Offline / airgapped machines:** `BgeEmbedder` downloads `BAAI/bge-base-en-v1.5`
+(~438MB) from Hugging Face on first use and caches it — no network access is
+needed on subsequent runs. To use it on a machine without network access,
+pre-populate the cache on a machine that does, then copy that cache directory
+over and point `ATTIC_MODEL_CACHE_DIR` at it. Without network access and
+without a pre-populated cache, semantic search falls back to `HashingEmbedder`
+for that (unclaimed) session rather than failing to start.
+
+### `attic.toml` (optional resource/embedding tuning)
+
+A second, optional file living alongside `<ATTIC_HOME>/config.toml` (which
+keeps its existing `[[repositories]]` workspace-membership role, untouched).
+`attic.toml` exposes hardware-aware runtime tuning:
+
+```toml
+[resources]
+mode = "auto"  # or "low" / "balanced" / "performance" to force a tier
+
+# Optional overrides — uncomment to override automatic tuning.
+# total_memory_budget_mib = 4096
+# min_free_memory_mib = 400
+# max_foreground_queries = 64
+# writer_batch_size = 256
+# writer_flush_interval_ms = 50
+# writer_queue_capacity = 512
+# max_io_ops_per_sec = 200
+
+[embedding]
+# Default: Attic's recommended provider ("bge", a real neural embedder).
+# Uncomment to force the deterministic offline baseline instead.
+# provider = "hashing"
+```
+
+There is no `model` override — V1 has exactly one loadable model per provider
+(`bge` → `bge-base-en-v1.5`; hardware-tiered model selection is deferred, not
+user-configurable). `provider` is the only real, working `[embedding]` knob.
+
+Absent, the file defaults to `mode = "auto"` (hardware-detected) and the
+recommended embedding provider. `scheduler_workers`, SQLite `cache`/`mmap`
+sizing, and `embedding_batch_size` are mode-derived/automatic and not
+user-tunable in `attic.toml` by design.
 
 ## Troubleshooting
 
