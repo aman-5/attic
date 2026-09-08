@@ -605,9 +605,23 @@ pub(crate) async fn run_daemon_accept_loop(
     if join_result.is_err() {
         warn!(
             "attic daemon: {} connection task(s) did not finish within the shutdown timeout; \
-             proceeding with database shutdown maintenance regardless",
+             aborting them before proceeding with database shutdown maintenance",
             tasks.len()
         );
+        // Force-abort every still-running connection task so its `server`
+        // clone (and the `Arc<WriterQueue>` inside it) is guaranteed
+        // dropped before the WAL checkpoint in `run_shutdown_sequence`
+        // runs below. Without this, a connection handler that genuinely
+        // hung past the join deadline could still hold a live `server`
+        // clone at this point, racing the checkpoint against the writer
+        // thread not actually being stopped yet — the same invariant the
+        // `drop(server)` above establishes for the common case, closed
+        // here for the timeout edge case too. `join_next()` is drained
+        // (not just `abort_all()` called) so this function does not
+        // return until every task has actually finished unwinding, not
+        // merely been asked to.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
 
     run_shutdown_sequence(shutdown_handles, semantic_enricher, &shutdown_reason).await;

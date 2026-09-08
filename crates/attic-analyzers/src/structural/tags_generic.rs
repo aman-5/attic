@@ -389,7 +389,10 @@ fn map_symbol_kind(syntax_type: &str) -> SymbolKind {
         "module" => SymbolKind::Module,
         "macro" => SymbolKind::Macro,
         "type" => SymbolKind::TypeAlias,
-        "field" | "property" | "variable" => SymbolKind::Variable,
+        // "field"/"property"/"variable" fall through here too — no
+        // dedicated SymbolKind exists for them, so they're intentionally
+        // indistinguishable from the catch-all rather than listed
+        // separately as if they were treated differently.
         _ => SymbolKind::Variable,
     }
 }
