@@ -68,8 +68,9 @@ flowchart TD
 - **Cross-repository intelligence** (`attic-crossrepo`) — resolves
   dependency edges across the workspace's member repositories once at startup; gates
   cross-repo-dependent answers while degraded.
-- **MCP surface** (`attic-server`) — rmcp stdio transport; tools: `file`,
-  `search`, `repo_map`, `status`, `context`.
+- **MCP surface** (`attic-server`) — rmcp stdio transport (relayed over a
+  daemon's local socket/named pipe on later launches); tools: `file`,
+  `search`, `repo_map`, `status`, `context`, `workspace`, `logging`.
 
 ### Indexing pipeline
 
@@ -318,10 +319,13 @@ rationale lives only in the archive branch's git history now):
   independently of the schema version so that shipping an improved secret
   pattern set can trigger a targeted re-scan (`PARTIALLY_REBUILDABLE`)
   without forcing a full workspace rebuild.
-- **Single-process ownership is a schema-level guarantee, not just a
+- **Single-writer ownership is a schema-level guarantee, not just a
   convention**: `ops_server_state` has a `CHECK` constraint pinning it to
-  exactly one row, so a second process attempting to run against the same
-  database cannot silently diverge into two independent server-state views.
+  exactly one row, so a second process attempting to write against the same
+  database outside the daemon/relay protocol cannot silently diverge into
+  two independent server-state views (see [Process and ownership
+  model](#process-and-ownership-model): one daemon owns the writer per
+  database; later launches relay to it rather than opening a second one).
 - **Per-subsystem compatibility versioning**: `core_index_generations.
   subsystem_versions_json` tracks schema/analyzer/segmentation/discovery
   versions independently, so a change in one subsystem (e.g. an analyzer
@@ -451,17 +455,18 @@ this system needs to not accidentally break.
 - The writer queue is drained (bounded) before process exit — shutdown never
   abandons a write mid-flight without at least attempting to finish it.
 
-## Semantic layer (optional, default-disabled)
+## Semantic layer (optional, default-enabled)
 
-Semantic (embedding-based) retrieval is **disabled by default** and only
-activates when `ATTIC_SEMANTIC=1` is set. When enabled, `BgeEmbedder` — a
+Semantic (embedding-based) retrieval is **enabled by default**; set
+`ATTIC_SEMANTIC=0` to disable it. When enabled, `BgeEmbedder` — a
 real, Candle-backed neural embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — is the
 default provider; `HashingEmbedder`, a deterministic feature-hashing
 baseline, remains available as an explicit `attic.toml` `[embedding]`
 override and is what CI/tests use to stay offline and byte-deterministic.
-See `docs/PROBLEM_STATEMENT.md` for the full embedding-profile/resource
-design (`EmbeddingProfile` persistence, `ResourceMode`/`ResourcePolicy`,
-hybrid search). When disabled or degraded, canonical (lexical/structural)
+See [Resource management](#resource-management) below for the
+`EmbeddingProfile` persistence and `ResourceMode`/`ResourcePolicy` design,
+and `crates/attic-retrieval/src/hybrid.rs` for the RRF hybrid-search fusion.
+When disabled or degraded, canonical (lexical/structural)
 retrieval is entirely unaffected; the semantic layer never gates or blocks
 an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
 rationale.
@@ -551,9 +556,9 @@ pins the entire application home: config + database + backups + scratch.
 Attic speaks MCP exclusively over stdio: **stdout carries only the MCP
 JSON-RPC protocol; every log line goes to stderr** (`tracing`, controlled by
 `ATTIC_LOG`/`RUST_LOG`). This has been verified by a smoke test that spawns
-the release binary and inspects both streams directly. The six registered
-tools (`file`, `search`, `repo_map`, `status`, `context`, `workspace`) are
-documented in the README; their exact schemas are defined once in
+the release binary and inspects both streams directly. The seven registered
+tools (`file`, `search`, `repo_map`, `status`, `context`, `workspace`,
+`logging`) are documented in the README; their exact schemas are defined once in
 `crates/attic-server/src/main.rs::make_tools()` and returned verbatim via
 `tools/list` — that function is the single source of truth for the tool
 surface.

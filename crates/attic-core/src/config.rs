@@ -47,10 +47,17 @@ pub enum ResourceModeSetting {
 /// mode-derived/automatic in V1 by design — not parsed from this struct at
 /// all, so there is no parsed-and-ignored field for them.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceOverrides {
-    /// `"auto"` (default), or an explicit forced mode.
+    /// `None` when not set at all (falls through to the next layer in
+    /// `resolve_effective_config`'s precedence chain); `Some(Auto)` when
+    /// EXPLICITLY set to `"auto"`/`ATTIC_RESOURCE_MODE=auto`. These two must
+    /// stay distinguishable: an explicit env override of `auto` must still
+    /// win over a toml `mode = "performance"` per the documented
+    /// `env > toml` precedence, which a bare (non-`Option`) `Auto` value
+    /// could not express (it would be indistinguishable from "unset").
     #[serde(default)]
-    pub mode: ResourceModeSetting,
+    pub mode: Option<ResourceModeSetting>,
     /// Override for `ResourcePolicy::memory_budget_mib`.
     pub total_memory_budget_mib: Option<u64>,
     /// Override for `ResourcePolicy::min_free_memory_mib`.
@@ -74,11 +81,7 @@ impl ResourceOverrides {
     /// in `attic_storage::resource_policy::resolve_effective_config`).
     pub fn layer(self, other: &ResourceOverrides) -> Self {
         Self {
-            mode: if matches!(other.mode, ResourceModeSetting::Auto) {
-                self.mode
-            } else {
-                other.mode
-            },
+            mode: other.mode.or(self.mode),
             total_memory_budget_mib: other
                 .total_memory_budget_mib
                 .or(self.total_memory_budget_mib),
@@ -205,7 +208,7 @@ mod tests {
     fn default_config_has_no_explicit_embedding_override() {
         let cfg = AtticConfig::default();
         assert!(!cfg.has_explicit_embedding_override());
-        assert!(matches!(cfg.resources.mode, ResourceModeSetting::Auto));
+        assert!(cfg.resources.mode.is_none());
     }
 
     #[test]
@@ -242,7 +245,14 @@ mod tests {
     #[test]
     fn shipped_template_parses_and_has_no_overrides() {
         let cfg = AtticConfig::parse_str(ATTIC_TOML_TEMPLATE).unwrap();
-        assert!(matches!(cfg.resources.mode, ResourceModeSetting::Auto));
+        // The shipped template explicitly writes `mode = "auto"`, so this is
+        // `Some(Auto)` (an explicit choice), not `None` (unset) — see
+        // `default_config_has_no_explicit_embedding_override` for the
+        // actually-unset case.
+        assert!(matches!(
+            cfg.resources.mode,
+            Some(ResourceModeSetting::Auto)
+        ));
         assert!(cfg.resources.total_memory_budget_mib.is_none());
         assert!(!cfg.has_explicit_embedding_override());
     }
@@ -264,14 +274,36 @@ mod tests {
     }
 
     #[test]
-    fn resource_overrides_layer_keeps_base_mode_when_other_is_auto() {
+    fn resource_overrides_layer_keeps_base_mode_when_other_is_unset() {
         let base = ResourceOverrides {
-            mode: ResourceModeSetting::Performance,
+            mode: Some(ResourceModeSetting::Performance),
             ..Default::default()
         };
         let env = ResourceOverrides::default();
         let merged = base.layer(&env);
-        assert!(matches!(merged.mode, ResourceModeSetting::Performance));
+        assert!(matches!(
+            merged.mode,
+            Some(ResourceModeSetting::Performance)
+        ));
+    }
+
+    #[test]
+    fn resource_overrides_layer_prefers_other_explicit_auto_over_base_mode() {
+        // The precedence-breaking case this type exists to prevent: an
+        // explicit `Some(Auto)` in `other` (e.g. `ATTIC_RESOURCE_MODE=auto`)
+        // must still win over a set `self.mode`, exactly like any other
+        // explicit `other` value would — it must NOT be treated as if `other`
+        // left mode unset.
+        let base = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Performance),
+            ..Default::default()
+        };
+        let env = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Auto),
+            ..Default::default()
+        };
+        let merged = base.layer(&env);
+        assert!(matches!(merged.mode, Some(ResourceModeSetting::Auto)));
     }
 
     #[test]
@@ -290,7 +322,7 @@ mod tests {
         let cfg = AtticConfig::parse_str(toml).unwrap();
         assert!(matches!(
             cfg.resources.mode,
-            ResourceModeSetting::Performance
+            Some(ResourceModeSetting::Performance)
         ));
         assert_eq!(cfg.resources.total_memory_budget_mib, Some(8192));
         assert_eq!(cfg.resources.max_io_ops_per_sec, Some(400));

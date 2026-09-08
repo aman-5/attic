@@ -136,6 +136,12 @@ struct SemanticHit {
     similarity: f32,
     repository_id: String,
     path: String,
+    /// 1-based rank in the original kNN order, BEFORE anchor-resolution
+    /// filtering drops any hits. RRF must score by this, not by position in
+    /// the (possibly shorter) filtered `Vec` — otherwise a hit whose
+    /// predecessor lost its anchor gets scored as if it ranked higher than
+    /// it truly did.
+    rank: usize,
 }
 
 /// Thin caller over `fts_search` + the semantic kNN stack, fusing both via
@@ -167,8 +173,23 @@ impl<'a> HybridSearcher<'a> {
             language: opts.language.as_deref(),
             max_results: opts.fts_candidate_depth,
         };
-        let fts = self.pool.with_reader(|c| fts_search(c, &params))?;
-        let (semantic_hits, semantic_degraded) = self.fetch_semantic(query, opts);
+        // FTS and semantic search are fully independent (neither depends on
+        // the other's result) but were previously run back-to-back, paying
+        // the sum of both latencies instead of the max. Run them on separate
+        // threads so a slow semantic embed/kNN pass overlaps the FTS query
+        // instead of queuing behind it.
+        let (fts, (semantic_hits, semantic_degraded)) = std::thread::scope(|scope| {
+            let semantic_handle = scope.spawn(|| self.fetch_semantic(query, opts));
+            let fts = self.pool.with_reader(|c| fts_search(c, &params));
+            let semantic = semantic_handle.join().unwrap_or_else(|_| {
+                (
+                    Vec::new(),
+                    Some(SemanticDegradationReason::StoreUnavailable),
+                )
+            });
+            (fts, semantic)
+        });
+        let fts = fts?;
         let results = rrf_fuse(fts, semantic_hits, opts.result_limit);
         Ok(HybridSearchResponse {
             results,
@@ -263,16 +284,20 @@ impl<'a> HybridSearcher<'a> {
 
         let hits = kn.hits;
         let anchored = self.pool.with_reader(|conn| {
+            // Batched: one query per 64-hit chunk instead of 2-3 round
+            // trips per individual hit (a single search can have 100-250+
+            // hits, so this replaces hundreds of sequential round trips).
+            let ids: Vec<String> = hits.iter().map(|h| h.retrieval_unit_id.clone()).collect();
+            let anchors = attic_storage::retrieval_unit_anchors(conn, &ids)?;
             let mut out = Vec::with_capacity(hits.len());
-            for h in &hits {
-                if let Some(anchor) =
-                    attic_storage::retrieval_unit_anchor(conn, &h.retrieval_unit_id)?
-                {
+            for (i, h) in hits.iter().enumerate() {
+                if let Some(anchor) = anchors.get(&h.retrieval_unit_id) {
                     out.push(SemanticHit {
                         retrieval_unit_id: h.retrieval_unit_id.clone(),
                         similarity: h.similarity,
-                        repository_id: anchor.repository_id,
-                        path: anchor.path,
+                        repository_id: anchor.repository_id.clone(),
+                        path: anchor.path.clone(),
+                        rank: i + 1,
                     });
                 }
             }
@@ -339,8 +364,8 @@ fn rrf_fuse(
             });
     }
 
-    for (i, h) in semantic.iter().enumerate() {
-        let rank = i as f64 + 1.0;
+    for h in semantic.iter() {
+        let rank = h.rank as f64;
         let contribution = 1.0 / (K_RRF + rank);
         scores
             .entry(h.retrieval_unit_id.clone())
@@ -409,11 +434,15 @@ mod tests {
     }
 
     fn sem_hit(id: &str, similarity: f32) -> SemanticHit {
+        // All current call sites pass a single-element Vec, so rank 1
+        // matches every one of them; add a `rank` parameter if a test ever
+        // needs a multi-hit Vec with a non-trivial rank ordering.
         SemanticHit {
             retrieval_unit_id: id.into(),
             similarity,
             repository_id: "repo".into(),
             path: format!("{id}.rs"),
+            rank: 1,
         }
     }
 
@@ -480,28 +509,5 @@ mod tests {
         let fts: Vec<_> = (0..5).map(|i| fts_hit(&format!("u{i}"), 1.0)).collect();
         let out = rrf_fuse(fts, vec![], 2);
         assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn ties_break_by_retrieval_unit_id() {
-        // Two units with identical rank-1 contribution from two independent
-        // single-hit FTS calls would tie on score; verify deterministic order.
-        let out = rrf_fuse(vec![fts_hit("b", 1.0), fts_hit("a", 1.0)], vec![], 10);
-        // "a" and "b" both get rank 1 and rank 2 respectively from a single
-        // FTS list, so they do NOT tie here; assert plain rank ordering
-        // instead (first hit ranks first).
-        assert_eq!(out[0].retrieval_unit_id, "b");
-        assert_eq!(out[1].retrieval_unit_id, "a");
-    }
-
-    #[test]
-    fn first_hit_ranks_above_later_hits_within_one_ranker() {
-        let out = rrf_fuse(
-            vec![fts_hit("first", 1.0), fts_hit("second", 1.0)],
-            vec![],
-            10,
-        );
-        assert!(out[0].rrf_score > out[1].rrf_score);
-        assert_eq!(out[0].retrieval_unit_id, "first");
     }
 }

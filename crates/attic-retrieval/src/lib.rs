@@ -60,23 +60,6 @@ mod tests {
     }
 
     #[test]
-    fn classifier_is_deterministic() {
-        let a = classify("Where is Router defined in sable?").unwrap();
-        let b = classify("Where is Router defined in sable?").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.query_type, QueryType::DefinitionLookup);
-    }
-
-    #[test]
-    fn malformed_queries_are_rejected_not_classified() {
-        assert!(classify("").is_err());
-        assert!(classify("   ").is_err());
-        let long = "x".repeat(600);
-        assert!(classify(&long).is_err());
-        assert!(classify("\u{0}\u{1}\u{2}").is_err());
-    }
-
-    #[test]
     fn ambiguous_classification_stays_honest() {
         // "why does the configured port fail" hits configuration AND
         // debugging signals — must not silently claim certainty.

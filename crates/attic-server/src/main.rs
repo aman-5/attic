@@ -288,7 +288,23 @@ fn resolve_semantic_provider(
                         }
                     }
                 }
-                _ => Arc::new(attic_semantic::HashingEmbedder::new()),
+                id if id == attic_semantic::HashingEmbedder::ID => {
+                    Arc::new(attic_semantic::HashingEmbedder::new())
+                }
+                id => {
+                    // Unrecognized persisted provider id (typo, renamed id,
+                    // or an id from a newer build) — same anti-drift rule as
+                    // the bge arm above applies: never silently reinterpret
+                    // it as hashing, which would write hashing-space vectors
+                    // under a mismatched claimed identity.
+                    tracing::warn!(
+                        "persisted profile names unrecognized provider '{id}'; semantic layer \
+                         DEGRADED — never silently reinterpreting as hashing"
+                    );
+                    Arc::new(attic_semantic::UnavailableProvider {
+                        reason: format!("unrecognized persisted provider id '{id}'"),
+                    })
+                }
             };
         return (provider, EmbeddingIntentSource::Recommendation);
     }
@@ -678,6 +694,19 @@ impl AtticServer {
         let results_mutex: std::sync::Mutex<Vec<Result<(PathBuf, String), ServerError>>> =
             std::sync::Mutex::new(Vec::new());
 
+        // Phase 2B: each bootstrap worker must hold an indexing-heavy permit
+        // (a background slot from the shared `ResourceMonitor`) for the
+        // duration of its `bootstrap_workspace_cancellable` call.  Without
+        // this, unbounded numbers of concurrent bootstrap threads could proceed
+        // under `Pause`/`Emergency` pressure or beyond the configured
+        // background-slot capacity, silently violating the resource model.
+        //
+        // The borrow is extracted here (before the scope) so the reference has
+        // a lifetime that outlives the scope's thread closures — `Arc::as_ref`
+        // gives a `&ResourceMonitor` that lives as long as `self`.
+        let monitor_ref: Option<&attic_storage::resource_manager::ResourceMonitor> =
+            self.resource_monitor.as_deref();
+
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| {
@@ -687,6 +716,29 @@ impl AtticServer {
                             q.pop_front()
                         };
                         let Some(root) = root else { break };
+
+                        // Acquire an indexing-heavy background permit before
+                        // doing any expensive filesystem/DB work.  The blocking
+                        // variant spins with sleep until:
+                        //   (a) a slot opens AND pressure is below Pause/Emergency
+                        //       → returns Some(permit), RAII-released on drop; or
+                        //   (b) cancellation fires → returns None → break loop.
+                        // When no ResourceMonitor is configured (tests / legacy
+                        // mode) the permit is skipped entirely.
+                        let _permit: Option<attic_storage::IndexingHeavyPermit<'_>> =
+                            if let Some(monitor) = monitor_ref {
+                                let permit = monitor.acquire_indexing_heavy_blocking(|| {
+                                    cancellation.is_cancelled()
+                                });
+                                if permit.is_none() {
+                                    // Cancellation fired while waiting for a slot.
+                                    break;
+                                }
+                                permit
+                            } else {
+                                None
+                            };
+
                         let outcome = self
                             .bootstrap_workspace_cancellable(&root, cancellation)
                             .map(|id| (root, id));
@@ -694,6 +746,8 @@ impl AtticServer {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push(outcome);
+                        // `_permit` drops here, releasing the background slot
+                        // before the next iteration's acquisition attempt.
                     }
                 });
             }
@@ -703,8 +757,25 @@ impl AtticServer {
             .into_inner()
             .unwrap_or_else(|e| e.into_inner());
         let mut ok_results = Vec::with_capacity(results.len());
+        let mut first_err = None;
         for r in results {
-            ok_results.push(r?);
+            match r {
+                Ok(v) => ok_results.push(v),
+                Err(e) => {
+                    tracing::warn!("nested repo bootstrap failed: {e}");
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        // Every root is attempted regardless of a sibling's failure (see doc
+        // comment above); a failure only propagates to the caller when NO
+        // root succeeded, so partial successes aren't discarded alongside it.
+        if ok_results.is_empty()
+            && let Some(e) = first_err
+        {
+            return Err(e);
         }
         Ok(ok_results)
     }
@@ -2065,10 +2136,19 @@ fn handle_status(
     if let Some(monitor) = resource_monitor {
         payload["resource_pressure"] = json!({
             "level": monitor.pressure().to_string().to_lowercase(),
+            // Phase 1 extension: hysteresis-smoothed tier (stable_tier_pressure)
+            // and slot/RSS/uptime observability fields.
+            "stable_tier": format!("{:?}", monitor.stable_tier_pressure()).to_lowercase(),
             "memory_used_mib": monitor.memory_used_mib(),
             "peak_memory_used_mib": monitor.peak_memory_used_mib(),
+            "process_rss_mib": monitor.process_rss_mib(),
             "min_free_memory_mib": monitor.min_free_memory_mib(),
             "max_memory_mib": monitor.max_memory_mib(),
+            "foreground_slots_in_use": monitor.foreground_slots_in_use(),
+            "foreground_capacity": monitor.foreground_capacity(),
+            "background_slots_in_use": monitor.background_slots_in_use(),
+            "background_capacity": monitor.background_capacity(),
+            "uptime_secs": monitor.uptime_secs(),
         });
         payload["resource_advisory"] = json!({
             "advisory": match attic_storage::resource_manager::current_advisory(monitor) {
@@ -2605,6 +2685,41 @@ impl ServerHandler for AtticServer {
             // IDs that belong to the CURRENT configured workspace. Query tools
             // use this so historical repositories still present in storage can
             // never leak into active retrieval.
+            // Phase 5: pressure-aware foreground admission by tool cost.
+            // Cheap tools (status, logging, workspace) are always admitted.
+            // Normal tools (file, search, repo_map) are always admitted.
+            // Expensive tools (context) are rejected at Critical/Emergency pressure tier
+            // to protect available memory for in-flight requests.
+            if matches!(name.as_ref(), "context") {
+                if let Some(monitor) = self.resource_monitor.as_ref() {
+                    use attic_core::ResourcePressure;
+                    let tier = monitor.stable_tier_pressure();
+                    if matches!(
+                        tier,
+                        ResourcePressure::Critical | ResourcePressure::Emergency
+                    ) {
+                        tracing::info!(
+                            tool = "context",
+                            ?tier,
+                            "Phase 5: rejecting expensive tool call under high memory pressure"
+                        );
+                        drop(admission);
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(
+                            serde_json::json!({
+                                "error": "server_busy",
+                                "message": format!(
+                                    "memory pressure too high ({tier:?}) to accept a new \
+                                     context query; retry shortly or use mode=FAST"
+                                ),
+                                "retriable": true,
+                            })
+                            .to_string(),
+                        )])
+                        .into());
+                    }
+                }
+            }
+
             let active_ids: HashSet<String> = if workspace_configured {
                 let container_repo_roots =
                     lock_or_call_err!(self.container_repo_roots.read(), "container_repo_roots");
@@ -3171,24 +3286,43 @@ async fn main() -> anyhow::Result<()> {
         }
         Ownership::Legacy(lock_file)
     } else {
-        match daemon::elect(db_path).await? {
-            daemon::ElectionResult::Relay(relay) => {
-                info!(
-                    "attic relay: another instance already owns database '{}'; \
-                     splicing stdio to its daemon",
-                    db_path.display()
-                );
-                return daemon::run_relay(relay).await;
+        // [FIX] Looped so a relay whose daemon disappears (crash, restart,
+        // config-change relaunch) retries election instead of the process
+        // exiting with a bare "connection closed" — see daemon.rs's
+        // `RelayExit` doc comment. `elect()` already implements exactly the
+        // right semantics for a fresh attempt (try to become the daemon
+        // first, else discover/connect to whoever already is one), so
+        // looping back into it after a `DaemonClosed` exit needs no separate
+        // "promote relay to daemon" logic: if this process wins, it falls
+        // through to the same `Ownership::Daemon` path below as any launch
+        // that won on its first try.
+        loop {
+            match daemon::elect(db_path).await? {
+                daemon::ElectionResult::Relay(relay) => {
+                    info!(
+                        "attic relay: another instance already owns database '{}'; \
+                         splicing stdio to its daemon (supervised recovery enabled)",
+                        db_path.display()
+                    );
+                    // Phase 6/7: run_relay_supervised handles bounded
+                    // exponential-backoff re-election and MCP session-cache
+                    // replay internally. It returns only when stdin is closed
+                    // (normal exit) or the recovery budget is exhausted
+                    // (unrecoverable — exit cleanly so the client sees the
+                    // disconnect immediately rather than spinning here).
+                    daemon::run_relay_supervised(relay, db_path).await?;
+                    return Ok(());
+                }
+                daemon::ElectionResult::Daemon(handle) => break Ownership::Daemon(handle),
+                // [FIX] Daemon socket/IPC setup failed even though this process
+                // already safely holds `attic.lock` (e.g. the local socket/named
+                // pipe bind or the `attic.ipc` write failed). Rather than
+                // hard-killing the whole launch, fall back to the same legacy
+                // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
+                // the lock guard this process already won instead of
+                // re-acquiring it.
+                daemon::ElectionResult::Fallback(lock_file) => break Ownership::Legacy(lock_file),
             }
-            daemon::ElectionResult::Daemon(handle) => Ownership::Daemon(handle),
-            // [FIX] Daemon socket/IPC setup failed even though this process
-            // already safely holds `attic.lock` (e.g. the local socket/named
-            // pipe bind or the `attic.ipc` write failed). Rather than
-            // hard-killing the whole launch, fall back to the same legacy
-            // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
-            // the lock guard this process already won instead of
-            // re-acquiring it.
-            daemon::ElectionResult::Fallback(lock_file) => Ownership::Legacy(lock_file),
         }
     };
 
@@ -3531,6 +3665,9 @@ pub(crate) struct ShutdownHandles {
     watches: Arc<std::sync::Mutex<HashMap<String, attic_incremental::IncrementalWatch>>>,
     bootstrap_jobs: Arc<std::sync::Mutex<Vec<BootstrapJob>>>,
     scheduler: Arc<std::sync::Mutex<Option<attic_incremental::SchedulerHandle>>>,
+    /// Phase 3: periodic RSS sampler cancellation + join handle.
+    /// `None` when `resource_monitor` is absent (tests / legacy mode).
+    rss_sampler: Option<(attic_core::CancellationToken, tokio::task::JoinHandle<()>)>,
 }
 
 impl ShutdownHandles {
@@ -3541,6 +3678,7 @@ impl ShutdownHandles {
             watches: server.watches.clone(),
             bootstrap_jobs: server.bootstrap_jobs.clone(),
             scheduler: server.scheduler.clone(),
+            rss_sampler: None,
         }
     }
 }
@@ -3583,7 +3721,27 @@ async fn serve_until_closed(
     //
     // Handles are captured BEFORE `server` is consumed by `serve` so
     // shutdown can deterministically reach every one of them afterwards.
-    let handles = ShutdownHandles::capture(&server);
+    // Phase 3: spawn periodic RSS sampler before `server` is consumed by
+    // `serve`.  Drives `guidance_pressure()` between foreground queries so
+    // the hysteresis tier stays current throughout the session.
+    let rss_sampler = server.resource_monitor.as_ref().map(|monitor| {
+        let monitor = monitor.clone();
+        let cancel = attic_core::CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if cancel_for_task.is_cancelled() {
+                    break;
+                }
+                monitor.refresh_process_memory();
+                let _ = monitor.guidance_pressure();
+            }
+        });
+        (cancel, handle)
+    });
+    let mut handles = ShutdownHandles::capture(&server);
+    handles.rss_sampler = rss_sampler;
     let running = server
         .serve(stdio())
         .await
@@ -3627,7 +3785,16 @@ pub(crate) async fn run_shutdown_sequence(
         watches,
         bootstrap_jobs,
         scheduler,
+        rss_sampler,
     } = handles;
+
+    // Phase 3: cancel and join the periodic RSS sampler before bootstrap
+    // cancel — ensures the hysteresis tier reflects current pressure right
+    // up to the start of teardown, then stops updating it.
+    if let Some((cancel, handle)) = rss_sampler {
+        cancel.cancel();
+        let _ = handle.await;
+    }
 
     // 2. Cancel and JOIN every server-owned bootstrap before touching watchers,
     // scheduler, WAL or DB resources. spawn_blocking cannot be force-aborted once
@@ -6726,19 +6893,6 @@ mod tests {
         assert_eq!(loaded.len(), 1, "must never interleave into a mixed file");
         assert!(loaded == vec![root_a] || loaded == vec![root_b]);
     }
-
-    /// ┬º37 watcher startup failure: NOT VERIFIED on Windows.
-    ///
-    /// `start_watcher` calls `IncrementalService::start_incremental_watch`
-    /// which either starts a native watcher or falls back to periodic
-    /// reconciliation. On Windows there is no practical seam to force this
-    /// to fail without a mock layer. The error path IS exercised by the
-    /// `start_watcher` Err arm in `handle_workspace` (logs error, returns
-    /// false, root remains indexed). Status: NOT VERIFIED ΓÇö would require
-    /// refactoring IncrementalService to accept a mock watcher factory.
-    #[test]
-    #[ignore = "NOT VERIFIED on Windows ΓÇö see comment above"]
-    fn watcher_startup_failure_not_verified() {}
 
     #[test]
     fn mcp_stderr_does_not_contaminate_stdout() {

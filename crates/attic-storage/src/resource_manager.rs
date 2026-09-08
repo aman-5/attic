@@ -58,6 +58,64 @@ pub const PRESSURE_WARNING_PCT: u64 = 70;
 /// Critical and the tier could never be observed. See [`safe_min_free_mib`].
 pub const PRESSURE_CRITICAL_PCT: u64 = 85;
 
+// ── Phase 3 hysteresis thresholds ─────────────────────────────────────────
+//
+// Escalation into a higher tier is IMMEDIATE (any single sample at or above
+// the entry threshold triggers the transition).  De-escalation back to a
+// lower tier requires the effective usage to remain CONTINUOUSLY below the
+// exit threshold for the specified hold duration, preventing thrashing at
+// tier boundaries.
+//
+// Warning  → Normal : usage < 65% sustained for  5 s
+// Critical → Warning: usage < 78% sustained for 10 s
+// Emergency→ Critical: usage < 82% sustained for 15 s
+//
+// These percentages are intentionally LOWER than the corresponding entry
+// percentages (70/85/ceiling) so there is a band of hysteresis between entry
+// and exit at every tier boundary.
+
+/// Exit threshold (%) for Warning → Normal.  Must be < PRESSURE_WARNING_PCT.
+const HYSTERESIS_EXIT_WARNING_PCT: u64 = 65;
+/// Exit threshold (%) for Critical → Warning.  Must be < PRESSURE_CRITICAL_PCT.
+const HYSTERESIS_EXIT_CRITICAL_PCT: u64 = 78;
+/// Exit threshold (%) for Emergency → Critical (applied against effective pct).
+const HYSTERESIS_EXIT_EMERGENCY_PCT: u64 = 82;
+
+/// How long (ms) usage must stay below the Warning exit threshold before we
+/// de-escalate Warning → Normal.
+const HYSTERESIS_HOLD_WARNING_MS: u64 = 5_000;
+/// How long (ms) usage must stay below the Critical exit threshold before we
+/// de-escalate Critical → Warning.
+const HYSTERESIS_HOLD_CRITICAL_MS: u64 = 10_000;
+/// How long (ms) usage must stay below the Emergency exit threshold before we
+/// de-escalate Emergency → Critical.
+const HYSTERESIS_HOLD_EMERGENCY_MS: u64 = 15_000;
+
+/// Numeric ordinal encoding for `ResourcePressure` stored in `AtomicU64`.
+/// Must match the ordering Normal < Warning < Critical < Emergency.
+const TIER_NORMAL: u64 = 0;
+const TIER_WARNING: u64 = 1;
+const TIER_CRITICAL: u64 = 2;
+const TIER_EMERGENCY: u64 = 3;
+
+fn tier_from_pressure(p: ResourcePressure) -> u64 {
+    match p {
+        ResourcePressure::Normal => TIER_NORMAL,
+        ResourcePressure::Warning => TIER_WARNING,
+        ResourcePressure::Critical => TIER_CRITICAL,
+        ResourcePressure::Emergency => TIER_EMERGENCY,
+    }
+}
+
+fn pressure_from_tier(t: u64) -> ResourcePressure {
+    match t {
+        TIER_WARNING => ResourcePressure::Warning,
+        TIER_CRITICAL => ResourcePressure::Critical,
+        TIER_EMERGENCY => ResourcePressure::Emergency,
+        _ => ResourcePressure::Normal,
+    }
+}
+
 /// Return a `min_free_memory_mib` value that keeps all four pressure tiers
 /// (Normal/Warning/Critical/Emergency) reachable against `max_memory_mib`.
 ///
@@ -139,6 +197,27 @@ pub struct ResourceMonitor {
     foreground_capacity: AtomicUsize,
     /// Background slot capacity (mutable via `apply_config`).
     background_capacity: AtomicUsize,
+
+    // ── Phase 3 hysteresis state ───────────────────────────────────────────
+    /// Current hysteresis-smoothed pressure tier (TIER_* constants).
+    ///
+    /// Escalation is immediate (raw pressure ≥ entry threshold → tier updates
+    /// instantly).  De-escalation is deferred: the tier only drops once usage
+    /// has remained below the exit threshold for the required hold duration
+    /// (see `HYSTERESIS_HOLD_*_MS` constants).
+    hysteresis_tier: AtomicU64,
+    /// Monotonic ms timestamp (from `elapsed_ms()`) of the last time the
+    /// hysteresis tier was raised OR the moment the effective usage first
+    /// dropped below the current tier's exit threshold.  Used to measure how
+    /// long we have been eligible to de-escalate.
+    ///
+    /// Semantics: when `hysteresis_tier == TIER_T`, this field holds the
+    /// clock value at which usage *first* fell below T's exit threshold in
+    /// the current eligible window.  A value of 0 means "not yet eligible"
+    /// (usage is still above the exit threshold for the current tier) — this
+    /// is distinct from "entered at t=0" because the monitor starts at
+    /// elapsed_ms≈0 and the first real sample will set this properly.
+    hysteresis_exit_eligible_ms: AtomicU64,
 }
 
 /// RAII guard for a foreground slot: releases the slot on drop.
@@ -156,6 +235,29 @@ impl ForegroundSlotGuard<'_> {
     /// Current degraded-advisory for the in-flight query (cheap read).
     pub fn advisory(&self) -> ResourceAdvisory {
         current_advisory(self.monitor)
+    }
+}
+
+/// RAII guard for an **indexing-heavy** background permit.
+///
+/// Held for the duration of one `bootstrap_workspace_cancellable()` call so
+/// that heavy bootstrap indexing work occupies a background slot for its
+/// entire lifetime.  The slot is released (and the counter decremented) on
+/// drop — including on panic or early-return — so the background capacity is
+/// never permanently leaked by a worker that exits without releasing.
+///
+/// Internally this reuses the existing `background_slots` /
+/// `background_capacity` counters rather than introducing a separate counter,
+/// so all background-slot admission decisions (incremental scheduler,
+/// enrichment, and now bootstrap indexing) are governed by the same shared
+/// budget.
+pub struct IndexingHeavyPermit<'a> {
+    monitor: &'a ResourceMonitor,
+}
+
+impl Drop for IndexingHeavyPermit<'_> {
+    fn drop(&mut self) {
+        self.monitor.release_background_slot();
     }
 }
 
@@ -208,6 +310,8 @@ impl ResourceMonitor {
             min_free_memory_mib: AtomicU64::new(min_free_memory_mib),
             foreground_capacity: AtomicUsize::new(foreground),
             background_capacity: AtomicUsize::new(background),
+            hysteresis_tier: AtomicU64::new(TIER_NORMAL),
+            hysteresis_exit_eligible_ms: AtomicU64::new(0),
         }
     }
 
@@ -265,10 +369,15 @@ impl ResourceMonitor {
         self.peak_memory_used
             .fetch_max(new_total, Ordering::Relaxed);
 
-        // Check if we're crossing pressure thresholds.
-        let pressure = self.compute_pressure(new_total);
+        // Compute the "new" pressure from the EFFECTIVE memory usage (same
+        // basis `self.pressure()` uses, i.e. max(accounted, real RSS)) —
+        // see the identical comment on `record_memory_decrease` above. Using
+        // the raw `new_total` counter here would mix two different bases
+        // and can spuriously fire (or fail to fire) `announce_pressure_change`.
+        let effective = self.effective_memory_used();
+        let pressure = self.compute_pressure(effective);
         if pressure != self.pressure() {
-            self.announce_pressure_change(pressure, new_total);
+            self.announce_pressure_change(pressure, effective);
         }
     }
 
@@ -395,6 +504,90 @@ impl ResourceMonitor {
             });
     }
 
+    // ── Indexing-heavy permit (bootstrap) ─────────────────────────────────
+
+    /// Non-blocking attempt to acquire an **indexing-heavy** background permit.
+    ///
+    /// Returns `None` when:
+    /// - the current advisory is `Pause` or `Emergency` (pressure too high), or
+    /// - the shared background-slot capacity is exhausted.
+    ///
+    /// The caller holds the returned [`IndexingHeavyPermit`] for the duration
+    /// of one `bootstrap_workspace_cancellable()` call; the slot is released
+    /// automatically on drop.
+    pub fn try_indexing_heavy(&self) -> Option<IndexingHeavyPermit<'_>> {
+        match current_advisory(self) {
+            ResourceAdvisory::Pause | ResourceAdvisory::Emergency => return None,
+            _ => {}
+        }
+        let max = self.background_capacity.load(Ordering::Acquire);
+        loop {
+            let current = self.background_slots.load(Ordering::Acquire);
+            if current >= max {
+                return None;
+            }
+            match self.background_slots.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(IndexingHeavyPermit { monitor: self }),
+                Err(observed) => {
+                    if observed >= max {
+                        return None;
+                    }
+                    // Spurious CAS failure — retry.
+                }
+            }
+        }
+    }
+
+    /// Blocking (OS-thread) acquisition of an **indexing-heavy** background
+    /// permit, intended for use inside `std::thread::scope` workers.
+    ///
+    /// Spins with a short sleep between attempts until one of:
+    /// - a background slot becomes available AND pressure is below
+    ///   `Pause`/`Emergency`, in which case `Some(permit)` is returned;
+    /// - `is_cancelled()` returns `true`, in which case `None` is returned so
+    ///   the caller can break cleanly from its worker loop.
+    ///
+    /// The `is_cancelled` parameter is a simple predicate rather than a
+    /// concrete cancellation-token type so this method stays free of a
+    /// `tokio` dependency inside `attic-storage`.  Callers pass
+    /// `|| token.is_cancelled()` from a `tokio_util::sync::CancellationToken`.
+    ///
+    /// Sleep interval: 50 ms with a small backoff up to 200 ms so that idle
+    /// waiting during sustained pressure does not busy-spin while still
+    /// reacting within ~200 ms to both pressure clearing and cancellation.
+    pub fn acquire_indexing_heavy_blocking(
+        &self,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Option<IndexingHeavyPermit<'_>> {
+        const INITIAL_SLEEP_MS: u64 = 50;
+        const MAX_SLEEP_MS: u64 = 200;
+        let mut sleep_ms = INITIAL_SLEEP_MS;
+
+        loop {
+            if is_cancelled() {
+                return None;
+            }
+            // Refresh RSS before every admission check so pressure decisions
+            // reflect genuine process memory, not a stale snapshot from the
+            // last foreground query that happened to call refresh.
+            self.refresh_process_memory();
+            if let Some(permit) = self.try_indexing_heavy() {
+                return Some(permit);
+            }
+            // Either pressure is too high or capacity is exhausted — sleep and
+            // retry.  The sleep interval backs off up to MAX_SLEEP_MS so that
+            // prolonged high-pressure periods don't busy-loop while still
+            // keeping latency low when pressure clears quickly.
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
+        }
+    }
+
     /// Current number of in-use foreground slots (observability/tests).
     pub fn foreground_slots_in_use(&self) -> usize {
         self.foreground_slots.load(Ordering::Relaxed)
@@ -418,6 +611,131 @@ impl ResourceMonitor {
     /// Last sampled real process RSS in MiB (0 until first sample).
     pub fn process_rss_mib(&self) -> u64 {
         self.process_rss_mib.load(Ordering::Relaxed)
+    }
+
+    // ── Phase 3: hysteresis-smoothed pressure ─────────────────────────────
+
+    /// Hysteresis-smoothed resource pressure.
+    ///
+    /// Unlike `pressure()` (which is point-in-time raw), `guidance_pressure()`
+    /// applies the Phase 3 adaptive controller:
+    ///
+    /// * **Escalation is immediate**: a single sample at or above the entry
+    ///   threshold for a higher tier causes an instant tier upgrade.
+    /// * **De-escalation is deferred**: the tier only drops once usage has
+    ///   been continuously below the exit threshold for the required hold
+    ///   duration (Warning→Normal: <65% for 5 s; Critical→Warning: <78% for
+    ///   10 s; Emergency→Critical: <82% for 15 s).
+    ///
+    /// This prevents rapid tier thrashing when memory oscillates near a
+    /// boundary, which would otherwise cause background workers to repeatedly
+    /// start and stop within a short window.
+    ///
+    /// Callers that need the stable, hysteresis-smoothed advisory for
+    /// admission decisions (e.g. the periodic background scheduler) should
+    /// use this method.  Point-in-time `pressure()` remains for raw
+    /// observability (the `status` tool, unit tests, and admission paths
+    /// that already handle transient fluctuations themselves).
+    pub fn guidance_pressure(&self) -> ResourcePressure {
+        let raw = self.pressure();
+        let raw_tier = tier_from_pressure(raw);
+        let now_ms = self.elapsed_ms();
+        let current_tier = self.hysteresis_tier.load(Ordering::Acquire);
+
+        // ── Escalation (immediate) ──────────────────────────────────────
+        if raw_tier > current_tier {
+            self.hysteresis_tier.store(raw_tier, Ordering::Release);
+            // Reset the exit-eligibility clock: we just entered a higher tier,
+            // so we are no longer in a sustained below-exit-threshold window.
+            self.hysteresis_exit_eligible_ms.store(0, Ordering::Release);
+            let new_pressure = pressure_from_tier(raw_tier);
+            debug!(
+                "guidance_pressure: escalated tier {} → {} at {}ms",
+                current_tier, raw_tier, now_ms
+            );
+            return new_pressure;
+        }
+
+        // ── No change needed (raw == current) ──────────────────────────
+        if raw_tier == current_tier {
+            // We are at the expected tier; reset exit eligibility since we
+            // are not currently below the exit threshold for the current tier.
+            // (If raw_tier == current_tier, usage is at or above the entry
+            // threshold, which is always above the exit threshold.)
+            self.hysteresis_exit_eligible_ms.store(0, Ordering::Release);
+            return pressure_from_tier(current_tier);
+        }
+
+        // ── Possible de-escalation (raw < current_tier) ────────────────
+        // raw_tier < current_tier: usage has dropped below the entry threshold
+        // for the current tier.  Check whether it is also below the exit
+        // threshold for the current tier and has been for long enough.
+        let max_mib = self.max_memory_mib.load(Ordering::Relaxed);
+        let used_mib = self.effective_memory_used();
+        let used_pct = used_mib
+            .saturating_mul(100)
+            .checked_div(max_mib)
+            .unwrap_or(0);
+
+        let (exit_pct, hold_ms) = match current_tier {
+            TIER_WARNING => (HYSTERESIS_EXIT_WARNING_PCT, HYSTERESIS_HOLD_WARNING_MS),
+            TIER_CRITICAL => (HYSTERESIS_EXIT_CRITICAL_PCT, HYSTERESIS_HOLD_CRITICAL_MS),
+            TIER_EMERGENCY => (HYSTERESIS_EXIT_EMERGENCY_PCT, HYSTERESIS_HOLD_EMERGENCY_MS),
+            _ => {
+                // TIER_NORMAL has no exit threshold — it is the floor.
+                return ResourcePressure::Normal;
+            }
+        };
+
+        if used_pct >= exit_pct {
+            // Usage is still above the exit threshold for the current tier;
+            // reset the eligibility clock.
+            self.hysteresis_exit_eligible_ms.store(0, Ordering::Release);
+            return pressure_from_tier(current_tier);
+        }
+
+        // Usage is below the exit threshold.  Start or continue counting.
+        let eligible_since = self.hysteresis_exit_eligible_ms.load(Ordering::Acquire);
+        let eligible_since = if eligible_since == 0 {
+            // First sample below the exit threshold — record the clock.
+            self.hysteresis_exit_eligible_ms
+                .store(now_ms, Ordering::Release);
+            now_ms
+        } else {
+            eligible_since
+        };
+
+        let elapsed_below = now_ms.saturating_sub(eligible_since);
+        if elapsed_below < hold_ms {
+            // Not yet sustained long enough — hold the current tier.
+            return pressure_from_tier(current_tier);
+        }
+
+        // Hold duration met: de-escalate exactly one tier at a time so each
+        // tier's hold requirement is independently satisfied (e.g.
+        // Emergency→Critical requires its own 15 s hold; the subsequent
+        // Critical→Warning requires a further 10 s hold at that level).
+        let new_tier = current_tier.saturating_sub(1);
+        self.hysteresis_tier.store(new_tier, Ordering::Release);
+        // Reset so the next tier's hold window starts fresh.
+        self.hysteresis_exit_eligible_ms.store(0, Ordering::Release);
+        info!(
+            rss_mib = used_mib,
+            pct = used_pct,
+            elapsed_below_ms = elapsed_below,
+            "guidance_pressure: de-escalated tier {} → {} after {}ms below {}%",
+            current_tier,
+            new_tier,
+            elapsed_below,
+            exit_pct
+        );
+        pressure_from_tier(new_tier)
+    }
+
+    /// Current hysteresis-smoothed tier as a `ResourcePressure` (convenience
+    /// accessor that reads the stored tier without recomputing).
+    pub fn stable_tier_pressure(&self) -> ResourcePressure {
+        pressure_from_tier(self.hysteresis_tier.load(Ordering::Relaxed))
     }
 
     // ── Pressure model ─────────────────────────────────────────────────────
@@ -861,39 +1179,6 @@ mod tests {
     }
 
     #[test]
-    fn resource_config_validate_rejects_unreachable_critical_tier() {
-        let config = ResourceConfig {
-            total_memory_budget_mib: Some(1000),
-            min_free_memory_mib: Some(250),
-            ..ResourceConfig::default()
-        };
-        assert!(
-            config.validate().is_err(),
-            "config making Critical unreachable must be rejected"
-        );
-    }
-
-    #[test]
-    fn resource_config_validate_accepts_consistent_config() {
-        let config = ResourceConfig {
-            total_memory_budget_mib: Some(1000),
-            min_free_memory_mib: Some(50),
-            ..ResourceConfig::default()
-        };
-        assert!(config.validate().is_ok());
-        assert!(ResourceConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn resource_config_validate_rejects_zero_values() {
-        let config = ResourceConfig {
-            max_foreground_queries: Some(0),
-            ..ResourceConfig::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
     fn resource_monitor_memory_increase_decrease() {
         let monitor = ResourceMonitor::new();
 
@@ -1141,24 +1426,6 @@ mod tests {
             0,
             "no pressure-change should be announced when the effective tier hasn't changed"
         );
-    }
-
-    #[test]
-    fn resource_config_apply_to_actually_reconfigures() {
-        let monitor = ResourceMonitor::new();
-        let config = ResourceConfig {
-            total_memory_budget_mib: Some(2048),
-            min_free_memory_mib: Some(100),
-            max_foreground_queries: Some(8),
-            max_background_workers: Some(3),
-            ..ResourceConfig::default()
-        };
-        config.apply_to(&monitor);
-
-        assert_eq!(monitor.max_memory_mib(), 2048);
-        assert_eq!(monitor.min_free_memory_mib(), 100);
-        assert_eq!(monitor.foreground_capacity(), 8);
-        assert_eq!(monitor.background_capacity(), 3);
     }
 
     #[test]

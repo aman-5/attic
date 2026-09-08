@@ -63,7 +63,9 @@ pub use ops_tasks::{
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
     enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
 };
-pub use resource_manager::{ResourceAdvisory, ResourceConfig, ResourceMonitor};
+pub use resource_manager::{
+    IndexingHeavyPermit, ResourceAdvisory, ResourceConfig, ResourceMonitor,
+};
 pub use resource_policy::{
     EffectiveResourceConfig, HardwareSnapshot, ResourceDetectionError, ResourceMode,
     ResourceModeSource, ResourcePolicy, ResourceResolution, detect_resource_mode,
@@ -102,5 +104,6 @@ pub use retrieval_reads::{
     structural_nodes_for_file,
 };
 pub use semantic_reads::{
-    SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, semantic_unit_rows, semantic_units_by_ids,
+    SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, retrieval_unit_anchors, semantic_unit_rows,
+    semantic_units_by_ids,
 };

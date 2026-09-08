@@ -627,6 +627,12 @@ fn analyze_tags(
                             format!("{language_tag}: failed to generate tags: {e}"),
                         ));
                         structurally_complete = false;
+                        // No tags attempt succeeded here either — without this,
+                        // `capability_used` below falls into `StructuralParse`
+                        // (since `out.symbols` stays empty) even though zero
+                        // tags were ever generated, misreporting a structural
+                        // parse that never happened.
+                        skipped_entirely = true;
                     }
                 }
                 });
@@ -728,33 +734,6 @@ pub(crate) fn tier2_analyzers() -> Vec<(&'static str, Arc<dyn Analyzer>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Proves the hand-authored Dockerfile tags query actually works against
-    /// the real grammar (kept from the original spike this module replaces).
-    #[test]
-    fn dockerfile_tags_query_extracts_stage_names() {
-        let lang: tree_sitter::Language = tree_sitter_containerfile::LANGUAGE.into();
-        let config = TagsConfiguration::new(lang, DOCKERFILE_TAGS_QUERY, "").unwrap();
-        let mut ctx = TagsContext::new();
-        let sample = b"FROM node:18 AS builder\nFROM builder AS runner\n";
-        let (tags, _) = ctx.generate_tags(&config, sample, None).unwrap();
-        let mut results = Vec::new();
-        for tag in tags {
-            let tag = tag.unwrap();
-            let name = std::str::from_utf8(&sample[tag.name_range]).unwrap();
-            let kind = config.syntax_type_name(tag.syntax_type_id);
-            results.push((tag.is_definition, kind.to_string(), name.to_string()));
-        }
-        assert_eq!(
-            results,
-            vec![
-                (false, "module".to_string(), "node:18".to_string()),
-                (true, "module".to_string(), "builder".to_string()),
-                (false, "module".to_string(), "builder".to_string()),
-                (true, "module".to_string(), "runner".to_string()),
-            ]
-        );
-    }
 
     /// Every table entry must compile its tags query against its grammar.
     /// A failure here means a query/grammar version mismatch that

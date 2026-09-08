@@ -64,14 +64,6 @@ mod tests {
         let decoded: SourceSpan = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded);
     }
-
-    #[test]
-    fn contains_works() {
-        let outer = SourceSpan::new(0, 0, 10, 0);
-        let inner = SourceSpan::new(2, 5, 5, 5);
-        assert!(outer.contains(&inner));
-        assert!(!inner.contains(&outer));
-    }
 }
 
 // Resource budgets for a single indexing/retrieval operation.

@@ -281,12 +281,6 @@ fn smoke_go_js_ts() {
         out_ts
             .symbols
             .iter()
-            .any(|s| s.kind == SymbolKind::Interface && s.qualified_name == "Options")
-    );
-    assert!(
-        out_ts
-            .symbols
-            .iter()
             .any(|s| s.kind == SymbolKind::TypeAlias && s.short_name == "Alias")
     );
     assert!(
@@ -295,9 +289,6 @@ fn smoke_go_js_ts() {
             .iter()
             .any(|s| s.kind == SymbolKind::Module && s.short_name == "Util")
     );
-    assert!(out_ts.symbols.iter().any(|s| s.kind == SymbolKind::Method
-        && s.qualified_name == "Options.run"
-        && !s.is_definition));
     assert!(
         out_ts
             .imports

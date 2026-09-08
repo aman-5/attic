@@ -295,6 +295,61 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Atomically persists a batch of embeddings and marks their queue entries
+    /// DONE under a single mutex acquisition and one SQLite transaction — the
+    /// batched counterpart to calling `put()` + `queue_mark_done()` once per
+    /// record, which issues 2 auto-committed statements per unit.
+    pub fn put_batch_and_mark_done(
+        &self,
+        records: &[EmbeddingRecord],
+    ) -> Result<(), SemanticError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.guard()?;
+        let tx = conn.transaction()?;
+
+        {
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO sem_embeddings
+                     (retrieval_unit_id, repository_id, source_revision_id,
+                      index_generation_id, selection_version, provider_id, model_id,
+                      content_hash, dim, norm, vector, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )?;
+            let mut mark_stmt =
+                tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
+
+            let now = Self::now_ms();
+            for rec in records {
+                let norm: f32 = rec.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let mut blob = Vec::with_capacity(rec.vector.len() * 4);
+                for v in &rec.vector {
+                    blob.extend_from_slice(&v.to_le_bytes());
+                }
+                insert_stmt.execute(params![
+                    rec.retrieval_unit_id,
+                    rec.repository_id,
+                    rec.source_revision_id,
+                    rec.index_generation_id,
+                    rec.selection_version,
+                    rec.provider_id,
+                    rec.model_id,
+                    rec.content_hash,
+                    rec.dim as i64,
+                    norm,
+                    blob,
+                    now,
+                ])?;
+                mark_stmt.execute(params![rec.retrieval_unit_id, Q_DONE])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Delete every embedding for one unit (all models) or one exact record
     /// when `provider`/`model` are given.
     pub fn delete(
@@ -807,6 +862,33 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn put_batch_and_mark_done_persists_records_and_updates_queue() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        s.queue_enqueue(&["u1".into(), "u2".into()], 1.0).unwrap();
+        let items = s.queue_take_batch(2).unwrap();
+        assert_eq!(items.len(), 2);
+
+        let records = vec![rec("u1", vec![1.0, 0.0]), rec("u2", vec![0.0, 1.0])];
+        s.put_batch_and_mark_done(&records).unwrap();
+
+        let got1 = s
+            .lookup("u1", "hashing", "hashed-ngram-v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got1.vector, vec![1.0, 0.0]);
+        let got2 = s
+            .lookup("u2", "hashing", "hashed-ngram-v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.vector, vec![0.0, 1.0]);
+
+        let counts = s.queue_counts().unwrap();
+        assert_eq!(counts.get(Q_DONE), Some(&2));
+        assert_eq!(counts.get(Q_INFLIGHT).copied().unwrap_or(0), 0);
+        assert_eq!(counts.get(Q_PENDING).copied().unwrap_or(0), 0);
     }
 
     #[test]

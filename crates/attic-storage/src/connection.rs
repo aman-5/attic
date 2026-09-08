@@ -261,19 +261,12 @@ pub fn configure_connection_with_pragmas(
 
 /// Open a read-write connection at `path` and apply PRAGMAs.
 pub fn open_rw(path: &Path) -> Result<Connection, StorageError> {
-    let conn = Connection::open(path)?;
-    configure_connection(&conn)?;
-    Ok(conn)
+    open_rw_with_pragmas(path, DEFAULT_CACHE_PAGES, DEFAULT_MMAP_BYTES)
 }
 
 /// Open a read-only connection at `path` and apply PRAGMAs.
 pub fn open_ro(path: &Path) -> Result<Connection, StorageError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    configure_connection(&conn)?;
-    Ok(conn)
+    open_ro_with_pragmas(path, DEFAULT_CACHE_PAGES, DEFAULT_MMAP_BYTES)
 }
 
 /// Open a read-write connection at `path` with explicit `cache_size`/
