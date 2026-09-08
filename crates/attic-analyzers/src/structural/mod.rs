@@ -64,6 +64,7 @@ pub mod go;
 pub mod java;
 pub mod javascript;
 pub mod python;
+pub mod tags_generic;
 pub mod typescript;
 
 /// Streaming prefix cap for LARGE files: bounded structural analysis.
@@ -976,6 +977,29 @@ pub fn default_registry() -> AnalyzerRegistry {
     reg.register_specialized(go::analyzer());
     reg.register_specialized(javascript::analyzer());
     reg.register_specialized(typescript::analyzer());
+    // `.tsx` bug fix: register the JSX-aware grammar under an explicit
+    // language tag rather than `FileType::TypeScript` — both `TypeScriptSpec`
+    // and `TsxSpec` declare identical capability levels, so registering both
+    // under the same `FileType` key would hit `best_entry`'s alphabetical
+    // tie-break ("tsx-treesitter" < "typescript-treesitter"), incorrectly
+    // selecting the TSX grammar for *every* `.ts` file too. Keying by
+    // language hint instead makes the choice unambiguous: `.tsx` sources
+    // carry `language_hint = Some("tsx")` (set by `attic-indexing`) and hit
+    // this entry directly; `.ts` sources carry `Some("typescript")` (or no
+    // hint at all), which never matches here and falls through to the
+    // `FileType::TypeScript` map above, where `TypeScriptSpec` is the sole
+    // entry.
+    reg.register_for_language("tsx", typescript::tsx_analyzer());
+
+    // Tier 2 — tags.scm-based structural coverage (Phase 3 broadening).
+    // Registered only under explicit language tags, never under `FileType`,
+    // so they can never collide with (or shadow) the tier-1 hand-written
+    // analyzers above. (Java/Python/Go/JavaScript/TypeScript/Tsx language
+    // tags are already claimed above; `tags_generic::tier2_analyzers()` never
+    // emits those tags — see its own module docs for the exclusion list.)
+    for (tag, analyzer) in tags_generic::tier2_analyzers() {
+        reg.register_for_language(tag, analyzer);
+    }
     reg
 }
 

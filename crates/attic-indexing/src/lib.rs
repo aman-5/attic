@@ -1188,7 +1188,7 @@ fn analyze_single_file(
         path: rec.abs_path.clone(),
         content: analyzer_content,
         file_type: rec.file_type,
-        language_hint: None,
+        language_hint: infer_language_hint(&rec.abs_path).map(str::to_string),
         size_bytes,
         is_partial_scan,
         cancellation_token: cancellation.clone(),
@@ -1311,6 +1311,49 @@ fn infer_file_type(path: &Path) -> FileType {
         Some("json") => FileType::Json,
         Some("yaml") | Some("yml") => FileType::Yaml,
         _ => FileType::Other,
+    }
+}
+
+/// Infer the fine-grained language tag used by `attic_analyzers::AnalyzerRegistry`'s
+/// language-hint lookup (`AnalyzerInput::language_hint`), additive to — and
+/// finer-grained than — `infer_file_type`'s broad `FileType` classification.
+///
+/// This is the mechanism that lets `.tsx` route to the JSX-aware TypeScript
+/// grammar while `.ts` keeps the plain one (both share `FileType::TypeScript`,
+/// which cannot itself distinguish them), and lets tier-2 tags.scm-based
+/// languages (which have no `FileType` variant at all, e.g. Ruby/C#/Scala/
+/// PHP/Swift/Lua/Dockerfile) be selected without widening `attic-core`'s
+/// domain enum. Returns `None` for anything not handled by a registered
+/// language-specific analyzer; such files still get generic full-text
+/// coverage via `infer_file_type`'s existing fallback path.
+///
+/// Tag strings here MUST match the tags used to register analyzers in
+/// `attic_analyzers::structural::default_registry` exactly.
+fn infer_language_hint(path: &Path) -> Option<&'static str> {
+    // Filename-based match (checked before extension-based, same convention
+    // `infer_file_type` would use if it needed one): Dockerfiles are
+    // conventionally named `Dockerfile`/`dockerfile` with no extension.
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.eq_ignore_ascii_case("dockerfile")
+    {
+        return Some("dockerfile");
+    }
+
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("tsx") => Some("tsx"),
+        Some("ts") => Some("typescript"),
+        Some("rs") => Some("rust"),
+        Some("c") | Some("h") => Some("c"),
+        Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("h++")
+        | Some("hxx") => Some("cpp"),
+        Some("rb") => Some("ruby"),
+        Some("cs") => Some("csharp"),
+        Some("scala") | Some("sc") => Some("scala"),
+        Some("php") => Some("php"),
+        Some("swift") => Some("swift"),
+        Some("lua") => Some("lua"),
+        Some("dockerfile") => Some("dockerfile"),
+        _ => None,
     }
 }
 

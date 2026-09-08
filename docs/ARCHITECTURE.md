@@ -109,16 +109,34 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
 ## Process and ownership model
 
-- **One `attic` process owns one logical workspace.** (The binary is built
-  from the `attic-server` crate — hence that crate/component name
-  elsewhere in this doc — but the executable itself is named `attic`; see
-  README Quick Start.) A single process holds the one SQLite writer
-  (`WriterQueue`), one MCP stdio transport, and one filesystem watcher
-  **per configured repository**, all for a given database file. This is
-  not a configuration choice — `run_startup_recovery`, the watcher epoch,
-  and `ops_server_state` all assume single-process ownership. Attic does
-  **not** support multiple processes concurrently writing to the same
-  database.
+- **One `attic` daemon owns one logical workspace — per database, not per
+  process launch.** (The binary is built from the `attic-server` crate —
+  hence that crate/component name elsewhere in this doc — but the
+  executable itself is named `attic`; see README Quick Start.) The first
+  `attic` launch for a given database wins an advisory `attic.lock` and
+  becomes that database's daemon: it alone holds the one SQLite writer
+  (`WriterQueue`), one filesystem watcher **per configured repository**,
+  and runs startup recovery, for as long as it stays up. This single-owner
+  invariant is not a configuration choice — `run_startup_recovery`, the
+  watcher epoch, and `ops_server_state` all assume it — it is simply no
+  longer tied to "one process launch"; it is now tied to "one daemon per
+  database". Every later `attic` launch against the same database fails
+  that same `try_lock()` and instead becomes a thin relay: it discovers the
+  daemon's local-socket address (`interprocess::local_socket`, published to
+  a sibling `attic.ipc` file only after the daemon's listener is bound) and
+  splices its own MCP stdio transport to that socket byte-for-byte, so
+  multiple windows on the same project run genuinely concurrently against
+  the one shared live state — there is no second writer, watcher, or
+  recovery pass to reconcile. The daemon shuts down on an idle timeout once
+  every connection (its own original caller's included) has disconnected,
+  or on SIGINT; a crashed daemon's `attic.lock` is released automatically
+  by the OS, so the next launch re-elects cleanly. See
+  `crates/attic-server/src/daemon.rs` for the election/relay/accept-loop
+  implementation. Attic still does **not** support multiple *daemons*
+  concurrently writing to the same database — only one process is ever the
+  daemon for a given database at a time; setting `ATTIC_NO_DAEMON=1`
+  reproduces the older, stricter behavior where a second launch simply
+  refuses to start instead of relaying.
 - **Multi-root workspaces**: the logical workspace is the SET of
   configured repository roots, not one filesystem directory — roots may
   live anywhere on disk with no common parent, no symlinks, and no Git

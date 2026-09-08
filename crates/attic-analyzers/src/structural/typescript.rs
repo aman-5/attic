@@ -19,12 +19,67 @@ use crate::structural::{
 };
 
 pub(crate) static TYPESCRIPT_SPEC: TypeScriptSpec = TypeScriptSpec;
+pub(crate) static TSX_SPEC: TsxSpec = TsxSpec;
 
 pub struct TypeScriptSpec;
+pub struct TsxSpec;
 
 /// Public factory for registry wiring.
 pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&TYPESCRIPT_SPEC)
+}
+
+/// Public factory for TSX registry wiring.
+pub fn tsx_analyzer() -> Arc<dyn Analyzer> {
+    make_analyzer(&TSX_SPEC)
+}
+
+impl TreeSitterLanguageSpec for TsxSpec {
+    fn analyzer_id(&self) -> &'static str {
+        "tsx-treesitter"
+    }
+
+    fn description(&self) -> &'static str {
+        "Tree-sitter structural analyzer for TypeScript JSX (TSX): full JSX/TSX syntax \
+         with interfaces, type aliases, enums, components, and type-only imports."
+    }
+
+    fn file_types(&self) -> &'static [FileType] {
+        &[FileType::TypeScript]
+    }
+
+    fn capabilities(&self) -> AnalyzerCapabilities {
+        AnalyzerCapabilities {
+            entries: vec![
+                (CapabilityKind::StructuralParse, CapabilityLevel::Full),
+                (CapabilityKind::SymbolExtraction, CapabilityLevel::Full),
+                (CapabilityKind::ImportExtraction, CapabilityLevel::Full),
+                (CapabilityKind::ReferenceExtraction, CapabilityLevel::Basic),
+                (
+                    CapabilityKind::RelationshipResolution,
+                    CapabilityLevel::Basic,
+                ),
+            ],
+        }
+    }
+
+    fn grammar(&self) -> tree_sitter_language::LanguageFn {
+        tree_sitter_typescript::LANGUAGE_TSX
+    }
+
+    fn language_tag(&self) -> &'static str {
+        "tsx"
+    }
+
+    fn extract(&self, root: Node<'_>, src: &SourceText<'_>, out: &mut Extraction<'_>) {
+        let mut st = js::JsState {
+            lang_tag: "tsx",
+            src,
+            locals: Vec::new(),
+            imported: Vec::new(),
+        };
+        walk_ts_container(&mut st, root, &[], None, true, out);
+    }
 }
 
 impl TreeSitterLanguageSpec for TypeScriptSpec {

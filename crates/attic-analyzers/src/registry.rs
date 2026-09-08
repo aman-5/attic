@@ -45,6 +45,15 @@ pub struct AnalyzerRegistry {
     /// `descriptor().name` (lexicographic ascending).
     specialized: HashMap<FileType, Vec<RegistryEntry>>,
 
+    /// Specialized analyzers keyed by an explicit language tag (e.g. `"tsx"`,
+    /// `"rust"`, `"dockerfile"`) rather than the closed `FileType` enum.
+    ///
+    /// This is the mechanism that lets analyzers distinguish languages that
+    /// `FileType` cannot represent (e.g. `.ts` vs `.tsx`, or languages with no
+    /// `FileType` variant at all) without widening `attic-core`'s domain enum.
+    /// Checked *before* the `FileType`-keyed map in [`select`](Self::select).
+    specialized_by_language: HashMap<&'static str, Vec<RegistryEntry>>,
+
     /// The mandatory language-agnostic fallback — always present.
     generic: Arc<dyn Analyzer>,
 }
@@ -53,10 +62,12 @@ impl AnalyzerRegistry {
     /// Create a new registry with the given generic (fallback) analyzer.
     ///
     /// Additional specialized analyzers can be added via
-    /// [`register_specialized`](Self::register_specialized).
+    /// [`register_specialized`](Self::register_specialized) or
+    /// [`register_for_language`](Self::register_for_language).
     pub fn new(generic: Arc<dyn Analyzer>) -> Self {
         Self {
             specialized: HashMap::new(),
+            specialized_by_language: HashMap::new(),
             generic,
         }
     }
@@ -92,15 +103,63 @@ impl AnalyzerRegistry {
         }
     }
 
-    /// Select the best analyzer for the given `FileType`.
+    /// Register a specialized analyzer under an explicit language tag (e.g.
+    /// `"tsx"`, `"rust"`, `"dockerfile"`), rather than `FileType`.
+    ///
+    /// Use this for languages `FileType` cannot represent, or to disambiguate
+    /// within a single `FileType` (e.g. `.tsx` vs `.ts`, both `FileType::TypeScript`).
+    /// Checked before the `FileType` map in [`select`](Self::select) whenever
+    /// a matching `language_hint` is supplied.
+    pub fn register_for_language(
+        &mut self,
+        language_tag: &'static str,
+        analyzer: Arc<dyn Analyzer>,
+    ) {
+        let desc = analyzer.descriptor();
+        let max_level = max_capability_level(desc);
+        let entry = RegistryEntry {
+            analyzer: Arc::clone(&analyzer),
+            max_level,
+        };
+        self.specialized_by_language
+            .entry(language_tag)
+            .or_default()
+            .push(entry);
+    }
+
+    /// Select the best analyzer for the given `FileType`, optionally
+    /// disambiguated by an explicit `language_hint`.
+    ///
+    /// Lookup order:
+    /// 1. If `language_hint` is `Some` and matches an entry registered via
+    ///    [`register_for_language`](Self::register_for_language), that wins.
+    /// 2. Otherwise, fall back to the `FileType`-keyed map (unchanged
+    ///    behavior from before `language_hint` existed).
+    /// 3. Otherwise, the generic fallback.
     ///
     /// Returns `(analyzer, is_generic)`:
     /// - `is_generic = false` → a specialized analyzer was selected.
     /// - `is_generic = true`  → the generic fallback was selected.
     ///
-    /// Selection is **deterministic**: given the same registry state and file
-    /// type, the same analyzer is always returned.
-    pub fn select(&self, file_type: FileType) -> (Arc<dyn Analyzer>, bool) {
+    /// Selection is **deterministic**: given the same registry state, file
+    /// type and language hint, the same analyzer is always returned.
+    pub fn select(
+        &self,
+        file_type: FileType,
+        language_hint: Option<&str>,
+    ) -> (Arc<dyn Analyzer>, bool) {
+        if let Some(hint) = language_hint
+            && let Some(entries) = self.specialized_by_language.get(hint)
+            && let Some(best) = best_entry(entries)
+        {
+            debug!(
+                analyzer = %best.descriptor().name,
+                language_hint = hint,
+                "registry: selected analyzer by language hint"
+            );
+            return (Arc::clone(best), false);
+        }
+
         if let Some(entries) = self.specialized.get(&file_type)
             && let Some(best) = best_entry(entries)
         {
@@ -262,7 +321,7 @@ mod tests {
         let generic = Arc::new(GenericAnalyzer::new());
         let registry = AnalyzerRegistry::new(Arc::clone(&generic) as Arc<dyn Analyzer>);
 
-        let (selected, is_generic) = registry.select(FileType::Other);
+        let (selected, is_generic) = registry.select(FileType::Other, None);
         assert!(is_generic, "Other FileType must select generic");
         assert_eq!(selected.descriptor().name, "generic");
     }
@@ -281,7 +340,7 @@ mod tests {
         ));
         registry.register_specialized(stub as Arc<dyn Analyzer>);
 
-        let (selected, is_generic) = registry.select(FileType::Rust);
+        let (selected, is_generic) = registry.select(FileType::Rust, None);
         assert!(!is_generic, "Rust FileType must select specialized");
         assert_eq!(selected.descriptor().name, "rust-stub");
     }
@@ -310,7 +369,7 @@ mod tests {
         registry.register_specialized(low as Arc<dyn Analyzer>);
 
         for _ in 0..10 {
-            let (selected, is_generic) = registry.select(FileType::Rust);
+            let (selected, is_generic) = registry.select(FileType::Rust, None);
             assert!(!is_generic);
             // Full > Basic → rust-high must always win
             assert_eq!(selected.descriptor().name, "rust-high");
@@ -343,7 +402,7 @@ mod tests {
         registry.register_specialized(semantic_basic as Arc<dyn Analyzer>);
         registry.register_specialized(lexical_full as Arc<dyn Analyzer>);
 
-        let (selected, _) = registry.select(FileType::Python);
+        let (selected, _) = registry.select(FileType::Python, None);
         assert_eq!(
             selected.descriptor().name,
             "lexical-full",
@@ -372,7 +431,7 @@ mod tests {
         registry.register_specialized(z as Arc<dyn Analyzer>);
         registry.register_specialized(a as Arc<dyn Analyzer>);
 
-        let (selected, _) = registry.select(FileType::Rust);
+        let (selected, _) = registry.select(FileType::Rust, None);
         assert_eq!(
             selected.descriptor().name,
             "aaa-rust",
@@ -426,7 +485,7 @@ mod tests {
         }) as Arc<dyn Analyzer>);
 
         // Still selects generic for any type.
-        let (selected, is_generic) = registry.select(FileType::Rust);
+        let (selected, is_generic) = registry.select(FileType::Rust, None);
         assert!(is_generic);
         assert_eq!(selected.descriptor().name, "generic");
     }
@@ -492,7 +551,7 @@ mod tests {
 
         // Simulate: specialized not found → use generic, mark fallback_used.
         let input = make_input(FileType::Rust, "fn main() {}");
-        let (analyzer, is_generic) = registry.select(FileType::Rust);
+        let (analyzer, is_generic) = registry.select(FileType::Rust, None);
         assert!(is_generic);
 
         let mut output = analyzer.analyze(input);
@@ -523,11 +582,50 @@ mod tests {
         registry.register_specialized(basic as Arc<dyn Analyzer>);
         registry.register_specialized(partial as Arc<dyn Analyzer>);
 
-        let (selected, _) = registry.select(FileType::JavaScript);
+        let (selected, _) = registry.select(FileType::JavaScript, None);
         assert_eq!(
             selected.descriptor().name,
             "partial-analyzer",
             "Partial level must beat Basic level"
         );
+    }
+
+    /// `.tsx` bug fix, generic-mechanism proof: a `language_hint` matching a
+    /// `register_for_language` entry wins over the `FileType` map, and any
+    /// other/no hint falls through to it unaffected. (The concrete TSX-vs-
+    /// plain-TS scenario is covered end-to-end in
+    /// `tests/structural_tags_tier2.rs` instead of here — this crate's
+    /// `central_dispatch_has_no_language_specific_branching` architectural
+    /// guard forbids literal language-name string constants anywhere in this
+    /// file, including comments, so the language-specific case intentionally
+    /// lives in that separate integration test file instead.)
+    #[test]
+    fn language_hint_wins_over_file_type_map() {
+        let generic = Arc::new(GenericAnalyzer::new());
+        let mut registry = AnalyzerRegistry::new(Arc::clone(&generic) as Arc<dyn Analyzer>);
+
+        let by_file_type = Arc::new(StubAnalyzer::new(
+            "by-file-type",
+            FileType::Rust,
+            CapabilityKind::SymbolExtraction,
+            CapabilityLevel::Full,
+        ));
+        let by_hint = Arc::new(StubAnalyzer::new(
+            "by-hint",
+            FileType::Rust,
+            CapabilityKind::SymbolExtraction,
+            CapabilityLevel::Full,
+        ));
+        registry.register_specialized(by_file_type as Arc<dyn Analyzer>);
+        registry.register_for_language("some-tag", by_hint as Arc<dyn Analyzer>);
+
+        let (hinted, _) = registry.select(FileType::Rust, Some("some-tag"));
+        assert_eq!(hinted.descriptor().name, "by-hint");
+
+        let (unhinted, _) = registry.select(FileType::Rust, None);
+        assert_eq!(unhinted.descriptor().name, "by-file-type");
+
+        let (mismatched_hint, _) = registry.select(FileType::Rust, Some("other-tag"));
+        assert_eq!(mismatched_hint.descriptor().name, "by-file-type");
     }
 }

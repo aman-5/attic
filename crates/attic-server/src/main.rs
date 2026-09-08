@@ -5,6 +5,8 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
+mod daemon;
+
 use attic_discovery::{
     DiscoveryPolicy, GlobRule, SecretScanDecision, canonicalize_within_root,
     preprocess_file_content,
@@ -131,7 +133,7 @@ struct BootstrapJob {
 }
 
 #[derive(Clone)]
-struct AtticServer {
+pub(crate) struct AtticServer {
     pool: DbPool,
     writer: WriterQueueHandle,
     _queue: Arc<WriterQueue>,
@@ -3048,6 +3050,19 @@ fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> RootValidation {
 
 // ΓöÇΓöÇΓöÇ main ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
+/// Which role this process holds for the resolved database (see `daemon.rs`
+/// for the full election design). Each variant carries whatever guard must
+/// be kept alive for the remainder of `main`'s lifetime — in both cases,
+/// the `attic.lock` advisory lock.
+enum Ownership {
+    /// `ATTIC_NO_DAEMON=1`: today's single-process behavior, unchanged — a
+    /// second launch against the same database still hard-fails.
+    Legacy(std::fs::File),
+    /// This process won the daemon election; `daemon::run_daemon_accept_loop`
+    /// takes over instead of `serve_until_closed`.
+    Daemon(daemon::DaemonHandle),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Phase 7: platform-appropriate data/cache/temp policy (see
@@ -3112,32 +3127,61 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // [FIX] Single-instance lock: refuse to start a second attic-server
-    // against the same database. Root cause of a real, confirmed incident —
-    // multiple independent processes each running their own WriterQueue
-    // against the same attic.db, causing "BEGIN IMMEDIATE failed: database
-    // is locked" write failures. An OS-level advisory file lock (not a PID
-    // file) releases automatically on process exit, including a crash/kill,
-    // so there is no stale-lock state to clean up or get wrong. `_lock_guard`
-    // is intentionally never used beyond being kept alive — it must outlive
-    // everything else in `main`, which its ordinary scope-based drop (at the
-    // end of `main`, at shutdown) already guarantees without extra plumbing.
-    let lock_path = db_path.with_file_name("attic.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| anyhow::anyhow!("failed to open lock file '{}': {e}", lock_path.display()))?;
-    if let Err(e) = lock_file.try_lock() {
-        anyhow::bail!(
-            "another attic-server instance is already running for database '{}' \
-             (lock '{}' held): {e}",
-            db_path.display(),
-            lock_path.display()
-        );
-    }
-    let _lock_guard = lock_file;
+    // [FIX] Multi-window concurrency: only the first `attic-server` launch
+    // for a given database becomes the "daemon" — it alone owns the SQLite
+    // writer, the filesystem watcher, and startup recovery (the same
+    // single-owner invariants as before, just relocated to "per daemon"
+    // instead of "per launch"). Every later launch for the same database
+    // becomes a thin relay that splices its own stdin/stdout to the
+    // daemon's local socket, so multiple windows on the same project run
+    // genuinely concurrently against the one shared live state. Setting
+    // `ATTIC_NO_DAEMON` (`1`/`true`) skips all of this and reproduces the
+    // exact old single-process behavior, including hard-failing a second
+    // launch — see `daemon.rs` for the full election/relay/accept-loop
+    // implementation.
+    let ownership: Ownership = if daemon::no_daemon_mode() {
+        // [FIX] Single-instance lock: refuse to start a second attic-server
+        // against the same database. Root cause of a real, confirmed incident —
+        // multiple independent processes each running their own WriterQueue
+        // against the same attic.db, causing "BEGIN IMMEDIATE failed: database
+        // is locked" write failures. An OS-level advisory file lock (not a PID
+        // file) releases automatically on process exit, including a crash/kill,
+        // so there is no stale-lock state to clean up or get wrong. The guard
+        // is intentionally never used beyond being kept alive — it must outlive
+        // everything else in `main`, which is guaranteed by staying bound
+        // inside the `Ownership::Legacy` value carried through to the final
+        // `match` at the end of `main`.
+        let lock_path = db_path.with_file_name("attic.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                anyhow::anyhow!("failed to open lock file '{}': {e}", lock_path.display())
+            })?;
+        if let Err(e) = lock_file.try_lock() {
+            anyhow::bail!(
+                "another attic-server instance is already running for database '{}' \
+                 (lock '{}' held): {e}",
+                db_path.display(),
+                lock_path.display()
+            );
+        }
+        Ownership::Legacy(lock_file)
+    } else {
+        match daemon::elect(db_path).await? {
+            daemon::ElectionResult::Relay(relay) => {
+                info!(
+                    "attic relay: another instance already owns database '{}'; \
+                     splicing stdio to its daemon",
+                    db_path.display()
+                );
+                return daemon::run_relay(relay).await;
+            }
+            daemon::ElectionResult::Daemon(handle) => Ownership::Daemon(handle),
+        }
+    };
 
     info!(
         "attic starting, db={} (home {})",
@@ -3457,7 +3501,38 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    serve_until_closed(server, semantic_enricher).await
+    match ownership {
+        Ownership::Legacy(_lock_guard) => serve_until_closed(server, semantic_enricher).await,
+        Ownership::Daemon(handle) => {
+            daemon::run_daemon_accept_loop(server, semantic_enricher, handle).await
+        }
+    }
+}
+
+/// Handles needed to run the shared teardown sequence ([`run_shutdown_sequence`],
+/// steps 2-8 of [`serve_until_closed`]'s original ordering) regardless of how
+/// the process stopped accepting new MCP work — natural stdio close,
+/// Ctrl+C, or (daemon mode) an idle-timeout/SIGINT on the accept loop.
+/// Captured from an `AtticServer` before it is consumed by `.serve(...)`,
+/// since `serve` takes the transport-bound clone by value.
+pub(crate) struct ShutdownHandles {
+    writer: WriterQueueHandle,
+    db_path: PathBuf,
+    watches: Arc<std::sync::Mutex<HashMap<String, attic_incremental::IncrementalWatch>>>,
+    bootstrap_jobs: Arc<std::sync::Mutex<Vec<BootstrapJob>>>,
+    scheduler: Arc<std::sync::Mutex<Option<attic_incremental::SchedulerHandle>>>,
+}
+
+impl ShutdownHandles {
+    pub(crate) fn capture(server: &AtticServer) -> Self {
+        Self {
+            writer: server.writer.clone(),
+            db_path: server.db_path.clone(),
+            watches: server.watches.clone(),
+            bootstrap_jobs: server.bootstrap_jobs.clone(),
+            scheduler: server.scheduler.clone(),
+        }
+    }
 }
 
 /// Serve MCP until the stdio transport closes OR the process receives
@@ -3475,9 +3550,12 @@ async fn main() -> anyhow::Result<()> {
 ///   7. Close DB resources (pool + writer connection).
 ///   8. Exit.
 ///
-/// `watch`/scheduler/`semantic_enricher` are owned by the server lifecycle
-/// (not left to an implicit drop in `main`) specifically so each can be
-/// stopped, in order, deterministically and with a bounded join ΓÇö a
+/// Steps 2-8 are shared with the daemon accept-loop path (see
+/// `daemon::run_daemon_accept_loop`) via [`run_shutdown_sequence`] — this
+/// function only owns step 1, which is specific to the single stdio
+/// transport. `watch`/scheduler/`semantic_enricher` are owned by the server
+/// lifecycle (not left to an implicit drop in `main`) specifically so each
+/// can be stopped, in order, deterministically and with a bounded join ΓÇö a
 /// production worker whose shutdown is left to "whatever `main` does last"
 /// is not controlled.
 async fn serve_until_closed(
@@ -3492,13 +3570,10 @@ async fn serve_until_closed(
     //    awaiting the same `waiting()` future ΓÇö so the service task is
     //    never left running detached while later steps close its
     //    resources out from under it.
-    let writer_for_shutdown = server.writer.clone();
-    let db_path_for_shutdown = server.db_path.clone();
-    // Clone the watcher handle map BEFORE `server` is consumed by `serve` so
-    // shutdown can deterministically stop every live watcher afterwards.
-    let watches_for_shutdown = server.watches.clone();
-    let bootstrap_jobs_for_shutdown = server.bootstrap_jobs.clone();
-    let scheduler_for_shutdown = server.scheduler.clone();
+    //
+    // Handles are captured BEFORE `server` is consumed by `serve` so
+    // shutdown can deterministically reach every one of them afterwards.
+    let handles = ShutdownHandles::capture(&server);
     let running = server
         .serve(stdio())
         .await
@@ -3519,13 +3594,36 @@ async fn serve_until_closed(
     ctrl_c_watcher.abort();
     info!("attic server stopped: {reason:?}");
 
+    run_shutdown_sequence(handles, semantic_enricher, &format!("{reason:?}")).await;
+    Ok(())
+}
+
+/// Shared teardown sequence (steps 2-8 of [`serve_until_closed`]'s doc
+/// comment): cancel+join bootstrap jobs, stop watchers, stop the scheduler,
+/// stop the semantic background worker, record the clean-shutdown marker,
+/// checkpoint+backup the database, then drop the writer. Runs exactly once
+/// per process lifetime — used by both the single stdio path
+/// (`serve_until_closed`) and the daemon accept-loop path
+/// (`daemon::run_daemon_accept_loop`), on whatever trigger each of those
+/// decides ends the process (stdio close/Ctrl+C, or idle-timeout/SIGINT).
+pub(crate) async fn run_shutdown_sequence(
+    handles: ShutdownHandles,
+    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
+    reason: &str,
+) {
+    let ShutdownHandles {
+        writer,
+        db_path,
+        watches,
+        bootstrap_jobs,
+        scheduler,
+    } = handles;
+
     // 2. Cancel and JOIN every server-owned bootstrap before touching watchers,
     // scheduler, WAL or DB resources. spawn_blocking cannot be force-aborted once
     // running, so the indexing pipeline cooperatively observes these tokens.
     let jobs = {
-        let mut guard = bootstrap_jobs_for_shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = bootstrap_jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in guard.iter() {
             job.cancellation.cancel();
         }
@@ -3543,19 +3641,14 @@ async fn serve_until_closed(
     //    scheduler can still be asked to do. Both joins are bounded (worker
     //    threads poll a stop flag / condvar, not indefinite blocking I/O).
     {
-        let mut watches_guard = watches_for_shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut watches_guard = watches.lock().unwrap_or_else(|e| e.into_inner());
 
         for watch in watches_guard.values_mut() {
             watch.stop();
         }
     } // MutexGuard is definitely dropped here
 
-    let sched = scheduler_for_shutdown
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    let sched = scheduler.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(sched) = sched {
         sched.shutdown();
     }
@@ -3576,7 +3669,7 @@ async fn serve_until_closed(
     }
 
     // 4. Record clean shutdown marker (durable task state, REC-INV-1).
-    let _ = attic_incremental::record_clean_shutdown_marker(&writer_for_shutdown);
+    let _ = attic_incremental::record_clean_shutdown_marker(&writer);
 
     // 5. Explicit WAL checkpoint + backup (Phase 7).  After a clean shutdown:
     //    force a TRUNCATE checkpoint so the WAL is emptied into the main
@@ -3585,7 +3678,7 @@ async fn serve_until_closed(
     //    failure is logged but never prevents clean exit, since the data is
     //    still recoverable from the WAL on next open.
     {
-        let db_path = db_path_for_shutdown.clone();
+        let db_path = db_path.clone();
         let maintenance = tokio::task::spawn_blocking(move || {
             let (conn, _pool) = match attic_storage::open_db(&db_path) {
                 Ok(x) => x,
@@ -3620,16 +3713,16 @@ async fn serve_until_closed(
 
     // 6. Stop workers.  Drop the WriterQueue - this signals the worker thread
     //    to shut down and joins it deterministically. By this point `server`
-    //    (and its `Arc<WriterQueue>`) has already been fully dropped inside
-    //    `running.waiting()` above, so this drops the last outstanding
-    //    handle clone.
-    drop(writer_for_shutdown);
+    //    (and its `Arc<WriterQueue>`) has already been fully dropped (either
+    //    inside `running.waiting()` for the stdio path, or once every
+    //    accepted connection's `RunningService` finished for the daemon
+    //    path), so this drops the last outstanding handle clone.
+    drop(writer);
 
     // 7. Close DB resources (pool + writer connection) via Drop.
-    // 8. Exit (return to `main`, which returns `Ok(())` to the runtime).
+    // 8. Exit (return to the caller, which returns `Ok(())` to the runtime).
 
-    info!("attic server shut down cleanly: {reason:?}");
-    Ok(())
+    info!("attic server shut down cleanly: {reason}");
 }
 
 // ΓöÇΓöÇΓöÇ tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5394,6 +5487,17 @@ mod tests {
             // cached model, so leaving it on would make every one of them
             // attempt a real network download. Explicitly opt out.
             .env("ATTIC_SEMANTIC", "0")
+            // These supplemental manual JSON-RPC tests drive one process
+            // directly over its own stdio and (in
+            // `mcp_disconnect_cancels_and_joins_background_bootstrap`) rely
+            // on a closed transport triggering shutdown immediately — which
+            // is exactly the legacy single-process contract, not the daemon
+            // path's intentional idle-timeout grace period for a solo
+            // connection (see `daemon.rs`). Keep this whole suite on the
+            // legacy path, same as `tests/rmcp_stdio_integration.rs`; daemon
+            // behavior itself is covered by
+            // `tests/daemon_relay_integration.rs`.
+            .env("ATTIC_NO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

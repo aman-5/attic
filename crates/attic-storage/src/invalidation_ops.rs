@@ -231,13 +231,17 @@ pub fn invalidate_for_occurrences(
         }
     }
     if !symbol_ids.is_empty() {
-        counts.symbol_occurrences = update_freshness(
-            conn,
-            "core_symbol_occurrences",
-            "id",
-            &symbol_ids,
-            FreshnessState::Invalid,
-        )?;
+        // Unlike the other derived-artifact tables, `core_symbol_occurrences`
+        // has no `freshness_state` column of its own (see
+        // `migrations/0001_initial.sql`): its liveness is derived
+        // transitively through `file_occurrence_id` -> the owning
+        // `core_file_occurrences.freshness_state`, which was already
+        // invalidated above. Every read path (`retrieval_reads.rs`,
+        // `semantic_reads.rs`) filters on `fo.freshness_state`, never on a
+        // per-row state here, and `repository/structural.rs` deletes rows
+        // outright rather than flagging them. So there is nothing to update
+        // on this table — only the audit trail is recorded.
+        counts.symbol_occurrences = symbol_ids.len() as u64;
         record_invalidation(
             conn,
             InvalidationArtifactType::SymbolOccurrence,

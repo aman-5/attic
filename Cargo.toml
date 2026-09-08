@@ -60,6 +60,19 @@ tree-sitter-python    = "0.25"
 tree-sitter-go        = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
+tree-sitter-tags       = "0.26"
+tree-sitter-c          = "0.24"
+tree-sitter-cpp        = "0.23"
+tree-sitter-ruby       = "0.23"
+tree-sitter-c-sharp    = "0.23"
+tree-sitter-scala      = "0.26"
+tree-sitter-php        = "0.24"
+tree-sitter-rust       = "0.24"
+tree-sitter-containerfile = "0.9"
+tree-sitter-kotlin-ng  = "1.1"
+tree-sitter-swift      = "0.7"
+tree-sitter-lua        = "0.5"
+interprocess           = { version = "2.4", features = ["tokio"] }
 # Phase 1D: Official Rust MCP SDK (ADR-008)
 # Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
