@@ -31,8 +31,16 @@ use crate::api::{
 };
 use crate::cancellation::CancellationToken;
 
-/// Maximum source lines per retrieval unit.
-pub const MAX_LINES_PER_CHUNK: usize = 500;
+/// Target characters per retrieval unit (chunk boundary decisions accumulate
+/// whole lines up to this size, never splitting a line to hit it exactly —
+/// see `next_chunk_end`). Character-based, not line-count-based: a line-count
+/// cap (the old `MAX_LINES_PER_CHUNK = 500`) let files with very long lines
+/// (long single-line JSON/log dumps, minified content) produce chunks tens
+/// of thousands of characters long — well past the semantic layer's hard
+/// per-unit embedding size cap — so such content was silently never
+/// embeddable. Bounding by characters instead keeps every chunk within a
+/// predictable size regardless of how long individual lines are.
+pub const TARGET_CHUNK_CHARS: usize = 2_000;
 
 /// Maximum bytes held in the inter-chunk carry buffer.
 pub const MAX_CARRY_BYTES: usize = 65_536; // 64 KiB
@@ -262,6 +270,37 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Compute the exclusive end index of the next chunk starting at `start`,
+/// accumulating `len_at(i)` (bytes) for lines `start..count` up to
+/// `target_chars`. Always consumes at least one line, even if that single
+/// line alone exceeds `target_chars` (an oversized line becomes its own
+/// chunk rather than being silently dropped or merged further).
+///
+/// Returns `count` if the accumulated length across ALL remaining lines
+/// never reaches `target_chars` — callers use this to distinguish "not
+/// enough accumulated yet, wait for more input" (streaming, mid-stream)
+/// from "this is everything there is, take it as the final chunk"
+/// (streaming EOF flush, and the buffered path where all input is
+/// already in hand).
+fn next_chunk_end<F: Fn(usize) -> usize>(
+    start: usize,
+    count: usize,
+    target_chars: usize,
+    len_at: F,
+) -> usize {
+    let mut end = start;
+    let mut acc = 0usize;
+    while end < count {
+        let len = len_at(end);
+        if end > start && acc + len > target_chars {
+            break;
+        }
+        acc += len;
+        end += 1;
+    }
+    end
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Build RetrievalUnitSpec — 0-based exclusive-end spans
 // ─────────────────────────────────────────────────────────────────────────────
@@ -381,7 +420,9 @@ fn chunk_text_into_units(
             return;
         }
 
-        let chunk_end = (chunk_start + MAX_LINES_PER_CHUNK).min(lines.len());
+        let chunk_end = next_chunk_end(chunk_start, lines.len(), TARGET_CHUNK_CHARS, |i| {
+            lines[i].content.len()
+        });
         let chunk_lines: Vec<String> = lines[chunk_start..chunk_end]
             .iter()
             .map(|l| l.content.clone())
@@ -545,9 +586,18 @@ fn stream_into_units(
             carry.clear();
         }
 
-        // Flush complete chunks from pending_lines.
-        while pending_lines.len() >= MAX_LINES_PER_CHUNK {
-            let chunk_lines: Vec<String> = pending_lines.drain(..MAX_LINES_PER_CHUNK).collect();
+        // Flush complete chunks from pending_lines. `next_chunk_end` returns
+        // `pending_lines.len()` (i.e. "not enough accumulated yet") when the
+        // total pending content is still under the target — in that case we
+        // stop and wait for more stream data rather than flushing early.
+        loop {
+            let take = next_chunk_end(0, pending_lines.len(), TARGET_CHUNK_CHARS, |i| {
+                pending_lines[i].len()
+            });
+            if take >= pending_lines.len() {
+                break;
+            }
+            let chunk_lines: Vec<String> = pending_lines.drain(..take).collect();
             let unit =
                 build_retrieval_unit_from_lines(units.len() as u32, next_line_0, &chunk_lines);
             next_line_0 += chunk_lines.len() as u32;
@@ -638,7 +688,9 @@ fn flush_stream_pending(
             pending_lines.clear();
             return;
         }
-        let take = MAX_LINES_PER_CHUNK.min(pending_lines.len());
+        let take = next_chunk_end(0, pending_lines.len(), TARGET_CHUNK_CHARS, |i| {
+            pending_lines[i].len()
+        });
         let chunk_lines: Vec<String> = pending_lines.drain(..take).collect();
         let unit = build_retrieval_unit_from_lines(units.len() as u32, *next_line_0, &chunk_lines);
         *next_line_0 += chunk_lines.len() as u32;
@@ -764,22 +816,41 @@ mod tests {
     // ── Multi-chunk splitting ─────────────────────────────────────────────────
 
     #[test]
-    fn more_than_max_lines_produces_multiple_chunks() {
+    fn exceeding_target_chars_produces_multiple_chunks() {
+        // Each line's content is "x" (1 char). Accumulation stops as soon as
+        // adding the NEXT line would push the running total over
+        // TARGET_CHUNK_CHARS, so exactly TARGET_CHUNK_CHARS 1-char lines
+        // (total length == target, not yet over it) fill the first chunk.
         let line = "x\n";
-        let n = MAX_LINES_PER_CHUNK + 3;
+        let n = TARGET_CHUNK_CHARS + 3;
         let text: String = line.repeat(n);
         let out = analyzer().analyze(text_input(&text));
         assert_eq!(out.retrieval_units.len(), 2, "must split into 2 chunks");
 
         let u0 = &out.retrieval_units[0];
         assert_eq!(u0.span.start_line, 0);
-        assert_eq!(u0.span.end_line, MAX_LINES_PER_CHUNK as u32);
+        assert_eq!(u0.span.end_line, TARGET_CHUNK_CHARS as u32);
         assert_eq!(u0.ordinal, 0);
 
         let u1 = &out.retrieval_units[1];
-        assert_eq!(u1.span.start_line, MAX_LINES_PER_CHUNK as u32);
+        assert_eq!(u1.span.start_line, TARGET_CHUNK_CHARS as u32);
         assert_eq!(u1.span.end_line, n as u32);
         assert_eq!(u1.ordinal, 1);
+    }
+
+    #[test]
+    fn single_line_exceeding_target_chars_still_becomes_one_chunk() {
+        // A single line far longer than TARGET_CHUNK_CHARS must still become
+        // its own chunk (never dropped, never split mid-line in the buffered
+        // path) rather than being merged with anything else.
+        let text = "x".repeat(TARGET_CHUNK_CHARS * 5);
+        let out = analyzer().analyze(text_input(&text));
+        assert_eq!(
+            out.retrieval_units.len(),
+            1,
+            "one oversized line must still produce exactly one chunk"
+        );
+        assert_eq!(out.retrieval_units[0].retrieval_text.len(), text.len());
     }
 
     // ── RedactedBytes ─────────────────────────────────────────────────────────
@@ -823,7 +894,10 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let n = MAX_LINES_PER_CHUNK * 4;
+        // "line" content is 4 chars; TARGET_CHUNK_CHARS lines' worth of that
+        // content (2000 lines × 4 chars = 8000 chars) would form ~4 chunks
+        // if allowed to complete.
+        let n = TARGET_CHUNK_CHARS;
         let text: String = "line\n".repeat(n);
         let mut input = text_input(&text);
         input.cancellation_token = token;
@@ -837,7 +911,7 @@ mod tests {
             "pre-cancelled input must emit CANCELLED; got: {codes:?}"
         );
         // May produce zero or partial units — either is acceptable, but must
-        // not have processed all 4 × MAX_LINES_PER_CHUNK lines.
+        // not have processed all ~4 chunks' worth of content.
         assert!(
             out.retrieval_units.len() < 4,
             "cancelled analysis should not produce all 4 chunks; got {}",
@@ -850,7 +924,8 @@ mod tests {
     #[test]
     fn resource_limit_retrieval_units() {
         // Set max_retrieval_units = 1 with content that would otherwise produce 3+.
-        let n = MAX_LINES_PER_CHUNK * 3 + 1;
+        // "x" content is 1 char, so TARGET_CHUNK_CHARS lines fill one chunk.
+        let n = TARGET_CHUNK_CHARS * 3 + 1;
         let text: String = "x\n".repeat(n);
 
         let mut input = text_input(&text);
