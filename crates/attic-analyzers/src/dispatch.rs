@@ -122,8 +122,7 @@ enum SpoolPreparation {
 pub fn dispatch(registry: &AnalyzerRegistry, input: AnalyzerInput) -> AnalyzerOutput {
     // `FileType` is `Copy`; read it before consuming `input`.
     let file_type = input.file_type;
-    let language_hint = input.language_hint.clone();
-    let (analyzer, is_generic) = registry.select(file_type, language_hint.as_deref());
+    let (analyzer, is_generic) = registry.select(file_type, input.language_hint.as_deref());
 
     // GenericAnalyzer is the terminal safe fallback — there is nowhere further
     // to fall back to, but it must still never be allowed to unwind past this

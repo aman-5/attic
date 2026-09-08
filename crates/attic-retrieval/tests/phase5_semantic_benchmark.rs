@@ -29,6 +29,7 @@ const FULL: EnrichmentConfig = EnrichmentConfig {
     batch_size: 16,
     max_attempts: 3,
     budget_ms: 10_000,
+    embedding_worker_count: 1,
 };
 
 #[test]

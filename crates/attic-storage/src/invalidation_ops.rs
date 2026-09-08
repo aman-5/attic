@@ -426,6 +426,115 @@ pub fn get_freshness_totals(conn: &Connection) -> Result<FreshnessTotals, Storag
 }
 
 // ---------------------------------------------------------------------------
+// Pruning (bounded audit trail / tombstone lifecycle)
+// ---------------------------------------------------------------------------
+
+/// Microseconds in one day (matches the `*_at`/`*_us` column unit used
+/// throughout this schema).
+const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+
+/// Default retention window, in days, for `core_file_occurrences` tombstone
+/// rows before [`prune_old_tombstones`] considers them eligible for deletion.
+pub const DEFAULT_TOMBSTONE_RETENTION_DAYS: u32 = 90;
+
+/// Default retention window, in days, for `core_invalidation_records` rows
+/// before [`prune_old_invalidation_records`] considers them eligible for
+/// deletion.
+pub const DEFAULT_INVALIDATION_RECORD_RETENTION_DAYS: u32 = 90;
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or_default()
+}
+
+/// Permanently delete old `core_file_occurrences` tombstone rows
+/// (`existence_state = 'deleted'`) so the table does not grow forever.
+///
+/// `core_file_occurrences` has no `deleted_at`/`updated_at` column of its
+/// own (see `migrations/0001_initial.sql`) — a tombstone is born already
+/// `deleted`, so its owning revision's capture time (`fo.source_revision_id`
+/// → `core_source_revisions.captured_at`, always present via a `NOT NULL`
+/// foreign key) IS the moment the deletion was recorded, and is used here as
+/// the age basis in place of a dedicated deletion timestamp.
+///
+/// Five other tables carry a foreign key to `core_file_occurrences.id`
+/// (`core_dependency_declarations`, `core_knowledge_items`,
+/// `core_retrieval_units`, `core_structural_nodes`,
+/// `core_symbol_occurrences`); with `PRAGMA foreign_keys = ON` (always set by
+/// [`crate::connection::configure_connection`]) deleting a tombstone that
+/// still has a live dependent in any of those tables would either raise a
+/// foreign-key constraint violation (the four `NOT NULL` FKs) or leave a
+/// dangling pointer (the nullable FK on `core_dependency_declarations`). This
+/// function therefore only deletes tombstones with **no** live dependents in
+/// any of those five tables; a tombstone with lingering dependents is simply
+/// left for a later run, once whatever code path owns those dependents has
+/// cleaned them up.
+///
+/// Returns the number of tombstone rows actually deleted.
+pub fn prune_old_tombstones(
+    conn: &Connection,
+    older_than_days: u32,
+) -> Result<usize, StorageError> {
+    let cutoff_us = now_us() - i64::from(older_than_days) * DAY_US;
+    let n = conn.execute(
+        "DELETE FROM core_file_occurrences
+          WHERE existence_state = 'deleted'
+            AND EXISTS (
+                SELECT 1 FROM core_source_revisions sr
+                 WHERE sr.id = core_file_occurrences.source_revision_id
+                   AND sr.captured_at < ?1
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM core_dependency_declarations d
+                 WHERE d.file_occurrence_id = core_file_occurrences.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM core_knowledge_items k
+                 WHERE k.file_occurrence_id = core_file_occurrences.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM core_retrieval_units r
+                 WHERE r.file_occurrence_id = core_file_occurrences.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM core_structural_nodes s
+                 WHERE s.file_occurrence_id = core_file_occurrences.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM core_symbol_occurrences so
+                 WHERE so.file_occurrence_id = core_file_occurrences.id
+            )",
+        rusqlite::params![cutoff_us],
+    )?;
+    Ok(n)
+}
+
+/// Permanently delete old `core_invalidation_records` rows so this
+/// pure audit log does not grow forever.
+///
+/// `invalidated_at` (microseconds since Unix epoch) is the row's own
+/// creation timestamp and is used directly as the age basis; rows are
+/// pruned regardless of `recomputed_at` (closed or still-pending) once they
+/// are older than the retention window — this table is an audit trail, not
+/// a work queue, so "pending" rows do not need to be preserved indefinitely
+/// either.
+///
+/// Returns the number of rows actually deleted.
+pub fn prune_old_invalidation_records(
+    conn: &Connection,
+    older_than_days: u32,
+) -> Result<usize, StorageError> {
+    let cutoff_us = now_us() - i64::from(older_than_days) * DAY_US;
+    let n = conn.execute(
+        "DELETE FROM core_invalidation_records WHERE invalidated_at < ?1",
+        rusqlite::params![cutoff_us],
+    )?;
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -607,5 +716,203 @@ mod tests {
         let t = get_freshness_totals(&conn).unwrap();
         assert_eq!(t.unknown, 1);
         assert_eq!(t.current, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pruning
+    // -----------------------------------------------------------------------
+
+    fn set_revision_captured_at(conn: &Connection, rev_id: &str, captured_at_us: i64) {
+        conn.execute(
+            "UPDATE core_source_revisions SET captured_at = ?2 WHERE id = ?1",
+            rusqlite::params![rev_id, captured_at_us],
+        )
+        .unwrap();
+    }
+
+    /// Seed a minimal repo + revision + identity + occurrence with no
+    /// dependents in any FK-referencing table, so it is a clean pruning
+    /// candidate on its own. Returns `(occurrence_id, source_revision_id)`.
+    fn seed_bare_occurrence(
+        conn: &Connection,
+        existence: ExistenceState,
+        path: &str,
+    ) -> (String, String) {
+        let repo = RepositoryId::new_v4();
+        upsert_repository(conn, &repo, &format!("/repo-{path}"), "prune-test").unwrap();
+        let rev = SourceRevisionId::new_v4();
+        insert_source_revision(
+            conn,
+            &rev,
+            &repo,
+            "deadbeef",
+            "2026-01-01T00:00:00Z",
+            SourceType::Git,
+        )
+        .unwrap();
+        let fi = attic_core::FileIdentityId::new_v4();
+        upsert_file_identity(conn, &fi, &repo, path).unwrap();
+        let occ = attic_core::FileOccurrenceId::new_v4();
+        insert_file_occurrence(
+            conn,
+            &NewFileOccurrence {
+                id: &occ,
+                file_identity_id: &fi,
+                source_revision_id: &rev,
+                index_generation_id: None,
+                path,
+                content_hash: "h-prune",
+                size_bytes: 0,
+                language: None,
+                file_type: FileType::Other,
+                discovery_class: DiscoveryClass::Vcs,
+                security_state: SecurityState::Clean,
+                existence_state: existence,
+            },
+        )
+        .unwrap();
+        (occ.to_string_repr(), rev.to_string_repr())
+    }
+
+    fn occurrence_exists(conn: &Connection, occ_id: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_file_occurrences WHERE id = ?1",
+                [occ_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    #[test]
+    fn prune_old_tombstones_prunes_only_old_deleted_rows() {
+        let conn = migrated_conn();
+        let old_cutoff_us = now_us() - (i64::from(DEFAULT_TOMBSTONE_RETENTION_DAYS) + 1) * DAY_US;
+
+        // Old tombstone: must be pruned.
+        let (old_occ, old_rev) = seed_bare_occurrence(&conn, ExistenceState::Deleted, "old.rs");
+        set_revision_captured_at(&conn, &old_rev, old_cutoff_us);
+
+        // Recent tombstone (captured_at defaults to "now"): must survive.
+        let (new_occ, _new_rev) = seed_bare_occurrence(&conn, ExistenceState::Deleted, "new.rs");
+
+        // Live (non-deleted) row, artificially aged past the threshold: must
+        // never be touched regardless of age.
+        let (live_occ, live_rev) = seed_bare_occurrence(&conn, ExistenceState::Present, "live.rs");
+        set_revision_captured_at(&conn, &live_rev, old_cutoff_us);
+
+        let pruned = prune_old_tombstones(&conn, DEFAULT_TOMBSTONE_RETENTION_DAYS).unwrap();
+        assert_eq!(pruned, 1, "exactly the old tombstone must be pruned");
+
+        assert!(
+            !occurrence_exists(&conn, &old_occ),
+            "old tombstone must be gone"
+        );
+        assert!(
+            occurrence_exists(&conn, &new_occ),
+            "recent tombstone must survive"
+        );
+        assert!(
+            occurrence_exists(&conn, &live_occ),
+            "live row must never be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_old_tombstones_skips_rows_with_live_dependents() {
+        let conn = migrated_conn();
+        let old_cutoff_us = now_us() - (i64::from(DEFAULT_TOMBSTONE_RETENTION_DAYS) + 1) * DAY_US;
+
+        let (occ, rev) = seed_bare_occurrence(&conn, ExistenceState::Deleted, "referenced.rs");
+        set_revision_captured_at(&conn, &rev, old_cutoff_us);
+
+        // Give it a live dependent in one of the five FK-referencing tables.
+        let gen_id = attic_core::IndexGenerationId::new_v4();
+        let repo_row: String = conn
+            .query_row(
+                "SELECT fi.repository_id FROM core_file_occurrences fo
+                   JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+                  WHERE fo.id = ?1",
+                [&occ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_index_generation(
+            &conn,
+            &gen_id,
+            &repo_row.parse().unwrap(),
+            &rev.parse().unwrap(),
+            1,
+            &SubsystemVersions::default(),
+        )
+        .unwrap();
+        insert_retrieval_unit_with_fts(
+            &conn,
+            &NewRetrievalUnit {
+                id: &attic_core::RetrievalUnitId::new_v4().to_string_repr(),
+                file_occurrence_id: &occ,
+                index_generation_id: &gen_id.to_string_repr(),
+                repository_id: &repo_row,
+                retrieval_text: "fn stale() {}",
+                analyzer_id: "generic",
+                analyzer_version: "0.1.0",
+                start_line: Some(0),
+                end_line: Some(0),
+                is_redacted: false,
+            },
+        )
+        .unwrap();
+
+        let pruned = prune_old_tombstones(&conn, DEFAULT_TOMBSTONE_RETENTION_DAYS).unwrap();
+        assert_eq!(
+            pruned, 0,
+            "a tombstone with a live dependent must not be pruned"
+        );
+        assert!(occurrence_exists(&conn, &occ));
+    }
+
+    #[test]
+    fn prune_old_invalidation_records_prunes_only_old_rows() {
+        let conn = migrated_conn();
+        let seed = seed_repo_rev_occ(&conn);
+
+        let old_cutoff_us =
+            now_us() - (i64::from(DEFAULT_INVALIDATION_RECORD_RETENTION_DAYS) + 1) * DAY_US;
+        record_invalidation(
+            &conn,
+            InvalidationArtifactType::FileOccurrence,
+            std::slice::from_ref(&seed.occ),
+            InvalidationCause::SourceChanged,
+            old_cutoff_us,
+        )
+        .unwrap();
+        record_invalidation(
+            &conn,
+            InvalidationArtifactType::FileOccurrence,
+            std::slice::from_ref(&seed.occ),
+            InvalidationCause::SourceChanged,
+            now_us(),
+        )
+        .unwrap();
+
+        let total_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM core_invalidation_records", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(total_before, 2);
+
+        let pruned =
+            prune_old_invalidation_records(&conn, DEFAULT_INVALIDATION_RECORD_RETENTION_DAYS)
+                .unwrap();
+        assert_eq!(pruned, 1, "only the old record must be pruned");
+
+        let total_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM core_invalidation_records", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(total_after, 1, "the recent record must survive");
     }
 }

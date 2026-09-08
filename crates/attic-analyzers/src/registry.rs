@@ -179,6 +179,16 @@ impl AnalyzerRegistry {
         Arc::clone(&self.generic)
     }
 
+    /// Every language tag registered via
+    /// [`register_for_language`](Self::register_for_language) (e.g.
+    /// `"rust"`, `"tsx"`, `"dockerfile"`). Used to cross-check that any
+    /// language-hint-producing code elsewhere in the workspace (e.g.
+    /// `attic-indexing`'s `infer_language_hint`) stays in sync with what this
+    /// registry actually recognizes.
+    pub fn known_language_tags(&self) -> std::collections::HashSet<&'static str> {
+        self.specialized_by_language.keys().copied().collect()
+    }
+
     /// Return the descriptor of every registered analyzer (specialized +
     /// generic), sorted by name for determinism.  Useful for diagnostics.
     pub fn all_descriptors(&self) -> Vec<AnalyzerDescriptor> {

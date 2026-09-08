@@ -58,9 +58,9 @@ Attic connects even with nothing configured, then you configure it by simply
 telling your AI client:
 
 > Configure Attic with these repositories:
-> `C:\Users\me\Desktop\Dump`
-> `C:\work\HDFC`
-> `D:\repos\HDFC-Bank-on-prem`
+> `C:\Users\<username>\projects\repo-a`
+> `C:\work\repo-b`
+> `D:\repos\repo-c`
 
 The AI invokes Attic's `workspace` MCP tool; Attic validates the roots,
 persists them atomically to `~/.attic/config.toml` (override the location
@@ -180,9 +180,9 @@ rarely one directory tree — repositories often live in unrelated
 locations with no common parent, e.g.:
 
 ```text
-C:\Users\<username>\Desktop\Dump
-C:\Users\<username>\Path1
-C:\Users\<username>\Path3
+C:\Users\<username>\projects\repo-a
+C:\Users\<username>\projects\repo-b
+C:\Users\<username>\projects\repo-c
 ```
 
 Set `ATTIC_CONFIG` to a small config file listing each root explicitly —
@@ -191,13 +191,13 @@ submodules, and no additional MCP entries/databases:
 
 ```text
 [[repositories]]
-path = "C:\Users\<username>\Desktop\Dump"
+path = "C:\Users\<username>\projects\repo-a"
 
 [[repositories]]
-path = "C:\Users\<username>\Path1"
+path = "C:\Users\<username>\projects\repo-b"
 
 [[repositories]]
-path = "C:\Users\<username>\Path3"
+path = "C:\Users\<username>\projects\repo-c"
 ```
 
 ```sh
@@ -216,11 +216,21 @@ shared auth package" from each repository's own manifests (`package.json`,
 `pom.xml`, `go.mod`, `.gitmodules`, etc.) — arbitrary, unrelated roots work
 exactly like repositories that happen to share a parent directory.
 
-A **single** `attic` process owns one logical workspace and one
-database: one coordinated writer queue, one MCP transport, one watcher
-per configured repository. Attic does **not** support multiple `attic-server` processes writing to the same database
-concurrently — give each concurrently running instance its own
-`ATTIC_HOME`.
+One logical workspace, one database, one coordinated writer queue, one
+watcher per configured repository — but not necessarily one process. The
+first `attic` launch for a given database self-elects as its **daemon**
+(owns the writer, watchers, and startup recovery); every later launch
+against the same database becomes a thin **relay** that splices its own
+MCP stdio to the daemon over a local socket/named pipe, so multiple
+windows on the same project run genuinely concurrently against one shared
+live state — there is still only ever one writer. The daemon shuts down
+after an idle timeout (~90s with zero connections); set `ATTIC_NO_DAEMON=1`
+to force the older, stricter behavior where a second launch against the
+same database simply refuses to start instead of relaying. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#process-and-ownership-model)
+for the full election/relay design. Attic still does **not** support
+multiple *daemons* concurrently writing to the same database — give each
+concurrently running *daemon* its own `ATTIC_HOME`.
 
 ## Project Knowledge
 
@@ -259,8 +269,9 @@ this repository for a ready-to-copy template.
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
-| Java / Python / Go / JavaScript / TypeScript | Structural (tree-sitter) | Symbols, definitions, relationships |
-| Rust / Swift / C++ / Kotlin / etc. | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later |
+| Java / Python / Go / JavaScript / TypeScript (incl. `.tsx`) | Structural (hand-written tree-sitter) | Full symbols, definitions, imports, relationships |
+| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Structural (generic tags.scm) | Symbol definitions + intra-file references only — no import/relationship resolution (honestly declared, not overclaimed) |
+| Everything else (Kotlin, etc.) | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later |
 
 Rich language support is additive, not a gate on usability — every
 text-based file in your workspace is searchable from the first index,
@@ -313,6 +324,7 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_CHECKPOINT_WAL_FRAMES` / `ATTIC_CHECKPOINT_MINUTES` / `ATTIC_WAL_AUTOCKPT_ENABLED` | WAL checkpoint interval (by frame count or elapsed time, whichever comes first) and whether auto-checkpointing is enabled. |
 | `ATTIC_GRACEFUL_SHUTDOWN_TIMEOUT_MS` | How long the server waits for in-flight tasks to complete on shutdown before force-exiting. |
 | `ATTIC_STARTUP_INTEGRITY_CHECK` / `ATTIC_STARTUP_FOREIGN_KEY_CHECK` | Whether the database integrity check / foreign-key check runs at startup (see Crash recovery in `docs/ARCHITECTURE.md`). |
+| `ATTIC_NO_DAEMON` | Set to `1` to disable the daemon/relay architecture and force the older single-process behavior, where a second launch against the same database refuses to start instead of relaying (see [Workspaces & Multiple Repositories](#workspaces--multiple-repositories)). |
 
 Home resolution: `ATTIC_HOME` (if set and non-empty) → `~/.attic` (derived
 from the OS user home directory). Setting `ATTIC_HOME` to an empty string is

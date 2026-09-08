@@ -134,6 +134,9 @@ pub struct ResourcePolicy {
     /// Embedding batch size (consumed by a future `SemanticProvider`
     /// implementation; not yet consumed by `HashingEmbedder`).
     pub embedding_batch_size: usize,
+    /// Number of concurrent background embedding worker threads
+    /// (`BackgroundEnricher::spawn`).
+    pub embedding_worker_count: usize,
     /// `WriterQueue` batch size.
     pub writer_batch_size: usize,
     /// `WriterQueue` flush interval, in ms.
@@ -172,6 +175,7 @@ impl ResourcePolicy {
                 min_free_memory_mib: 256,
                 max_foreground_queries: 32,
                 embedding_batch_size: 8,
+                embedding_worker_count: 1,
                 writer_batch_size: 128,
                 writer_flush_interval_ms: 100,
                 writer_queue_capacity: 256,
@@ -184,7 +188,8 @@ impl ResourcePolicy {
                 memory_budget_mib: 4096,
                 min_free_memory_mib: 400,
                 max_foreground_queries: 64,
-                embedding_batch_size: 32,
+                embedding_batch_size: 16,
+                embedding_worker_count: 3,
                 writer_batch_size: 256,
                 writer_flush_interval_ms: 50,
                 writer_queue_capacity: 512,
@@ -198,6 +203,7 @@ impl ResourcePolicy {
                 min_free_memory_mib: 400,
                 max_foreground_queries: 128,
                 embedding_batch_size: 64,
+                embedding_worker_count: 3,
                 writer_batch_size: 512,
                 writer_flush_interval_ms: 25,
                 writer_queue_capacity: 1024,
@@ -253,6 +259,11 @@ impl ResourcePolicy {
         if self.embedding_batch_size == 0 {
             return Err(ConfigError::Invalid(
                 "embedding_batch_size must be >= 1".into(),
+            ));
+        }
+        if self.embedding_worker_count == 0 {
+            return Err(ConfigError::Invalid(
+                "embedding_worker_count must be >= 1".into(),
             ));
         }
         // [FIX] Now that max_io_ops_per_sec is actually enforced (writer.rs's
@@ -363,6 +374,8 @@ pub struct EffectiveResourceConfig {
     pub max_foreground_queries: usize,
     /// See [`ResourcePolicy::embedding_batch_size`].
     pub embedding_batch_size: usize,
+    /// See [`ResourcePolicy::embedding_worker_count`].
+    pub embedding_worker_count: usize,
     /// See [`ResourcePolicy::writer_batch_size`].
     pub writer_batch_size: usize,
     /// See [`ResourcePolicy::writer_flush_interval_ms`].
@@ -383,6 +396,7 @@ impl From<ResourcePolicy> for EffectiveResourceConfig {
             min_free_memory_mib: p.min_free_memory_mib,
             max_foreground_queries: p.max_foreground_queries,
             embedding_batch_size: p.embedding_batch_size,
+            embedding_worker_count: p.embedding_worker_count,
             writer_batch_size: p.writer_batch_size,
             writer_flush_interval_ms: p.writer_flush_interval_ms,
             writer_queue_capacity: p.writer_queue_capacity,
@@ -395,7 +409,7 @@ impl EffectiveResourceConfig {
     /// Project onto the existing [`ResourceConfig`] shape so
     /// `ResourceMonitor::from_config` can consume it without a parallel
     /// admission-control code path. `per_repo_memory_budget_mib` and
-    /// `max_background_workers` are outside `ResourcePolicy`'s 11 fields
+    /// `max_background_workers` are outside `ResourcePolicy`'s 12 fields
     /// (per Low-Level Design §1) and keep their existing
     /// `attic_core::resources` defaults here.
     pub fn as_resource_config(&self) -> ResourceConfig {

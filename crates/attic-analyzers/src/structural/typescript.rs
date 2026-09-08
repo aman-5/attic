@@ -24,6 +24,41 @@ pub(crate) static TSX_SPEC: TsxSpec = TsxSpec;
 pub struct TypeScriptSpec;
 pub struct TsxSpec;
 
+/// Shared capability table for the TypeScript grammar family (plain `.ts` and
+/// JSX-aware `.tsx`): both variants offer identical extraction fidelity, only
+/// `lang_tag`/grammar selection differs — see `extract`/`TsxSpec::extract`.
+fn ts_family_capabilities() -> AnalyzerCapabilities {
+    AnalyzerCapabilities {
+        entries: vec![
+            (CapabilityKind::StructuralParse, CapabilityLevel::Full),
+            (CapabilityKind::SymbolExtraction, CapabilityLevel::Full),
+            (CapabilityKind::ImportExtraction, CapabilityLevel::Full),
+            (CapabilityKind::ReferenceExtraction, CapabilityLevel::Basic),
+            (
+                CapabilityKind::RelationshipResolution,
+                CapabilityLevel::Basic,
+            ),
+        ],
+    }
+}
+
+/// Shared `extract` body for the TypeScript grammar family; only `lang_tag`
+/// differs between `.ts` and `.tsx`.
+fn extract_ts_family(
+    lang_tag: &'static str,
+    root: Node<'_>,
+    src: &SourceText<'_>,
+    out: &mut Extraction<'_>,
+) {
+    let mut st = js::JsState {
+        lang_tag,
+        src,
+        locals: Vec::new(),
+        imported: Vec::new(),
+    };
+    walk_ts_container(&mut st, root, &[], None, true, out);
+}
+
 /// Public factory for registry wiring.
 pub fn analyzer() -> Arc<dyn Analyzer> {
     make_analyzer(&TYPESCRIPT_SPEC)
@@ -49,18 +84,7 @@ impl TreeSitterLanguageSpec for TsxSpec {
     }
 
     fn capabilities(&self) -> AnalyzerCapabilities {
-        AnalyzerCapabilities {
-            entries: vec![
-                (CapabilityKind::StructuralParse, CapabilityLevel::Full),
-                (CapabilityKind::SymbolExtraction, CapabilityLevel::Full),
-                (CapabilityKind::ImportExtraction, CapabilityLevel::Full),
-                (CapabilityKind::ReferenceExtraction, CapabilityLevel::Basic),
-                (
-                    CapabilityKind::RelationshipResolution,
-                    CapabilityLevel::Basic,
-                ),
-            ],
-        }
+        ts_family_capabilities()
     }
 
     fn grammar(&self) -> tree_sitter_language::LanguageFn {
@@ -72,13 +96,7 @@ impl TreeSitterLanguageSpec for TsxSpec {
     }
 
     fn extract(&self, root: Node<'_>, src: &SourceText<'_>, out: &mut Extraction<'_>) {
-        let mut st = js::JsState {
-            lang_tag: "tsx",
-            src,
-            locals: Vec::new(),
-            imported: Vec::new(),
-        };
-        walk_ts_container(&mut st, root, &[], None, true, out);
+        extract_ts_family("tsx", root, src, out);
     }
 }
 
@@ -98,18 +116,7 @@ impl TreeSitterLanguageSpec for TypeScriptSpec {
     }
 
     fn capabilities(&self) -> AnalyzerCapabilities {
-        AnalyzerCapabilities {
-            entries: vec![
-                (CapabilityKind::StructuralParse, CapabilityLevel::Full),
-                (CapabilityKind::SymbolExtraction, CapabilityLevel::Full),
-                (CapabilityKind::ImportExtraction, CapabilityLevel::Full),
-                (CapabilityKind::ReferenceExtraction, CapabilityLevel::Basic),
-                (
-                    CapabilityKind::RelationshipResolution,
-                    CapabilityLevel::Basic,
-                ),
-            ],
-        }
+        ts_family_capabilities()
     }
 
     fn grammar(&self) -> tree_sitter_language::LanguageFn {
@@ -123,13 +130,7 @@ impl TreeSitterLanguageSpec for TypeScriptSpec {
     }
 
     fn extract(&self, root: Node<'_>, src: &SourceText<'_>, out: &mut Extraction<'_>) {
-        let mut st = js::JsState {
-            lang_tag: "typescript",
-            src,
-            locals: Vec::new(),
-            imported: Vec::new(),
-        };
-        walk_ts_container(&mut st, root, &[], None, true, out);
+        extract_ts_family("typescript", root, src, out);
     }
 }
 

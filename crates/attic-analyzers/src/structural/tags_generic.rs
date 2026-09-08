@@ -447,19 +447,196 @@ fn analyze_tags(
         resource_budget,
     } = input;
 
-    // Split content: keep an owned byte copy for tags parsing (when
-    // available) while reconstructing an equivalent input for GenericAnalyzer
-    // so retrieval-unit production is reused verbatim.
-    let (bytes_for_tags, content_for_generic) = match content {
-        AnalyzerContent::FullBytes(b) => (Some(b.clone()), AnalyzerContent::FullBytes(b)),
-        AnalyzerContent::RedactedBytes(b) => (Some(b.clone()), AnalyzerContent::RedactedBytes(b)),
-        AnalyzerContent::StreamingHandle(s) => (None, AnalyzerContent::StreamingHandle(s)),
-    };
+    // Tags-based extraction runs FIRST, against a *borrow* of `content`'s
+    // bytes (when available) — this avoids the full-file byte clone that used
+    // to be required to hand an owned copy to both this pass and
+    // GenericAnalyzer below (see `structural/mod.rs`'s `engine::run`, which
+    // uses the analogous "borrow first, move later" shape via
+    // `std::mem::replace`). `content` itself is moved into `generic_input`
+    // completely unchanged once this borrow's scope ends.
+    let mut tag_diagnostics: Vec<AnalyzerDiagnostic> = Vec::new();
+    let mut tag_nodes: Vec<StructuralNodeSpec> = Vec::new();
+    let mut tag_symbols: Vec<SymbolSpec> = Vec::new();
+    let mut structurally_complete = true;
+    // Set only for the two "no tags attempt was made at all" cases (streamed
+    // LARGE file, or already-cancelled before extraction started) — mirrors
+    // the original early-return paths, which reported `Lexical` regardless of
+    // `out.symbols` (empty in both cases anyway).
+    let mut skipped_entirely = false;
 
+    match &content {
+        AnalyzerContent::StreamingHandle(_) => {
+            // LARGE (streamed) file: lexical-only, honestly marked — see module docs.
+            tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                "STRUCTURAL_SKIPPED_LARGE_FILE",
+                format!(
+                    "{language_tag}: tags-based structural analysis is not attempted for \
+                     streamed LARGE files; output is lexical-only via GenericAnalyzer."
+                ),
+            ));
+            structurally_complete = false;
+            skipped_entirely = true;
+        }
+        AnalyzerContent::FullBytes(bytes) | AnalyzerContent::RedactedBytes(bytes) => {
+            if cancellation_token.is_cancelled() {
+                tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::CANCELLED,
+                    "Cancelled before tags-based structural analysis started.",
+                ));
+                structurally_complete = false;
+                skipped_entirely = true;
+            } else {
+                let entity_cap = TAGS_ENTITY_CAP.min(
+                    usize::try_from(resource_budget.max_retrieval_units).unwrap_or(TAGS_ENTITY_CAP),
+                );
+                // Reuse one `TagsContext` (parser + cursor) per language per
+                // thread rather than rebuilding it for every file: the
+                // compiled `TagsConfiguration` is already cached per-language
+                // via `OnceLock` (see `build_analyzer`), but `TagsContext`
+                // wraps the actual tree-sitter parser, which is comparatively
+                // expensive to construct. `thread_local!` (rather than a
+                // `Mutex<TagsContext>` field) avoids lock contention when
+                // multiple indexing threads analyze files concurrently, at
+                // the cost of one parser per thread per language instead of
+                // one globally — `generate_tags` resets all per-call parse
+                // state itself (it parses `bytes` fresh with no previous
+                // tree), so reusing the context across unrelated files of the
+                // same language is safe.
+                thread_local! {
+                    static TAGS_CONTEXT_CACHE: std::cell::RefCell<std::collections::HashMap<&'static str, TagsContext>> =
+                        std::cell::RefCell::new(std::collections::HashMap::new());
+                }
+
+                TAGS_CONTEXT_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let ctx = cache
+                    .entry(language_tag)
+                    .or_insert_with(TagsContext::new);
+
+                match ctx.generate_tags(config, bytes, None) {
+                    Ok((tags_iter, has_error)) => {
+                        if has_error {
+                            tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                                "PARSE_ERROR",
+                                format!(
+                                    "{language_tag}: source contains syntax errors; structural output is partial"
+                                ),
+                            ));
+                            structurally_complete = false;
+                        }
+
+                        let mut processed: u32 = 0;
+                        'tags: for tag_result in tags_iter {
+                            processed += 1;
+                            if processed.is_multiple_of(CHECK_EVERY) {
+                                if cancellation_token.is_cancelled() {
+                                    tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                                        diagnostic_codes::CANCELLED,
+                                        "Tags-based structural analysis cancelled mid-extraction; \
+                                         output is PARTIAL.",
+                                    ));
+                                    structurally_complete = false;
+                                    break 'tags;
+                                }
+                                if started.elapsed().as_millis() as u64 >= resource_budget.max_time_ms
+                                {
+                                    tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                                        diagnostic_codes::RESOURCE_EXHAUSTED,
+                                        "Time budget exhausted during tags-based structural extraction; \
+                                         output is PARTIAL.",
+                                    ));
+                                    structurally_complete = false;
+                                    break 'tags;
+                                }
+                            }
+
+                            let tag = match tag_result {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    structurally_complete = false;
+                                    break 'tags;
+                                }
+                            };
+
+                            // Only definitions become symbols — see module docs for why
+                            // references are not represented anywhere in the output.
+                            if !tag.is_definition {
+                                continue;
+                            }
+
+                            if tag_symbols.len() >= entity_cap {
+                                tag_diagnostics.push(AnalyzerDiagnostic::warning(
+                                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                                    format!(
+                                        "symbol cap ({entity_cap}) reached; further tags skipped — \
+                                         output is PARTIAL"
+                                    ),
+                                ));
+                                structurally_complete = false;
+                                break 'tags;
+                            }
+
+                            let Some(name_bytes) = bytes.get(tag.name_range.clone()) else {
+                                continue;
+                            };
+                            let name = String::from_utf8_lossy(name_bytes).into_owned();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let syntax_type =
+                                config.syntax_type_name(tag.syntax_type_id).to_string();
+                            let kind = map_symbol_kind(&syntax_type);
+                            let span = span_from_points(tag.span.clone());
+                            let identity_basis = format!("{language_tag}|{name}|{syntax_type}");
+                            let structural_identity = super::structural_identity(&identity_basis);
+                            let content_hash = bytes
+                                .get(tag.range.clone())
+                                .map(|b| blake3::hash(b).to_hex().to_string())
+                                .unwrap_or_default();
+
+                            let node_index = tag_nodes.len();
+                            tag_nodes.push(StructuralNodeSpec {
+                                node_type: syntax_type.to_ascii_uppercase(),
+                                name: name.clone(),
+                                span,
+                                parent_index: None,
+                                structural_identity,
+                                content_hash,
+                                metadata_json: None,
+                            });
+                            tag_symbols.push(SymbolSpec {
+                                qualified_name: name.clone(),
+                                short_name: name,
+                                kind,
+                                definition_span: span,
+                                is_public: true,
+                                disambiguator: None,
+                                signature: None,
+                                visibility: None,
+                                is_definition: true,
+                                node_index: Some(node_index),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tag_diagnostics.push(AnalyzerDiagnostic::error(
+                            "TAGS_QUERY_FAILED",
+                            format!("{language_tag}: failed to generate tags: {e}"),
+                        ));
+                        structurally_complete = false;
+                    }
+                }
+                });
+            }
+        }
+    }
+
+    // Borrow of `content` ends here; move it unchanged into GenericAnalyzer's
+    // input so retrieval-unit production is reused verbatim — no clone.
     let generic_input = AnalyzerInput {
         file_occurrence_id,
         path,
-        content: content_for_generic,
+        content,
         language_hint,
         file_type,
         size_bytes,
@@ -471,148 +648,13 @@ fn analyze_tags(
     out.analyzer_id = analyzer_id.to_string();
     out.analyzer_version = env!("CARGO_PKG_VERSION").to_string();
 
-    let Some(bytes) = bytes_for_tags else {
-        // LARGE (streamed) file: lexical-only, honestly marked — see module docs.
-        out.diagnostics.push(AnalyzerDiagnostic::warning(
-            "STRUCTURAL_SKIPPED_LARGE_FILE",
-            format!(
-                "{language_tag}: tags-based structural analysis is not attempted for \
-                 streamed LARGE files; output is lexical-only via GenericAnalyzer."
-            ),
-        ));
-        out.capability_used = CapabilityKind::Lexical;
-        out.structurally_complete = false;
-        return out;
-    };
+    out.diagnostics.extend(tag_diagnostics);
+    out.structural_nodes.extend(tag_nodes);
+    out.symbols.extend(tag_symbols);
 
-    if cancellation_token.is_cancelled() {
-        out.diagnostics.push(AnalyzerDiagnostic::warning(
-            diagnostic_codes::CANCELLED,
-            "Cancelled before tags-based structural analysis started.",
-        ));
-        out.capability_used = CapabilityKind::Lexical;
-        out.structurally_complete = false;
-        return out;
-    }
-
-    let entity_cap = TAGS_ENTITY_CAP
-        .min(usize::try_from(resource_budget.max_retrieval_units).unwrap_or(TAGS_ENTITY_CAP));
-    let mut structurally_complete = true;
-    let mut ctx = TagsContext::new();
-
-    match ctx.generate_tags(config, &bytes, None) {
-        Ok((tags_iter, has_error)) => {
-            if has_error {
-                out.diagnostics.push(AnalyzerDiagnostic::warning(
-                    "PARSE_ERROR",
-                    format!(
-                        "{language_tag}: source contains syntax errors; structural output is partial"
-                    ),
-                ));
-                structurally_complete = false;
-            }
-
-            let mut processed: u32 = 0;
-            'tags: for tag_result in tags_iter {
-                processed += 1;
-                if processed.is_multiple_of(CHECK_EVERY) {
-                    if cancellation_token.is_cancelled() {
-                        out.diagnostics.push(AnalyzerDiagnostic::warning(
-                            diagnostic_codes::CANCELLED,
-                            "Tags-based structural analysis cancelled mid-extraction; \
-                             output is PARTIAL.",
-                        ));
-                        structurally_complete = false;
-                        break 'tags;
-                    }
-                    if started.elapsed().as_millis() as u64 >= resource_budget.max_time_ms {
-                        out.diagnostics.push(AnalyzerDiagnostic::warning(
-                            diagnostic_codes::RESOURCE_EXHAUSTED,
-                            "Time budget exhausted during tags-based structural extraction; \
-                             output is PARTIAL.",
-                        ));
-                        structurally_complete = false;
-                        break 'tags;
-                    }
-                }
-
-                let tag = match tag_result {
-                    Ok(t) => t,
-                    Err(_) => {
-                        structurally_complete = false;
-                        break 'tags;
-                    }
-                };
-
-                // Only definitions become symbols — see module docs for why
-                // references are not represented anywhere in the output.
-                if !tag.is_definition {
-                    continue;
-                }
-
-                if out.symbols.len() >= entity_cap {
-                    out.diagnostics.push(AnalyzerDiagnostic::warning(
-                        diagnostic_codes::RESOURCE_EXHAUSTED,
-                        format!(
-                            "symbol cap ({entity_cap}) reached; further tags skipped — \
-                             output is PARTIAL"
-                        ),
-                    ));
-                    structurally_complete = false;
-                    break 'tags;
-                }
-
-                let Some(name_bytes) = bytes.get(tag.name_range.clone()) else {
-                    continue;
-                };
-                let name = String::from_utf8_lossy(name_bytes).into_owned();
-                if name.is_empty() {
-                    continue;
-                }
-                let syntax_type = config.syntax_type_name(tag.syntax_type_id).to_string();
-                let kind = map_symbol_kind(&syntax_type);
-                let span = span_from_points(tag.span.clone());
-                let identity_basis = format!("{language_tag}|{name}|{syntax_type}");
-                let structural_identity = super::structural_identity(&identity_basis);
-                let content_hash = bytes
-                    .get(tag.range.clone())
-                    .map(|b| blake3::hash(b).to_hex().to_string())
-                    .unwrap_or_default();
-
-                let node_index = out.structural_nodes.len();
-                out.structural_nodes.push(StructuralNodeSpec {
-                    node_type: syntax_type.to_ascii_uppercase(),
-                    name: name.clone(),
-                    span,
-                    parent_index: None,
-                    structural_identity,
-                    content_hash,
-                    metadata_json: None,
-                });
-                out.symbols.push(SymbolSpec {
-                    qualified_name: name.clone(),
-                    short_name: name,
-                    kind,
-                    definition_span: span,
-                    is_public: true,
-                    disambiguator: None,
-                    signature: None,
-                    visibility: None,
-                    is_definition: true,
-                    node_index: Some(node_index),
-                });
-            }
-        }
-        Err(e) => {
-            out.diagnostics.push(AnalyzerDiagnostic::error(
-                "TAGS_QUERY_FAILED",
-                format!("{language_tag}: failed to generate tags: {e}"),
-            ));
-            structurally_complete = false;
-        }
-    }
-
-    out.capability_used = if out.symbols.is_empty() {
+    out.capability_used = if skipped_entirely {
+        CapabilityKind::Lexical
+    } else if out.symbols.is_empty() {
         CapabilityKind::StructuralParse
     } else {
         CapabilityKind::SymbolExtraction

@@ -173,6 +173,20 @@ pub fn checkpoint_wal(conn: &Connection) -> Result<(i64, i64, i64), StorageError
 /// * `vacuum` — rebuild the database to reclaim space and defragment.
 ///   VACUUM must NOT run while a transaction is open on the connection; it
 ///   is intended for shutdown/idle maintenance windows only.
+///
+/// This is the intended **production maintenance entry point** for
+/// `attic.db`: it is meant to be invoked periodically (e.g. from an idle
+/// maintenance task) or once during a clean server shutdown — never from
+/// inside a writer-queue transaction closure. It must be called on the
+/// **writer** connection with `vacuum: true` at least occasionally, or the
+/// database file will never shrink after deletes (`VACUUM` is otherwise
+/// nothing more than a capability nobody exercises).
+///
+/// Passing `vacuum: true` while a transaction is open on `conn` would
+/// otherwise surface as an opaque SQLite error ("cannot VACUUM from within a
+/// transaction"); this function checks [`Connection::is_autocommit`] up
+/// front and fails closed with a clear [`StorageError::Worker`] instead, so
+/// callers get an actionable error rather than a raw SQLite message.
 pub fn run_maintenance(
     conn: &Connection,
     wal_checkpoint: bool,
@@ -188,6 +202,12 @@ pub fn run_maintenance(
         }
     }
     if vacuum {
+        if !conn.is_autocommit() {
+            return Err(StorageError::Worker(
+                "run_maintenance: VACUUM requested while a transaction is open on this connection"
+                    .to_string(),
+            ));
+        }
         conn.execute_batch("VACUUM")?;
     }
     violations.extend(verify_connection(conn)?);
@@ -744,6 +764,85 @@ mod tests {
                 violations.is_empty(),
                 "no violations on healthy db: {violations:?}"
             );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// Dedicated coverage for the `vacuum: true` production path (Bug 13):
+    /// churn enough rows to give VACUUM real work, then confirm it succeeds
+    /// cleanly and the file does not grow as a result.
+    #[test]
+    fn run_maintenance_with_vacuum_true_succeeds_and_does_not_grow_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_vacuum_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let (writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+            for i in 0..200 {
+                writer
+                    .execute(
+                        "INSERT INTO core_repositories \
+                             (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, 1, 1, 0, 0)",
+                        rusqlite::params![
+                            uuid::Uuid::new_v4().to_string(),
+                            format!("/tmp/vacuum-fixture-{i}"),
+                            format!("repo-{i}")
+                        ],
+                    )
+                    .unwrap();
+            }
+            // Delete most rows so VACUUM has real free space to reclaim.
+            writer
+                .execute(
+                    "DELETE FROM core_repositories WHERE root_path LIKE '/tmp/%'",
+                    [],
+                )
+                .unwrap();
+            checkpoint_wal(&writer).unwrap();
+
+            let size_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let violations =
+                run_maintenance(&writer, true, true).expect("maintenance with vacuum must succeed");
+            assert!(
+                violations.is_empty(),
+                "no violations expected on a healthy db: {violations:?}"
+            );
+            let size_after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                size_after <= size_before,
+                "VACUUM must not grow the file: before={size_before} after={size_after}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// VACUUM must never silently run mid-transaction (see the safety
+    /// comment on `run_maintenance`); confirm the precondition check rejects
+    /// it with a clear error instead of surfacing SQLite's own message.
+    #[test]
+    fn run_maintenance_vacuum_rejected_inside_open_transaction() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("attic_vacuum_txn_{}.db", uuid::Uuid::new_v4()));
+
+        {
+            let (mut writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+
+            let tx = writer.transaction().unwrap();
+            let result = run_maintenance(&tx, false, true);
+            assert!(
+                matches!(result, Err(StorageError::Worker(_))),
+                "expected a Worker error rejecting VACUUM mid-transaction, got {result:?}"
+            );
+            tx.rollback().unwrap();
         }
 
         let _ = std::fs::remove_file(&path);

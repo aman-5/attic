@@ -1368,6 +1368,75 @@ mod tests {
     use attic_storage::{WriterQueue, connection::open_ro};
     use tempfile::TempDir;
 
+    /// Bug fix regression: nothing previously cross-checked that every tag
+    /// string `infer_language_hint` can produce is actually a tag the
+    /// analyzer registry recognizes — only a doc comment on
+    /// `infer_language_hint` asserted "MUST match exactly" between this crate
+    /// and `attic-analyzers`'s tier-2 table / `default_registry`. This test
+    /// fails loudly the moment the two crates' tag strings drift.
+    ///
+    /// One sample path per `infer_language_hint` match arm (kept in sync with
+    /// that function manually, since its match arms aren't otherwise
+    /// enumerable from the outside).
+    #[test]
+    fn infer_language_hint_tags_are_registered_in_analyzer_registry() {
+        let samples: &[&str] = &[
+            "Dockerfile",
+            "x.tsx",
+            "x.ts",
+            "x.rs",
+            "x.c",
+            "x.h",
+            "x.cpp",
+            "x.cc",
+            "x.cxx",
+            "x.hpp",
+            "x.hh",
+            "x.h++",
+            "x.hxx",
+            "x.rb",
+            "x.cs",
+            "x.scala",
+            "x.sc",
+            "x.php",
+            "x.swift",
+            "x.lua",
+            "x.dockerfile",
+        ];
+        let produced: HashSet<&'static str> = samples
+            .iter()
+            .filter_map(|s| infer_language_hint(Path::new(s)))
+            .collect();
+        assert!(
+            !produced.is_empty(),
+            "sample path list above must actually exercise infer_language_hint's match arms"
+        );
+
+        let registry = attic_analyzers::structural::default_registry();
+        let known = registry.known_language_tags();
+
+        for tag in &produced {
+            // `"typescript"` is a documented exception: plain `.ts` sources
+            // are dispatched via the `FileType::TypeScript` map (see
+            // `TypeScriptSpec` in attic-analyzers), not via
+            // `register_for_language`, so `"typescript"` never appears in
+            // `known_language_tags()` even though the hint is correct —
+            // `AnalyzerRegistry::select` falls through to the FileType-keyed
+            // entry whenever a language-hint lookup misses, so this is safe
+            // rather than a real drift.
+            if *tag == "typescript" {
+                continue;
+            }
+            assert!(
+                known.contains(tag),
+                "infer_language_hint can produce tag {tag:?}, but default_registry() has no \
+                 analyzer registered under that language tag — attic-analyzers's tier-2 table \
+                 (or the tsx registration) in structural/mod.rs / tags_generic.rs has drifted \
+                 from infer_language_hint's match arms"
+            );
+        }
+    }
+
     /// File-backed store fixture: open_db → migrations → WriterQueue.
     ///
     /// Mirrors exactly how `attic-server` constructs its endpoints; there is

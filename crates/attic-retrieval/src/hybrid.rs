@@ -52,12 +52,17 @@ impl HybridSearchOptions {
     /// each ranker before fusing, then truncating, produces materially
     /// better results than requesting `result_limit` from each directly.
     pub fn with_result_limit(result_limit: usize) -> Self {
+        // Widen the candidate depths to at least `result_limit` so a caller
+        // requesting more results than `DEFAULT_CANDIDATE_DEPTH` doesn't get
+        // silently truncated before `result_limit` is even applied (fusion
+        // can only return as many results as entered it).
+        let candidate_depth = result_limit.max(DEFAULT_CANDIDATE_DEPTH);
         Self {
             repository_id: None,
             file_type: None,
             language: None,
-            fts_candidate_depth: DEFAULT_CANDIDATE_DEPTH,
-            semantic_candidate_depth: DEFAULT_CANDIDATE_DEPTH,
+            fts_candidate_depth: candidate_depth,
+            semantic_candidate_depth: candidate_depth,
             result_limit,
         }
     }
@@ -410,6 +415,28 @@ mod tests {
             repository_id: "repo".into(),
             path: format!("{id}.rs"),
         }
+    }
+
+    #[test]
+    fn with_result_limit_widens_candidate_depths_above_default() {
+        // Regression test for Bug 18: requesting more results than
+        // `DEFAULT_CANDIDATE_DEPTH` (100) must widen both candidate depths
+        // to at least `result_limit`, instead of silently capping the fused
+        // candidate pool below the requested output size.
+        let opts = HybridSearchOptions::with_result_limit(250);
+        assert!(opts.fts_candidate_depth >= 250);
+        assert!(opts.semantic_candidate_depth >= 250);
+        assert_eq!(opts.result_limit, 250);
+    }
+
+    #[test]
+    fn with_result_limit_keeps_default_depth_for_small_limits() {
+        // A small result_limit must not shrink the candidate depth below the
+        // default (100) — fetching wide before fusing is still desirable.
+        let opts = HybridSearchOptions::with_result_limit(5);
+        assert_eq!(opts.fts_candidate_depth, DEFAULT_CANDIDATE_DEPTH);
+        assert_eq!(opts.semantic_candidate_depth, DEFAULT_CANDIDATE_DEPTH);
+        assert_eq!(opts.result_limit, 5);
     }
 
     #[test]

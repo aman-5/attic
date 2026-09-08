@@ -11,6 +11,7 @@
 //! The adaptive Phase 7 scheduler is explicitly out of scope.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,10 @@ pub struct EnrichmentConfig {
     pub max_attempts: u32,
     /// Wall-clock budget for ONE drive() call (ms).
     pub budget_ms: u64,
+    /// Number of concurrent background embedding worker threads
+    /// `BackgroundEnricher::spawn` spins up (mirrors
+    /// `attic_storage::ResourcePolicy::embedding_worker_count`).
+    pub embedding_worker_count: usize,
 }
 
 impl Default for EnrichmentConfig {
@@ -104,6 +109,7 @@ impl Default for EnrichmentConfig {
             batch_size: 16,
             max_attempts: 3,
             budget_ms: 2_000,
+            embedding_worker_count: 1,
         }
     }
 }
@@ -260,7 +266,36 @@ pub fn drive(
 /// store is the ONLY shared object and queries never lock it.
 pub struct BackgroundEnricher {
     stop: std::sync::Arc<CancelFlag>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Shared reconcile-coordination gate (§Phase 8 multi-worker enrichment):
+/// with `embedding_worker_count` threads all driving the same queue, only
+/// ONE may ever run the real `reconcile()` scan (up to `max_units_total`
+/// rows) at a time — every other thread must stay productive pulling
+/// embedding work via `queue_take_batch` instead of redundantly reconciling
+/// in lockstep. `last_seen_generation`/`last_reconcile_at` are the SAME
+/// debounce state the single-threaded version used to keep locally per
+/// closure; now shared so the debounce is process-wide, not per-thread.
+struct ReconcileGate {
+    last_seen_generation: u64,
+    last_reconcile_at: Option<Instant>,
+    reconciling: bool,
+}
+
+/// Cheap, self-contained per-call jitter — no randomness crate (`rand`,
+/// `fastrand`, ...) is a dependency anywhere in this workspace, so this adds
+/// 0-40ms derived from the current subsecond nanosecond count rather than
+/// pulling in a new external dependency for a small anti-thundering-herd
+/// tweak. Purpose: `embedding_worker_count` threads all backing off on the
+/// same fixed intervals would otherwise wake in lockstep and hammer the
+/// store/resource-monitor at the same instant.
+fn jittered(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    base + Duration::from_millis((nanos % 41) as u64)
 }
 
 impl BackgroundEnricher {
@@ -292,6 +327,17 @@ impl BackgroundEnricher {
     /// competing with the canonical writer for I/O/CPU instead of staying
     /// out of its way. Reacting to the counter (not a blind timer) still
     /// keeps the idle case free; the floor bounds the busy case.
+    ///
+    /// [FIX] `cfg.embedding_worker_count` worker threads are spawned (rather
+    /// than exactly one), each racing to pull batches off the same queue via
+    /// `queue_take_batch` (now atomic — see that function's doc comment).
+    /// `reconcile()` itself must NOT run concurrently from multiple threads,
+    /// so its debounce state (`last_seen_generation`/`last_reconcile_at`,
+    /// plus a new `reconciling` flag) moved out of each thread's local
+    /// closure into one shared `Arc<Mutex<ReconcileGate>>` constructed here
+    /// and cloned into every thread: whichever thread wins the gate check
+    /// runs `reconcile()`; every other thread that tick skips straight to
+    /// `drive()` so all threads stay productive on embedding work.
     pub fn spawn(
         canonical_db_path: std::path::PathBuf,
         store: std::sync::Arc<SemanticStore>,
@@ -302,121 +348,166 @@ impl BackgroundEnricher {
         write_generation: Arc<AtomicU64>,
     ) -> Self {
         let stop = std::sync::Arc::new(CancelFlag::new());
-        let stop2 = stop.clone();
-        let handle = std::thread::spawn(move || {
-            let conn = match Connection::open(&canonical_db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("background enrichment cannot open index: {e}");
-                    return;
-                }
-            };
-            // Seeded to force a mismatch on the very first tick, so a
-            // freshly (re)started server always reconciles once up front —
-            // covers "already-indexed-but-never-embedded" content from
-            // before this worker existed or from a restart.
-            let mut last_seen_generation = write_generation.load(Ordering::Acquire).wrapping_sub(1);
-            // Floor between actual `reconcile()` scans, regardless of how
-            // often the generation counter changes in between — see the
-            // `[FIX]` note on `spawn`'s doc comment above.
-            const RECONCILE_MIN_INTERVAL: Duration = Duration::from_secs(2);
-            let mut last_reconcile_at: Option<Instant> = None;
-            while !stop2.is_cancelled() {
-                if let Some(monitor) = resource_monitor.as_ref() {
-                    use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
-                    if matches!(
-                        current_advisory(monitor),
-                        ResourceAdvisory::Pause | ResourceAdvisory::Emergency
-                    ) {
-                        std::thread::sleep(Duration::from_millis(200));
-                        continue;
+        // Floor between actual `reconcile()` scans, regardless of how often
+        // the generation counter changes in between — see the `[FIX]` note
+        // on `spawn`'s doc comment above.
+        const RECONCILE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+        // Seeded to force a mismatch on the very first tick, so a freshly
+        // (re)started server always reconciles once up front — covers
+        // "already-indexed-but-never-embedded" content from before this
+        // worker existed or from a restart.
+        let initial_generation = write_generation.load(Ordering::Acquire).wrapping_sub(1);
+        let reconcile_gate = Arc::new(Mutex::new(ReconcileGate {
+            last_seen_generation: initial_generation,
+            last_reconcile_at: None,
+            reconciling: false,
+        }));
+
+        // [FIX] `.max(1)`: `validate()` already rejects a configured 0, but a
+        // defensive floor here means a 0 that somehow slips through produces
+        // a `BackgroundEnricher` that still does real work instead of one
+        // that silently spawns no threads at all.
+        let worker_count = cfg.embedding_worker_count.max(1);
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let stop2 = stop.clone();
+            let conn_path = canonical_db_path.clone();
+            let store = store.clone();
+            let provider = provider.clone();
+            let cfg = cfg.clone();
+            let resource_monitor = resource_monitor.clone();
+            let write_generation = write_generation.clone();
+            let reconcile_gate = reconcile_gate.clone();
+            let handle = std::thread::spawn(move || {
+                let conn = match Connection::open(&conn_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("background enrichment cannot open index: {e}");
+                        return;
                     }
-                }
-                let current_generation = write_generation.load(Ordering::Acquire);
-                let due_for_reconcile = match last_reconcile_at {
-                    Some(t) => t.elapsed() >= RECONCILE_MIN_INTERVAL,
-                    None => true,
                 };
-                if current_generation != last_seen_generation && due_for_reconcile {
-                    match reconcile(
+                while !stop2.is_cancelled() {
+                    if let Some(monitor) = resource_monitor.as_ref() {
+                        use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
+                        if matches!(
+                            current_advisory(monitor),
+                            ResourceAdvisory::Pause | ResourceAdvisory::Emergency
+                        ) {
+                            std::thread::sleep(jittered(Duration::from_millis(200)));
+                            continue;
+                        }
+                    }
+                    let current_generation = write_generation.load(Ordering::Acquire);
+                    // Claim the reconcile gate (if due and not already held)
+                    // under the shared lock, then release it BEFORE actually
+                    // calling reconcile() — never call out to reconcile()
+                    // while holding the gate's mutex.
+                    let should_reconcile = {
+                        let mut gate = reconcile_gate
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let due_for_reconcile = match gate.last_reconcile_at {
+                            Some(t) => t.elapsed() >= RECONCILE_MIN_INTERVAL,
+                            None => true,
+                        };
+                        if !gate.reconciling
+                            && due_for_reconcile
+                            && current_generation != gate.last_seen_generation
+                        {
+                            gate.reconciling = true;
+                            gate.last_seen_generation = current_generation;
+                            gate.last_reconcile_at = Some(Instant::now());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_reconcile {
+                        match reconcile(
+                            &conn,
+                            &store,
+                            provider.as_ref(),
+                            &SelectionConfig::default(),
+                        ) {
+                            Ok(report) if report.enqueued > 0 => {
+                                tracing::info!(
+                                    enqueued = report.enqueued,
+                                    invalidated = report.invalidated_stale,
+                                    "semantic reconcile"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("semantic reconcile failed: {e}"),
+                        }
+                        let mut gate = reconcile_gate
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        gate.reconciling = false;
+                    }
+                    match drive(
                         &conn,
                         &store,
                         provider.as_ref(),
-                        &SelectionConfig::default(),
+                        &cfg,
+                        &stop2,
+                        intent_source,
                     ) {
-                        Ok(report) if report.enqueued > 0 => {
-                            tracing::info!(
-                                enqueued = report.enqueued,
-                                invalidated = report.invalidated_stale,
-                                "semantic reconcile"
+                        // [FIX] A Conflict can only ever be resolved by a
+                        // restart (see ensure_profile_claimed's docs) — retrying
+                        // the same doomed claim check every ~50ms forever just
+                        // burns DB round trips for no possible gain. Back off far
+                        // longer; still cooperatively cancellable via `stop2`.
+                        Ok(s) if s.blocked_by_conflict => {
+                            tracing::warn!(
+                                "semantic enrichment blocked by an embedding-profile conflict; \
+                                 backing off until restart (see status for re_index_recommended)"
                             );
+                            let backoff = Duration::from_secs(30);
+                            let deadline = Instant::now() + backoff;
+                            while Instant::now() < deadline && !stop2.is_cancelled() {
+                                std::thread::sleep(jittered(Duration::from_millis(200)));
+                            }
+                        }
+                        Ok(s) if s.embedded == 0 && !s.cancelled => {
+                            // Queue drained; idle-poll so we stay responsive to
+                            // new enqueues without spinning hot.
+                            std::thread::sleep(jittered(Duration::from_millis(50)));
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::warn!("semantic reconcile failed: {e}"),
-                    }
-                    last_seen_generation = current_generation;
-                    last_reconcile_at = Some(Instant::now());
-                }
-                match drive(
-                    &conn,
-                    &store,
-                    provider.as_ref(),
-                    &cfg,
-                    &stop2,
-                    intent_source,
-                ) {
-                    // [FIX] A Conflict can only ever be resolved by a
-                    // restart (see ensure_profile_claimed's docs) — retrying
-                    // the same doomed claim check every ~50ms forever just
-                    // burns DB round trips for no possible gain. Back off far
-                    // longer; still cooperatively cancellable via `stop2`.
-                    Ok(s) if s.blocked_by_conflict => {
-                        tracing::warn!(
-                            "semantic enrichment blocked by an embedding-profile conflict; \
-                             backing off until restart (see status for re_index_recommended)"
-                        );
-                        let backoff = Duration::from_secs(30);
-                        let deadline = Instant::now() + backoff;
-                        while Instant::now() < deadline && !stop2.is_cancelled() {
-                            std::thread::sleep(Duration::from_millis(200));
+                        Err(e) => {
+                            tracing::warn!("background enrichment error: {e}");
+                            std::thread::sleep(jittered(Duration::from_millis(200)));
                         }
                     }
-                    Ok(s) if s.embedded == 0 && !s.cancelled => {
-                        // Queue drained; idle-poll so we stay responsive to
-                        // new enqueues without spinning hot.
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("background enrichment error: {e}");
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
                 }
-            }
-        });
-        Self {
-            stop,
-            handle: Some(handle),
+            });
+            handles.push(handle);
         }
+        Self { stop, handles }
     }
 
-    /// Request stop and join with timeout; true when the worker exited.
+    /// Request stop and join every worker thread against a SHARED timeout
+    /// budget; true only when ALL of them exited within it (matching the
+    /// original single-handle contract, generalized to N handles).
     pub fn shutdown(mut self, timeout: Duration) -> bool {
         self.stop.cancel();
-        match self.handle.take() {
-            Some(h) => {
-                let deadline = Instant::now() + timeout;
-                while Instant::now() < deadline {
-                    if h.is_finished() {
-                        let _ = h.join();
-                        return true;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
+        let deadline = Instant::now() + timeout;
+        let mut all_joined = true;
+        for h in self.handles.drain(..) {
+            let mut joined = false;
+            while Instant::now() < deadline {
+                if h.is_finished() {
+                    let _ = h.join();
+                    joined = true;
+                    break;
                 }
-                false // deterministic timeout; test owns cleanup decisions
+                std::thread::sleep(Duration::from_millis(5));
             }
-            None => true,
+            if !joined {
+                all_joined = false; // deterministic timeout; test owns cleanup decisions
+            }
         }
+        all_joined
     }
 }
 

@@ -41,11 +41,11 @@ pub enum ResourceModeSetting {
 
 /// User-tunable resource overrides (`[resources]` in `attic.toml`).
 ///
-/// Intentionally exposes only 7 of `ResourcePolicy`'s 11 controlled values.
-/// `scheduler_workers`, `sqlite_cache_pages`, `sqlite_mmap_bytes`, and
-/// `embedding_batch_size` remain mode-derived/automatic in V1 by design —
-/// not parsed from this struct at all, so there is no parsed-and-ignored
-/// field for them.
+/// Intentionally exposes only 7 of `ResourcePolicy`'s 12 controlled values.
+/// `scheduler_workers`, `sqlite_cache_pages`, `sqlite_mmap_bytes`,
+/// `embedding_batch_size`, and `embedding_worker_count` remain
+/// mode-derived/automatic in V1 by design — not parsed from this struct at
+/// all, so there is no parsed-and-ignored field for them.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResourceOverrides {
     /// `"auto"` (default), or an explicit forced mode.

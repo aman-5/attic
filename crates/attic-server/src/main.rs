@@ -725,7 +725,7 @@ impl AtticServer {
         let body = match action {
             "on" => {
                 handle
-                    .modify(|filter| *filter = LevelFilter::OFF)
+                    .modify(|filter| *filter = LevelFilter::INFO)
                     .map_err(|e| {
                         ServerError::InvalidArg(format!("failed to enable file logging: {e}"))
                     })?;
@@ -2094,6 +2094,7 @@ fn handle_status(
         "min_free_memory_mib": phase8.effective_resources.min_free_memory_mib,
         "max_foreground_queries": phase8.effective_resources.max_foreground_queries,
         "embedding_batch_size": phase8.effective_resources.embedding_batch_size,
+        "embedding_worker_count": phase8.effective_resources.embedding_worker_count,
         "writer_batch_size": phase8.effective_resources.writer_batch_size,
         "writer_flush_interval_ms": phase8.effective_resources.writer_flush_interval_ms,
         "writer_queue_capacity": phase8.effective_resources.writer_queue_capacity,
@@ -3180,6 +3181,14 @@ async fn main() -> anyhow::Result<()> {
                 return daemon::run_relay(relay).await;
             }
             daemon::ElectionResult::Daemon(handle) => Ownership::Daemon(handle),
+            // [FIX] Daemon socket/IPC setup failed even though this process
+            // already safely holds `attic.lock` (e.g. the local socket/named
+            // pipe bind or the `attic.ipc` write failed). Rather than
+            // hard-killing the whole launch, fall back to the same legacy
+            // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
+            // the lock guard this process already won instead of
+            // re-acquiring it.
+            daemon::ElectionResult::Fallback(lock_file) => Ownership::Legacy(lock_file),
         }
     };
 
@@ -3234,6 +3243,7 @@ async fn main() -> anyhow::Result<()> {
         // the queue. Wire it to the same `effective.embedding_batch_size`.
         let enrichment_cfg = attic_semantic::EnrichmentConfig {
             batch_size: server.effective_resources.embedding_batch_size,
+            embedding_worker_count: server.effective_resources.embedding_worker_count,
             ..attic_semantic::EnrichmentConfig::default()
         };
         semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
@@ -3695,6 +3705,54 @@ pub(crate) async fn run_shutdown_sequence(
                 }
                 Err(e) => warn!("shutdown WAL checkpoint failed: {e}"),
             }
+
+            // 5b. Retention pruning (best-effort): drop old file-occurrence
+            // tombstones, old invalidation audit records, and old terminal
+            // task rows before vacuuming, so VACUUM has real space to
+            // reclaim. Never fails shutdown — each is independently logged.
+            match attic_storage::invalidation_ops::prune_old_tombstones(
+                &conn,
+                attic_storage::invalidation_ops::DEFAULT_TOMBSTONE_RETENTION_DAYS,
+            ) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!("shutdown maintenance: pruned {n} old file-occurrence tombstones");
+                    }
+                }
+                Err(e) => warn!("shutdown tombstone pruning failed (best-effort): {e}"),
+            }
+            match attic_storage::invalidation_ops::prune_old_invalidation_records(
+                &conn,
+                attic_storage::invalidation_ops::DEFAULT_INVALIDATION_RECORD_RETENTION_DAYS,
+            ) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!("shutdown maintenance: pruned {n} old invalidation records");
+                    }
+                }
+                Err(e) => warn!("shutdown invalidation-record pruning failed (best-effort): {e}"),
+            }
+            match attic_storage::ops_tasks::prune_terminal_tasks(
+                &conn,
+                attic_storage::ops_tasks::DEFAULT_TERMINAL_TASK_RETENTION_DAYS,
+            ) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!("shutdown maintenance: pruned {n} old terminal task rows");
+                    }
+                }
+                Err(e) => warn!("shutdown terminal-task pruning failed (best-effort): {e}"),
+            }
+
+            // 5c. Reclaim freed space on disk. `wal_checkpoint: false` since
+            // step 5a already checkpointed above; `vacuum: true` is now safe
+            // in this connection's autocommit state.
+            match attic_storage::connection::run_maintenance(&conn, false, true) {
+                Ok(errs) if errs.is_empty() => info!("shutdown VACUUM (attic.db): ok"),
+                Ok(errs) => warn!("shutdown VACUUM (attic.db) reported issues: {errs:?}"),
+                Err(e) => warn!("shutdown VACUUM (attic.db) failed (best-effort): {e}"),
+            }
+
             if let Err(e) = attic_storage::connection::backup_database(
                 &db_path,
                 &db_path
@@ -3703,6 +3761,22 @@ pub(crate) async fn run_shutdown_sequence(
                     .join(attic_core::resources::BACKUP_RELATIVE_DIR),
             ) {
                 warn!("shutdown backup failed (best-effort): {e}");
+            }
+
+            // 5d. Same reclaim for semantic.db, only if the semantic layer
+            // was ever enabled for this workspace (file may not exist).
+            let semantic_db_path = db_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("semantic.db");
+            if semantic_db_path.exists() {
+                match attic_semantic::store::SemanticStore::open(&semantic_db_path) {
+                    Ok(store) => match store.run_maintenance(true) {
+                        Ok(()) => info!("shutdown VACUUM (semantic.db): ok"),
+                        Err(e) => warn!("shutdown VACUUM (semantic.db) failed (best-effort): {e}"),
+                    },
+                    Err(e) => warn!("shutdown semantic.db open failed (best-effort): {e}"),
+                }
             }
         })
         .await;
