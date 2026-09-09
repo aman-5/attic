@@ -3432,15 +3432,14 @@ async fn run() -> anyhow::Result<()> {
                      splicing stdio to its daemon (supervised recovery enabled)",
                     db_path.display()
                 );
-                // Phase 96: run_relay_supervised handles bounded
-                // exponential-backoff re-election and MCP session-cache
-                // replay internally. Returns an explicit outcome:
-                //
-                // - ClientClosed: stdin closed (normal exit).
-                // - PromoteToDaemon: this relay won election; caller must
-                //   start replacement daemon AND keep relay alive.
-                // - Fatal: unrecoverable error (budget exhausted, etc).
-                match daemon::run_relay_supervised(relay, db_path).await {
+                let db_path_buf = db_path.to_path_buf();
+                let paths_clone = paths.clone();
+                let daemon_starter: daemon::DaemonStarter = Arc::new(move |daemon_handle, ready_tx| {
+                    let (srv, enricher) = build_server_and_enricher(&db_path_buf, &paths_clone)?;
+                    Ok(daemon::spawn_daemon(srv, enricher, daemon_handle, ready_tx))
+                });
+
+                match daemon::run_relay_supervised(relay, db_path, Some(daemon_starter)).await {
                     daemon::RelaySupervisionOutcome::ClientClosed => {
                         return Ok(());
                     }
@@ -3448,10 +3447,6 @@ async fn run() -> anyhow::Result<()> {
                         daemon_handle,
                         recovery_state,
                     } => {
-                        // Phase 96: relay won daemon election during
-                        // recovery. Use the new Promoted ownership
-                        // variant so the lifecycle layer can start the
-                        // daemon AND resume the relay concurrently.
                         Ownership::Promoted {
                             daemon_handle,
                             recovery_state,
@@ -3464,13 +3459,6 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             daemon::ElectionResult::Daemon(handle) => Ownership::Daemon(handle),
-            // [FIX] Daemon socket/IPC setup failed even though this process
-            // already safely holds `attic.lock` (e.g. the local socket/named
-            // pipe bind or the `attic.ipc` write failed). Rather than
-            // hard-killing the whole launch, fall back to the same legacy
-            // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
-            // the lock guard this process already won instead of
-            // re-acquiring it.
             daemon::ElectionResult::Fallback(lock_file) => Ownership::Legacy(lock_file),
         }
     };
@@ -3480,16 +3468,6 @@ async fn run() -> anyhow::Result<()> {
         db_path.display(),
         paths.home.display()
     );
-    // [FIX] `AtticServer` colocates config.toml/attic.toml/semantic.db/models
-    // with wherever `db_path` actually lives (matching `ATTIC_DB_PATH`'s
-    // documented "data dir derived from its parent" contract) — it never
-    // reads `paths.runtime_config`/`config_file`/`semantic_db` directly.
-    // When `ATTIC_HOME` and `ATTIC_DB_PATH` are BOTH set to conflicting
-    // directories, `AtticPaths.home` (pinned by `ATTIC_HOME`, per its
-    // documented priority) and `db_path`'s own directory silently disagree.
-    // Not a behavior change — `ATTIC_HOME` winning for `home` is the
-    // documented, existing precedence — just making a genuinely ambiguous
-    // configuration observable instead of silent.
     if db_path.parent() != Some(paths.home.as_path()) {
         tracing::warn!(
             "ATTIC_HOME ({}) and ATTIC_DB_PATH's directory ({}) disagree; attic.toml/config.toml/\
@@ -3506,10 +3484,77 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
+    match ownership {
+        Ownership::Legacy(_lock_guard) => {
+            let (server, semantic_enricher) = build_server_and_enricher(db_path, &paths)?;
+            serve_until_closed(server, semantic_enricher).await
+        }
+        Ownership::Daemon(handle) => {
+            let (server, semantic_enricher) = build_server_and_enricher(db_path, &paths)?;
+            daemon::run_daemon_accept_loop(server, semantic_enricher, handle, true).await
+        }
+        Ownership::Promoted {
+            daemon_handle,
+            recovery_state,
+        } => {
+            let (server, semantic_enricher) = build_server_and_enricher(db_path, &paths)?;
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+            info!(
+                "relay promotion: spawning replacement daemon + resuming relay \
+                 (existing MCP client stays connected)"
+            );
+
+            let daemon_task =
+                daemon::spawn_daemon(server, semantic_enricher, daemon_handle, ready_tx);
+
+            if ready_rx.await.is_err() {
+                error!("relay promotion: daemon task failed before signaling readiness");
+                match daemon_task.await {
+                    Ok(Err(e)) => return Err(e.context("daemon failed during promotion")),
+                    Err(e) => return Err(anyhow::anyhow!("daemon task panicked: {e}")),
+                    Ok(Ok(())) => {
+                        return Err(anyhow::anyhow!("daemon exited without signaling readiness"));
+                    }
+                }
+            }
+
+            let relay_result = daemon::resume_relay_after_promotion(db_path, recovery_state).await;
+
+            if let Err(ref e) = relay_result {
+                warn!("relay promotion: relay ended with error: {e:#}");
+            }
+
+            info!("relay promotion: relay finished; waiting for daemon task");
+            match daemon_task.await {
+                Ok(Ok(())) => {
+                    info!("relay promotion: daemon exited cleanly");
+                }
+                Ok(Err(e)) => {
+                    warn!("relay promotion: daemon exited with error: {e:#}");
+                }
+                Err(e) => {
+                    warn!("relay promotion: daemon task panicked: {e}");
+                }
+            }
+
+            relay_result
+        }
+    }
+}
+
+/// Constructs and initializes an [`AtticServer`] along with its optional
+/// background semantic enricher, startup recovery, workspace bootstrap,
+/// and incremental scheduler. Called lazily on daemon/legacy launch or upon
+/// promotion from relay to replacement daemon.
+pub(crate) fn build_server_and_enricher(
+    db_path: &std::path::Path,
+    paths: &attic_core::AtticPaths,
+) -> anyhow::Result<(AtticServer, Option<attic_semantic::BackgroundEnricher>)> {
     let server = AtticServer::new(db_path)?;
 
     // Phase 5/7: when the semantic layer is opt-in and opened successfully,
-    // it needs a background worker to actually drain the enrichment queue ΓÇö
+    // it needs a background worker to actually drain the enrichment queue —
     // without this, embeddings are never produced and the opt-in layer is a
     // no-op that permanently falls back to non-semantic retrieval. Lowest
     // priority background subsystem (ADR-014 D1): bounded batches, never
@@ -3519,18 +3564,13 @@ async fn run() -> anyhow::Result<()> {
         let intent_source = server
             .semantic_intent_source
             .unwrap_or(attic_semantic::EmbeddingIntentSource::Recommendation);
-        // [FIX] Drive-cycle batch size was hardcoded (EnrichmentConfig's own
-        // default), ignoring the same resource-mode-derived batch size
-        // already used to construct the embedder itself — Performance mode
-        // sped up each embedding call but never pulled bigger batches from
-        // the queue. Wire it to the same `effective.embedding_batch_size`.
         let enrichment_cfg = attic_semantic::EnrichmentConfig {
             batch_size: server.effective_resources.embedding_batch_size,
             embedding_worker_count: server.effective_resources.embedding_worker_count,
             ..attic_semantic::EnrichmentConfig::default()
         };
         semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
-            db_path.clone(),
+            db_path.to_path_buf(),
             stack.store.clone(),
             stack.provider.clone(),
             enrichment_cfg,
@@ -3541,11 +3581,9 @@ async fn run() -> anyhow::Result<()> {
         info!("semantic background enrichment worker started");
     }
 
-    // ΓöÇΓöÇΓöÇ Startup recovery ΓÇö ALWAYS before serving (recovery contract ┬º3) ΓöÇΓöÇΓöÇΓöÇ
-    //
+    // Startup recovery — ALWAYS before serving (recovery contract §3)
     // Fail-closed: if recovery cannot establish a safe state, the process
-    // refuses to serve rather than risk presenting affected data as CURRENT
-    // (REC-INV-1).  There is no silent "keep going" path.
+    // refuses to serve rather than risk presenting affected data as CURRENT.
     match attic_incremental::run_startup_recovery(&server.pool, &server.writer) {
         Ok(report) => info!(
             tasks_reset = report.tasks_reset,
@@ -3556,35 +3594,26 @@ async fn run() -> anyhow::Result<()> {
             "startup recovery complete"
         ),
         Err(e) => {
-            error!("startup recovery FAILED ΓÇö refusing to serve (fail-closed): {e}");
+            error!("startup recovery FAILED — refusing to serve (fail-closed): {e}");
             return Err(anyhow::anyhow!("startup recovery failed: {e}"));
         }
     }
 
-    // Phase 7: verify database integrity and foreign key consistency
-    // per the crash recovery contract (┬º3, ┬º5).
-    // Open a fresh writer connection just for the verification step; this
-    // does not affect the primary writer connection or the connection pool.
+    // Verify database integrity and foreign key consistency
     let (verify_conn, _verify_pool) = attic_storage::open_db(db_path)
         .map_err(|e| anyhow::anyhow!("failed to open verification connection: {e}"))?;
     let integrity_violations = attic_storage::connection::verify_connection(&verify_conn)?;
-    drop(verify_conn); // always release the verification connection
+    drop(verify_conn);
     if !integrity_violations.is_empty() {
         for v in &integrity_violations {
             error!("database integrity violation during startup: {v}");
         }
-        // Fail-closed: if the database is corrupt, refuse to serve.
         return Err(anyhow::anyhow!(
             "database integrity check failed during startup"
         ));
     }
 
-    // ΓöÇΓöÇΓöÇ Multi-root workspace bootstrap ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    //
-    // `roots` may be zero (UNCONFIGURED first run ΓÇö watch mode disabled,
-    // status reports UNCONFIGURED, and the MCP `workspace` tool is the
-    // configuration entry point), one (legacy single-repository), or many
-    // arbitrary/unrelated filesystem paths (multi-root workspace).
+    // Multi-root workspace bootstrap
     let default_config = paths.config_file.clone();
     let (config_source, raw_roots) = load_workspace_roots(&default_config)?;
     let validation = validate_configured_roots(raw_roots);
@@ -3609,8 +3638,6 @@ async fn run() -> anyhow::Result<()> {
     );
 
     if !roots.is_empty() {
-        // Startup indexing must never delay MCP availability. It is a server-owned
-        // background job, cooperatively cancellable and joined during shutdown.
         let startup_server = server.clone();
         let startup_roots = roots.clone();
         let startup_config_source = config_source.clone();
@@ -3695,12 +3722,6 @@ async fn run() -> anyhow::Result<()> {
                         edges = result.edges_emitted,
                         "background cross-repo workspace sync complete"
                     );
-                    // Resolver diagnostics (unresolved/ambiguous cross-repo
-                    // declaration targets) were previously computed and
-                    // silently dropped here — surface them so a repo/
-                    // declaration that fails to resolve is visible in
-                    // server logs instead of only manifesting as a missing
-                    // cross-repo edge with no trace of why.
                     if !result.diagnostics.is_empty() {
                         warn!(
                             missing = result.diagnostics.missing_targets.len(),
@@ -3716,7 +3737,7 @@ async fn run() -> anyhow::Result<()> {
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 Ok(Err(e)) => warn!("background cross-repo workspace sync failed: {e}"),
-                Err(e) => warn!("background cross-repo workspace sync task failed: {e}"),
+                Err(e) => warn!("background cross-repo workspace task failed: {e}"),
             }
 
             if worker_cancellation.is_cancelled() {
@@ -3793,85 +3814,7 @@ async fn run() -> anyhow::Result<()> {
             });
         }
     }
-
-    match ownership {
-        Ownership::Legacy(_lock_guard) => serve_until_closed(server, semantic_enricher).await,
-        Ownership::Daemon(handle) => {
-            daemon::run_daemon_accept_loop(server, semantic_enricher, handle, true).await
-        }
-        Ownership::Promoted {
-            daemon_handle,
-            recovery_state,
-        } => {
-            // Phase 96: This relay won the daemon election during recovery.
-            // The existing MCP client is still connected over stdin/stdout.
-            //
-            // Strategy:
-            //   1. Spawn the daemon accept loop as a background task.
-            //   2. Wait for it to signal listener readiness.
-            //   3. Resume the relay: connect to the replacement daemon via
-            //      local IPC, replay MCP initialization, handle interrupted
-            //      requests, and continue forwarding client traffic.
-            //   4. When the relay finishes (client closes stdin), await the
-            //      daemon task for clean shutdown.
-
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-
-            info!(
-                "relay promotion: spawning replacement daemon + resuming relay \
-                 (existing MCP client stays connected)"
-            );
-
-            let daemon_task =
-                daemon::spawn_daemon(server, semantic_enricher, daemon_handle, ready_tx);
-
-            // Wait for the daemon to signal readiness before connecting
-            // the relay. This is immediate since the listener was already
-            // bound during election, but we use an explicit signal to
-            // avoid any timing assumptions.
-            if ready_rx.await.is_err() {
-                error!("relay promotion: daemon task failed before signaling readiness");
-                // Try to collect the daemon error.
-                match daemon_task.await {
-                    Ok(Err(e)) => return Err(e.context("daemon failed during promotion")),
-                    Err(e) => return Err(anyhow::anyhow!("daemon task panicked: {e}")),
-                    Ok(Ok(())) => {
-                        return Err(anyhow::anyhow!("daemon exited without signaling readiness"));
-                    }
-                }
-            }
-
-            // Resume the relay: connect to the replacement daemon, replay
-            // session state, handle interrupted requests, then continue
-            // forwarding until the MCP client disconnects.
-            let relay_result = daemon::resume_relay_after_promotion(db_path, recovery_state).await;
-
-            // The relay has finished (client disconnected or error).
-            // The daemon may still be serving other IPC clients — let it
-            // shut down via its own idle timeout / shutdown mechanisms.
-            // But if the relay hit an error, log it.
-            if let Err(ref e) = relay_result {
-                warn!("relay promotion: relay ended with error: {e:#}");
-            }
-
-            // Wait for the daemon task to finish. It will shut down when
-            // idle (no more connected clients) or on Ctrl+C.
-            info!("relay promotion: relay finished; waiting for daemon task");
-            match daemon_task.await {
-                Ok(Ok(())) => {
-                    info!("relay promotion: daemon exited cleanly");
-                }
-                Ok(Err(e)) => {
-                    warn!("relay promotion: daemon exited with error: {e:#}");
-                }
-                Err(e) => {
-                    warn!("relay promotion: daemon task panicked: {e}");
-                }
-            }
-
-            relay_result
-        }
-    }
+    Ok((server, semantic_enricher))
 }
 
 /// Handles needed to run the shared teardown sequence ([`run_shutdown_sequence`],

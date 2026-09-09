@@ -41,14 +41,14 @@ uuid               = { version = "1.11.0",  features = ["v4", "v5", "serde"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3",     features = ["env-filter", "registry"] }
 tracing-appender   = "0.2"
-# Phase 1B: gitignore-aware walking (ripgrep/ignore, MSRV 1.88, Unlicense OR MIT)
+# Phase 1B: gitignore-aware walking (ripgrep/ignore, MSRV 1.89, Unlicense OR MIT)
 ignore             = "0.4.33"
 # Phase 1B: BLAKE3 hashing required by source_revision contract
 blake3             = "1.8.7"
 # Phase 1D: Async runtime (rmcp requires tokio)
 tokio              = { version = "1",        features = ["rt-multi-thread", "macros", "sync", "io-std", "fs", "time", "signal"] }
 # Phase 2: filesystem watching (ADR-008). Stable debouncer 0.7 pulls notify 8.2.x;
-# MSRV 1.88 matches the workspace toolchain.
+# MSRV 1.89 matches the workspace toolchain.
 notify-debouncer-full = "0.7"
 # Phase 3: structural intelligence (ADR-010). Official tree-sitter runtime +
 # grammar crates. Grammars bundle their C sources (cc build); all MIT licensed.
@@ -74,7 +74,7 @@ tree-sitter-swift      = "0.7"
 tree-sitter-lua        = "0.5"
 interprocess           = { version = "2.4", features = ["tokio"] }
 # Phase 1D: Official Rust MCP SDK (ADR-008)
-# Version 3.1.4 — MSRV 1.88 — features: server (includes schemars, macros) + transport-io (stdio)
+# Version 3.1.4 — MSRV 1.89 — features: server (includes schemars, macros) + transport-io (stdio)
 rmcp               = { version = "3.1.4",   features = ["server", "transport-io"] }
 anyhow             = "1"
 # Phase 7: cross-platform process memory measurement (real RSS, not counters).

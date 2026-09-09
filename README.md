@@ -432,7 +432,7 @@ cargo build --release --package attic-server
 Requires:
 
 - **Rust** — pinned in `rust-toolchain.toml` (currently `1.98.0`,
-  MSRV `1.88`); `rustup show` in the repo root installs it automatically.
+  MSRV `1.89`); `rustup show` in the repo root installs it automatically.
 - **A linker for your platform**:
   - **Windows (recommended)**: Microsoft "Build Tools for Visual Studio"
     with the C++ build tools workload.

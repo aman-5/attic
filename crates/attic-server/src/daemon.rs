@@ -53,7 +53,7 @@ use interprocess::local_socket::{
     tokio::{Listener as IpcListener, Stream as IpcStream, prelude::*},
 };
 use rmcp::ServiceExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{AtticServer, ShutdownHandles, run_shutdown_sequence};
 
@@ -184,6 +184,29 @@ pub(crate) struct RelayRecoveryState {
     stdout: tokio::io::Stdout,
     /// Unparsed or pending stdin bytes from before promotion.
     pending_stdin: Vec<u8>,
+}
+
+/// Tracks a daemon accept-loop background task owned by a relay that won
+/// election and promoted itself.
+pub(crate) struct OwnedDaemon {
+    pub(crate) task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+/// Factory callback allowing a supervised relay to start a replacement daemon
+/// accept loop when this relay wins an election during recovery.
+pub(crate) type DaemonStarter = Arc<
+    dyn Fn(
+        DaemonHandle,
+        tokio::sync::oneshot::Sender<()>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>>
+    + Send
+    + Sync,
+>;
+
+/// Target produced by a single [`recover_daemon`] attempt.
+enum RecoveredTarget {
+    Connected(IpcStream),
+    WonElection(DaemonHandle),
 }
 
 /// Derive a deterministic local-socket name from the resolved database path,
@@ -823,7 +846,7 @@ async fn run_relay_with_cache(
                     }
                     Ok(n) => {
                         stdin_buf.extend_from_slice(&stdin_tmp[..n]);
-                        info!(len = n, raw = %String::from_utf8_lossy(&stdin_tmp[..n]), "relay: stdin read");
+                        trace!(len = n, "relay: stdin bytes received");
 
                         // Parse and cache any complete frames before forwarding.
                         let mut parse_offset = 0usize;
@@ -912,211 +935,282 @@ async fn run_relay_with_cache(
     Ok(exit)
 }
 
-/// Supervised relay loop (Phase 6 + 7): run [`run_relay_with_cache`] and, on
-/// a [`RelayExit::DaemonClosed`], attempt bounded recovery:
+/// Helper to replay cached MCP initialization and resolve an interrupted request onto a recovered stream.
+async fn replay_session_and_resolve_inflight(
+    stream: &mut IpcStream,
+    cache: &RelaySessionCache,
+    in_flight: &mut Option<InFlightRequest>,
+    stdout: &mut tokio::io::Stdout,
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+
+    // Replay MCP initialization onto the new daemon connection.
+    if !cache.replay_to(stream).await {
+        warn!("relay: session replay failed on new daemon connection; will retry");
+        return false;
+    }
+
+    // Handle the interrupted in-flight request.
+    // Safety rule (opt-in allowlist): only methods explicitly listed in
+    // `is_safe_readonly_method` may be retried once. Everything else —
+    // mutations, unknown/future tools, and anything with unclear idempotency —
+    // receives a synthesized JSON-RPC error.
+    if let Some(req) = in_flight.take() {
+        if is_safe_readonly_method(&req.method) {
+            info!(
+                method = %req.method,
+                id    = %req.id_raw,
+                "relay: retrying in-flight read-only request against new daemon (max 1 retry)"
+            );
+            if stream.write_all(&req.framed).await.is_err() || stream.flush().await.is_err() {
+                warn!("relay: retry write failed; new daemon connection already broken");
+                return false;
+            }
+            // Re-arm for completeness so the response clears the in-flight slot.
+            *in_flight = Some(InFlightRequest {
+                id_raw: req.id_raw,
+                method: req.method,
+                framed: req.framed,
+                delivery: DeliveryState::Sent,
+            });
+        } else {
+            // Mutation or unknown method — synthesize error, never replay.
+            let err_bytes = make_jsonrpc_error_response(
+                &req.id_raw,
+                -32603,
+                "The daemon disconnected while this operation was in flight. \
+                 Its completion state is unknown. The operation was not automatically retried.",
+            );
+            let _ = stdout.write_all(&err_bytes).await;
+            let _ = stdout.flush().await;
+            warn!(
+                method = %req.method,
+                id    = %req.id_raw,
+                "relay: in-flight request had ambiguous delivery; \
+                 synthesized error to client (method not on read-only allowlist)"
+            );
+        }
+    }
+
+    true
+}
+
+/// Encapsulates one daemon recovery attempt during reconnect/re-election.
+async fn recover_daemon(
+    db_path: &Path,
+    owned_daemon: &mut Option<OwnedDaemon>,
+    daemon_starter: Option<&DaemonStarter>,
+    attempt: usize,
+) -> anyhow::Result<RecoveredTarget> {
+    // Observe and clean up previously owned daemon task if it completed
+    if let Some(owned) = owned_daemon.as_mut()
+        && owned.task.is_finished()
+    {
+        match (&mut owned.task).await {
+            Ok(Ok(())) => info!("relay recovery: previously owned daemon task exited cleanly"),
+            Ok(Err(e)) => warn!("relay recovery: previously owned daemon task exited with error: {e:#}"),
+            Err(e) => warn!("relay recovery: previously owned daemon task panicked: {e}"),
+        }
+        *owned_daemon = None;
+    }
+
+    // Bounded backoff
+    let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
+
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("relay recovery: SIGINT/Ctrl+C received during recovery backoff; cancelling recovery");
+            return Err(anyhow::anyhow!("relay recovery cancelled by SIGINT"));
+        }
+    }
+
+    match elect(db_path).await? {
+        ElectionResult::Relay(new_relay) => {
+            // Another daemon won or already exists.
+            if owned_daemon.is_some() {
+                *owned_daemon = None;
+            }
+            Ok(RecoveredTarget::Connected(new_relay.stream))
+        }
+        ElectionResult::Daemon(handle) => {
+            if let Some(starter) = daemon_starter {
+                info!("relay: won daemon election during recovery; starting replacement daemon inline");
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let socket_name = derive_socket_name(db_path);
+                let daemon_task = starter(handle, ready_tx)
+                    .map_err(|e| anyhow::anyhow!("failed to start replacement daemon: {e}"))?;
+
+                if ready_rx.await.is_err() {
+                    match daemon_task.await {
+                        Ok(Err(e)) => return Err(e.context("replacement daemon failed before signaling readiness")),
+                        Err(e) => return Err(anyhow::anyhow!("replacement daemon task panicked: {e}")),
+                        Ok(Ok(())) => return Err(anyhow::anyhow!("replacement daemon exited prematurely")),
+                    }
+                }
+
+                *owned_daemon = Some(OwnedDaemon { task: daemon_task });
+                let stream = connect_stream(&socket_name).await.map_err(|e| {
+                    anyhow::anyhow!("failed to connect to newly started replacement daemon at '{socket_name}': {e}")
+                })?;
+                Ok(RecoveredTarget::Connected(stream))
+            } else {
+                Ok(RecoveredTarget::WonElection(handle))
+            }
+        }
+        ElectionResult::Fallback(_lock) => {
+            Err(anyhow::anyhow!(
+                "attic: relay won the daemon lock but IPC setup failed; cannot continue in relay mode"
+            ))
+        }
+    }
+}
+
+/// Supervised relay loop: manages the entire lifecycle of an MCP client session over stdio.
 ///
-/// 1. Re-run [`elect`]: if another process has already become the new daemon
-///    we just `Relay`-connect to it.  If no daemon exists and this relay wins
-///    the election we return [`RelaySupervisionOutcome::PromoteToDaemon`] so
-///    that the higher-level lifecycle layer (in `main.rs`) can start a
-///    replacement daemon through the same normal production initialization
-///    path while **keeping the existing relay alive**.
-/// 2. Replay the cached MCP `initialize` / `notifications/initialized`
-///    frames onto the new connection.
-/// 3. Phase 7: handle the interrupted in-flight request — retry read-only
-///    requests once; synthesize a JSON-RPC error for mutations.
-/// 4. Resume normal splicing.
+/// As long as the external MCP client is alive, any daemon disconnect triggers recovery rather
+/// than terminating the relay.
 ///
-/// Returns [`RelaySupervisionOutcome::ClientClosed`] when the MCP client
-/// exits normally, [`RelaySupervisionOutcome::PromoteToDaemon`] when this
-/// relay won the daemon election and the caller must start a replacement
-/// daemon while keeping the relay alive, or
-/// [`RelaySupervisionOutcome::Fatal`] on unrecoverable error.
+/// Lifecycle invariant:
+/// 1. Runs [`run_relay_with_cache`] to splice stdio <-> internal daemon IPC.
+/// 2. On [`RelayExit::DaemonClosed`], discards the dead IPC stream, applies bounded backoff,
+///    and runs daemon election.
+/// 3. If another daemon exists, connects to it over internal IPC.
+/// 4. If this process wins election, starts a replacement daemon accept loop via [`DaemonStarter`]
+///    and connects to it locally, keeping external stdio intact.
+/// 5. Replays cached MCP initialization and handles interrupted in-flight requests (safe
+///    read-only requests retried at most once; mutations/unknown methods receive a synthesized error).
+/// 6. Repeats recovery across any number of subsequent daemon failures until the external
+///    client disconnects.
+/// 7. When the external MCP client disconnects, if this process owns a running replacement daemon,
+///    it awaits the daemon task allowing it to serve any other connected clients according
+///    to standard idle policy.
 pub(crate) async fn run_relay_supervised(
     relay: RelayHandle,
     db_path: &Path,
+    daemon_starter: Option<DaemonStarter>,
 ) -> RelaySupervisionOutcome {
-    use tokio::io::AsyncWriteExt;
-
     let mut cache = RelaySessionCache::default();
-    // Phase 7: one in-flight request slot (MCP stdio is serial).
+    // One in-flight request slot (MCP stdio is serial).
     let mut in_flight: Option<InFlightRequest> = None;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut stdin_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut owned_daemon: Option<OwnedDaemon> = None;
 
-    // First run — use the relay handle we were given.
-    match run_relay_with_cache(
-        relay,
-        &mut cache,
-        &mut in_flight,
-        &mut stdin,
-        &mut stdout,
-        &mut stdin_buf,
-    )
-    .await
-    {
-        Ok(RelayExit::StdinClosed) => return RelaySupervisionOutcome::ClientClosed,
-        Ok(RelayExit::DaemonClosed) => {} // fall through to recovery loop
-        Err(e) => {
-            return RelaySupervisionOutcome::Fatal {
-                error: e.context("relay initial connection failed"),
-            };
-        }
-    }
-
-    // Recovery loop — bounded by RELAY_RECOVERY_BUDGET.
-    let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
-    let mut attempt = 0usize;
+    let mut current_stream = relay.stream;
 
     loop {
-        if Instant::now() >= recovery_deadline {
-            return RelaySupervisionOutcome::Fatal {
-                error: anyhow::anyhow!(
-                    "attic: relay could not reconnect to a daemon within \
-                     {RELAY_RECOVERY_BUDGET:?}; giving up"
-                ),
-            };
-        }
-
-        // Back-off before retrying election.
-        let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
-            .get(attempt)
-            .copied()
-            .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        attempt += 1;
-
-        info!(
-            attempt,
-            "relay: daemon disconnected; attempting recovery (budget remaining: {:?})",
-            recovery_deadline.saturating_duration_since(Instant::now()),
-        );
-
-        match elect(db_path).await {
+        match run_relay_with_cache(
+            RelayHandle { stream: current_stream },
+            &mut cache,
+            &mut in_flight,
+            &mut stdin,
+            &mut stdout,
+            &mut stdin_buf,
+        )
+        .await
+        {
+            Ok(RelayExit::StdinClosed) => {
+                info!("relay: client closed stdin; relay session exiting normally");
+                // Original stdio client closed. If this process owns a daemon,
+                // do not kill it if other clients remain. Await it per normal
+                // idle timeout / client count policy.
+                if let Some(mut owned) = owned_daemon.take() {
+                    info!("relay supervisor: client closed; waiting for owned daemon to exit per idle policy");
+                    tokio::select! {
+                        res = &mut owned.task => {
+                            match res {
+                                Ok(Ok(())) => info!("relay supervisor: owned daemon exited cleanly"),
+                                Ok(Err(e)) => warn!("relay supervisor: owned daemon exited with error: {e:#}"),
+                                Err(e) => warn!("relay supervisor: owned daemon task panicked: {e}"),
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("relay supervisor: SIGINT received while waiting for daemon; aborting daemon task");
+                            owned.task.abort();
+                        }
+                    }
+                }
+                return RelaySupervisionOutcome::ClientClosed;
+            }
+            Ok(RelayExit::DaemonClosed) => {
+                info!("relay: daemon connection lost; entering recovery");
+            }
             Err(e) => {
                 return RelaySupervisionOutcome::Fatal {
-                    error: e.context("relay recovery: election failed"),
+                    error: e.context("relay: error on daemon connection"),
                 };
             }
+        }
 
-            // ── relay wins election: return promotion outcome with recovery state ──
-            Ok(ElectionResult::Daemon(handle)) => {
-                info!(
-                    "relay: won daemon election; returning PromoteToDaemon \
-                     (relay will remain alive for existing MCP client)"
-                );
-                return RelaySupervisionOutcome::PromoteToDaemon {
-                    daemon_handle: handle,
-                    recovery_state: RelayRecoveryState {
-                        session_cache: cache,
-                        interrupted_request: in_flight,
-                        stdin,
-                        stdout,
-                        pending_stdin: stdin_buf,
-                    },
-                };
+        // Recovery loop — bounded by RELAY_RECOVERY_BUDGET
+        let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
+        let mut attempt = 0usize;
+        let mut recovered_stream: Option<IpcStream> = None;
+
+        while Instant::now() < recovery_deadline {
+            info!(
+                attempt,
+                "relay: attempting recovery (budget remaining: {:?})",
+                recovery_deadline.saturating_duration_since(Instant::now()),
+            );
+
+            match recover_daemon(
+                db_path,
+                &mut owned_daemon,
+                daemon_starter.as_ref(),
+                attempt,
+            )
+            .await
+            {
+                Ok(RecoveredTarget::WonElection(handle)) => {
+                    info!("relay: won daemon election without inline starter; returning PromoteToDaemon");
+                    return RelaySupervisionOutcome::PromoteToDaemon {
+                        daemon_handle: handle,
+                        recovery_state: RelayRecoveryState {
+                            session_cache: cache,
+                            interrupted_request: in_flight,
+                            stdin,
+                            stdout,
+                            pending_stdin: stdin_buf,
+                        },
+                    };
+                }
+                Ok(RecoveredTarget::Connected(mut stream)) => {
+                    if replay_session_and_resolve_inflight(
+                        &mut stream,
+                        &cache,
+                        &mut in_flight,
+                        &mut stdout,
+                    )
+                    .await
+                    {
+                        recovered_stream = Some(stream);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("relay: recovery attempt {attempt} failed: {e:#}; will retry");
+                }
             }
+            attempt += 1;
+        }
 
-            // ── fallback: no IPC, serve inline — relay cannot do this ──
-            Ok(ElectionResult::Fallback(_lock)) => {
+        match recovered_stream {
+            Some(s) => {
+                current_stream = s;
+                info!("relay: daemon connection recovered; resuming forwarding");
+            }
+            None => {
                 return RelaySupervisionOutcome::Fatal {
                     error: anyhow::anyhow!(
-                        "attic: relay won the daemon lock but IPC setup failed; \
-                         cannot continue in relay mode"
+                        "attic: relay could not reconnect to a daemon within {RELAY_RECOVERY_BUDGET:?}; giving up"
                     ),
                 };
-            }
-
-            // ── connected to a (new) daemon: replay session + resume ──
-            Ok(ElectionResult::Relay(new_relay)) => {
-                let mut stream = new_relay.stream;
-
-                // Replay MCP initialization onto the new daemon connection.
-                if !cache.replay_to(&mut stream).await {
-                    warn!("relay: session replay failed on new daemon connection; will retry");
-                    continue;
-                }
-
-                // Phase 7: handle the interrupted in-flight request.
-                //
-                // Safety rule (opt-in allowlist): only methods explicitly
-                // listed in `is_safe_readonly_method` may be retried once.
-                // Everything else — mutations, unknown/future tools, and
-                // anything with unclear idempotency — receives a synthesized
-                // JSON-RPC error. Unknown methods default to never-retry,
-                // which is the correct safe failure mode.
-                if let Some(req) = in_flight.take() {
-                    if is_safe_readonly_method(&req.method) {
-                        // Explicitly known read-only: retry at most once.
-                        info!(
-                            method = %req.method,
-                            id    = %req.id_raw,
-                            "relay: retrying in-flight read-only request \
-                             against new daemon (max 1 retry)"
-                        );
-                        if stream.write_all(&req.framed).await.is_err()
-                            || stream.flush().await.is_err()
-                        {
-                            warn!(
-                                "relay: retry write failed; new daemon connection \
-                                 already broken"
-                            );
-                            // in_flight was already taken; the retry simply
-                            // won't produce a response. Loop and try again.
-                            continue;
-                        }
-                        // Re-arm the in-flight tracker so the response clears it.
-                        in_flight = Some(InFlightRequest {
-                            id_raw: req.id_raw,
-                            method: req.method,
-                            framed: req.framed,
-                            delivery: DeliveryState::Sent,
-                        });
-                    } else {
-                        // Mutation, unknown tool, or anything not on the
-                        // read-only allowlist: synthesize a JSON-RPC error —
-                        // never replay.
-                        let err_bytes = make_jsonrpc_error_response(
-                            &req.id_raw,
-                            -32603,
-                            "The daemon disconnected while this operation was in \
-                             flight. Its completion state is unknown. The operation \
-                             was not automatically retried.",
-                        );
-                        let _ = stdout.write_all(&err_bytes).await;
-                        let _ = stdout.flush().await;
-                        warn!(
-                            method = %req.method,
-                            id    = %req.id_raw,
-                            "relay: in-flight request had ambiguous delivery; \
-                             synthesized error to client (method not on read-only allowlist)"
-                        );
-                    }
-                }
-
-                // Resume normal splicing against the new daemon connection.
-                match run_relay_with_cache(
-                    RelayHandle { stream },
-                    &mut cache,
-                    &mut in_flight,
-                    &mut stdin,
-                    &mut stdout,
-                    &mut stdin_buf,
-                )
-                .await
-                {
-                    Ok(RelayExit::StdinClosed) => return RelaySupervisionOutcome::ClientClosed,
-                    Ok(RelayExit::DaemonClosed) => {
-                        // Another disconnect — keep looping within the budget.
-                        warn!("relay: new daemon connection also closed; continuing recovery loop");
-                    }
-                    Err(e) => {
-                        return RelaySupervisionOutcome::Fatal {
-                            error: e.context("relay: connection error during recovery"),
-                        };
-                    }
-                }
             }
         }
     }
@@ -1261,7 +1355,6 @@ pub(crate) async fn resume_relay_after_promotion(
     db_path: &Path,
     recovery: RelayRecoveryState,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
 
     let RelayRecoveryState {
         mut session_cache,
@@ -1289,84 +1382,83 @@ pub(crate) async fn resume_relay_after_promotion(
 
     info!("relay promotion: connected to replacement daemon");
 
-    // Replay MCP initialization onto the new daemon connection.
-    if !session_cache.replay_to(&mut stream).await {
-        anyhow::bail!(
-            "relay promotion: failed to replay MCP initialization \
-             to replacement daemon"
-        );
-    }
-    info!("relay promotion: MCP initialization replayed successfully");
-
-    // Phase 7: handle the interrupted in-flight request.
-    if let Some(req) = interrupted_request.take() {
-        if is_safe_readonly_method(&req.method) {
-            info!(
-                method = %req.method,
-                id    = %req.id_raw,
-                "relay promotion: retrying safe read-only in-flight request"
-            );
-            if stream.write_all(&req.framed).await.is_err() || stream.flush().await.is_err() {
-                warn!(
-                    "relay promotion: retry write failed; \
-                     replacement daemon connection broken"
-                );
-                anyhow::bail!(
-                    "relay promotion: replacement daemon connection \
-                     broke during in-flight retry"
-                );
-            }
-            // Re-arm for completeness (the response will flow through
-            // run_relay_supervised's own in-flight tracker below).
-            #[allow(unused_assignments)]
-            {
-                interrupted_request = Some(InFlightRequest {
-                    id_raw: req.id_raw,
-                    method: req.method,
-                    framed: req.framed,
-                    delivery: DeliveryState::Sent,
-                });
-            }
-        } else {
-            // Mutation or unknown method — synthesize error, never replay.
-            let err_bytes = make_jsonrpc_error_response(
-                &req.id_raw,
-                -32603,
-                "The daemon disconnected while this operation was in \
-                 flight. Its completion state is unknown. The operation \
-                 was not automatically retried.",
-            );
-            let _ = stdout.write_all(&err_bytes).await;
-            let _ = stdout.flush().await;
-            warn!(
-                method = %req.method,
-                id    = %req.id_raw,
-                "relay promotion: synthesized error for unsafe in-flight request"
-            );
-        }
+    // Replay MCP initialization + in-flight request onto the new daemon connection.
+    if !replay_session_and_resolve_inflight(
+        &mut stream,
+        &session_cache,
+        &mut interrupted_request,
+        &mut stdout,
+    )
+    .await
+    {
+        anyhow::bail!("relay promotion: initial replay failed on replacement daemon");
     }
 
     info!("relay promotion: resuming normal relay forwarding");
 
-    // Splice traffic between the existing stdio client and the replacement daemon.
-    let relay = RelayHandle { stream };
-    match run_relay_with_cache(
-        relay,
-        &mut session_cache,
-        &mut interrupted_request,
-        &mut stdin,
-        &mut stdout,
-        &mut pending_stdin,
-    )
-    .await?
-    {
-        RelayExit::StdinClosed => {
-            info!("relay promotion: MCP client closed normally");
-            Ok(())
-        }
-        RelayExit::DaemonClosed => {
-            warn!("relay promotion: replacement daemon closed connection");
-            Ok(())
+    let mut current_stream = stream;
+
+    loop {
+        let relay = RelayHandle { stream: current_stream };
+        match run_relay_with_cache(
+            relay,
+            &mut session_cache,
+            &mut interrupted_request,
+            &mut stdin,
+            &mut stdout,
+            &mut pending_stdin,
+        )
+        .await?
+        {
+            RelayExit::StdinClosed => {
+                info!("relay promotion: MCP client closed normally");
+                return Ok(());
+            }
+            RelayExit::DaemonClosed => {
+                warn!("relay promotion: replacement daemon closed connection; attempting recovery");
+                let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
+                let mut attempt = 0usize;
+                let mut reconnected = None;
+
+                while Instant::now() < recovery_deadline {
+                    let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    attempt += 1;
+
+                    match elect(db_path).await {
+                        Ok(ElectionResult::Relay(new_relay)) => {
+                            let mut s = new_relay.stream;
+                            if replay_session_and_resolve_inflight(
+                                &mut s,
+                                &session_cache,
+                                &mut interrupted_request,
+                                &mut stdout,
+                            )
+                            .await
+                            {
+                                reconnected = Some(s);
+                                break;
+                            }
+                        }
+                        Ok(ElectionResult::Daemon(_handle)) => {
+                            warn!("relay promotion: won election during second recovery; retrying connection");
+                        }
+                        Ok(ElectionResult::Fallback(_)) => break,
+                        Err(e) => {
+                            warn!("relay promotion: election attempt failed: {e}");
+                        }
+                    }
+                }
+
+                if let Some(s) = reconnected {
+                    current_stream = s;
+                    continue;
+                }
+                anyhow::bail!("relay promotion: could not recover after replacement daemon closed");
+            }
         }
     }
 }
