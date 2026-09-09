@@ -1802,6 +1802,58 @@ fn enforce_response_limit(mut body: String) -> String {
 
 // ΓöÇΓöÇΓöÇ tool handlers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
+// --- MCP work classification (Phase 5) -----------------------------------
+//
+// Every MCP tool is assigned a cost class.  The resource controller uses the
+// class — not individual tool names — to decide whether to admit, bound, or
+// reject work under memory pressure.  Unknown tools default to `Expensive`
+// (fail-safe): a new tool that was accidentally omitted from the map will be
+// treated conservatively rather than silently admitted at full cost.
+
+/// Cost tier for an MCP tool call, used by the pressure-aware admission gate
+/// inside `call_tool`.  Variants are ordered from cheapest to most expensive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpWorkClass {
+    /// Health, status, logging — always admitted even under Emergency pressure.
+    Cheap,
+    /// Ordinary search, file reads, repo_map — admitted unless Emergency.
+    Normal,
+    /// Context assembly, large result expansion — rejected under
+    /// Critical / Emergency.
+    Expensive,
+    /// Workspace-mutating operations — rejected under Emergency only.
+    Mutation,
+}
+
+/// Map a tool name to its [`McpWorkClass`].
+///
+/// This is the **single, centralised** place that assigns a cost class.
+/// Individual tool implementations must **not** contain resource-policy
+/// knowledge — all admission decisions flow through the class returned here.
+///
+/// Fail-safe: an unrecognised tool name returns [`McpWorkClass::Expensive`]
+/// so a newly-added tool is always treated conservatively until it is
+/// explicitly classified here.
+fn classify_mcp_tool(name: &str) -> McpWorkClass {
+    match name {
+        // Cheap: health/status/diagnostics — must stay alive under all pressure.
+        "status" | "logging" => McpWorkClass::Cheap,
+
+        // Normal: read-heavy but bounded — safe to admit under Warning/Critical.
+        "file" | "search" | "repo_map" => McpWorkClass::Normal,
+
+        // Expensive: memory-heavy assembly — rejected under Critical/Emergency.
+        "context" => McpWorkClass::Expensive,
+
+        // Mutation: workspace-state changes — rejected only under Emergency.
+        "workspace" => McpWorkClass::Mutation,
+
+        // Fail-safe: any unrecognised/future tool is treated as Expensive until
+        // explicitly classified above.
+        _ => McpWorkClass::Expensive,
+    }
+}
+
 fn handle_file(
     pool: &DbPool,
     args: &HashMap<String, Value>,
@@ -2149,13 +2201,24 @@ fn handle_status(
             "background_slots_in_use": monitor.background_slots_in_use(),
             "background_capacity": monitor.background_capacity(),
             "uptime_secs": monitor.uptime_secs(),
+            // Phase 93+: adaptive-limit observability fields.
+            "recovery_stage": format!("{:?}", monitor.recovery_stage()),
+            "effective_indexing_heavy_limit": monitor.effective_indexing_heavy_limit(),
+            "max_indexing_heavy": monitor.max_indexing_heavy(),
+            "active_indexing_heavy": monitor.indexing_heavy_active(),
+            "effective_embedding_limit": monitor.effective_embedding_limit(),
+            "active_embedding_heavy": monitor.embedding_heavy_active(),
+            "effective_embedding_batch": monitor.current_embedding_batch(),
+            "mcp_pressure_rejections": monitor.mcp_pressure_rejections(),
+            "daemon_reconnect_count": monitor.daemon_reconnect_count.load(
+                std::sync::atomic::Ordering::Relaxed
+            ),
         });
         payload["resource_advisory"] = json!({
             "advisory": match attic_storage::resource_manager::current_advisory(monitor) {
-                attic_storage::resource_manager::ResourceAdvisory::Normal => "normal",
+                attic_storage::resource_manager::ResourceAdvisory::Ok => "ok",
                 attic_storage::resource_manager::ResourceAdvisory::Degraded => "degraded",
-                attic_storage::resource_manager::ResourceAdvisory::Pause => "pause",
-                attic_storage::resource_manager::ResourceAdvisory::Emergency => "emergency",
+                attic_storage::resource_manager::ResourceAdvisory::Restricted => "restricted",
             }
         });
     }
@@ -2423,8 +2486,7 @@ fn handle_context(
     if mode == attic_retrieval::AnswerMode::Deep
         && matches!(
             resource_advisory,
-            attic_storage::resource_manager::ResourceAdvisory::Pause
-                | attic_storage::resource_manager::ResourceAdvisory::Emergency
+            attic_storage::resource_manager::ResourceAdvisory::Restricted
         )
     {
         mode = attic_retrieval::AnswerMode::Normal;
@@ -2685,38 +2747,55 @@ impl ServerHandler for AtticServer {
             // IDs that belong to the CURRENT configured workspace. Query tools
             // use this so historical repositories still present in storage can
             // never leak into active retrieval.
-            // Phase 5: pressure-aware foreground admission by tool cost.
-            // Cheap tools (status, logging, workspace) are always admitted.
-            // Normal tools (file, search, repo_map) are always admitted.
-            // Expensive tools (context) are rejected at Critical/Emergency pressure tier
-            // to protect available memory for in-flight requests.
-            if matches!(name.as_ref(), "context") {
-                if let Some(monitor) = self.resource_monitor.as_ref() {
-                    use attic_core::ResourcePressure;
+            // Phase 5: class-based pressure-aware foreground admission.
+            // McpWorkClass maps each tool to a cost tier; pressure policy is
+            // expressed once here, not scattered through individual tools.
+            {
+                use attic_core::ResourcePressure;
+                let work_class = classify_mcp_tool(name.as_ref());
+                let needs_rejection = if let Some(monitor) = self.resource_monitor.as_ref() {
                     let tier = monitor.stable_tier_pressure();
-                    if matches!(
-                        tier,
-                        ResourcePressure::Critical | ResourcePressure::Emergency
-                    ) {
-                        tracing::info!(
-                            tool = "context",
-                            ?tier,
-                            "Phase 5: rejecting expensive tool call under high memory pressure"
-                        );
-                        drop(admission);
-                        return Ok(CallToolResult::error(vec![ContentBlock::text(
-                            serde_json::json!({
-                                "error": "server_busy",
-                                "message": format!(
-                                    "memory pressure too high ({tier:?}) to accept a new \
-                                     context query; retry shortly or use mode=FAST"
-                                ),
-                                "retriable": true,
-                            })
-                            .to_string(),
-                        )])
-                        .into());
+                    match work_class {
+                        McpWorkClass::Cheap => false,
+                        McpWorkClass::Normal => false,
+                        McpWorkClass::Expensive => matches!(
+                            tier,
+                            ResourcePressure::Critical | ResourcePressure::Emergency
+                        ),
+                        McpWorkClass::Mutation => matches!(tier, ResourcePressure::Emergency),
                     }
+                } else {
+                    false
+                };
+                if needs_rejection {
+                    let tier = self
+                        .resource_monitor
+                        .as_ref()
+                        .map(|m| m.stable_tier_pressure())
+                        .unwrap_or(ResourcePressure::Normal);
+                    tracing::info!(
+                        tool = %name,
+                        class = ?work_class,
+                        ?tier,
+                        "Phase 5: rejecting MCP work class under memory pressure"
+                    );
+                    if let Some(monitor) = self.resource_monitor.as_ref() {
+                        monitor.record_mcp_pressure_rejection();
+                    }
+                    drop(admission);
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        serde_json::json!({
+                            "error": "server_busy",
+                            "message": format!(
+                                "Attic is temporarily under memory pressure ({tier:?}). \
+                                 This request was not started. Retry shortly."
+                            ),
+                            "retriable": true,
+                            "work_class": format!("{work_class:?}"),
+                        })
+                        .to_string(),
+                    )])
+                    .into());
                 }
             }
 
@@ -3306,11 +3385,23 @@ async fn main() -> anyhow::Result<()> {
                     );
                     // Phase 6/7: run_relay_supervised handles bounded
                     // exponential-backoff re-election and MCP session-cache
-                    // replay internally. It returns only when stdin is closed
-                    // (normal exit) or the recovery budget is exhausted
-                    // (unrecoverable — exit cleanly so the client sees the
-                    // disconnect immediately rather than spinning here).
-                    daemon::run_relay_supervised(relay, db_path).await?;
+                    // replay internally. Returns Ok(None) when stdin is
+                    // closed (normal exit) or the recovery budget is
+                    // exhausted (unrecoverable — exit cleanly so the client
+                    // sees the disconnect immediately rather than spinning
+                    // here). Returns Ok(Some(handle)) when this relay won
+                    // the daemon election during recovery — fall through to
+                    // the server-construction path below, identical to a
+                    // direct Daemon win at startup.
+                    if let Some(daemon_handle) =
+                        daemon::run_relay_supervised(relay, db_path).await?
+                    {
+                        // Phase 6: relay won daemon election during recovery.
+                        // Use the same production AtticServer construction
+                        // and run_daemon_accept_loop path as a normal Daemon
+                        // election win — no duplicate initialization logic.
+                        break Ownership::Daemon(daemon_handle);
+                    }
                     return Ok(());
                 }
                 daemon::ElectionResult::Daemon(handle) => break Ownership::Daemon(handle),

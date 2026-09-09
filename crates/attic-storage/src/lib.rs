@@ -64,7 +64,8 @@ pub use ops_tasks::{
     enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
 };
 pub use resource_manager::{
-    IndexingHeavyPermit, ResourceAdvisory, ResourceConfig, ResourceMonitor,
+    EmbeddingHeavyPermit, IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig,
+    ResourceMonitor, adaptive_embedding_batch, adaptive_embedding_limit, adaptive_indexing_limit,
 };
 pub use resource_policy::{
     EffectiveResourceConfig, HardwareSnapshot, ResourceDetectionError, ResourceMode,

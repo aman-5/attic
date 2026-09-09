@@ -418,14 +418,16 @@ impl EffectiveResourceConfig {
     /// overrides (read by the removed `ResourceConfig::load()`) are read
     /// directly here rather than silently dropped.
     pub fn as_resource_config(&self) -> ResourceConfig {
+        // ResourceConfig only covers the fields that ResourceMonitor consumes
+        // (memory budget, foreground/background admission).  The writer/IO
+        // fields (writer_batch_size, writer_queue_capacity,
+        // writer_flush_interval_ms, max_io_ops_per_sec) are consumed directly
+        // from EffectiveResourceConfig by the writer and scheduler subsystems —
+        // they are NOT ResourceMonitor concerns and must not be set here.
         ResourceConfig {
             total_memory_budget_mib: Some(self.memory_budget_mib),
             min_free_memory_mib: Some(self.min_free_memory_mib),
             max_foreground_queries: Some(self.max_foreground_queries),
-            max_io_ops_per_sec: Some(self.max_io_ops_per_sec as u64),
-            writer_queue_capacity: Some(self.writer_queue_capacity),
-            writer_batch_size: Some(self.writer_batch_size),
-            writer_flush_interval_ms: Some(self.writer_flush_interval_ms),
             per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
                 .ok()
                 .and_then(|v| v.parse().ok()),

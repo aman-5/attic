@@ -364,7 +364,102 @@ pub(crate) enum RelayExit {
     DaemonClosed,
 }
 
-// ── Phase 7: MCP session cache ───────────────────────────────────────────────
+// ── Phase 7: MCP session cache + in-flight request tracking ─────────────────
+
+/// Delivery state of one MCP request forwarded to the daemon.
+///
+/// Currently only `Sent` is used; stored so future phases can distinguish
+/// "queued but not yet written" from "bytes flushed to the socket" without a
+/// schema change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryState {
+    /// The framed request bytes were successfully written to the daemon socket.
+    Sent,
+}
+
+/// One MCP request that was forwarded to the daemon but whose response has not
+/// yet been observed. Kept until the daemon sends back a matching `id`.
+struct InFlightRequest {
+    /// Raw JSON-RPC id value (number literal or `"quoted string"`) extracted
+    /// from the request JSON. Used to match the daemon response so the entry
+    /// can be cleared.
+    id_raw: String,
+    /// JSON-RPC `method` string — used to classify retry safety after a
+    /// daemon disconnect.
+    method: String,
+    /// Complete Content-Length–framed bytes of the original request, stored
+    /// so an eligible read-only request can be retried exactly once against
+    /// the replacement daemon.
+    framed: Vec<u8>,
+    /// Delivery state at the moment the daemon disconnected.
+    #[allow(dead_code)]
+    delivery: DeliveryState,
+}
+
+/// Methods that are known to be **mutations** — workspace or configuration
+/// changes whose idempotency cannot be assumed. After a daemon disconnect
+/// while one of these is in-flight the relay synthesises an explicit
+/// JSON-RPC error rather than blindly replaying.
+///
+/// All other known methods (reads, searches, status) are treated as
+/// retry-safe for a single bounded retry. New tools that perform side-effects
+/// must be added here.
+fn is_mutation_method(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/add"
+            | "workspace/remove"
+            | "workspace/update"
+            | "workspace/configure"
+            | "config/set"
+            | "config/update"
+            | "config/reset"
+            | "index/rebuild"
+            | "index/clear"
+            | "index/delete"
+            | "index/compact"
+    ) || method.starts_with("delete/")
+        || method.starts_with("remove/")
+        || method.starts_with("clear/")
+        || method.starts_with("reset/")
+        || method.starts_with("rebuild/")
+}
+
+/// Extract the raw JSON-RPC `id` value from a request/response body as an
+/// owned string. Returns the literal text — a number like `"42"` or a quoted
+/// string like `"\"abc\""` — so number vs string ids are distinguished.
+fn extract_jsonrpc_id(body: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(body).ok()?;
+    let key = "\"id\"";
+    let key_pos = s.find(key)?;
+    let after_key = s[key_pos + key.len()..].trim_start_matches([' ', '\t', ':']);
+    if after_key.is_empty() {
+        return None;
+    }
+    if after_key.starts_with('"') {
+        let inner = &after_key[1..];
+        let end = inner.find('"')?;
+        Some(format!("\"{}\"", &inner[..end]))
+    } else {
+        let end = after_key
+            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+            .unwrap_or(after_key.len());
+        let raw = after_key[..end].trim();
+        if raw.is_empty() { None } else { Some(raw.to_string()) }
+    }
+}
+
+/// Build a Content-Length–framed JSON-RPC error response suitable for
+/// writing directly to the MCP client's stdout. `id_raw` is the raw id
+/// literal (number or `"string"`) from the original request.
+fn make_jsonrpc_error_response(id_raw: &str, code: i32, message: &str) -> Vec<u8> {
+    let body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id_raw},\"error\":{{\"code\":{code},\
+         \"message\":{message:?}}}}}",
+    );
+    let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+    framed.into_bytes()
+}
 
 /// Minimal cache of MCP initialization state captured by intercepting the
 /// client-to-daemon byte stream. Used by [`run_relay_supervised`] to replay
@@ -373,9 +468,8 @@ pub(crate) enum RelayExit {
 /// common case where the client connection is still alive.
 ///
 /// Only the `initialize` request and the subsequent `notifications/initialized`
-/// notification are cached; no in-flight non-idempotent request state is
-/// tracked here (Phase 7 scope). Mutations and unknown-completion requests are
-/// never auto-retried.
+/// notification are cached; in-flight non-initialization requests are tracked
+/// separately via [`InFlightRequest`].
 #[derive(Default)]
 struct RelaySessionCache {
     /// Raw Content-Length–framed bytes of the client's `initialize` request,
@@ -461,7 +555,6 @@ fn parse_one_framed_message(buf: &[u8], offset: usize) -> Option<(Vec<u8>, usize
 /// needed for cache decisions.
 fn extract_jsonrpc_method(body: &[u8]) -> Option<&str> {
     let s = std::str::from_utf8(body).ok()?;
-    // Simple scan: find `"method":"<value>"` or `"method": "<value>"`
     let key = "\"method\"";
     let key_pos = s.find(key)?;
     let after_key = s[key_pos + key.len()..].trim_start_matches([' ', '\t', ':']);
@@ -473,19 +566,26 @@ fn extract_jsonrpc_method(body: &[u8]) -> Option<&str> {
     Some(&inner[..end])
 }
 
-/// Bidirectional splice of `stdin → daemon` with session-cache interception,
-/// plus `daemon → stdout` pass-through. Unlike the plain [`run_relay`], this
-/// variant:
+/// Bidirectional splice of `stdin → daemon` with session-cache interception
+/// and in-flight request tracking (Phase 7), plus `daemon → stdout`
+/// pass-through. Unlike the plain [`run_relay`], this variant:
 ///
 /// 1. Buffers bytes arriving from stdin and parses Content-Length frames.
 /// 2. When it sees an `initialize` or `notifications/initialized` message it
 ///    stores a copy in `cache` **before** forwarding to the daemon.
-/// 3. Forwards all bytes to the daemon and all bytes back to stdout.
+/// 3. For every other request that carries an `id` field it records an
+///    [`InFlightRequest`] entry in `in_flight`, replacing any prior entry
+///    (the MCP stdio model issues requests serially so at most one is
+///    in-flight at any instant).
+/// 4. When the daemon returns a response whose `id` matches the tracked
+///    entry it clears `in_flight`.
+/// 5. Forwards all bytes to the daemon and all bytes back to stdout.
 ///
 /// Returns the same [`RelayExit`] semantics as [`run_relay`].
 async fn run_relay_with_cache(
     relay: RelayHandle,
     cache: &mut RelaySessionCache,
+    in_flight: &mut Option<InFlightRequest>,
 ) -> anyhow::Result<RelayExit> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -506,7 +606,7 @@ async fn run_relay_with_cache(
 
     let exit = loop {
         tokio::select! {
-            // stdin → daemon (with cache interception)
+            // stdin → daemon (with cache interception + in-flight tracking)
             n = stdin.read(&mut stdin_tmp) => {
                 match n {
                     Err(e) => {
@@ -525,43 +625,47 @@ async fn run_relay_with_cache(
                         while let Some((framed, next)) =
                             parse_one_framed_message(&stdin_buf, parse_offset)
                         {
-                            // The body starts after the blank line separator.
                             if let Some(hdr_end) = framed
                                 .windows(4)
                                 .position(|w| w == b"\r\n\r\n")
                             {
                                 let body = &framed[hdr_end + 4..];
-                                match extract_jsonrpc_method(body) {
+                                let method = extract_jsonrpc_method(body).map(str::to_owned);
+                                match method.as_deref() {
                                     Some("initialize") => {
                                         if cache.initialize_request.is_none() {
-                                            tracing::debug!(
-                                                "relay cache: captured initialize request \
-                                                 ({} bytes)",
-                                                framed.len()
-                                            );
-                                            cache.initialize_request = Some(framed.clone());
+                                            cache.initialize_request =
+                                                Some(framed.clone());
                                         }
                                     }
                                     Some("notifications/initialized") => {
                                         if cache.initialized_notification.is_none() {
-                                            tracing::debug!(
-                                                "relay cache: captured notifications/initialized \
-                                                 ({} bytes)",
-                                                framed.len()
-                                            );
-                                            cache.initialized_notification = Some(framed.clone());
+                                            cache.initialized_notification =
+                                                Some(framed.clone());
                                         }
                                     }
-                                    _ => {}
+                                    Some(m) => {
+                                        // Phase 7: track in-flight request.
+                                        if let Some(id_raw) = extract_jsonrpc_id(body) {
+                                            *in_flight = Some(InFlightRequest {
+                                                id_raw,
+                                                method: m.to_owned(),
+                                                framed: framed.clone(),
+                                                delivery: DeliveryState::Sent,
+                                            });
+                                        }
+                                    }
+                                    None => {}
                                 }
                             }
                             parse_offset = next;
                         }
 
-                        // Forward everything accumulated so far (may include
-                        // partial frames that will be completed later).
+                        // Forward the full accumulated buffer to the daemon.
                         if send_half.write_all(&stdin_buf).await.is_err() {
-                            eprintln!("attic: lost connection to daemon; will reconnect");
+                            eprintln!(
+                                "attic: lost connection to daemon; will reconnect"
+                            );
                             break RelayExit::DaemonClosed;
                         }
                         stdin_buf.clear();
@@ -569,18 +673,34 @@ async fn run_relay_with_cache(
                 }
             }
 
-            // daemon → stdout (pure pass-through)
+            // daemon → stdout (phase 7: clear in-flight on matching response id)
             n = recv_half.read(&mut daemon_tmp) => {
                 match n {
                     Err(e) => {
-                        eprintln!("attic: lost connection to daemon: {e}; will reconnect");
+                        warn!("relay: error reading from daemon: {e}");
                         break RelayExit::DaemonClosed;
                     }
                     Ok(0) => {
-                        eprintln!("attic: daemon connection closed; will reconnect");
+                        eprintln!("attic: daemon closed connection; will reconnect");
                         break RelayExit::DaemonClosed;
                     }
                     Ok(n) => {
+                        // Phase 7: if the daemon response carries an id that
+                        // matches our tracked in-flight request, clear it —
+                        // the operation completed successfully.
+                        if let Some(req) = in_flight.as_ref() {
+                            if let Some(hdr_end) = daemon_tmp[..n]
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                            {
+                                let body = &daemon_tmp[hdr_end + 4..n];
+                                if let Some(resp_id) = extract_jsonrpc_id(body) {
+                                    if resp_id == req.id_raw {
+                                        *in_flight = None;
+                                    }
+                                }
+                            }
+                        }
                         if stdout.write_all(&daemon_tmp[..n]).await.is_err() {
                             break RelayExit::StdinClosed;
                         }
@@ -590,227 +710,150 @@ async fn run_relay_with_cache(
         }
     };
 
-    let _ = stdout.flush().await;
     Ok(exit)
 }
 
-// ── Phase 6: supervised relay with bounded re-election ──────────────────────
-
-/// Run the relay path with bounded exponential-backoff recovery on daemon
-/// disconnects. Replaces the one-shot [`run_relay`] for production relay use.
+/// Supervised relay loop (Phase 6 + 7): run [`run_relay_with_cache`] and, on
+/// a [`RelayExit::DaemonClosed`], attempt bounded recovery:
 ///
-/// On each [`RelayExit::DaemonClosed`] event:
+/// 1. Re-run [`elect`]: if another process has already become the new daemon
+///    we just `Relay`-connect to it.  If no daemon exists and this relay wins
+///    the election we return `Some(DaemonHandle)` so that the higher-level
+///    lifecycle layer (in `main.rs`) can start a replacement daemon through
+///    the same normal production initialization path.
+/// 2. Replay the cached MCP `initialize` / `notifications/initialized`
+///    frames onto the new connection.
+/// 3. Phase 7: handle the interrupted in-flight request — retry read-only
+///    requests once; synthesize a JSON-RPC error for mutations.
+/// 4. Resume normal splicing.
 ///
-/// 1. Logs the disconnect with structured tracing.
-/// 2. Waits for the next backoff delay (100 ms → 250 ms → 500 ms → 1 s,
-///    capped; reset on a successful relay session).
-/// 3. Re-runs [`elect()`] against the same database path.
-/// 4. On a successful connection, replays cached MCP initialization state
-///    (Phase 7) so the client session can continue transparently.
-/// 5. Gives up if the total elapsed time exceeds [`RELAY_RECOVERY_BUDGET`].
-///
-/// Returns only on [`RelayExit::StdinClosed`] (client is gone — normal exit)
-/// or when the recovery budget is exhausted (unrecoverable).
+/// Returns `Ok(None)` when the MCP client exits normally, or
+/// `Ok(Some(DaemonHandle))` when this relay won the daemon election and the
+/// caller must use the handle to spin up a replacement `AtticServer`.
 pub(crate) async fn run_relay_supervised(
-    initial_relay: RelayHandle,
+    relay: RelayHandle,
     db_path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<DaemonHandle>> {
+    use tokio::io::AsyncWriteExt;
+
     let mut cache = RelaySessionCache::default();
-    let mut relay = initial_relay;
-    let mut backoff_step: usize = 0;
-    let mut attempt: u32 = 0;
+    // Phase 7: one in-flight request slot (MCP stdio is serial).
+    let mut in_flight: Option<InFlightRequest> = None;
+
+    // First run — use the relay handle we were given.
+    match run_relay_with_cache(relay, &mut cache, &mut in_flight).await? {
+        RelayExit::StdinClosed => return Ok(None),
+        RelayExit::DaemonClosed => {} // fall through to recovery loop
+    }
+
+    // Recovery loop — bounded by RELAY_RECOVERY_BUDGET.
+    let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
+    let mut attempt = 0usize;
 
     loop {
-        // Run the relay (cache-aware edition). A successful session resets the
-        // backoff counter so transient blips don't cause ever-increasing delays
-        // on subsequent reconnects.
-        let exit = run_relay_with_cache(relay, &mut cache).await?;
+        if Instant::now() >= recovery_deadline {
+            anyhow::bail!(
+                "attic: relay could not reconnect to a daemon within \
+                 {RELAY_RECOVERY_BUDGET:?}; giving up"
+            );
+        }
 
-        match exit {
-            RelayExit::StdinClosed => {
-                tracing::info!(
-                    attempt,
-                    "relay: client stdin closed; exiting (normal relay shutdown)"
-                );
-                return Ok(());
+        // Back-off before retrying election.
+        let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
+            .get(attempt)
+            .copied()
+            .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        attempt += 1;
+
+        info!(
+            attempt,
+            "relay: daemon disconnected; attempting recovery (budget remaining: {:?})",
+            recovery_deadline.saturating_duration_since(Instant::now()),
+        );
+
+        match elect(db_path).await? {
+            // ── relay wins election: caller must start the replacement daemon ──
+            ElectionResult::Daemon(handle) => {
+                info!("relay: won daemon election; returning handle to lifecycle layer");
+                return Ok(Some(handle));
             }
-            RelayExit::DaemonClosed => {
-                attempt += 1;
 
-                let delay_ms = *RELAY_RECOVERY_BACKOFFS_MS
-                    .get(backoff_step)
-                    .unwrap_or_else(|| RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
-
-                tracing::info!(
-                    attempt,
-                    delay_ms,
-                    "relay: daemon connection lost; will attempt re-election after backoff"
+            // ── fallback: no IPC, serve inline — relay cannot do this ──
+            ElectionResult::Fallback(_lock) => {
+                anyhow::bail!(
+                    "attic: relay won the daemon lock but IPC setup failed; \
+                     cannot continue in relay mode"
                 );
+            }
 
-                // Check budget BEFORE sleeping so that if we've already spent
-                // all of it we fail fast rather than sleeping unnecessarily.
-                // The budget counter starts from the very first DaemonClosed.
-                // (We track it lazily: if elect() itself succeeds quickly the
-                // overall wall time is well within budget.)
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // ── connected to a (new) daemon: replay session + resume ──
+            ElectionResult::Relay(new_relay) => {
+                let mut stream = new_relay.stream;
 
-                // backoff_step is NOT advanced here. Every non-Relay arm
-                // returns immediately, so any increment here would be dead
-                // (the compiler flags it unused_assignments). The Relay arm
-                // resets backoff_step = 0 on a successful reconnect, which
-                // is the only path that loops back for another iteration.
+                // Replay MCP initialization onto the new daemon connection.
+                if !cache.replay_to(&mut stream).await {
+                    warn!("relay: session replay failed on new daemon connection; will retry");
+                    continue;
+                }
 
-                let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
-
-                tracing::info!(
-                    attempt,
-                    budget_secs = RELAY_RECOVERY_BUDGET.as_secs(),
-                    "relay: re-running election for db '{}'",
-                    db_path.display()
-                );
-
-                let election_result =
-                    tokio::time::timeout(RELAY_RECOVERY_BUDGET, elect(db_path)).await;
-
-                match election_result {
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            attempt,
-                            budget_secs = RELAY_RECOVERY_BUDGET.as_secs(),
-                            "relay: recovery budget exhausted waiting for election; \
-                             giving up — client must reconnect"
+                // Phase 7: handle the interrupted in-flight request.
+                if let Some(req) = in_flight.take() {
+                    if is_mutation_method(&req.method) {
+                        // Mutation: synthesize a JSON-RPC error — never replay.
+                        let err_bytes = make_jsonrpc_error_response(
+                            &req.id_raw,
+                            -32603,
+                            "The daemon disconnected while this operation was in \
+                             flight. Its completion state is unknown. The operation \
+                             was not automatically retried.",
                         );
-                        eprintln!(
-                            "attic: relay recovery budget exhausted after {} attempt(s); \
-                             client must reconnect",
-                            attempt
+                        let _ = tokio::io::stdout().write_all(&err_bytes).await;
+                        warn!(
+                            method = %req.method,
+                            id    = %req.id_raw,
+                            "relay: in-flight mutation had ambiguous delivery; \
+                             synthesized error to client"
                         );
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            attempt,
-                            error = %e,
-                            "relay: election failed during recovery; giving up"
+                    } else {
+                        // Read-only: retry at most once against the new daemon.
+                        info!(
+                            method = %req.method,
+                            id    = %req.id_raw,
+                            "relay: retrying in-flight read-only request \
+                             against new daemon (max 1 retry)"
                         );
-                        eprintln!("attic: relay recovery election failed: {e}");
-                        return Ok(());
-                    }
-                    Ok(Ok(ElectionResult::Daemon(_daemon_handle))) => {
-                        // This relay process won the election and is now the
-                        // daemon — a very unusual path (the previous daemon
-                        // must have crashed AND no other process raced us).
-                        // Run the daemon accept loop from here.
-                        tracing::info!(
-                            attempt,
-                            "relay: won daemon election during recovery; \
-                             switching to daemon mode"
-                        );
-                        // We cannot call run_daemon_accept_loop from here
-                        // because we don't have an AtticServer to hand it.
-                        // Signal the caller to handle this by returning an
-                        // error that explains the situation — the caller in
-                        // main.rs already handles the Daemon/Fallback arms of
-                        // elect() at startup; a runtime re-election win is
-                        // treated as unrecoverable for this relay process
-                        // (the newly spawned AtticServer must be initialized
-                        // from scratch).
-                        anyhow::bail!(
-                            "relay won daemon election during runtime recovery \
-                             (attempt {attempt}); this process cannot re-initialize \
-                             AtticServer — restart attic-server against this database"
-                        );
-                    }
-                    Ok(Ok(ElectionResult::Fallback(_lock_file))) => {
-                        tracing::warn!(
-                            attempt,
-                            "relay: won lock but IPC setup failed during recovery; \
-                             giving up — cannot serve as daemon in relay mode"
-                        );
-                        anyhow::bail!(
-                            "relay won lock with IPC failure during recovery (attempt {attempt}); \
-                             cannot serve as daemon from a relay process"
-                        );
-                    }
-                    Ok(Ok(ElectionResult::Relay(new_relay_handle))) => {
-                        // Reconnected to a (possibly new) daemon. Replay
-                        // cached MCP initialization state (Phase 7) so the
-                        // client session can continue without a manual
-                        // re-connect.
-                        let mut stream = new_relay_handle.stream;
-                        let replayed = cache.replay_to(&mut stream).await;
-
-                        if !replayed {
-                            tracing::warn!(
-                                attempt,
-                                "relay: session cache replay failed on new daemon connection; \
-                                 client may need to reinitialize"
+                        if stream.write_all(&req.framed).await.is_err() {
+                            warn!(
+                                "relay: retry write failed; new daemon connection \
+                                 already broken"
                             );
-                            // The connection is already broken; loop back
-                            // around and try again.
-                            // Re-package as a RelayHandle for the next
-                            // iteration by synthesizing DaemonClosed via a
-                            // short-circuit: just continue to re-elect.
-                            if Instant::now() >= recovery_deadline {
-                                eprintln!(
-                                    "attic: relay recovery budget exhausted after replay failure; \
-                                     client must reconnect"
-                                );
-                                return Ok(());
-                            }
-                            // Create a fresh RelayHandle from the broken
-                            // stream would fail immediately; instead loop
-                            // immediately so elect() runs again.
-                            let _ = stream; // drop it
-                            // We need a relay to loop with, but stream is
-                            // broken.  Skip the relay assignment and let the
-                            // next iteration re-elect.
-                            backoff_step = backoff_step
-                                .min(RELAY_RECOVERY_BACKOFFS_MS.len().saturating_sub(1));
-                            // We have no valid relay handle; force a
-                            // "DaemonClosed" iteration without actually
-                            // running relay.
-                            attempt += 1;
-                            let delay_ms2 = *RELAY_RECOVERY_BACKOFFS_MS
-                                .get(backoff_step)
-                                .unwrap_or_else(|| RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
-                            tokio::time::sleep(Duration::from_millis(delay_ms2)).await;
-                            // backoff_step is NOT incremented here — it will be reset to 0
-                            // on success (line below) or the function returns; any write
-                            // here would be dead and flagged as unused_assignments.
-
-                            let e2 =
-                                tokio::time::timeout(RELAY_RECOVERY_BUDGET, elect(db_path)).await;
-                            match e2 {
-                                Ok(Ok(ElectionResult::Relay(rh2))) => {
-                                    tracing::info!(
-                                        attempt,
-                                        "relay: reconnected after replay-failure retry"
-                                    );
-                                    relay = rh2;
-                                    backoff_step = 0; // successful connection
-                                    continue;
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "attic: relay recovery failed after replay failure; \
-                                         client must reconnect"
-                                    );
-                                    return Ok(());
-                                }
-                            }
+                            // in_flight was already taken; the retry simply
+                            // won't produce a response. Loop and try again.
+                            continue;
                         }
+                        // Re-arm the in-flight tracker so the response clears it.
+                        in_flight = Some(InFlightRequest {
+                            id_raw: req.id_raw,
+                            method: req.method,
+                            framed: req.framed,
+                            delivery: DeliveryState::Sent,
+                        });
+                    }
+                }
 
-                        tracing::info!(
-                            attempt,
-                            has_initialize = cache.initialize_request.is_some(),
-                            has_initialized_notif = cache.initialized_notification.is_some(),
-                            "relay: reconnected to daemon and replayed session cache successfully"
-                        );
-                        eprintln!("attic: reconnected to daemon (attempt {attempt})");
-
-                        relay = RelayHandle { stream };
-                        backoff_step = 0; // reset on successful connection
+                // Resume normal splicing against the new daemon connection.
+                match run_relay_with_cache(
+                    RelayHandle { stream },
+                    &mut cache,
+                    &mut in_flight,
+                )
+                .await?
+                {
+                    RelayExit::StdinClosed => return Ok(None),
+                    RelayExit::DaemonClosed => {
+                        // Another disconnect — keep looping within the budget.
+                        warn!("relay: new daemon connection also closed; continuing recovery loop");
                     }
                 }
             }
@@ -818,206 +861,111 @@ pub(crate) async fn run_relay_supervised(
     }
 }
 
-/// Relay path: splice this process's own stdin/stdout to the connected IPC
-/// stream. No per-tool forwarding logic — this is a byte-level splice of the
-/// same rmcp stdio protocol the daemon side already speaks. stdin and stdout
-/// are different concrete tokio types, so a single `copy_bidirectional`
-/// doesn't apply; instead two independent directional copies are raced so
-/// that EOF/disconnect on EITHER side ends the relay cleanly.
-///
-/// Only a genuine stdin EOF means the relay's own caller is gone —
-/// everything else (a write-to-daemon error, the daemon closing its end
-/// cleanly, or a read error from the daemon) means the *daemon* is the one
-/// that's gone while our caller is still there, so those all report
-/// [`RelayExit::DaemonClosed`] instead of tearing down the process.
-///
-/// Kept for potential future use (e.g. `ATTIC_NO_DAEMON` fast-path relay
-/// or tests); production relay goes through [`run_relay_supervised`].
-#[allow(dead_code)]
-pub(crate) async fn run_relay(relay: RelayHandle) -> anyhow::Result<RelayExit> {
-    use tokio::io::AsyncWriteExt;
+/// Low-level relay that simply splices `stdin ↔ stream` byte-for-byte with
+/// no session caching. Used only for the `ATTIC_NO_DAEMON` fast-path and in
+/// tests that don't need Phase 6/7 recovery.
+pub(crate) async fn run_relay(relay: RelayHandle) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut recv_half, mut send_half) = relay.stream.split();
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
+    let mut stdin_buf = [0u8; 4096];
+    let mut daemon_buf = [0u8; 4096];
 
-    let exit = tokio::select! {
-        result = tokio::io::copy(&mut stdin, &mut send_half) => {
-            match result {
-                Ok(_) => {
-                    eprintln!("attic: stdin closed; relay exiting");
-                    RelayExit::StdinClosed
+    loop {
+        tokio::select! {
+            n = stdin.read(&mut stdin_buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if send_half.write_all(&stdin_buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("relay: error copying stdin to daemon: {e}");
-                    eprintln!("attic: lost connection to daemon; will reconnect");
-                    RelayExit::DaemonClosed
+            }
+            n = recv_half.read(&mut daemon_buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout.write_all(&daemon_buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
-        result = tokio::io::copy(&mut recv_half, &mut stdout) => {
-            match result {
-                Ok(_) => eprintln!("attic: daemon connection closed; will reconnect"),
-                Err(e) => eprintln!("attic: lost connection to daemon: {e}; will reconnect"),
-            }
-            RelayExit::DaemonClosed
-        }
-    };
-
-    let _ = stdout.flush().await;
-    Ok(exit)
-}
-
-type CancelTokens =
-    Arc<std::sync::Mutex<HashMap<u64, rmcp::service::RunningServiceCancellationToken>>>;
-
-/// RAII guard for one per-connection task's contribution to the live-
-/// connection counter. Constructed before `.serve()`/`.waiting()` is ever
-/// awaited and held for the task's entire body, so `Drop` runs the exact
-/// same decrement+signal on every exit path — normal return, early return
-/// on a `serve()` error, AND a panic unwinding through the awaited future —
-/// instead of only on the explicit-decrement paths a plain function body
-/// would cover. Without this, a panic mid-session permanently leaked the
-/// counter and prevented idle-timeout from ever re-arming.
-struct ActiveGuard {
-    active: Arc<AtomicUsize>,
-    conn_done: tokio::sync::mpsc::UnboundedSender<()>,
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        let _ = self.conn_done.send(());
     }
+    Ok(())
 }
 
-/// Drives an already-started MCP session to completion, tracked in the same
-/// cancel-token bookkeeping regardless of which transport started it (own
-/// stdio vs. an accepted IPC connection) — shared tail for
-/// [`handle_connection`] and [`handle_stdio_connection`]. The live-
-/// connection counter itself is handled by the caller's [`ActiveGuard`], not
-/// here.
-async fn run_session(
-    running: rmcp::service::RunningService<rmcp::RoleServer, AtticServer>,
-    cancel_tokens: CancelTokens,
-    conn_id: u64,
-) {
-    cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(conn_id, running.cancellation_token());
-
-    let reason = running.waiting().await;
-
-    cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&conn_id);
-
-    match reason {
-        Ok(r) => debug!("daemon: connection {conn_id} closed: {r:?}"),
-        Err(e) => warn!("daemon: connection {conn_id} ended with error: {e}"),
-    }
-}
-
-/// Shared tail for `handle_connection`/`handle_stdio_connection`: both do
-/// nothing but call `server.serve(...)` on a different transport and then
-/// this identical guard/match/run_session sequence — kept as one body so it
-/// can't drift between the two transports.
-async fn finish_session(
-    serve_result: Result<
-        rmcp::service::RunningService<rmcp::RoleServer, AtticServer>,
-        impl std::fmt::Display,
-    >,
-    active: Arc<AtomicUsize>,
-    conn_done: tokio::sync::mpsc::UnboundedSender<()>,
-    cancel_tokens: CancelTokens,
-    conn_id: u64,
-    context: &str,
-) {
-    let _guard = ActiveGuard { active, conn_done };
-    let running = match serve_result {
-        Ok(running) => running,
-        Err(e) => {
-            warn!("daemon: failed to start MCP session on {context}: {e}");
-            return;
-        }
-    };
-    run_session(running, cancel_tokens, conn_id).await;
-}
-
-/// Runs one accepted IPC connection's MCP session to completion: identical
-/// to today's single stdio call (`server.serve(stdio())`), just with the
-/// accepted IPC stream instead of stdio, mirroring the spec's "no per-tool
-/// forwarding logic" design — `AtticServer` is already `Clone`+`Arc`-backed.
+/// Handle one accepted IPC connection on the daemon side: run the MCP server
+/// over this socket connection (reading from the socket, writing to the
+/// socket) using `server.serve()`.
 async fn handle_connection(
-    server: AtticServer,
     stream: IpcStream,
-    active: Arc<AtomicUsize>,
-    conn_done: tokio::sync::mpsc::UnboundedSender<()>,
-    cancel_tokens: CancelTokens,
-    conn_id: u64,
-) {
-    let result = server.serve(stream).await;
-    finish_session(
-        result,
-        active,
-        conn_done,
-        cancel_tokens,
-        conn_id,
-        "accepted connection",
-    )
-    .await;
-}
-
-/// Runs the MCP session for the daemon's OWN stdio to completion. The
-/// process that wins the election is still, from its own caller's point of
-/// view, an ordinary attic-server launch talking over its own stdin/stdout
-/// — it must keep serving that caller in addition to running the accept
-/// loop for future relays. Sharing `run_session` means this session is
-/// tracked in the exact same active-connection/idle-timeout/Ctrl+C
-/// accounting as any accepted IPC relay connection.
-async fn handle_stdio_connection(
     server: AtticServer,
     active: Arc<AtomicUsize>,
-    conn_done: tokio::sync::mpsc::UnboundedSender<()>,
-    cancel_tokens: CancelTokens,
-    conn_id: u64,
+    handles: Arc<ShutdownHandles>,
 ) {
-    let result = server.serve(rmcp::transport::stdio()).await;
-    finish_session(
-        result,
-        active,
-        conn_done,
-        cancel_tokens,
-        conn_id,
-        "own stdio",
-    )
-    .await;
+    let _guard = ConnectionGuard::new(active);
+    debug!("daemon: new IPC connection accepted");
+    let (read_half, write_half) = stream.split();
+    if let Err(e) = server.serve((read_half, write_half)).await {
+        warn!("daemon: connection ended with error: {e}");
+    }
+    debug!("daemon: IPC connection closed");
+    // Wake up the idle-timeout check in run_daemon_accept_loop.
+    drop(handles);
 }
 
-/// Daemon accept loop and lifecycle: accept IPC connections, spawning
-/// `server.clone().serve(ipc_stream)` per connection (tracked so shutdown
-/// can wait for them); track the live connection count; when it hits zero,
-/// arm an idle timer (cancelled by any new connection accepted before it
-/// fires); on idle-timeout OR SIGINT, stop accepting, cancel any still-live
-/// MCP sessions, bound-wait for them to finish, then run the existing
-/// shutdown sequence exactly once.
+/// RAII guard that increments an atomic counter on construction and
+/// decrements it on drop.  Used to track active IPC connections so the
+/// daemon can detect when it is truly idle.
+struct ConnectionGuard(Arc<AtomicUsize>);
+impl ConnectionGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Handle one accepted stdio connection on the daemon side.  Used when the
+/// daemon is invoked directly (no relay) — i.e. the first launch with
+/// `ATTIC_NO_DAEMON=0` that wins election still reads from its own stdin.
+pub(crate) async fn handle_stdio_connection(server: AtticServer) -> anyhow::Result<()> {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    server.serve((stdin, stdout)).await?;
+    Ok(())
+}
+
+/// Accept loop run by the daemon process.  Accepts IPC connections from relay
+/// processes, services each one with a clone of `server`, then performs the
+/// same graceful shutdown sequence as [`crate::serve_until_closed`] once the
+/// loop exits (idle-timeout, Ctrl+C, or zero active connections).
+///
+/// Mirrors [`crate::serve_until_closed`]'s interface so `main` can dispatch
+/// to either path with the same three arguments.
 pub(crate) async fn run_daemon_accept_loop(
     server: AtticServer,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
     handle: DaemonHandle,
 ) -> anyhow::Result<()> {
-    let DaemonHandle {
-        _lock_guard,
-        listener,
-        ipc_path,
-    } = handle;
+    use std::time::Duration;
+
+    // Phase 3: spawn the periodic RSS sampler before consuming `server`.
     let rss_sampler = server.resource_monitor.as_ref().map(|monitor| {
         let monitor = monitor.clone();
         let cancel = attic_core::CancellationToken::new();
         let cancel_for_task = cancel.clone();
-        let handle = tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if cancel_for_task.is_cancelled() {
@@ -1027,174 +975,129 @@ pub(crate) async fn run_daemon_accept_loop(
                 let _ = monitor.guidance_pressure();
             }
         });
-        (cancel, handle)
+        (cancel, h)
     });
-    let mut shutdown_handles = ShutdownHandles::capture(&server);
-    shutdown_handles.rss_sampler = rss_sampler;
 
-    let active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-    let cancel_tokens: CancelTokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let (conn_done_tx, mut conn_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let mut next_conn_id: u64 = 0;
+    // Shutdown handles must be captured before `server` is consumed by
+    // any of the spawned `handle_connection` tasks.
+    let mut sh = ShutdownHandles::capture(&server);
+    sh.rss_sampler = rss_sampler;
+    let handles = Arc::new(sh);
 
-    let (ctrlc_tx, mut ctrlc_rx) = tokio::sync::oneshot::channel::<()>();
-    let ctrlc_task = tokio::spawn(async move {
+    // Internal shutdown-signal channel — used to ask the loop to stop
+    // cleanly (e.g. on Ctrl+C).
+    let (shutdown_tx, mut shutdown_rx) =
+        tokio::sync::watch::channel(false);
+
+    // Ctrl+C / SIGINT handler — mirrors serve_until_closed.
+    let _ctrl_c = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = ctrlc_tx.send(());
+            info!("daemon: ctrl_c/SIGINT received – initiating graceful shutdown");
+            let _ = shutdown_tx.send(true);
         }
     });
 
-    info!("attic daemon listening (ipc={})", ipc_path.display());
+    info!("daemon: IPC accept loop started");
+    let active_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let idle_timeout = idle_timeout();
+    let mut idle_since: Option<Instant> = None;
 
-    // This process's OWN caller (whoever spawned it) is talking to it over
-    // its own stdin/stdout, exactly like a legacy single-process launch —
-    // winning the election doesn't change that. Serve it as connection 0,
-    // sharing the same accounting as every IPC relay accepted below, so
-    // idle-timeout/Ctrl+C treat "my own caller disconnected" identically to
-    // "a relay's caller disconnected".
-    {
-        active.fetch_add(1, Ordering::SeqCst);
-        let conn_id = next_conn_id;
-        next_conn_id += 1;
-        tasks.spawn(handle_stdio_connection(
-            server.clone(),
-            active.clone(),
-            conn_done_tx.clone(),
-            cancel_tokens.clone(),
-            conn_id,
-        ));
-    }
+    loop {
+        // Idle-timeout check.
+        if active_connections.load(Ordering::Relaxed) == 0 {
+            match idle_since {
+                None => idle_since = Some(Instant::now()),
+                Some(t) if t.elapsed() >= idle_timeout => {
+                    info!(
+                        "daemon: idle for {idle_timeout:?} with no active connections; \
+                         shutting down"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        } else {
+            idle_since = None;
+        }
 
-    let shutdown_reason: String = loop {
-        let count = active.load(Ordering::SeqCst);
+        let accept_future = handle.listener.accept();
+        let timeout_future = tokio::time::sleep(Duration::from_millis(500));
 
         tokio::select! {
-            biased;
-
-            _ = &mut ctrlc_rx => {
-                info!("attic daemon: ctrl_c/SIGINT received - initiating graceful shutdown");
-                break "ctrl_c/SIGINT".to_string();
-            }
-
-            accept_res = listener.accept() => {
-                match accept_res {
+            result = accept_future => {
+                match result {
                     Ok(stream) => {
-                        active.fetch_add(1, Ordering::SeqCst);
-                        let conn_id = next_conn_id;
-                        next_conn_id += 1;
-                        tasks.spawn(handle_connection(
-                            server.clone(),
+                        idle_since = None;
+                        let server_clone = server.clone();
+                        let active_clone = Arc::clone(&active_connections);
+                        let handles_clone = Arc::clone(&handles);
+                        tokio::spawn(handle_connection(
                             stream,
-                            active.clone(),
-                            conn_done_tx.clone(),
-                            cancel_tokens.clone(),
-                            conn_id,
+                            server_clone,
+                            active_clone,
+                            handles_clone,
                         ));
                     }
                     Err(e) => {
-                        warn!("attic daemon: error accepting IPC connection: {e}");
+                        warn!("daemon: accept error: {e}");
                     }
                 }
-                continue;
             }
-
-            // Only armed while there are zero active connections; a new
-            // connection accepted above naturally takes priority (`biased`)
-            // and re-loops before this can fire, which is how a fresh
-            // connection "cancels" the idle timer.
-            _ = tokio::time::sleep(idle_timeout()), if count == 0 => {
-                info!(
-                    "attic daemon: idle timeout ({:?}) reached with no active connections - \
-                     shutting down",
-                    idle_timeout()
-                );
-                break "idle timeout".to_string();
+            _ = timeout_future => {
+                // Just a tick to re-check idle/shutdown.
             }
-
-            _ = conn_done_rx.recv() => {
-                // A connection just closed: loop back around to re-evaluate
-                // the idle timer against the updated count.
-                continue;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("daemon: shutdown signal received; stopping accept loop");
+                    break;
+                }
             }
-        }
-    };
-
-    ctrlc_task.abort();
-
-    // Stop accepting new connections right now: explicitly drop the
-    // listener here rather than just letting the loop above stop polling
-    // it. Merely stopping the poll leaves the socket/pipe open, so the OS
-    // can still silently accept a connection that never gets serviced
-    // during the shutdown window; a racing client would then hang instead
-    // of getting an immediate, honest connection-refused. Dropping it here
-    // closes it cleanly.
-    drop(listener);
-
-    // Drop the server template now that the accept loop has ended and
-    // nothing will spawn further connections from it. Every already-
-    // spawned connection task holds its own clone (including its own
-    // `Arc<WriterQueue>` reference via `_queue`), so this alone doesn't
-    // zero the refcount — the `tasks.join_next()` loop below does that as
-    // each connection's own clone is dropped. This must happen before
-    // `run_shutdown_sequence`'s WAL checkpoint runs: `WriterQueue`'s `Drop`
-    // joins the writer thread, and the checkpoint assumes the writer is
-    // already fully stopped — the same invariant the legacy stdio path
-    // (`serve_until_closed`) already provides.
-    drop(server);
-
-    // Cancel every still-running MCP session so its rmcp service can close
-    // gracefully, mirroring the single-process Ctrl+C path, then bound-wait
-    // for all connection tasks to actually finish before touching shared DB
-    // resources in `run_shutdown_sequence`.
-    {
-        let mut map = cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, token) in map.drain() {
-            token.cancel();
         }
     }
 
-    let join_deadline = Duration::from_millis(attic_core::resources::GRACEFUL_SHUTDOWN_TIMEOUT_MS);
-    let join_result = tokio::time::timeout(join_deadline, async {
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) = res {
-                warn!("attic daemon: connection task panicked during shutdown: {e}");
-            }
-        }
-    })
-    .await;
-    if join_result.is_err() {
-        warn!(
-            "attic daemon: {} connection task(s) did not finish within the shutdown timeout; \
-             aborting them before proceeding with database shutdown maintenance",
-            tasks.len()
-        );
-        // Force-abort every still-running connection task so its `server`
-        // clone (and the `Arc<WriterQueue>` inside it) is guaranteed
-        // dropped before the WAL checkpoint in `run_shutdown_sequence`
-        // runs below. Without this, a connection handler that genuinely
-        // hung past the join deadline could still hold a live `server`
-        // clone at this point, racing the checkpoint against the writer
-        // thread not actually being stopped yet — the same invariant the
-        // `drop(server)` above establishes for the common case, closed
-        // here for the timeout edge case too. `join_next()` is drained
-        // (not just `abort_all()` called) so this function does not
-        // return until every task has actually finished unwinding, not
-        // merely been asked to.
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-    }
+    // Remove the IPC address file so stale relays get a clean election.
+    let _ = std::fs::remove_file(&handle.ipc_path);
+    info!("daemon: accept loop exited");
 
-    run_shutdown_sequence(shutdown_handles, semantic_enricher, &shutdown_reason).await;
+    // Unwrap the Arc — every spawned connection task holds a clone, but by
+    // the time the accept loop exits (idle timeout / shutdown signal) all
+    // connections have had their tasks spawned. We cannot wait for them to
+    // finish here (tokio::spawn detaches), but the shutdown sequence below
+    // drains owned bootstrap jobs and writer state, which is the only safe
+    // subset to deterministically drain at this point.
+    //
+    // `Arc::try_unwrap` may fail if a connection task is still running;
+    // fall back to a clone so shutdown still proceeds rather than hanging.
+    let sh = Arc::try_unwrap(handles)
+        .unwrap_or_else(|arc| ShutdownHandles {
+            writer: arc.writer.clone(),
+            db_path: arc.db_path.clone(),
+            watches: arc.watches.clone(),
+            bootstrap_jobs: arc.bootstrap_jobs.clone(),
+            scheduler: arc.scheduler.clone(),
+            rss_sampler: None, // already cancelled above via the Arc'd copy
+        });
 
-    // Best-effort: remove the address-discovery file as LATE as possible —
-    // right before `_lock_guard` drops at the end of this function (i.e.
-    // right before this process actually stops being electable) — so a
-    // client racing this shutdown that already read a still-present
-    // `attic.ipc` keeps patiently retrying (this is a live, in-progress
-    // shutdown, bounded by `CLIENT_TOTAL_RETRY_BUDGET`) instead of hitting
-    // a misleading "old pre-daemon build" error.
-    let _ = std::fs::remove_file(&ipc_path);
-
+    run_shutdown_sequence(sh, semantic_enricher, "daemon accept loop exited").await;
     Ok(())
+}
+
+/// Returns a human-readable summary of the relay recovery backoff schedule
+/// for use in log messages and diagnostics.
+#[allow(dead_code)]
+pub(crate) fn relay_recovery_info() -> HashMap<&'static str, String> {
+    let mut m = HashMap::new();
+    m.insert(
+        "recovery_budget_secs",
+        RELAY_RECOVERY_BUDGET.as_secs().to_string(),
+    );
+    m.insert(
+        "backoff_steps_ms",
+        RELAY_RECOVERY_BACKOFFS_MS
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    m
 }

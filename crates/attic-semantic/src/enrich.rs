@@ -410,7 +410,7 @@ impl BackgroundEnricher {
                         use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
                         if matches!(
                             current_advisory(monitor),
-                            ResourceAdvisory::Pause | ResourceAdvisory::Emergency
+                            ResourceAdvisory::Restricted
                         ) {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
