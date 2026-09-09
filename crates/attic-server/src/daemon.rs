@@ -396,33 +396,51 @@ struct InFlightRequest {
     delivery: DeliveryState,
 }
 
-/// Methods that are known to be **mutations** — workspace or configuration
-/// changes whose idempotency cannot be assumed. After a daemon disconnect
-/// while one of these is in-flight the relay synthesises an explicit
-/// JSON-RPC error rather than blindly replaying.
+/// Methods that are **explicitly known to be safe, read-only, and
+/// idempotent** — the only ones the relay will automatically retry (at most
+/// once) after a daemon disconnect with an ambiguous in-flight request.
 ///
-/// All other known methods (reads, searches, status) are treated as
-/// retry-safe for a single bounded retry. New tools that perform side-effects
-/// must be added here.
-fn is_mutation_method(method: &str) -> bool {
+/// **Design:** this is an explicit opt-in allowlist, NOT a blocklist of known
+/// mutations. Unknown or future methods are therefore treated as unsafe by
+/// default — they never get auto-retried. Any new tool that performs
+/// side-effects is automatically protected without needing to be added here.
+/// Any new read-only tool must be explicitly listed here before it becomes
+/// eligible for auto-retry.
+///
+/// This mirrors the MCP work-class philosophy: unknown tools default to
+/// `Expensive` (fail-safe). Here, unknown methods default to never-retry
+/// (fail-safe). Both are opt-in for the permissive path.
+fn is_safe_readonly_method(method: &str) -> bool {
     matches!(
         method,
-        "workspace/add"
-            | "workspace/remove"
-            | "workspace/update"
-            | "workspace/configure"
-            | "config/set"
-            | "config/update"
-            | "config/reset"
-            | "index/rebuild"
-            | "index/clear"
-            | "index/delete"
-            | "index/compact"
-    ) || method.starts_with("delete/")
-        || method.starts_with("remove/")
-        || method.starts_with("clear/")
-        || method.starts_with("reset/")
-        || method.starts_with("rebuild/")
+        // MCP lifecycle — initialize is safe to replay; it is how session
+        // state is restored after reconnect and is explicitly handled by cache
+        "initialize"
+            | "ping"
+            // Tool/resource/prompt discovery
+            | "tools/list"
+            | "resources/list"
+            | "resources/read"
+            | "prompts/list"
+            | "prompts/get"
+            // Attic search and retrieval
+            | "search"
+            | "search/semantic"
+            | "search/keyword"
+            | "search/hybrid"
+            | "context"
+            | "symbols"
+            | "definition"
+            | "hover"
+            | "references"
+            // Attic status / diagnostics
+            | "status"
+            | "health"
+            | "diagnostics"
+            | "index/status"
+            | "workspace/list"
+            | "workspace/status"
+    )
 }
 
 /// Extract the raw JSON-RPC `id` value from a request/response body as an
@@ -798,25 +816,16 @@ pub(crate) async fn run_relay_supervised(
                 }
 
                 // Phase 7: handle the interrupted in-flight request.
+                //
+                // Safety rule (opt-in allowlist): only methods explicitly
+                // listed in `is_safe_readonly_method` may be retried once.
+                // Everything else — mutations, unknown/future tools, and
+                // anything with unclear idempotency — receives a synthesized
+                // JSON-RPC error. Unknown methods default to never-retry,
+                // which is the correct safe failure mode.
                 if let Some(req) = in_flight.take() {
-                    if is_mutation_method(&req.method) {
-                        // Mutation: synthesize a JSON-RPC error — never replay.
-                        let err_bytes = make_jsonrpc_error_response(
-                            &req.id_raw,
-                            -32603,
-                            "The daemon disconnected while this operation was in \
-                             flight. Its completion state is unknown. The operation \
-                             was not automatically retried.",
-                        );
-                        let _ = tokio::io::stdout().write_all(&err_bytes).await;
-                        warn!(
-                            method = %req.method,
-                            id    = %req.id_raw,
-                            "relay: in-flight mutation had ambiguous delivery; \
-                             synthesized error to client"
-                        );
-                    } else {
-                        // Read-only: retry at most once against the new daemon.
+                    if is_safe_readonly_method(&req.method) {
+                        // Explicitly known read-only: retry at most once.
                         info!(
                             method = %req.method,
                             id    = %req.id_raw,
@@ -839,6 +848,24 @@ pub(crate) async fn run_relay_supervised(
                             framed: req.framed,
                             delivery: DeliveryState::Sent,
                         });
+                    } else {
+                        // Mutation, unknown tool, or anything not on the
+                        // read-only allowlist: synthesize a JSON-RPC error —
+                        // never replay.
+                        let err_bytes = make_jsonrpc_error_response(
+                            &req.id_raw,
+                            -32603,
+                            "The daemon disconnected while this operation was in \
+                             flight. Its completion state is unknown. The operation \
+                             was not automatically retried.",
+                        );
+                        let _ = tokio::io::stdout().write_all(&err_bytes).await;
+                        warn!(
+                            method = %req.method,
+                            id    = %req.id_raw,
+                            "relay: in-flight request had ambiguous delivery; \
+                             synthesized error to client (method not on read-only allowlist)"
+                        );
                     }
                 }
 
