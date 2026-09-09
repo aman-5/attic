@@ -241,3 +241,81 @@ pub fn retrieval_unit_anchor(
         snippet: String::new(), // filled by caller from stored text if needed
     }))
 }
+
+/// Anchor lookup for many unit ids at once. Missing/invalidated ids are
+/// simply absent from the result map, same as `retrieval_unit_anchor`
+/// returning `None` for them.
+///
+/// Callers resolving a whole page of kNN hits (hybrid search, semantic
+/// selection) used to call `retrieval_unit_anchor` once per hit — 2-3 SQL
+/// round trips each, so 100+ hits meant 200-300+ sequential round trips.
+/// This batches the identity lookup (unit -> file_occurrence -> repository)
+/// into one query per 64-id chunk. The structural-node span scan stays
+/// per-unit: it's already bounded to 64 rows per unit via `LIMIT 64`, and a
+/// flat `LIMIT` across a batched query would silently truncate later units'
+/// span data instead of just capping each unit's own rows.
+pub fn retrieval_unit_anchors(
+    conn: &Connection,
+    unit_ids: &[String],
+) -> Result<std::collections::HashMap<String, UnitAnchor>, StorageError> {
+    let mut out = std::collections::HashMap::with_capacity(unit_ids.len());
+    for chunk in unit_ids.chunks(64) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT u.id, u.file_occurrence_id, fi.repository_id, fo.path,
+                    fo.source_revision_id, fo.index_generation_id, fo.content_hash,
+                    fo.freshness_state
+               FROM core_retrieval_units   u
+               JOIN core_file_occurrences  fo ON fo.id = u.file_occurrence_id
+               JOIN core_file_identities   fi ON fi.id = fo.file_identity_id
+              WHERE u.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let paramslice: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(paramslice.as_slice())?;
+        while let Some(r) = rows.next()? {
+            let unit_id: String = r.get(0)?;
+            let index_generation_id: Option<String> = r.get(5)?;
+            out.insert(
+                unit_id,
+                UnitAnchor {
+                    file_occurrence_id: r.get(1)?,
+                    repository_id: r.get(2)?,
+                    path: r.get(3)?,
+                    source_revision_id: r.get(4)?,
+                    index_generation_id: index_generation_id.unwrap_or_default(),
+                    content_hash: r.get(6)?,
+                    freshness_state: r.get(7)?,
+                    snippet: String::new(),
+                    start_line: None,
+                    end_line: None,
+                },
+            );
+        }
+    }
+
+    for (unit_id, anchor) in out.iter_mut() {
+        let mut starts: Vec<u32> = Vec::new();
+        let mut ends: Vec<u32> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT sn.source_span FROM core_retrieval_unit_nodes run
+               JOIN core_structural_nodes sn ON sn.id = run.structural_node_id
+              WHERE run.retrieval_unit_id = ?1 LIMIT 64",
+        )?;
+        let mut rows = stmt.query(params![unit_id.as_str()])?;
+        while let Some(r) = rows.next()? {
+            let span: String = r.get(0)?;
+            if let Some(s) = parse_span_start(&span) {
+                starts.push(s);
+            }
+            if let Some(e) = parse_span_end(&span) {
+                ends.push(e);
+            }
+        }
+        anchor.start_line = starts.iter().copied().min();
+        anchor.end_line = ends.iter().copied().max();
+    }
+
+    Ok(out)
+}

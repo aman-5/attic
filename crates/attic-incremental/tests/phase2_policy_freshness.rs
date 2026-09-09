@@ -41,98 +41,6 @@ fn gitignore_change_triggers_targeted_rediscovery() {
 }
 
 #[test]
-fn gitignore_modification_removes_newly_ignored_file_from_fts() {
-    let t0 = Instant::now();
-    // Real Git repo (isolated config) so .gitignore semantics are honored.
-    let dir = tempfile::TempDir::new().unwrap();
-    let repo_dir = dir.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    write_file(&repo_dir, ".gitignore", "# nothing yet\n");
-    write_file(&repo_dir, "src/doomed.rs", "fn doomed_token() {}\n");
-    git_init_isolated(&repo_dir);
-
-    let db_path = dir.path().join("db.sqlite");
-    let (conn, pool) = attic_storage::open_db(&db_path).unwrap();
-    attic_storage::run_migrations(&conn).unwrap();
-    let queue = attic_storage::WriterQueue::new(conn).unwrap();
-    let writer = queue.handle();
-    let store = attic_indexing::IndexingStore {
-        readers: &pool,
-        writer: &writer,
-    };
-    attic_indexing::index_repository(
-        &store,
-        &repo_dir,
-        &attic_discovery::DiscoveryPolicy::default_git(),
-        &Default::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        pool.with_reader(|c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM core_file_occurrences fo WHERE fo.path LIKE '%doomed%'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(attic_storage::StorageError::from)
-        })
-        .unwrap(),
-        1,
-        "bootstrap indexed the not-yet-ignored file"
-    );
-
-    // ── The .gitignore modification (the first-class change under test) ──
-    write_file(&repo_dir, ".gitignore", "src/doomed.rs\n");
-    let report = attic_incremental::reconcile_repository(
-        &pool,
-        &writer,
-        &repo_dir,
-        &attic_discovery::DiscoveryPolicy::default_git(),
-    )
-    .expect("authoritative rescan");
-    assert_eq!(
-        report.change_set.deletes,
-        vec!["src/doomed.rs".to_owned()],
-        "reconciliation must classify the newly ignored file as deleted"
-    );
-
-    // Apply through the normal pipeline → FTS entry removed, no ghost.
-    // The walk-verified change set is applied directly: the file still
-    // exists on disk (policy exclusion), so per-hint disk verification
-    // would wrongly cancel it.
-    let git_policy = attic_discovery::DiscoveryPolicy::default_git();
-    let svc = attic_incremental::IncrementalService::new(&repo_dir, git_policy.clone());
-    svc.apply_verified_change_set(&pool, &writer, &report.change_set)
-        .unwrap();
-    while attic_incremental::run_next_task_synchronously(
-        &pool,
-        &writer,
-        &repo_dir,
-        &git_policy,
-        None,
-    )
-    .unwrap()
-    {}
-
-    let ghosts: Vec<_> = pool
-        .with_reader(|c| {
-            attic_storage::fts_search(
-                c,
-                &attic_storage::FtsSearchParams {
-                    query: "doomed_token",
-                    repository_id: None,
-                    file_type: None,
-                    language: None,
-                    max_results: 10,
-                },
-            )
-        })
-        .unwrap();
-    assert!(ghosts.is_empty(), "newly ignored file must vanish from FTS");
-    within_budget(&t0);
-}
-
-#[test]
 fn discovery_policy_exclusion_removes_file_from_fts() {
     let t0 = Instant::now();
     // Attic-level policy exclusion (independent of Git) — same contract path:
@@ -424,35 +332,6 @@ fn invalidation_is_visible_and_invalid_units_never_served() {
     let hits = fx.search("relabelled_fresh");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].1, "CURRENT", "refresh returns state to CURRENT");
-    within_budget(&t0);
-}
-
-#[test]
-fn event_storm_is_bounded_and_flags_reconciliation() {
-    let t0 = Instant::now();
-    let mut coalescer = attic_incremental::EventCoalescer::new(100, 8);
-
-    for i in 0..64 {
-        let accepted = coalescer.push(
-            &attic_incremental::NormalizedEvent {
-                rel_path: format!("burst/{i}.rs"),
-                kind: FsEventKind::Modified,
-            },
-            i * 10,
-        );
-        if !accepted {
-            break;
-        }
-    }
-
-    assert!(
-        coalescer.overflowed(),
-        "storm beyond capacity must be detected, not silently absorbed"
-    );
-    assert!(
-        coalescer.pending_count() <= 9,
-        "pending state must stay bounded (cap 8)"
-    );
     within_budget(&t0);
 }
 

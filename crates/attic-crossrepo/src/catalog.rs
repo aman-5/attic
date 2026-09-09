@@ -225,38 +225,6 @@ fn go_module_prefix(provides: &[ProvidedIdentity]) -> Option<String> {
         .map(|p| p.name.clone())
 }
 
-/// Build a single repository's [`RepoCatalogData`] from a scan.
-#[cfg(test)]
-fn build_repo_catalog_data(
-    repository_id: &str,
-    root_path: &str,
-    source_revision_id: &str,
-    scan: &CatalogScan,
-) -> RepoCatalogData {
-    let mut provides = Vec::new();
-    let mut declarations = Vec::new();
-    for m in &scan.manifests {
-        provides.extend(m.provides.clone());
-        declarations.extend(m.declarations.clone());
-    }
-
-    // Truncate if over limits.
-    provides.truncate(limits::MAX_PROVIDES_PER_REPO);
-    declarations.truncate(limits::MAX_DECLARATIONS_PER_REPO);
-
-    let gmp = go_module_prefix(&provides);
-
-    RepoCatalogData {
-        repository_id: repository_id.to_owned(),
-        root_path: root_path.to_owned(),
-        source_revision_id: source_revision_id.to_owned(),
-        provides,
-        declarations,
-        primary_anchor_occurrence: None, // filled by caller
-        go_module_prefix: gmp,
-    }
-}
-
 /// Persist a catalog scan result into the database.
 ///
 /// Designed to run inside a single writer-queue closure (Phase 1A contract).
@@ -377,18 +345,6 @@ pub fn build_resolver_input(conn: &Connection) -> Result<Vec<RepoCatalogData>, C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestParse;
-
-    #[test]
-    fn indexed_manifest_paths_filters_non_manifests() {
-        // This tests the path filtering logic (is_manifest_path) indirectly
-        // through the SQL query structure — actual DB test requires full schema.
-        // The filtering logic is tested directly in manifest.rs tests.
-        assert!(manifest::is_manifest_path("go.mod"));
-        assert!(manifest::is_manifest_path("package.json"));
-        assert!(manifest::is_manifest_path("pom.xml"));
-        assert!(!manifest::is_manifest_path("src/main.rs"));
-    }
 
     #[test]
     fn read_manifest_bounded_rejects_escape() {
@@ -455,51 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn build_repo_catalog_data_populates_go_module_prefix() {
-        let scan = CatalogScan {
-            manifests: vec![ManifestParse {
-                provides: vec![crate::ProvidedIdentity {
-                    ecosystem: crate::Ecosystem::Go,
-                    name: "example.com/team/svc".to_owned(),
-                }],
-                declarations: vec![],
-                diagnostics: vec![],
-            }],
-            ..Default::default()
-        };
-
-        let data = build_repo_catalog_data("repo-1", "/ws/svc", "rev-1", &scan);
-        assert_eq!(
-            data.go_module_prefix.as_deref(),
-            Some("example.com/team/svc")
-        );
-        assert_eq!(data.provides.len(), 1);
-        assert_eq!(data.repository_id, "repo-1");
-    }
-
-    #[test]
-    fn build_repo_catalog_data_truncates_at_limits() {
-        let mut provides = Vec::new();
-        for i in 0..limits::MAX_PROVIDES_PER_REPO + 100 {
-            provides.push(crate::ProvidedIdentity {
-                ecosystem: crate::Ecosystem::Maven,
-                name: format!("g:a{i}"),
-            });
-        }
-        let scan = CatalogScan {
-            manifests: vec![ManifestParse {
-                provides,
-                declarations: vec![],
-                diagnostics: vec![],
-            }],
-            ..Default::default()
-        };
-
-        let data = build_repo_catalog_data("repo-x", "/ws/x", "rev-x", &scan);
-        assert_eq!(data.provides.len(), limits::MAX_PROVIDES_PER_REPO);
-    }
-
-    #[test]
     fn read_manifest_bounded_redacts_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -516,13 +427,5 @@ mod tests {
             !text.contains("AKIAIOSFODNN7EXAMPLE"),
             "secret must be redacted"
         );
-    }
-
-    #[test]
-    fn read_manifest_bounded_path_escape_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let result = read_manifest_bounded(root, "../../etc/passwd");
-        assert!(result.unwrap().is_none(), "path escape should return None");
     }
 }

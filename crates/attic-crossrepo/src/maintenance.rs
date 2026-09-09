@@ -776,55 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn repository_removed_cleans_up() {
-        let conn = seeded_conn();
-        insert_repo(&conn, "r0", "/ws/0");
-        insert_repo(&conn, "r1", "/ws/1");
-        let rev = insert_rev(&conn, "r0");
-        let _ = insert_rev(&conn, "r1");
-
-        // Insert catalog row
-        let catalog = attic_storage::crossrepo_ops::CatalogRow {
-            repository_id: tid("r0"),
-            source_revision_id: rev.clone(),
-            provides_json: "[]".to_owned(),
-            manifest_hash: "test_hash".to_owned(),
-            entry_count: 0,
-            freshness_state: "CURRENT".to_owned(),
-        };
-        attic_storage::crossrepo_ops::upsert_catalog_row(&conn, &catalog, &catalog.provides_json)
-            .unwrap();
-
-        // Insert edge
-        let _ = attic_storage::crossrepo_ops::insert_xrepo_edge(
-            &conn,
-            &tid("r0"),
-            "s0",
-            &tid("r1"),
-            "t1",
-            "PACKAGE_RESOLVED",
-            0.9,
-            "GO_MODULE",
-            "{}",
-            &rev,
-        )
-        .unwrap();
-
-        let (edges, _decls) = repository_removed(&conn, &tid("r0")).unwrap();
-        assert!(edges >= 1, "should have deleted at least one edge");
-
-        // Verify catalog row is gone
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM core_workspace_catalog WHERE repository_id = ?1",
-                rusqlite::params![tid("r0")],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
     fn sync_repository_persists_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

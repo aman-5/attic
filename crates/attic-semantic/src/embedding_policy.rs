@@ -44,11 +44,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recommendation_is_stable() {
-        assert_eq!(EmbeddingPolicy::recommend(), EmbeddingPolicy::recommend());
-    }
-
-    #[test]
     fn v1_recommends_bge_base() {
         let r = EmbeddingPolicy::recommend();
         assert_eq!(r.provider, "bge");

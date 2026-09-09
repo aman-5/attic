@@ -47,7 +47,10 @@ contributing to Attic itself — see [Build from Source](#build-from-source).
 ## Connect to your AI/MCP client
 
 Attic is an MCP server: transport is **stdio**. Your AI client starts the
-Attic process directly (no port, no daemon, no `localhost` URL); Attic
+Attic process directly (no port, no `localhost` URL) — the first launch for
+a database self-elects as a background daemon over stdio and a local
+socket/named pipe; every later launch against the same database becomes a
+thin relay to it, so you never manage a daemon process yourself. Attic
 indexes and maintains the workspace you point it at, and the client calls
 Attic's tools when it needs repository knowledge.
 
@@ -66,7 +69,7 @@ The AI invokes Attic's `workspace` MCP tool; Attic validates the roots,
 persists them atomically to `~/.attic/config.toml` (override the location
 with `ATTIC_HOME`), indexes and watches each repository, and reloads the
 same workspace automatically on every subsequent launch. Roots may live
-anywhere on disk — no common parent, no symlinks, one process, one database.
+anywhere on disk — no common parent, no symlinks, one daemon, one database.
 
 ```json
 {
@@ -135,20 +138,22 @@ On first start with `ATTIC_WORKSPACE_ROOT` set, Attic performs a one-time
 synchronous index before it starts serving MCP requests — the first tool
 call already sees current data — then watches the workspace for changes
 (native filesystem watcher, falling back to periodic reconciliation) and
-re-indexes incrementally. Canonical search (`search`/`file`/`repo_map`)
-works as soon as this initial index completes; it does not wait on the
-optional semantic layer, which is disabled by default.
+re-indexes incrementally. `search`/`file`/`repo_map` work as soon as this
+initial index completes; `search` also fuses in semantic (kNN) candidates
+via RRF once the optional semantic layer (on by default) has embeddings
+available, but degrades gracefully to lexical-only when it doesn't.
 
 ## MCP Tools
 
 | Tool | Purpose |
 |---|---|
-| `search` | Full-text search over indexed workspace content |
+| `search` | Hybrid full-text + semantic search over indexed workspace content (RRF fusion) |
 | `file` | Read a bounded, verified region of a file from the live workspace |
 | `repo_map` | Structural overview of a repository |
 | `context` | Evidence-backed answer to a natural-language question (`FAST` / `NORMAL` / `DEEP` modes) |
 | `status` | Server/indexing health, watcher mode, resource-pressure advisory |
 | `workspace` | Inspect and manage configured repository roots at runtime (`inspect` / `add` / `remove` / `set`), persisted to `<ATTIC_HOME>/config.toml` |
+| `logging` | Toggle the persistent file log between `INFO` and `OFF` at runtime, no restart required |
 
 Call `status` any time to check readiness: it reports whether indexing is
 current (`incremental.state`), which watcher mechanism is active
@@ -308,7 +313,7 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_CONFIG` | Path to a workspace config file listing multiple `[[repositories]]` roots (arbitrary locations, no common parent required). Mutually exclusive with `ATTIC_WORKSPACE_ROOT`. See [Workspaces & Multiple Repositories](#workspaces--multiple-repositories). |
 | `ATTIC_HOME` | Overrides the Attic application home directory (default: `~/.attic`). Config, database, and runtime state all derive from this location. An empty `ATTIC_HOME` is a startup error — unset it or provide a valid path. |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
-| `ATTIC_SEMANTIC` | Set to `1` to opt in to the (disabled-by-default, experimental) semantic retrieval layer — see [Semantic search](#semantic-search-optional). |
+| `ATTIC_SEMANTIC` | Semantic retrieval is enabled by default; set to `0` to disable it — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_MODEL_CACHE_DIR` | Directory `BgeEmbedder` downloads/caches model files into (default: alongside the database, in a `models` subdirectory). Point this at a pre-populated cache for offline/airgapped use — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
 | `ATTIC_RESOURCE_MODE` | Force `low` / `balanced` / `performance` resource tuning instead of hardware-detected `auto` (see `attic.toml`'s `[resources]` table for the same override, and the `status` tool's `resource_mode_source` field). |
@@ -335,7 +340,7 @@ Attic home directory.
 
 ### Semantic search (optional)
 
-Disabled by default (`ATTIC_SEMANTIC=1` to opt in). When enabled, `search`
+Enabled by default (`ATTIC_SEMANTIC=0` to disable). When enabled, `search`
 and `context` are backed by `BgeEmbedder` — a real, Candle-backed neural
 embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — by default; `HashingEmbedder`, a
 deterministic feature-hashing baseline, remains available as an explicit
@@ -427,7 +432,7 @@ cargo build --release --package attic-server
 Requires:
 
 - **Rust** — pinned in `rust-toolchain.toml` (currently `1.98.0`,
-  MSRV `1.88`); `rustup show` in the repo root installs it automatically.
+  MSRV `1.89`); `rustup show` in the repo root installs it automatically.
 - **A linker for your platform**:
   - **Windows (recommended)**: Microsoft "Build Tools for Visual Studio"
     with the C++ build tools workload.

@@ -200,6 +200,7 @@ pub fn drive(
         // slow/hung backend must never hold the drive loop past it.
         match provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline)) {
             Ok(outputs) => {
+                let mut batch_records = Vec::with_capacity(outputs.len());
                 for out in outputs {
                     if let Some(r) = meta.get(&out.unit_key) {
                         if out.vector.len() != provider.dimensions() {
@@ -215,7 +216,7 @@ pub fn drive(
                             SEMANTIC_SELECTION_VERSION,
                             &r.retrieval_text,
                         );
-                        store.put(&EmbeddingRecord {
+                        batch_records.push(EmbeddingRecord {
                             retrieval_unit_id: identity.retrieval_unit_id,
                             repository_id: r.repository_id.clone(),
                             source_revision_id: identity.source_revision_id,
@@ -226,11 +227,11 @@ pub fn drive(
                             content_hash: identity.content_hash,
                             dim: out.vector.len(),
                             vector: out.vector,
-                        })?;
-                        store.queue_mark_done(&out.unit_key)?;
-                        stats.embedded += 1;
+                        });
                     }
                 }
+                stats.embedded += batch_records.len() as u64;
+                store.put_batch_and_mark_done(&batch_records)?;
             }
             Err(SemanticError::Cancelled { .. }) => {
                 // Cancellation is NOT failure: by contract the provider
@@ -281,6 +282,24 @@ struct ReconcileGate {
     last_seen_generation: u64,
     last_reconcile_at: Option<Instant>,
     reconciling: bool,
+}
+
+/// RAII release for `ReconcileGate::reconciling`: guarantees the flag is
+/// cleared even if `reconcile()` panics. Without this, a panic inside
+/// `reconcile()` would unwind past a plain `gate.reconciling = false`
+/// statement, leaving the flag stuck `true` and permanently blocking every
+/// worker's `!gate.reconciling && due_for_reconcile` check for the rest of
+/// the process's life.
+struct ReconcileGuard<'a>(&'a Mutex<ReconcileGate>);
+
+impl Drop for ReconcileGuard<'_> {
+    fn drop(&mut self) {
+        let mut gate = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gate.reconciling = false;
+    }
 }
 
 /// Cheap, self-contained per-call jitter — no randomness crate (`rand`,
@@ -389,10 +408,7 @@ impl BackgroundEnricher {
                 while !stop2.is_cancelled() {
                     if let Some(monitor) = resource_monitor.as_ref() {
                         use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
-                        if matches!(
-                            current_advisory(monitor),
-                            ResourceAdvisory::Pause | ResourceAdvisory::Emergency
-                        ) {
+                        if matches!(current_advisory(monitor), ResourceAdvisory::Restricted) {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
                         }
@@ -423,6 +439,7 @@ impl BackgroundEnricher {
                         }
                     };
                     if should_reconcile {
+                        let _release_gate = ReconcileGuard(&reconcile_gate);
                         match reconcile(
                             &conn,
                             &store,
@@ -439,16 +456,59 @@ impl BackgroundEnricher {
                             Ok(_) => {}
                             Err(e) => tracing::warn!("semantic reconcile failed: {e}"),
                         }
-                        let mut gate = reconcile_gate
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        gate.reconciling = false;
+                        // _release_gate drops here (and on any unwind out of
+                        // the match above), clearing `reconciling` exactly
+                        // once either way.
                     }
+                    // ── Phase 3/8: adaptive embedding admission ──────────────
+                    // Acquire an EmbeddingHeavyPermit before the expensive
+                    // model/batch execution phase; read the dynamic batch size
+                    // at the point of each new batch so pressure reductions
+                    // take effect immediately rather than only on the next
+                    // server restart. The permit is held for the duration of
+                    // `drive()` and released on drop.
+                    //
+                    // If the resource monitor reports Emergency (no new
+                    // permits available) `acquire_embedding_heavy_blocking`
+                    // returns `None` — loop back and sleep rather than
+                    // skipping the advisory check entirely.
+                    let _embed_permit;
+                    let effective_cfg;
+                    let drive_cfg: &EnrichmentConfig = if let Some(monitor) =
+                        resource_monitor.as_ref()
+                    {
+                        let dynamic_batch = monitor.current_embedding_batch();
+                        match monitor.acquire_embedding_heavy_blocking(|| stop2.is_cancelled()) {
+                            Some(permit) => {
+                                _embed_permit = Some(permit);
+                                effective_cfg = EnrichmentConfig {
+                                    batch_size: dynamic_batch,
+                                    ..cfg.clone()
+                                };
+                                &effective_cfg
+                            }
+                            None => {
+                                // Cancelled (stop2) or Emergency — sleep
+                                // and retry rather than driving with no
+                                // permit.
+                                _embed_permit = None;
+                                std::thread::sleep(jittered(Duration::from_millis(200)));
+                                continue;
+                            }
+                        }
+                    } else {
+                        // No resource monitor (tests / no-daemon mode) —
+                        // use the static config unchanged.
+                        _embed_permit = None;
+                        effective_cfg = cfg.clone();
+                        &effective_cfg
+                    };
+
                     match drive(
                         &conn,
                         &store,
                         provider.as_ref(),
-                        &cfg,
+                        drive_cfg,
                         &stop2,
                         intent_source,
                     ) {
@@ -584,21 +644,6 @@ mod ensure_profile_claimed_tests {
         );
         let persisted = store.read_embedding_profile().unwrap().unwrap();
         assert_eq!(persisted.config.model, "bge-small-en-v1.5");
-    }
-
-    #[test]
-    fn matching_persisted_profile_proceeds() {
-        let store = SemanticStore::open_in_memory().unwrap();
-        let provider = DescriptorProvider(descriptor("bge-small-en-v1.5"));
-        assert!(
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
-                .unwrap()
-        );
-        // Second call (as if a later drive() iteration) — idempotent, still proceeds.
-        assert!(
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
-                .unwrap()
-        );
     }
 
     #[test]

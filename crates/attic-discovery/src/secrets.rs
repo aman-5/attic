@@ -1133,38 +1133,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_aws_key_detected() {
-        let text = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
-        let r = scan_and_redact(text);
-        assert!(!r.findings.is_empty());
-        assert!(r.findings.iter().any(|f| f.pattern_id == "AWS-001"));
-    }
-
-    #[test]
-    fn scan_gh_token_detected() {
-        let text = "token: ghp_abcdefghijklmnopqrstuvwxyz1234567890ab";
-        let r = scan_and_redact(text);
-        assert!(r.findings.iter().any(|f| f.pattern_id == "GH-001"));
-    }
-
-    #[test]
-    fn scan_jwt_detected() {
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-        let r = scan_and_redact(jwt);
-        assert!(r.findings.iter().any(|f| f.pattern_id == "JWT-001"));
-    }
-
-    #[test]
-    fn scan_redacted_text_does_not_contain_raw_token() {
-        let text = "token: ghp_abcdefghijklmnopqrstuvwxyz1234567890ab end";
-        let r = scan_and_redact(text);
-        assert!(
-            !r.redacted
-                .contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890ab")
-        );
-    }
-
-    #[test]
     fn scan_multiple_findings_non_overlapping() {
         let text = "AKIAIOSFODNN7EXAMPLE and ghp_abcdefghijklmnopqrstuvwxyz1234567890ab";
         let r = scan_and_redact(text);

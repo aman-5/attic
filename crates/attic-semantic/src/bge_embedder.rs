@@ -397,26 +397,39 @@ impl SemanticProvider for BgeEmbedder {
         deadline: Option<Instant>,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         let t0 = Instant::now();
-        let mut out = Vec::with_capacity(inputs.len());
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        for chunk in inputs.chunks(self.batch_size) {
+        for item in inputs {
+            if item.text.len() > self.max_input_bytes() {
+                return Err(SemanticError::InputTooLarge {
+                    len: item.text.len(),
+                    max: self.max_input_bytes(),
+                });
+            }
+        }
+
+        // Cluster by length so a sub-batch's BatchLongest padding target stays
+        // close to every member's real length, instead of one long outlier
+        // forcing quadratic attention cost onto short items sharing its batch.
+        let mut indexed: Vec<(usize, &EmbeddingInput)> = inputs.iter().enumerate().collect();
+        indexed.sort_by_key(|(_, item)| item.text.len());
+
+        let mut sorted_outputs: Vec<(usize, EmbeddingOutput)> = Vec::with_capacity(inputs.len());
+
+        for chunk in indexed.chunks(self.batch_size) {
             if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(SemanticError::Cancelled {
-                    completed: out.len(),
+                    completed: sorted_outputs.len(),
                     total: inputs.len(),
                 });
             }
-            for item in chunk {
-                if item.text.len() > self.max_input_bytes() {
-                    return Err(SemanticError::InputTooLarge {
-                        len: item.text.len(),
-                        max: self.max_input_bytes(),
-                    });
-                }
-            }
-            let texts: Vec<&str> = chunk.iter().map(|i| i.text.as_str()).collect();
+
+            let texts: Vec<&str> = chunk.iter().map(|(_, item)| item.text.as_str()).collect();
             let vectors = self.embed_sub_batch(&texts)?;
-            for (item, vector) in chunk.iter().zip(vectors) {
+
+            for ((orig_idx, item), vector) in chunk.iter().zip(vectors) {
                 if vector.len() != self.dims || vector.iter().any(|v| !v.is_finite()) {
                     return Err(SemanticError::EmbeddingFailed(format!(
                         "provider produced an invalid vector for unit '{}' (len={}, expected={})",
@@ -425,16 +438,24 @@ impl SemanticProvider for BgeEmbedder {
                         self.dims
                     )));
                 }
-                out.push(EmbeddingOutput {
-                    unit_key: item.unit_key.clone(),
-                    vector,
-                });
+                sorted_outputs.push((
+                    *orig_idx,
+                    EmbeddingOutput {
+                        unit_key: item.unit_key.clone(),
+                        vector,
+                    },
+                ));
             }
         }
+
+        // Restore caller-facing determinism: output order must match input order.
+        sorted_outputs.sort_by_key(|(orig_idx, _)| *orig_idx);
+        let out: Vec<EmbeddingOutput> = sorted_outputs.into_iter().map(|(_, o)| o).collect();
 
         usage.items_embedded += out.len() as u64;
         usage.input_bytes += inputs.iter().map(|i| i.text.len() as u64).sum::<u64>();
         usage.elapsed_ms += t0.elapsed().as_millis() as u64;
+
         Ok(out)
     }
 }

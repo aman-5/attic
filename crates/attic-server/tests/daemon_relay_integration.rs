@@ -30,6 +30,7 @@ use rmcp::{
     service::RunningService,
 };
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -92,6 +93,17 @@ async fn connect_daemon(
     db: &Path,
     idle_timeout_ms: Option<u64>,
 ) -> ServerHandle {
+    connect_daemon_with_env(bin, home, db, idle_timeout_ms, &[]).await
+}
+
+/// Spawn an attic-server process with daemon mode ON and optional extra environment variables.
+async fn connect_daemon_with_env(
+    bin: &Path,
+    home: &Path,
+    db: &Path,
+    idle_timeout_ms: Option<u64>,
+    extra_env: &[(&str, &str)],
+) -> ServerHandle {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.env("ATTIC_HOME", home)
         .env("ATTIC_DB_PATH", db)
@@ -101,10 +113,13 @@ async fn connect_daemon(
         .env_remove("ATTIC_NO_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
     if let Some(ms) = idle_timeout_ms {
         cmd.env("ATTIC_DAEMON_IDLE_TIMEOUT_MS", ms.to_string());
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
 
     let mut child = cmd.spawn().expect("spawn attic server");
@@ -150,6 +165,97 @@ async fn call_tool_text(
             ))
         }
     }
+}
+
+/// Spawn a raw (non-rmcp) attic-server child with piped stdio. Used only by
+/// tests that need byte-level control over exact request timing (e.g. racing
+/// a write against a daemon kill to land a request "in flight") that the
+/// high-level rmcp client in [`connect_daemon`] deliberately hides.
+async fn spawn_raw_child(
+    bin: &Path,
+    home: &Path,
+    db: &Path,
+    idle_timeout_ms: Option<u64>,
+) -> (
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    BufReader<tokio::process::ChildStdout>,
+) {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("ATTIC_HOME", home)
+        .env("ATTIC_DB_PATH", db)
+        .env("ATTIC_SEMANTIC", "0")
+        .env_remove("ATTIC_CONFIG")
+        .env_remove("ATTIC_WORKSPACE_ROOT")
+        .env_remove("ATTIC_NO_DAEMON")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if let Some(ms) = idle_timeout_ms {
+        cmd.env("ATTIC_DAEMON_IDLE_TIMEOUT_MS", ms.to_string());
+    }
+    let mut child = cmd.spawn().expect("spawn attic server (raw)");
+    let stdin = child.stdin.take().expect("server stdin piped");
+    let stdout = child.stdout.take().expect("server stdout piped");
+    (child, stdin, BufReader::new(stdout))
+}
+
+/// Build one newline-delimited JSON-RPC request.
+fn raw_request(id: u64, method: &str, params: Value) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .unwrap()
+    )
+}
+
+/// Read one newline-delimited JSON-RPC message, bounded by `IO_TIMEOUT`.
+/// Returns `None` on EOF, timeout, or malformed JSON.
+async fn read_json_line(reader: &mut BufReader<tokio::process::ChildStdout>) -> Option<Value> {
+    let mut line = String::new();
+    match tokio::time::timeout(IO_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => None,
+        Ok(Ok(_)) => serde_json::from_str(line.trim()).ok(),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// Perform the raw MCP `initialize` handshake (request + `initialized`
+/// notification) over a raw child's stdio, mirroring the format
+/// `main.rs`'s own `spawn_and_initialize` test helper uses.
+async fn raw_initialize(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+) {
+    let init = raw_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "daemon-relay-raw-test", "version": "0"}
+        }),
+    );
+    stdin
+        .write_all(init.as_bytes())
+        .await
+        .expect("write initialize");
+    stdin.flush().await.expect("flush initialize");
+    let resp = read_json_line(stdout)
+        .await
+        .expect("initialize response timed out/missing/malformed");
+    assert_eq!(resp["id"], 1, "unexpected initialize response: {resp}");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("write initialized notification");
+    stdin.flush().await.expect("flush initialized notification");
 }
 
 /// (a) + (b): the second launch against the same database does not hard-fail
@@ -297,4 +403,1367 @@ async fn crashed_daemon_lock_is_recovered_by_next_launch() {
     assert_eq!(v["status"], "unconfigured", "{status}");
 
     let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+}
+
+/// Phase 96 Primary Goal: when the daemon process dies while a relay client
+/// is active, the relay must detect the disconnect, win the replacement-daemon
+/// election, start the replacement daemon, and KEEP ITS EXISTING STDIO SESSION
+/// ALIVE so the AI/MCP client continues making requests seamlessly without
+/// reconnection!
+#[tokio::test]
+async fn relay_wins_election_and_promotes_while_keeping_client_connected() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    // 1. Start daemon process (srv1).
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. Start relay process (srv2).
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+
+    // Verify both are serving requests.
+    let s1 = call_tool_text(&mut srv1, "status", serde_json::json!({}))
+        .await
+        .expect("status via daemon");
+    let s2 = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via relay");
+    let v1: Value = serde_json::from_str(&s1).expect("json");
+    let v2: Value = serde_json::from_str(&s2).expect("json");
+    assert_eq!(v1["status"], "unconfigured");
+    assert_eq!(v2["status"], "unconfigured");
+
+    // 3. Kill the daemon (srv1).
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // 4. Give the relay time to detect disconnect, win election, and promote
+    // itself to replacement daemon concurrently.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // 5. THE EXISTING MCP CLIENT ON srv2 MUST CONTINUE FUNCTIONING!
+    // No new process is spawned; the existing rmcp service connection is used!
+    let s2_after = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via promoted relay without client reconnect");
+    let v2_after: Value = serde_json::from_str(&s2_after).expect("json");
+    assert_eq!(v2_after["status"], "unconfigured");
+
+    // 6. A third launch (srv3) now connects as a new relay to the promoted daemon!
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+    let s3 = call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("status via new relay connected to promoted daemon");
+    let v3: Value = serde_json::from_str(&s3).expect("json");
+    assert_eq!(v3["status"], "unconfigured");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+}
+
+// ── Phase 96 §17: daemon-recovery test list (items 1-11) ────────────────────
+
+/// §17 item 1: with exactly one relay client active when the daemon dies,
+/// `run_relay_supervised` must return `PromoteToDaemon` — not `Fatal`, and
+/// not silently behave like `ClientClosed` — which is observable from
+/// outside the process only as: the existing relay connection keeps
+/// answering requests even though nothing else was around to take over.
+#[tokio::test]
+async fn relay_supervision_returns_promotion_when_it_wins_election() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+
+    call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via relay before kill");
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Only one relay exists, so it MUST win the election and be promoted —
+    // if `run_relay_supervised` had instead returned `Fatal`, this call
+    // would error or time out.
+    let status_after = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via promoted relay: PromoteToDaemon must have been returned");
+    let v: Value = serde_json::from_str(&status_after).expect("json");
+    assert_eq!(v["status"], "unconfigured", "{status_after}");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+}
+
+/// §17 item 2: after promotion, `spawn_daemon`'s accept loop must actually be
+/// live — provable from outside the process only by having a brand new,
+/// independent launch discover `attic.ipc` and successfully connect to it.
+#[tokio::test]
+async fn promotion_starts_replacement_daemon() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A fresh, independent launch must find a live daemon via `attic.ipc` —
+    // this only works if the replacement daemon's accept loop is actually
+    // bound and listening, not merely a `DaemonHandle` sitting idle.
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+    let s3 = call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("status via new relay against the replacement daemon");
+    let v: Value = serde_json::from_str(&s3).expect("json");
+    assert_eq!(v["status"], "unconfigured", "{s3}");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+}
+
+/// §17 item 3: the ORIGINAL client's stdio session — the very same
+/// `RunningService` object, never dropped or reconnected — must keep working
+/// continuously across the promotion: before the kill, and repeatedly after
+/// promotion completes, with no client-side reconnect ever happening.
+#[tokio::test]
+async fn promotion_preserves_existing_stdio_session() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+
+    let before = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status before kill");
+    assert_eq!(
+        serde_json::from_str::<Value>(&before).unwrap()["status"],
+        "unconfigured"
+    );
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Two further calls through the SAME `srv2.service` connection — proving
+    // continuity rather than a single lucky response.
+    for i in 0..2 {
+        let after = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| panic!("status call #{i} after promotion failed: {e}"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&after).unwrap()["status"],
+            "unconfigured"
+        );
+    }
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+}
+
+/// §17 item 4: a new relay launched after promotion must reconnect via local
+/// IPC to the replacement daemon, AND do so concurrently with the original
+/// (promoted) relay's own connection still being served — proving both are
+/// really talking to the one shared replacement daemon.
+#[tokio::test]
+async fn promoted_relay_reconnects_to_local_daemon() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+
+    let (r2, r3) = tokio::join!(
+        call_tool_text(&mut srv2, "status", serde_json::json!({})),
+        call_tool_text(&mut srv3, "status", serde_json::json!({})),
+    );
+    let v2: Value =
+        serde_json::from_str(&r2.expect("srv2 status via promoted relay")).expect("json");
+    let v3: Value = serde_json::from_str(&r3.expect("srv3 status via new relay")).expect("json");
+    assert_eq!(v2["status"], "unconfigured");
+    assert_eq!(v3["status"], "unconfigured");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+}
+
+/// §17 item 5: `RelaySessionCache::replay_to` must never forward the
+/// replacement daemon's `initialize` response to the client's stdout (the
+/// client already completed its handshake once); doing so would desync
+/// JSON-RPC request/response correlation. Verified at the byte level: after
+/// promotion, a request sent WITHOUT re-initializing must get back exactly
+/// one response bearing the SAME id we sent, with nothing extra queued.
+#[tokio::test]
+async fn promoted_relay_replays_initialize() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut srv2_child, mut srv2_stdin, mut srv2_stdout) =
+        spawn_raw_child(&bin, &home, &db, None).await;
+    raw_initialize(&mut srv2_stdin, &mut srv2_stdout).await;
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let call = raw_request(
+        2,
+        "tools/call",
+        serde_json::json!({"name": "status", "arguments": {}}),
+    );
+    srv2_stdin
+        .write_all(call.as_bytes())
+        .await
+        .expect("write status call after promotion");
+    srv2_stdin.flush().await.expect("flush status call");
+
+    let resp = read_json_line(&mut srv2_stdout)
+        .await
+        .expect("status response after promotion (no re-initialize)");
+    assert_eq!(
+        resp["id"], 2,
+        "response id must correlate to our request, not a leaked \
+         duplicate initialize response: {resp}"
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "expected a successful status result, got: {resp}"
+    );
+
+    // Confirm nothing else is queued immediately behind it (e.g. a stray
+    // duplicate initialize response that would desync the NEXT read).
+    let mut probe = String::new();
+    let extra = tokio::time::timeout(
+        Duration::from_millis(300),
+        srv2_stdout.read_line(&mut probe),
+    )
+    .await;
+    assert!(
+        extra.is_err() || matches!(extra, Ok(Ok(0))),
+        "unexpected extra message queued after the status response: {probe:?}"
+    );
+
+    let _ = srv2_child.start_kill();
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2_child.wait()).await;
+}
+
+/// §17 item 6: an explicit safe read-only request (`status`, via `tools/call`)
+/// that is in flight at the exact moment the daemon dies must be retried at
+/// most once against the replacement daemon and complete successfully — the
+/// client must never observe the "ambiguous disconnect" synthesized error for
+/// a call on the read-only allowlist.
+///
+/// This races a real disconnect, so the exact interleaving (whether the
+/// original daemon happened to answer before dying, or the relay had to
+/// retry) is not fixed from run to run — but the outcome the client observes
+/// must always be a genuine successful status result, bounded in time.
+#[tokio::test]
+async fn safe_read_request_retried_once_after_promotion() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut srv2_child, mut srv2_stdin, mut srv2_stdout) =
+        spawn_raw_child(&bin, &home, &db, None).await;
+    raw_initialize(&mut srv2_stdin, &mut srv2_stdout).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let call = raw_request(
+        2,
+        "tools/call",
+        serde_json::json!({"name": "status", "arguments": {}}),
+    );
+    srv2_stdin
+        .write_all(call.as_bytes())
+        .await
+        .expect("write status call");
+    srv2_stdin.flush().await.expect("flush status call");
+
+    // Kill the daemon immediately, racing the in-flight request above.
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // Bounded wait: recovery (bounded by RELAY_RECOVERY_BUDGET) plus the
+    // (possibly retried) request round trip.
+    let resp = tokio::time::timeout(Duration::from_secs(20), read_json_line(&mut srv2_stdout))
+        .await
+        .expect("status response timed out entirely")
+        .expect("status response missing/malformed");
+    assert_eq!(resp["id"], 2, "{resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "safe read-only request must never surface the ambiguous-disconnect \
+         error; it must be retried once and succeed: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let v: Value = serde_json::from_str(text).expect("status payload is JSON");
+    assert_eq!(v["status"], "unconfigured", "{text}");
+
+    let _ = srv2_child.start_kill();
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2_child.wait()).await;
+}
+
+/// §17 item 7: a mutation (`workspace` tool, `add` action) that is in flight
+/// when the daemon dies must NEVER be blindly retried — its completion state
+/// is ambiguous, so at most it may be applied once (by the original daemon,
+/// if it completed before dying), never twice. Verified by checking, after
+/// recovery, that the added path appears in the workspace membership at most
+/// once — never duplicated, regardless of which side of the race fired.
+#[tokio::test]
+async fn mutation_not_retried_after_ambiguous_disconnect() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+    let workspace_root = tmp.path().join("mutation-root");
+    std::fs::create_dir_all(&workspace_root).expect("create candidate workspace root");
+    let workspace_root_str = workspace_root.to_string_lossy().replace('\\', "\\\\");
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut srv2_child, mut srv2_stdin, mut srv2_stdout) =
+        spawn_raw_child(&bin, &home, &db, None).await;
+    raw_initialize(&mut srv2_stdin, &mut srv2_stdout).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let call = raw_request(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "workspace",
+            "arguments": {"action": "add", "path": workspace_root.to_string_lossy()}
+        }),
+    );
+    srv2_stdin
+        .write_all(call.as_bytes())
+        .await
+        .expect("write workspace add call");
+    srv2_stdin.flush().await.expect("flush workspace add call");
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // Whatever comes back for the in-flight add (a synthesized error, a
+    // genuine success from the original daemon, or a genuine success from
+    // the new daemon if it was never actually sent) — read and discard it,
+    // bounded.
+    let _ = tokio::time::timeout(Duration::from_secs(20), read_json_line(&mut srv2_stdout)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let inspect = raw_request(
+        3,
+        "tools/call",
+        serde_json::json!({"name": "workspace", "arguments": {"action": "inspect"}}),
+    );
+    srv2_stdin
+        .write_all(inspect.as_bytes())
+        .await
+        .expect("write workspace inspect call");
+    srv2_stdin
+        .flush()
+        .await
+        .expect("flush workspace inspect call");
+    let resp = tokio::time::timeout(IO_TIMEOUT, read_json_line(&mut srv2_stdout))
+        .await
+        .expect("workspace inspect timed out")
+        .expect("workspace inspect response missing/malformed");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+
+    let occurrences = text.matches(workspace_root_str.trim_matches('"')).count()
+        + text.matches(&*workspace_root.to_string_lossy()).count();
+    assert!(
+        occurrences <= 2, // path may appear in more than one JSON field once; never duplicated as a second root entry
+        "the in-flight `workspace add` mutation must never be applied twice \
+         after an ambiguous disconnect; workspace inspect result: {text}"
+    );
+
+    let _ = srv2_child.start_kill();
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2_child.wait()).await;
+}
+
+/// §17 item 8: a request using a method NOT on the safe read-only allowlist
+/// (an unrecognized top-level JSON-RPC method, never routed by either the
+/// original or replacement daemon) that is in flight when the daemon dies
+/// must never be silently retried into a fabricated success — it must
+/// resolve, within a bounded time, to SOME well-formed error response (never
+/// a hang, and never a "result").
+#[tokio::test]
+async fn unknown_method_not_retried() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut srv2_child, mut srv2_stdin, mut srv2_stdout) =
+        spawn_raw_child(&bin, &home, &db, None).await;
+    raw_initialize(&mut srv2_stdin, &mut srv2_stdout).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let call = raw_request(2, "diagnostics/experimental_probe", serde_json::json!({}));
+    srv2_stdin
+        .write_all(call.as_bytes())
+        .await
+        .expect("write unknown-method call");
+    srv2_stdin.flush().await.expect("flush unknown-method call");
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    let resp = tokio::time::timeout(Duration::from_secs(20), read_json_line(&mut srv2_stdout))
+        .await
+        .expect("unknown-method response timed out entirely")
+        .expect("unknown-method response missing/malformed");
+    assert_eq!(resp["id"], 2, "{resp}");
+    assert!(
+        resp.get("result").is_none(),
+        "an unrecognized method must never resolve to a fabricated success: {resp}"
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "expected a JSON-RPC error: {resp}"
+    );
+
+    let _ = srv2_child.start_kill();
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2_child.wait()).await;
+}
+
+/// §17 item 9: with TWO relays active when the daemon dies, only one may
+/// become the replacement daemon — never a split-brain of two daemons each
+/// thinking they won. Verified both by the shared `attic.lock` (exactly one
+/// holder) and by both surviving relays remaining independently functional
+/// against that single replacement afterward.
+#[tokio::test]
+async fn multiple_relays_create_only_one_replacement_daemon() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+
+    call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("srv2 status before kill");
+    call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("srv3 status before kill");
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let lock_path = db.with_file_name("attic.lock");
+    let mut lock_held_by_someone = false;
+    for _ in 0..30 {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            && f.try_lock().is_err()
+        {
+            lock_held_by_someone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        lock_held_by_someone,
+        "expected exactly one replacement daemon to hold attic.lock"
+    );
+
+    // Both surviving relays must still be functional against the single
+    // replacement daemon — a split-brain would leave at least one wedged.
+    let (r2, r3) = tokio::join!(
+        call_tool_text(&mut srv2, "status", serde_json::json!({})),
+        call_tool_text(&mut srv3, "status", serde_json::json!({})),
+    );
+    let v2: Value = serde_json::from_str(&r2.expect("srv2 status after promotion")).expect("json");
+    let v3: Value = serde_json::from_str(&r3.expect("srv3 status after promotion")).expect("json");
+    assert_eq!(v2["status"], "unconfigured");
+    assert_eq!(v3["status"], "unconfigured");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+}
+
+/// §17 item 10: if, after the daemon dies, a relay can neither win the
+/// `attic.lock` re-election (something else already holds it) nor find a
+/// live daemon via `attic.ipc`, `run_relay_supervised`'s recovery loop must
+/// still give up and exit within a bounded time — never hang forever.
+///
+/// No internal test-only hook exists to force this deterministically fast
+/// (and none should be added purely for a test), so this exercises the REAL
+/// bound (`elect`'s `CLIENT_TOTAL_RETRY_BUDGET` = 40s): correct, but slow by
+/// construction. Simulates "daemon cannot start" by having the TEST PROCESS
+/// itself grab `attic.lock` the instant the original daemon dies, before the
+/// relay's own re-election attempt — so the relay can never win it either.
+#[tokio::test]
+async fn recovery_is_bounded_when_daemon_cannot_start() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut srv2_child, _srv2_stdin, _srv2_stdout) = spawn_raw_child(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // Immediately squat on attic.lock from the TEST process itself so no
+    // relay can ever win the re-election.
+    let lock_path = db.with_file_name("attic.lock");
+    let squat_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file to squat on it");
+    squat_lock.try_lock().expect(
+        "test process must win the lock immediately after the daemon died \
+         (before the relay's own re-election attempt) for this test's premise to hold",
+    );
+
+    let probe_start = std::time::Instant::now();
+    let deadline = probe_start + Duration::from_secs(90);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        match srv2_child.try_wait() {
+            Ok(Some(_status)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
+    eprintln!(
+        "[diag] recovery_is_bounded_when_daemon_cannot_start: exited={exited} after {:?}",
+        probe_start.elapsed()
+    );
+    drop(squat_lock);
+    assert!(
+        exited,
+        "relay did not give up within a bounded time when the daemon could \
+         never start — recovery must be bounded, not hang forever"
+    );
+}
+
+/// §17 item 11: if the MCP client disconnects (stdin closes) WHILE this
+/// relay is in the middle of recovering from its daemon's death, the process
+/// must exit promptly — never hang waiting on a client that is already gone.
+#[tokio::test]
+async fn shutdown_during_recovery_does_not_hang() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    const IDLE_MS: u64 = 800;
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon(&bin, &home, &db, Some(IDLE_MS)).await;
+
+    call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via relay before kill");
+
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // Close the MCP client's own connection WHILE recovery (backoff +
+    // re-election) is still in flight, rather than waiting for it to settle.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+
+    // Bounded by: recovery backoff/election + (if promoted) the replacement
+    // daemon's own idle-timeout shutdown, comfortably within this deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        match srv2.child.try_wait() {
+            Ok(Some(_status)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
+    assert!(
+        exited,
+        "relay did not exit within a bounded time after its MCP client \
+         disconnected mid-recovery"
+    );
+}
+
+// ── Section 17 items 12–19: Resource & stress validation ──────────────────
+
+/// §17 item 12: In Performance mode under healthy conditions, Attic configures
+/// and reaches 8 scheduler workers, max_indexing_heavy = 8, and effective_indexing_heavy_limit = 8.
+#[tokio::test]
+async fn performance_reaches_eight_workers_when_healthy() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[("ATTIC_RESOURCE_MODE", "performance")],
+    )
+    .await;
+
+    let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v: Value = serde_json::from_str(&res).expect("json");
+
+    assert_eq!(v["resource_mode"], "performance");
+    assert_eq!(v["effective_resources"]["scheduler_workers"], 8);
+    let rp = &v["resource_pressure"];
+    assert_eq!(rp["level"], "normal");
+    assert_eq!(rp["max_indexing_heavy"], 8);
+    assert_eq!(rp["effective_indexing_heavy_limit"], 8);
+    assert_eq!(rp["effective_embedding_limit"], 8);
+    assert_eq!(rp["effective_embedding_batch"], 64);
+    assert_eq!(rp["recovery_stage"], "Full");
+}
+
+/// §17 item 13: Warning pressure reduces heavy-work admission limits
+/// (indexing limit drops to 6 = 75% of 8, embedding batch shrinks to 32 = half of 64).
+#[tokio::test]
+async fn warning_reduces_heavy_admission() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "warning"),
+        ],
+    )
+    .await;
+
+    let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v: Value = serde_json::from_str(&res).expect("json");
+
+    let rp = &v["resource_pressure"];
+    assert_eq!(rp["level"], "warning");
+    assert_eq!(rp["max_indexing_heavy"], 8);
+    assert_eq!(rp["effective_indexing_heavy_limit"], 6);
+    assert_eq!(rp["effective_embedding_batch"], 32);
+}
+
+/// §17 item 14: Critical pressure reduces heavy-work admission further
+/// (indexing limit = 2 = 25% of 8, embedding limit = 1, batch = 16),
+/// and expensive MCP operations (e.g. `context`) are rejected with `server_busy`
+/// while lightweight MCP operations (`status`) remain responsive.
+#[tokio::test]
+async fn critical_reduces_heavy_admission_further() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "critical"),
+        ],
+    )
+    .await;
+
+    let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v: Value = serde_json::from_str(&res).expect("json");
+
+    let rp = &v["resource_pressure"];
+    assert_eq!(rp["level"], "critical");
+    assert_eq!(rp["effective_indexing_heavy_limit"], 2);
+    assert_eq!(rp["effective_embedding_limit"], 1);
+    assert_eq!(rp["effective_embedding_batch"], 16);
+
+    // Expensive MCP tool (`context`) must be rejected under Critical
+    let ctx_res = call_tool_text(&mut srv, "context", serde_json::json!({"query": "test"})).await;
+    let err_str = ctx_res.unwrap_or_else(|e| e);
+    assert!(
+        err_str.contains("server_busy") || err_str.contains("memory pressure"),
+        "expected server_busy rejection for expensive MCP call under Critical, got: {err_str}"
+    );
+
+    // Verify mcp_pressure_rejections counter incremented
+    let res2 = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v2: Value = serde_json::from_str(&res2).expect("json");
+    assert!(
+        v2["resource_pressure"]["mcp_pressure_rejections"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "expected mcp_pressure_rejections >= 1"
+    );
+}
+
+/// §17 item 15: Emergency pressure zeroes out new heavy indexing and embedding permits,
+/// rejects mutations (`workspace`), while keeping cheap diagnostics (`status`) responsive.
+#[tokio::test]
+async fn emergency_starts_no_new_heavy_work() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "emergency"),
+        ],
+    )
+    .await;
+
+    // Cheap tool (`status`) still responds
+    let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v: Value = serde_json::from_str(&res).expect("json");
+
+    let rp = &v["resource_pressure"];
+    assert_eq!(rp["level"], "emergency");
+    assert_eq!(rp["effective_indexing_heavy_limit"], 0);
+    assert_eq!(rp["effective_embedding_limit"], 0);
+    assert_eq!(rp["effective_embedding_batch"], 0);
+
+    // Mutation tool (`workspace`) is rejected under Emergency
+    let ws_res = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({"action": "inspect"}),
+    )
+    .await;
+    let err_str = ws_res.unwrap_or_else(|e| e);
+    assert!(
+        err_str.contains("server_busy") || err_str.contains("memory pressure"),
+        "expected server_busy rejection for mutation MCP call under Emergency, got: {err_str}"
+    );
+}
+
+/// §17 item 16: Embedding batch size shrinks monotonically with pressure:
+/// Normal (64) -> Warning (32) -> Critical (16) -> Emergency (0).
+#[tokio::test]
+async fn embedding_batch_shrinks_with_pressure() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    for (pressure_str, expected_batch) in [
+        ("normal", 64),
+        ("warning", 32),
+        ("critical", 16),
+        ("emergency", 0),
+    ] {
+        let (home, db) = attic_home_and_db(&tmp.path().join(pressure_str));
+        let mut srv = connect_daemon_with_env(
+            &bin,
+            &home,
+            &db,
+            None,
+            &[
+                ("ATTIC_RESOURCE_MODE", "performance"),
+                ("ATTIC_FORCE_RESOURCE_PRESSURE", pressure_str),
+            ],
+        )
+        .await;
+
+        let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+            .await
+            .expect("status call");
+        let v: Value = serde_json::from_str(&res).expect("json");
+        assert_eq!(
+            v["resource_pressure"]["effective_embedding_batch"], expected_batch,
+            "failed batch check for pressure={pressure_str}"
+        );
+        let _ = srv.service.close().await;
+    }
+}
+
+/// §17 item 17: When recovering from Emergency, capacity is restored gradually
+/// (0 -> Step1: 2 -> Step2: 4 -> Step3: 6 -> Full: 8) without rapid oscillation.
+#[tokio::test]
+async fn resource_capacity_recovers_gradually() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "emergency"),
+            ("ATTIC_FAST_RECOVERY_MS", "80"),
+        ],
+    )
+    .await;
+
+    let res = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status");
+    let v: Value = serde_json::from_str(&res).expect("json");
+    assert_eq!(v["resource_pressure"]["effective_indexing_heavy_limit"], 0);
+
+    // Switch to normal pressure via file override so the running server
+    // de-escalates to normal and begins graduated recovery.
+    let override_file = home.join("pressure_override");
+    std::fs::write(&override_file, "normal").expect("write normal override");
+
+    // Sample status periodically; verify monotonic capacity progression
+    let mut seen_limits = Vec::new();
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+    while start.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(res) = call_tool_text(&mut srv, "status", serde_json::json!({})).await
+            && let Ok(v) = serde_json::from_str::<Value>(&res)
+        {
+            let limit = v["resource_pressure"]["effective_indexing_heavy_limit"]
+                .as_u64()
+                .unwrap_or(0);
+            if seen_limits.last().copied() != Some(limit) {
+                seen_limits.push(limit);
+            }
+            if limit == 8 {
+                break;
+            }
+        }
+    }
+
+    eprintln!("[diag] graduated recovery seen limits: {seen_limits:?}");
+    assert!(
+        seen_limits.contains(&8),
+        "capacity must eventually reach Full (8 workers): seen={seen_limits:?}"
+    );
+    // Verify monotonic non-decreasing order (no rapid 8 -> 2 -> 8 oscillation)
+    for w in seen_limits.windows(2) {
+        assert!(
+            w[0] <= w[1],
+            "capacity must not oscillate backwards during recovery: seen={seen_limits:?}"
+        );
+    }
+}
+
+/// §17 item 18: MCP requests remain responsive during indexing / pressure.
+#[tokio::test]
+async fn mcp_remains_responsive_during_index_pressure() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    let mut srv1 = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "warning"),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut srv2 = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FORCE_RESOURCE_PRESSURE", "warning"),
+        ],
+    )
+    .await;
+
+    // Concurrently issue calls from both client connections; both must succeed swiftly.
+    let (r1, r2) = tokio::join!(
+        call_tool_text(&mut srv1, "status", serde_json::json!({})),
+        call_tool_text(&mut srv2, "status", serde_json::json!({})),
+    );
+
+    assert!(r1.is_ok(), "status 1 ok: {r1:?}");
+    assert!(r2.is_ok(), "status 2 ok: {r2:?}");
+
+    // Sequential call on same client also succeeds promptly.
+    let r3 = call_tool_text(&mut srv1, "status", serde_json::json!({})).await;
+    assert!(r3.is_ok(), "status 3 ok: {r3:?}");
+}
+
+/// §17 item 19 / §14: Combined final fault test:
+/// Performance mode (8 workers) + memory pressure + daemon death while MCP traffic
+/// is active + single relay election promotion + stdio preservation + initialization
+/// replay + memory pressure clearance + gradual capacity recovery.
+#[tokio::test]
+async fn combined_pressure_and_daemon_failure_recovers() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    // 1. Start primary daemon in Performance mode
+    let mut srv1 = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FAST_RECOVERY_MS", "80"),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. Start the single relay connected to it
+    let mut srv2 = connect_daemon_with_env(
+        &bin,
+        &home,
+        &db,
+        None,
+        &[
+            ("ATTIC_RESOURCE_MODE", "performance"),
+            ("ATTIC_FAST_RECOVERY_MS", "80"),
+        ],
+    )
+    .await;
+
+    // Verify initial healthy performance state via relay
+    let r0 = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("initial status via relay");
+    let v0: Value = serde_json::from_str(&r0).expect("json");
+    assert_eq!(v0["resource_mode"], "performance");
+    assert_eq!(v0["resource_pressure"]["effective_indexing_heavy_limit"], 8);
+
+    // 3. Inject memory pressure (warning) via file override
+    let override_file = home.join("pressure_override");
+    std::fs::write(&override_file, "warning").expect("write pressure override");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let rw = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status under pressure via relay");
+    let vw: Value = serde_json::from_str(&rw).expect("json");
+    assert_eq!(vw["resource_pressure"]["level"], "warning");
+    assert_eq!(vw["resource_pressure"]["effective_indexing_heavy_limit"], 6);
+
+    // 4. Kill the primary daemon (srv1) while MCP traffic is active.
+    // The single relay (srv2) must detect disconnect, win election,
+    // promote to replacement daemon, keep stdio alive, and replay initialize.
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
+
+    // Allow promotion and reconnect to complete
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // 5. The existing stdio client on srv2 continues functioning automatically!
+    let r_post = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status via promoted relay without client reconnect");
+    let v_post: Value = serde_json::from_str(&r_post).expect("json");
+    assert_eq!(v_post["status"], "unconfigured");
+
+    // 6. Clear memory pressure: capacity recovers gradually back to full Performance (8 workers)
+    std::fs::write(&override_file, "normal").expect("write normal override");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let r_rec = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("status post-recovery");
+    let v_rec: Value = serde_json::from_str(&r_rec).expect("json");
+    assert_eq!(v_rec["resource_pressure"]["level"], "normal");
+    assert_eq!(
+        v_rec["resource_pressure"]["effective_indexing_heavy_limit"],
+        8
+    );
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+}
+
+/// Section 15 item 2: Replacement daemon failure also recovers.
+/// Daemon 1 killed -> Relay 2 promoted to Daemon 2.
+/// Relay 3 connects to Daemon 2.
+/// Daemon 2 (process 2) killed.
+/// Relay 3 detects failure, promotes to Daemon 3, and continues serving MCP
+/// requests on its original stdio connection without client restart.
+#[tokio::test]
+async fn replacement_daemon_failure_recovers_to_another_daemon() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    // 1. Start primary daemon (srv1)
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. Start relay 2 (srv2)
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Verify initial relay status
+    let r0 = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("srv2 initial status");
+    let v0: Value = serde_json::from_str(&r0).expect("json");
+    assert_eq!(v0["status"], "unconfigured");
+
+    // 3. Kill Daemon 1 (srv1). Relay 2 promotes to Daemon 2.
+    srv1.child.start_kill().expect("kill daemon 1");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("srv1 did not exit in time");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Verify srv2 survived and is functioning as the new daemon
+    let r1 = call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("srv2 status after first promotion");
+    let v1: Value = serde_json::from_str(&r1).expect("json");
+    assert_eq!(v1["status"], "unconfigured");
+
+    // 4. Start relay 3 (srv3) which connects to Daemon 2
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let r2 = call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("srv3 initial status via daemon 2");
+    let v2: Value = serde_json::from_str(&r2).expect("json");
+    assert_eq!(v2["status"], "unconfigured");
+
+    // 5. Kill Daemon 2 (srv2). Relay 3 must detect this SECOND daemon failure,
+    // win election, promote to Daemon 3, and continue serving MCP requests!
+    srv2.child.start_kill().expect("kill daemon 2");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.child.wait())
+        .await
+        .expect("srv2 did not exit in time");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // srv3 stdio client was NEVER restarted; it must succeed on the same connection.
+    let r3 = call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("srv3 status after second daemon failure");
+    let v3: Value = serde_json::from_str(&r3).expect("json");
+    assert_eq!(v3["status"], "unconfigured");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+}
+
+/// Section 15 item 3: Three sequential daemon failures recover.
+/// 4 processes: srv1, srv2, srv3, srv4.
+/// Sequentially kill Daemon 1, then Daemon 2, then Daemon 3.
+/// Assert Relay 4 survives all 3 deaths on its original stdio connection.
+#[tokio::test]
+async fn three_sequential_daemon_failures_recover() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    // Launch srv1 first so it deterministically becomes Daemon 1
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Launch srv2, srv3, srv4 sequentially
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut srv3 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut srv4 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Initial check on srv4
+    let r0 = call_tool_text(&mut srv4, "status", serde_json::json!({}))
+        .await
+        .expect("srv4 initial status");
+    let v0: Value = serde_json::from_str(&r0).expect("json");
+    assert_eq!(v0["status"], "unconfigured");
+
+    // Failure 1: Kill Daemon 1 (srv1)
+    srv1.child.start_kill().expect("kill srv1");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("srv1 exit");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // srv4 survives Failure 1
+    let r1 = call_tool_text(&mut srv4, "status", serde_json::json!({}))
+        .await
+        .expect("srv4 status after failure 1");
+    let v1: Value = serde_json::from_str(&r1).expect("json");
+    assert_eq!(v1["status"], "unconfigured");
+
+    // Failure 2: Kill srv2
+    srv2.child.start_kill().expect("kill srv2");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.child.wait())
+        .await
+        .expect("srv2 exit");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // srv4 survives Failure 2
+    let r2 = call_tool_text(&mut srv4, "status", serde_json::json!({}))
+        .await
+        .expect("srv4 status after failure 2");
+    let v2: Value = serde_json::from_str(&r2).expect("json");
+    assert_eq!(v2["status"], "unconfigured");
+
+    // Failure 3: Kill srv3
+    srv3.child.start_kill().expect("kill srv3");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.child.wait())
+        .await
+        .expect("srv3 exit");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // srv4 survives Failure 3: original stdio connection still responsive!
+    let r3 = call_tool_text(&mut srv4, "status", serde_json::json!({}))
+        .await
+        .expect("srv4 status after failure 3");
+    let v3: Value = serde_json::from_str(&r3).expect("json");
+    assert_eq!(v3["status"], "unconfigured");
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv4.service.close()).await;
+}
+
+/// Section 15 items 14 & 15: Promoted relay's external client closure keeps
+/// the replacement daemon alive while other relay clients remain connected.
+/// When the last client disconnects, normal idle policy shuts down the daemon.
+#[tokio::test]
+async fn promoted_client_close_keeps_daemon_alive_for_other_clients() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    const IDLE_MS: u64 = 1000;
+
+    // 1. Primary daemon
+    let mut srv1 = connect_daemon(&bin, &home, &db, Some(IDLE_MS)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. Relay 2
+    let mut srv2 = connect_daemon(&bin, &home, &db, Some(IDLE_MS)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 3. Kill primary daemon -> Relay 2 promoted to replacement daemon
+    srv1.child.start_kill().expect("kill srv1");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("srv1 exit");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    call_tool_text(&mut srv2, "status", serde_json::json!({}))
+        .await
+        .expect("srv2 status post promotion");
+
+    // 4. Relay 3 connects to replacement daemon hosted in srv2
+    let mut srv3 = connect_daemon(&bin, &home, &db, Some(IDLE_MS)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("srv3 status via daemon 2");
+
+    // 5. Close srv2's own MCP client.
+    // Process 2 must NOT exit because it is hosting Daemon 2 which srv3 is actively using.
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv2.service.close()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        srv2.child.try_wait().expect("try_wait srv2").is_none(),
+        "srv2 must stay alive to host the daemon while srv3 is still connected"
+    );
+
+    // 6. srv3 continues making successful tool calls to Daemon 2
+    let r_srv3 = call_tool_text(&mut srv3, "status", serde_json::json!({}))
+        .await
+        .expect("srv3 tool call after srv2 client closed");
+    let v_srv3: Value = serde_json::from_str(&r_srv3).expect("json");
+    assert_eq!(v_srv3["status"], "unconfigured");
+
+    // Verify srv2 is still alive even after idle timeout duration has passed,
+    // because srv3 is still connected.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS + 200)).await;
+    assert!(
+        srv2.child.try_wait().expect("try_wait srv2").is_none(),
+        "srv2 must not shut down while active connections exist"
+    );
+
+    // 7. Disconnect srv3 (last client)
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv3.service.close()).await;
+
+    // 8. Now 0 connections remain. Process 2 should shut down cleanly per idle timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut srv2_exited = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(_)) = srv2.child.try_wait() {
+            srv2_exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        srv2_exited,
+        "srv2 process should exit cleanly after all clients disconnect and idle timeout expires"
+    );
+}
+
+/// Section 15 item 18 / Problem A: Verify that no raw MCP payload bodies
+/// (parameters, query tokens, request content) appear in logs (at info or trace levels),
+/// and only byte lengths are recorded at trace.
+#[tokio::test]
+async fn no_raw_mcp_payloads_in_logs() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (home, db) = attic_home_and_db(tmp.path());
+
+    // 1. Start primary daemon
+    let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. Spawn a relay child with stderr piped and ATTIC_LOG=trace
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.env("ATTIC_HOME", &home)
+        .env("ATTIC_DB_PATH", &db)
+        .env("ATTIC_SEMANTIC", "0")
+        .env("ATTIC_LOG", "trace")
+        .env_remove("ATTIC_CONFIG")
+        .env_remove("ATTIC_WORKSPACE_ROOT")
+        .env_remove("ATTIC_NO_DAEMON")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().expect("spawn relay with trace stderr");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+
+    raw_initialize(&mut stdin, &mut stdout).await;
+
+    // 3. Send a tool call containing a sensitive canary token in parameters
+    let canary_token = "CONFIDENTIAL_PAYLOAD_TOKEN_SECRET_987654";
+    let call = raw_request(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "status",
+            "arguments": {
+                "secret_canary": canary_token
+            }
+        }),
+    );
+    stdin.write_all(call.as_bytes()).await.expect("write call");
+    stdin.flush().await.expect("flush call");
+
+    let resp = read_json_line(&mut stdout)
+        .await
+        .expect("response timeout or missing");
+    assert_eq!(resp["id"], 2);
+
+    // 4. Close client stdin and let child exit
+    drop(stdin);
+    let _ = tokio::time::timeout(IO_TIMEOUT, child.wait()).await;
+
+    // 5. Read all accumulated stderr
+    let mut stderr_str = String::new();
+    let _ = tokio::time::timeout(IO_TIMEOUT, stderr.read_to_string(&mut stderr_str)).await;
+
+    // 6. Assert that canary token NEVER appears in the logs
+    assert!(
+        !stderr_str.contains(canary_token),
+        "Raw MCP payload content leaked in relay logs! Found '{canary_token}' in stderr:\n{stderr_str}"
+    );
+    assert!(
+        !stderr_str.contains("secret_canary"),
+        "Raw argument name leaked in relay logs!"
+    );
+
+    // 7. Verify that length-only trace logging IS occurring
+    assert!(
+        stderr_str.contains("relay: stdin bytes received")
+            || stderr_str.contains("len =")
+            || stderr_str.contains("len:"),
+        "Expected trace byte count logging in stderr, got:\n{stderr_str}"
+    );
+
+    let _ = srv1.child.start_kill();
 }

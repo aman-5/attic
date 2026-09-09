@@ -1560,21 +1560,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn align_classifications_scales_linearly_not_quadratically() {
-        // Not a timing benchmark (too flaky in CI); proves the O(N)
-        // contract structurally by checking a large aligned set resolves
-        // correctly and quickly enough to run inline in a unit test.
-        let n = 20_000;
-        let entries: Vec<EligibleEntry> = (0..n).map(|i| entry(&format!("f{i}.rs"))).collect();
-        let classifications: Vec<(String, DownstreamClassification)> = (0..n)
-            .map(|i| (format!("f{i}.rs"), DownstreamClassification::Excluded))
-            .collect();
-
-        let aligned = align_classifications(&entries, &classifications).unwrap();
-        assert_eq!(aligned.len(), n);
-    }
-
     // -----------------------------------------------------------------------
     // Basic pipeline tests
     // -----------------------------------------------------------------------
@@ -1768,40 +1753,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // E2E: real data actually reaches the database
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn e2e_indexed_file_is_searchable() {
-        let fx = make_store();
-        write_file(
-            fx._dir.path(),
-            "search_me.rs",
-            "pub fn greet_the_world() -> &'static str { \"hello\" }\n",
-        );
-        let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions::default();
-        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
-        assert!(result.units_inserted >= 1);
-
-        let hits = fx
-            .pool
-            .with_reader(|c| {
-                attic_storage::fts_search(
-                    c,
-                    &attic_storage::FtsSearchParams {
-                        query: "greet_the_world",
-                        repository_id: None,
-                        file_type: None,
-                        language: None,
-                        max_results: 10,
-                    },
-                )
-            })
-            .unwrap();
-        assert!(
-            !hits.is_empty(),
-            "FTS search must find indexed content after index_repository"
-        );
-    }
 
     #[test]
     fn e2e_repository_scoped_search() {

@@ -203,7 +203,7 @@ impl ResourcePolicy {
                 min_free_memory_mib: 400,
                 max_foreground_queries: 128,
                 embedding_batch_size: 64,
-                embedding_worker_count: 3,
+                embedding_worker_count: 8,
                 writer_batch_size: 512,
                 writer_flush_interval_ms: 25,
                 writer_queue_capacity: 1024,
@@ -327,6 +327,7 @@ impl ResourcePolicy {
             memory_budget_mib,
             min_free_memory_mib,
             scheduler_workers: self.scheduler_workers.min(snapshot.cpu_cores).max(1),
+            embedding_worker_count: self.embedding_worker_count.min(snapshot.cpu_cores).max(1),
             ..self.into()
         }
     }
@@ -348,6 +349,7 @@ impl ResourcePolicy {
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
         EffectiveResourceConfig {
             scheduler_workers: self.scheduler_workers.clamp(1, 2),
+            embedding_worker_count: self.embedding_worker_count.clamp(1, 2),
             memory_budget_mib,
             min_free_memory_mib,
             ..self.into()
@@ -410,18 +412,28 @@ impl EffectiveResourceConfig {
     /// `ResourceMonitor::from_config` can consume it without a parallel
     /// admission-control code path. `per_repo_memory_budget_mib` and
     /// `max_background_workers` are outside `ResourcePolicy`'s 12 fields
-    /// (per Low-Level Design §1) and keep their existing
-    /// `attic_core::resources` defaults here.
+    /// (per Low-Level Design §1), so they're not part of the hardware/mode
+    /// policy pipeline — but they're still real, live admission-control
+    /// gates in `ResourceMonitor::from_config`, so their `ATTIC_*` env
+    /// overrides (read by the removed `ResourceConfig::load()`) are read
+    /// directly here rather than silently dropped.
     pub fn as_resource_config(&self) -> ResourceConfig {
+        // ResourceConfig only covers the fields that ResourceMonitor consumes
+        // (memory budget, foreground/background admission).  The writer/IO
+        // fields (writer_batch_size, writer_queue_capacity,
+        // writer_flush_interval_ms, max_io_ops_per_sec) are consumed directly
+        // from EffectiveResourceConfig by the writer and scheduler subsystems —
+        // they are NOT ResourceMonitor concerns and must not be set here.
         ResourceConfig {
             total_memory_budget_mib: Some(self.memory_budget_mib),
             min_free_memory_mib: Some(self.min_free_memory_mib),
             max_foreground_queries: Some(self.max_foreground_queries),
-            max_io_ops_per_sec: Some(self.max_io_ops_per_sec as u64),
-            writer_queue_capacity: Some(self.writer_queue_capacity),
-            writer_batch_size: Some(self.writer_batch_size),
-            writer_flush_interval_ms: Some(self.writer_flush_interval_ms),
-            ..Default::default()
+            per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 }
@@ -431,11 +443,15 @@ impl EffectiveResourceConfig {
 /// that the pre-Phase-8 `ResourceConfig::load()` (a second, independent
 /// parser for the same names) has been removed as dead code.
 pub fn env_resource_overrides() -> ResourceOverrides {
+    // `None` here means "ATTIC_RESOURCE_MODE not set (or not recognized)",
+    // distinct from `Some(Auto)` ("explicitly set to auto") — see the field
+    // doc on `ResourceOverrides::mode` for why that distinction matters.
     let mode = match std::env::var("ATTIC_RESOURCE_MODE").ok().as_deref() {
-        Some("low") => ResourceModeSetting::Low,
-        Some("balanced") => ResourceModeSetting::Balanced,
-        Some("performance") => ResourceModeSetting::Performance,
-        _ => ResourceModeSetting::Auto,
+        Some("low") => Some(ResourceModeSetting::Low),
+        Some("balanced") => Some(ResourceModeSetting::Balanced),
+        Some("performance") => Some(ResourceModeSetting::Performance),
+        Some("auto") => Some(ResourceModeSetting::Auto),
+        _ => None,
     };
     ResourceOverrides {
         mode,
@@ -488,14 +504,10 @@ pub fn resolve_effective_config(
     snapshot: &Result<HardwareSnapshot, ResourceDetectionError>,
 ) -> Result<ResourceResolution, attic_core::config::ConfigError> {
     let (mode, mode_source) = match (env_overrides.mode, toml_overrides.mode, snapshot) {
-        (m, _, _) if !matches!(m, ResourceModeSetting::Auto) => {
-            (setting_to_mode(m), ResourceModeSource::EnvOverride)
-        }
-        (_, m, _) if !matches!(m, ResourceModeSetting::Auto) => {
-            (setting_to_mode(m), ResourceModeSource::TomlOverride)
-        }
-        (_, _, Ok(snap)) => (detect_resource_mode(snap), ResourceModeSource::Detected),
-        (_, _, Err(_)) => (ResourceMode::Low, ResourceModeSource::DetectionFailed),
+        (Some(m), _, _) => (setting_to_mode(m), ResourceModeSource::EnvOverride),
+        (None, Some(m), _) => (setting_to_mode(m), ResourceModeSource::TomlOverride),
+        (None, None, Ok(snap)) => (detect_resource_mode(snap), ResourceModeSource::Detected),
+        (None, None, Err(_)) => (ResourceMode::Low, ResourceModeSource::DetectionFailed),
     };
 
     let merged = toml_overrides.clone().layer(env_overrides);
@@ -696,17 +708,39 @@ mod tests {
     #[test]
     fn resolve_prefers_env_mode_over_toml_and_detected() {
         let toml = ResourceOverrides {
-            mode: ResourceModeSetting::Low,
+            mode: Some(ResourceModeSetting::Low),
             ..Default::default()
         };
         let env = ResourceOverrides {
-            mode: ResourceModeSetting::Performance,
+            mode: Some(ResourceModeSetting::Performance),
             ..Default::default()
         };
         let snapshot = Ok(snap(4096, 2)); // would detect Low
         let resolution = resolve_effective_config(&toml, &env, &snapshot).unwrap();
         assert_eq!(resolution.mode, ResourceMode::Performance);
         assert_eq!(resolution.mode_source, ResourceModeSource::EnvOverride);
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_env_auto_over_toml_mode() {
+        // Regression test: an explicit `ATTIC_RESOURCE_MODE=auto` must win
+        // over a toml `mode = "performance"`, per the documented
+        // `env > toml` precedence — it must NOT be treated the same as
+        // "ATTIC_RESOURCE_MODE unset" just because both are the `Auto`
+        // variant. Before the `Option<ResourceModeSetting>` fix, this
+        // resolved to `TomlOverride`/`Performance` instead.
+        let toml = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Performance),
+            ..Default::default()
+        };
+        let env = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Auto),
+            ..Default::default()
+        };
+        let snapshot = Ok(snap(4096, 2));
+        let resolution = resolve_effective_config(&toml, &env, &snapshot).unwrap();
+        assert_eq!(resolution.mode_source, ResourceModeSource::EnvOverride);
+        assert_ne!(resolution.mode, ResourceMode::Performance);
     }
 
     #[test]
