@@ -3434,10 +3434,12 @@ async fn run() -> anyhow::Result<()> {
                 );
                 let db_path_buf = db_path.to_path_buf();
                 let paths_clone = paths.clone();
-                let daemon_starter: daemon::DaemonStarter = Arc::new(move |daemon_handle, ready_tx| {
-                    let (srv, enricher) = build_server_and_enricher(&db_path_buf, &paths_clone)?;
-                    Ok(daemon::spawn_daemon(srv, enricher, daemon_handle, ready_tx))
-                });
+                let daemon_starter: daemon::DaemonStarter =
+                    Arc::new(move |daemon_handle, ready_tx| {
+                        let (srv, enricher) =
+                            build_server_and_enricher(&db_path_buf, &paths_clone)?;
+                        Ok(daemon::spawn_daemon(srv, enricher, daemon_handle, ready_tx))
+                    });
 
                 match daemon::run_relay_supervised(relay, db_path, Some(daemon_starter)).await {
                     daemon::RelaySupervisionOutcome::ClientClosed => {
@@ -3446,12 +3448,10 @@ async fn run() -> anyhow::Result<()> {
                     daemon::RelaySupervisionOutcome::PromoteToDaemon {
                         daemon_handle,
                         recovery_state,
-                    } => {
-                        Ownership::Promoted {
-                            daemon_handle,
-                            recovery_state,
-                        }
-                    }
+                    } => Ownership::Promoted {
+                        daemon_handle,
+                        recovery_state,
+                    },
                     daemon::RelaySupervisionOutcome::Fatal { error } => {
                         error!("relay supervision failed: {error:#}");
                         return Err(error);

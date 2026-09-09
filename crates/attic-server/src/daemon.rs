@@ -196,11 +196,11 @@ pub(crate) struct OwnedDaemon {
 /// accept loop when this relay wins an election during recovery.
 pub(crate) type DaemonStarter = Arc<
     dyn Fn(
-        DaemonHandle,
-        tokio::sync::oneshot::Sender<()>,
-    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>>
-    + Send
-    + Sync,
+            DaemonHandle,
+            tokio::sync::oneshot::Sender<()>,
+        ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>>
+        + Send
+        + Sync,
 >;
 
 /// Target produced by a single [`recover_daemon`] attempt.
@@ -928,11 +928,7 @@ async fn replay_session_and_resolve_inflight(
                 "The daemon disconnected while this operation was in flight. \
                  Its completion state is unknown. The operation was not automatically retried."
             };
-            let err_bytes = make_jsonrpc_error_response(
-                &req.id_raw,
-                -32603,
-                reason,
-            );
+            let err_bytes = make_jsonrpc_error_response(&req.id_raw, -32603, reason);
             let _ = stdout.write_all(&err_bytes).await;
             let _ = stdout.flush().await;
             warn!(
@@ -953,7 +949,9 @@ async fn observe_and_clean_owned_daemon(owned_daemon: &mut Option<OwnedDaemon>) 
         if owned.task.is_finished() {
             match owned.task.await {
                 Ok(Ok(())) => info!("relay recovery: previously owned daemon task exited cleanly"),
-                Ok(Err(e)) => warn!("relay recovery: previously owned daemon task exited with error: {e:#}"),
+                Ok(Err(e)) => {
+                    warn!("relay recovery: previously owned daemon task exited with error: {e:#}")
+                }
                 Err(e) => warn!("relay recovery: previously owned daemon task panicked: {e}"),
             }
         } else {
@@ -1004,7 +1002,9 @@ async fn recover_daemon(
         ElectionResult::Daemon(handle) => {
             if let Some(starter) = daemon_starter {
                 observe_and_clean_owned_daemon(owned_daemon).await;
-                info!("relay: won daemon election during recovery; starting replacement daemon inline");
+                info!(
+                    "relay: won daemon election during recovery; starting replacement daemon inline"
+                );
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let socket_name = derive_socket_name(db_path);
                 let daemon_task = starter(handle, ready_tx)
@@ -1012,9 +1012,17 @@ async fn recover_daemon(
 
                 if ready_rx.await.is_err() {
                     match daemon_task.await {
-                        Ok(Err(e)) => return Err(e.context("replacement daemon failed before signaling readiness")),
-                        Err(e) => return Err(anyhow::anyhow!("replacement daemon task panicked: {e}")),
-                        Ok(Ok(())) => return Err(anyhow::anyhow!("replacement daemon exited prematurely")),
+                        Ok(Err(e)) => {
+                            return Err(
+                                e.context("replacement daemon failed before signaling readiness")
+                            );
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("replacement daemon task panicked: {e}"));
+                        }
+                        Ok(Ok(())) => {
+                            return Err(anyhow::anyhow!("replacement daemon exited prematurely"));
+                        }
                     }
                 }
 
@@ -1027,11 +1035,9 @@ async fn recover_daemon(
                 Ok(RecoveredTarget::WonElection(handle))
             }
         }
-        ElectionResult::Fallback(_lock) => {
-            Err(anyhow::anyhow!(
-                "attic: relay won the daemon lock but IPC setup failed; cannot continue in relay mode"
-            ))
-        }
+        ElectionResult::Fallback(_lock) => Err(anyhow::anyhow!(
+            "attic: relay won the daemon lock but IPC setup failed; cannot continue in relay mode"
+        )),
     }
 }
 
@@ -1073,7 +1079,9 @@ pub(crate) async fn run_relay_supervised_internal(
 
     loop {
         match run_relay_with_cache(
-            RelayHandle { stream: current_stream },
+            RelayHandle {
+                stream: current_stream,
+            },
             &mut session_cache,
             &mut interrupted_request,
             &mut stdin,
@@ -1088,7 +1096,9 @@ pub(crate) async fn run_relay_supervised_internal(
                 // do not kill it if other clients remain. Await it per normal
                 // idle timeout / client count policy.
                 if let Some(mut owned) = owned_daemon.take() {
-                    info!("relay supervisor: client closed; waiting for owned daemon to exit per idle policy");
+                    info!(
+                        "relay supervisor: client closed; waiting for owned daemon to exit per idle policy"
+                    );
                     tokio::select! {
                         res = &mut owned.task => {
                             match res {
@@ -1127,16 +1137,12 @@ pub(crate) async fn run_relay_supervised_internal(
                 recovery_deadline.saturating_duration_since(Instant::now()),
             );
 
-            match recover_daemon(
-                db_path,
-                &mut owned_daemon,
-                daemon_starter.as_ref(),
-                attempt,
-            )
-            .await
+            match recover_daemon(db_path, &mut owned_daemon, daemon_starter.as_ref(), attempt).await
             {
                 Ok(RecoveredTarget::WonElection(handle)) => {
-                    info!("relay: won daemon election without inline starter; returning PromoteToDaemon");
+                    info!(
+                        "relay: won daemon election without inline starter; returning PromoteToDaemon"
+                    );
                     return RelaySupervisionOutcome::PromoteToDaemon {
                         daemon_handle: handle,
                         recovery_state: RelayRecoveryState {
@@ -1401,7 +1407,9 @@ pub(crate) async fn resume_relay_after_promotion(
     {
         RelaySupervisionOutcome::ClientClosed => Ok(()),
         RelaySupervisionOutcome::PromoteToDaemon { .. } => {
-            anyhow::bail!("relay promotion: won election during recovery but no daemon starter available")
+            anyhow::bail!(
+                "relay promotion: won election during recovery but no daemon starter available"
+            )
         }
         RelaySupervisionOutcome::Fatal { error } => Err(error),
     }
@@ -1718,14 +1726,16 @@ mod tests {
 
         // Stand up a test listener
         let listener = ListenerOptions::new()
-            .name(socket_name.as_str().to_ns_name::<GenericNamespaced>().expect("ns name"))
+            .name(
+                socket_name
+                    .as_str()
+                    .to_ns_name::<GenericNamespaced>()
+                    .expect("ns name"),
+            )
             .create_tokio()
             .expect("create listener");
 
-        let handle = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            stream
-        });
+        let handle = tokio::spawn(async move { listener.accept().await.expect("accept") });
 
         let mut client_stream = connect_stream(&socket_name).await.expect("connect");
         let _server_stream = handle.await.expect("server stream");
@@ -1735,7 +1745,11 @@ mod tests {
 
         // 1. Safe read-only request, first time (retried: false)
         let body = b"{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"status\"}";
-        let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), std::str::from_utf8(body).unwrap());
+        let framed = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
         let mut in_flight = Some(InFlightRequest {
             id_raw: "101".to_string(),
             method: "status".to_string(),
@@ -1755,7 +1769,10 @@ mod tests {
         // After first retry, in_flight must be re-armed with retried = true
         assert!(in_flight.is_some());
         let req = in_flight.as_ref().unwrap();
-        assert!(req.retried, "request must be marked retried after first retry");
+        assert!(
+            req.retried,
+            "request must be marked retried after first retry"
+        );
 
         // 2. Safe read-only request, second time (retried: true)
         // Daemon dies again before answering! On subsequent recovery, it must NOT be retried again.
@@ -1768,7 +1785,10 @@ mod tests {
         .await;
         assert!(ok2);
         // It must have synthesized an error and cleared in_flight (taken)
-        assert!(in_flight.is_none(), "already-retried request must not be retried a second time");
+        assert!(
+            in_flight.is_none(),
+            "already-retried request must not be retried a second time"
+        );
 
         // 3. Mutation request (retried: false) must NEVER be retried
         let mut mutation_flight = Some(InFlightRequest {
@@ -1804,7 +1824,10 @@ mod tests {
         )
         .await;
         assert!(ok4);
-        assert!(unknown_flight.is_none(), "unknown method must never be retried");
+        assert!(
+            unknown_flight.is_none(),
+            "unknown method must never be retried"
+        );
     }
 
     #[tokio::test]
@@ -1833,7 +1856,9 @@ mod tests {
         assert!(res.is_ok(), "first recovery must succeed");
         match res.unwrap() {
             RecoveredTarget::Connected(_stream) => {}
-            RecoveredTarget::WonElection(_) => panic!("expected Connected when daemon_starter is present"),
+            RecoveredTarget::WonElection(_) => {
+                panic!("expected Connected when daemon_starter is present")
+            }
         }
         assert_eq!(starter_called.load(Ordering::SeqCst), 1);
         assert!(owned_daemon.is_some());
@@ -1850,7 +1875,11 @@ mod tests {
             RecoveredTarget::Connected(_stream) => {}
             RecoveredTarget::WonElection(_) => panic!("expected Connected on second recovery"),
         }
-        assert_eq!(starter_called.load(Ordering::SeqCst), 2, "daemon_starter must be called for Daemon #3");
+        assert_eq!(
+            starter_called.load(Ordering::SeqCst),
+            2,
+            "daemon_starter must be called for Daemon #3"
+        );
         assert!(owned_daemon.is_some());
 
         // Failure 3: Third sequential recovery
@@ -1859,7 +1888,11 @@ mod tests {
 
         let res3 = recover_daemon(&db_path, &mut owned_daemon, Some(&daemon_starter), 0).await;
         assert!(res3.is_ok(), "third recovery must succeed");
-        assert_eq!(starter_called.load(Ordering::SeqCst), 3, "daemon_starter must be called for Daemon #4");
+        assert_eq!(
+            starter_called.load(Ordering::SeqCst),
+            3,
+            "daemon_starter must be called for Daemon #4"
+        );
         assert!(owned_daemon.is_some());
     }
 }

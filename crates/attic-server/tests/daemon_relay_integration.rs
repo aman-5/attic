@@ -1767,4 +1767,3 @@ async fn no_raw_mcp_payloads_in_logs() {
 
     let _ = srv1.child.start_kill();
 }
-
