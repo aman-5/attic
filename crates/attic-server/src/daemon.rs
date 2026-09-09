@@ -110,6 +110,21 @@ pub(crate) struct DaemonHandle {
     ipc_path: PathBuf,
 }
 
+impl DaemonHandle {
+    /// Returns the IPC discovery file path (e.g. `attic.ipc`).
+    #[allow(dead_code)]
+    pub(crate) fn ipc_path(&self) -> &Path {
+        &self.ipc_path
+    }
+
+    /// Derive the database path from the IPC path (sibling file convention:
+    /// `attic.ipc` lives next to `attic.db`).
+    #[allow(dead_code)]
+    pub(crate) fn db_path(&self) -> PathBuf {
+        self.ipc_path.with_file_name("attic.db")
+    }
+}
+
 /// A connected IPC stream, ready to be spliced to this process's own
 /// stdin/stdout.
 pub(crate) struct RelayHandle {
@@ -125,6 +140,50 @@ pub(crate) enum ElectionResult {
     Daemon(DaemonHandle),
     Relay(RelayHandle),
     Fallback(std::fs::File),
+}
+
+/// Outcome of [`run_relay_supervised`]: explicitly describes why relay
+/// supervision ended so the caller can take the correct action without
+/// guessing from an `Option`.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RelaySupervisionOutcome {
+    /// The MCP client (AI agent) closed its stdin. The relay is no longer
+    /// needed — normal clean exit.
+    ClientClosed,
+
+    /// The daemon died and this relay won the replacement-daemon election.
+    /// The caller must:
+    ///   1. Construct an `AtticServer` through the normal production path.
+    ///   2. Spawn the daemon accept loop concurrently (via [`spawn_daemon`]).
+    ///   3. Call [`resume_relay_after_promotion`] with the recovery state
+    ///      so that the existing stdin/stdout MCP session continues through
+    ///      a new local IPC connection to the replacement daemon.
+    PromoteToDaemon {
+        daemon_handle: DaemonHandle,
+        recovery_state: RelayRecoveryState,
+    },
+
+    /// An unrecoverable error occurred (recovery budget exhausted, IPC
+    /// setup failed during fallback, etc.).
+    Fatal { error: anyhow::Error },
+}
+
+/// State preserved from a relay session that is being promoted to a
+/// daemon+relay dual role. Carries everything needed to restore the
+/// existing MCP client's session on a new daemon connection without
+/// losing the stdin/stdout pipe.
+pub(crate) struct RelayRecoveryState {
+    /// Cached MCP initialization frames for replay.
+    session_cache: RelaySessionCache,
+    /// The request that was in-flight (sent to the old daemon but whose
+    /// response was never received) at the moment of daemon disconnect.
+    interrupted_request: Option<InFlightRequest>,
+    /// Persistent stdin handle (retained across recovery so Windows pipe state is preserved).
+    stdin: tokio::io::Stdin,
+    /// Persistent stdout handle (retained across recovery).
+    stdout: tokio::io::Stdout,
+    /// Unparsed or pending stdin bytes from before promotion.
+    pending_stdin: Vec<u8>,
 }
 
 /// Derive a deterministic local-socket name from the resolved database path,
@@ -454,8 +513,7 @@ fn extract_jsonrpc_id(body: &[u8]) -> Option<String> {
     if after_key.is_empty() {
         return None;
     }
-    if after_key.starts_with('"') {
-        let inner = &after_key[1..];
+    if let Some(inner) = after_key.strip_prefix('"') {
         let end = inner.find('"')?;
         Some(format!("\"{}\"", &inner[..end]))
     } else {
@@ -463,20 +521,41 @@ fn extract_jsonrpc_id(body: &[u8]) -> Option<String> {
             .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
             .unwrap_or(after_key.len());
         let raw = after_key[..end].trim();
-        if raw.is_empty() { None } else { Some(raw.to_string()) }
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        }
     }
 }
 
-/// Build a Content-Length–framed JSON-RPC error response suitable for
-/// writing directly to the MCP client's stdout. `id_raw` is the raw id
-/// literal (number or `"string"`) from the original request.
+/// Extract the JSON body slice from either a Content-Length framed message
+/// (`Content-Length: ...\r\n\r\n{...}`) or a newline-delimited JSON message (`{...}\n`).
+fn extract_body_slice(msg: &[u8]) -> &[u8] {
+    if let Some(hdr_end) = msg.windows(4).position(|w| w == b"\r\n\r\n") {
+        &msg[hdr_end + 4..]
+    } else {
+        // Trim trailing newline / whitespace
+        let mut end = msg.len();
+        while end > 0 && (msg[end - 1] == b'\n' || msg[end - 1] == b'\r' || msg[end - 1] == b' ') {
+            end -= 1;
+        }
+        let mut start = 0;
+        while start < end && (msg[start] == b' ' || msg[start] == b'\t') {
+            start += 1;
+        }
+        &msg[start..end]
+    }
+}
+
+/// Build a JSON-RPC error response suitable for writing directly to the MCP
+/// client's stdout. Standard MCP stdio transports use newline-delimited JSON.
 fn make_jsonrpc_error_response(id_raw: &str, code: i32, message: &str) -> Vec<u8> {
-    let body = format!(
+    format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{id_raw},\"error\":{{\"code\":{code},\
-         \"message\":{message:?}}}}}",
-    );
-    let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    framed.into_bytes()
+         \"message\":{message:?}}}}}\n",
+    )
+    .into_bytes()
 }
 
 /// Minimal cache of MCP initialization state captured by intercepting the
@@ -490,81 +569,114 @@ fn make_jsonrpc_error_response(id_raw: &str, code: i32, message: &str) -> Vec<u8
 /// separately via [`InFlightRequest`].
 #[derive(Default)]
 struct RelaySessionCache {
-    /// Raw Content-Length–framed bytes of the client's `initialize` request,
-    /// exactly as received from stdin. Replayed verbatim to a fresh daemon
-    /// socket before resuming the normal byte-level splice. `None` until the
-    /// first `initialize` message has been intercepted.
+    /// Raw bytes of the client's `initialize` request, exactly as received
+    /// from stdin. Replayed verbatim to a fresh daemon socket before resuming
+    /// the normal byte-level splice. `None` until the first `initialize` message
+    /// has been intercepted.
     initialize_request: Option<Vec<u8>>,
-    /// Raw Content-Length–framed bytes of the `notifications/initialized`
-    /// notification, if observed. Sent to the new daemon immediately after
-    /// the `initialize` replay.
+    /// Raw bytes of the `notifications/initialized` notification, if observed.
+    /// Sent to the new daemon immediately after the `initialize` replay.
     initialized_notification: Option<Vec<u8>>,
 }
 
 impl RelaySessionCache {
     /// Attempt to replay cached initialization state onto `stream`. Returns
     /// `true` if replay succeeded (or there was nothing to replay), `false`
-    /// if the write failed and the caller should treat this connection as
-    /// already broken.
+    /// if the write failed or the daemon's initialize response could not be read.
+    ///
+    /// # Critical Safety Rule (Phase 4 / §9.4):
+    /// The daemon's `initialize` response MUST be read and consumed from `stream`
+    /// right here. It must NEVER be forwarded to the client's stdout because
+    /// the client already completed its handshake originally. Delivering a
+    /// duplicate `initialize` response to the client breaks the JSON-RPC
+    /// request/response correlation.
     async fn replay_to(&self, stream: &mut IpcStream) -> bool {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         if let Some(init_bytes) = &self.initialize_request {
-            if stream.write_all(init_bytes).await.is_err() {
+            if stream.write_all(init_bytes).await.is_err() || stream.flush().await.is_err() {
                 return false;
+            }
+
+            // Read the daemon's initialize response from the stream until we
+            // have parsed the complete message (either Content-Length or newline-delimited).
+            let mut resp_buf = Vec::with_capacity(2048);
+            let mut tmp = [0u8; 1024];
+            let mut got_response = false;
+            while !got_response {
+                match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => {
+                        resp_buf.extend_from_slice(&tmp[..n]);
+                        if let Some((framed, _next)) = parse_one_framed_message(&resp_buf, 0) {
+                            let body = extract_body_slice(&framed);
+                            if let Ok(s) = std::str::from_utf8(body)
+                                && s.contains("\"error\"")
+                                && !s.contains("\"result\"")
+                            {
+                                warn!("replay_to: daemon returned error on initialize replay: {s}");
+                                return false;
+                            }
+                            got_response = true;
+                        }
+                    }
+                }
             }
         }
-        if let Some(notif_bytes) = &self.initialized_notification {
-            if stream.write_all(notif_bytes).await.is_err() {
-                return false;
-            }
+
+        if let Some(notif_bytes) = &self.initialized_notification
+            && (stream.write_all(notif_bytes).await.is_err() || stream.flush().await.is_err())
+        {
+            return false;
         }
         true
     }
 }
 
-/// Parse one Content-Length–framed MCP/LSP message from `buf` starting at
-/// `offset`. Returns `Some((message_bytes, next_offset))` where
-/// `message_bytes` is the *complete* framed chunk (headers + body) exactly
-/// as it should be forwarded, or `None` if the buffer doesn't yet contain a
-/// complete message.
+/// Parse one message from `buf` starting at `offset`. Supports both
+/// standard MCP newline-delimited JSON (`{...}\n`) and LSP-style
+/// `Content-Length: <N>\r\n\r\n<JSON>` framing.
 ///
-/// MCP over stdio uses the same framing as LSP:
-/// ```text
-/// Content-Length: <N>\r\n
-/// \r\n
-/// <N bytes of JSON>
-/// ```
+/// Returns `Some((message_bytes, next_offset))` where `message_bytes` is the
+/// *complete* chunk exactly as received, or `None` if `buf` doesn't yet contain
+/// a complete message.
 fn parse_one_framed_message(buf: &[u8], offset: usize) -> Option<(Vec<u8>, usize)> {
     let data = &buf[offset..];
-
-    // Find the blank line separating headers from body.
-    let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let headers = &data[..header_end];
-
-    // Extract the Content-Length value.
-    let cl_prefix = b"Content-Length: ";
-    let cl_pos = headers
-        .windows(cl_prefix.len())
-        .position(|w| w == cl_prefix)?;
-    let after_cl = &headers[cl_pos + cl_prefix.len()..];
-    let line_end = after_cl
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(after_cl.len());
-    let content_length: usize = std::str::from_utf8(&after_cl[..line_end])
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-
-    let body_start = header_end + 4; // skip the \r\n\r\n
-    let body_end = body_start + content_length;
-    if data.len() < body_end {
-        return None; // incomplete body
+    if data.is_empty() {
+        return None;
     }
 
-    let framed = data[..body_end].to_vec();
-    Some((framed, offset + body_end))
+    // LSP-style Content-Length header framing:
+    if data.starts_with(b"Content-Length:") || data.starts_with(b"content-length:") {
+        let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let headers = &data[..header_end];
+        let cl_prefix = b"Content-Length: ";
+        let cl_pos = headers
+            .windows(cl_prefix.len())
+            .position(|w| w.eq_ignore_ascii_case(cl_prefix))?;
+        let after_cl = &headers[cl_pos + cl_prefix.len()..];
+        let line_end = after_cl
+            .iter()
+            .position(|&b| b == b'\r' || b == b'\n')
+            .unwrap_or(after_cl.len());
+        let content_length: usize = std::str::from_utf8(&after_cl[..line_end])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+
+        let body_start = header_end + 4;
+        let body_end = body_start + content_length;
+        if data.len() < body_end {
+            return None;
+        }
+        return Some((data[..body_end].to_vec(), offset + body_end));
+    }
+
+    // Standard MCP line-delimited JSON (newline terminated):
+    let newline_pos = data.iter().position(|&b| b == b'\n')?;
+    let end = newline_pos + 1;
+    Some((data[..end].to_vec(), offset + end))
 }
 
 /// Look for the JSON-RPC `method` field value in a raw UTF-8 body slice.
@@ -582,6 +694,42 @@ fn extract_jsonrpc_method(body: &[u8]) -> Option<&str> {
     let inner = &after_key[1..];
     let end = inner.find('"')?;
     Some(&inner[..end])
+}
+
+/// Look for a `"params":{"name": "..."}` tool name in a raw UTF-8 body slice
+/// — the shape of every real MCP `tools/call` request. Same best-effort,
+/// no-JSON-library parsing style as [`extract_jsonrpc_method`].
+fn extract_tools_call_name(body: &[u8]) -> Option<&str> {
+    let s = std::str::from_utf8(body).ok()?;
+    let params_pos = s.find("\"params\"")?;
+    let after_params = &s[params_pos..];
+    let name_key = "\"name\"";
+    let key_pos = after_params.find(name_key)?;
+    let after_key = after_params[key_pos + name_key.len()..].trim_start_matches([' ', '\t', ':']);
+    if !after_key.starts_with('"') {
+        return None;
+    }
+    let inner = &after_key[1..];
+    let end = inner.find('"')?;
+    Some(&inner[..end])
+}
+
+/// Resolve the *effective* method used for retry-safety classification
+/// ([`is_safe_readonly_method`]): every real MCP tool invocation is sent as
+/// the JSON-RPC method `"tools/call"` with the actual tool name inside
+/// `params.name` — not as a bare top-level method matching the tool's name.
+/// `is_safe_readonly_method`'s allowlist is expressed in terms of tool names
+/// (`"status"`, `"search"`, ...), so `tools/call` requests must be reclassified
+/// by their inner tool name or the allowlist can never match real traffic.
+/// Direct JSON-RPC methods (`"initialize"`, `"ping"`, `"tools/list"`, ...)
+/// pass through unchanged. Falls back to `"tools/call"` itself (never on the
+/// allowlist, i.e. fail-safe/never-retried) if the tool name can't be parsed.
+fn effective_method_for_classification<'a>(method: &'a str, body: &'a [u8]) -> &'a str {
+    if method == "tools/call" {
+        extract_tools_call_name(body).unwrap_or(method)
+    } else {
+        method
+    }
 }
 
 /// Bidirectional splice of `stdin → daemon` with session-cache interception
@@ -604,16 +752,54 @@ async fn run_relay_with_cache(
     relay: RelayHandle,
     cache: &mut RelaySessionCache,
     in_flight: &mut Option<InFlightRequest>,
+    stdin: &mut tokio::io::Stdin,
+    stdout: &mut tokio::io::Stdout,
+    stdin_buf: &mut Vec<u8>,
 ) -> anyhow::Result<RelayExit> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut recv_half, mut send_half) = relay.stream.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
 
-    // Accumulation buffer for stdin bytes not yet forwarded (pending frame
-    // completion).
-    let mut stdin_buf: Vec<u8> = Vec::with_capacity(4096);
+    // If there were any buffered bytes from before (e.g. read before previous daemon died),
+    // flush them to the daemon now.
+    if !stdin_buf.is_empty() {
+        let mut parse_offset = 0usize;
+        while let Some((framed, next)) = parse_one_framed_message(stdin_buf, parse_offset) {
+            let body = extract_body_slice(&framed);
+            let method = extract_jsonrpc_method(body).map(str::to_owned);
+            match method.as_deref() {
+                Some("initialize") => {
+                    if cache.initialize_request.is_none() {
+                        cache.initialize_request = Some(framed.clone());
+                    }
+                }
+                Some("notifications/initialized") => {
+                    if cache.initialized_notification.is_none() {
+                        cache.initialized_notification = Some(framed.clone());
+                    }
+                }
+                Some(m) => {
+                    if let Some(id_raw) = extract_jsonrpc_id(body) {
+                        *in_flight = Some(InFlightRequest {
+                            id_raw,
+                            method: effective_method_for_classification(m, body).to_owned(),
+                            framed: framed.clone(),
+                            delivery: DeliveryState::Sent,
+                        });
+                    }
+                }
+                None => {}
+            }
+            parse_offset = next;
+        }
+
+        if send_half.write_all(stdin_buf).await.is_err() || send_half.flush().await.is_err() {
+            eprintln!("attic: lost connection to daemon; will reconnect");
+            return Ok(RelayExit::DaemonClosed);
+        }
+        stdin_buf.clear();
+    }
+
     // Two separate read buffers — tokio::select! evaluates both future
     // expressions before polling, which means both `stdin.read(&mut buf)`
     // and `recv_half.read(&mut buf)` would be constructed simultaneously.
@@ -637,50 +823,48 @@ async fn run_relay_with_cache(
                     }
                     Ok(n) => {
                         stdin_buf.extend_from_slice(&stdin_tmp[..n]);
+                        info!(len = n, raw = %String::from_utf8_lossy(&stdin_tmp[..n]), "relay: stdin read");
 
                         // Parse and cache any complete frames before forwarding.
                         let mut parse_offset = 0usize;
                         while let Some((framed, next)) =
-                            parse_one_framed_message(&stdin_buf, parse_offset)
+                            parse_one_framed_message(stdin_buf, parse_offset)
                         {
-                            if let Some(hdr_end) = framed
-                                .windows(4)
-                                .position(|w| w == b"\r\n\r\n")
-                            {
-                                let body = &framed[hdr_end + 4..];
-                                let method = extract_jsonrpc_method(body).map(str::to_owned);
-                                match method.as_deref() {
-                                    Some("initialize") => {
-                                        if cache.initialize_request.is_none() {
-                                            cache.initialize_request =
-                                                Some(framed.clone());
-                                        }
+                            let body = extract_body_slice(&framed);
+                            let method = extract_jsonrpc_method(body).map(str::to_owned);
+                            match method.as_deref() {
+                                Some("initialize") => {
+                                    if cache.initialize_request.is_none() {
+                                        cache.initialize_request =
+                                            Some(framed.clone());
                                     }
-                                    Some("notifications/initialized") => {
-                                        if cache.initialized_notification.is_none() {
-                                            cache.initialized_notification =
-                                                Some(framed.clone());
-                                        }
-                                    }
-                                    Some(m) => {
-                                        // Phase 7: track in-flight request.
-                                        if let Some(id_raw) = extract_jsonrpc_id(body) {
-                                            *in_flight = Some(InFlightRequest {
-                                                id_raw,
-                                                method: m.to_owned(),
-                                                framed: framed.clone(),
-                                                delivery: DeliveryState::Sent,
-                                            });
-                                        }
-                                    }
-                                    None => {}
                                 }
+                                Some("notifications/initialized") => {
+                                    if cache.initialized_notification.is_none() {
+                                        cache.initialized_notification =
+                                            Some(framed.clone());
+                                    }
+                                }
+                                Some(m) => {
+                                    // Phase 7: track in-flight request.
+                                    if let Some(id_raw) = extract_jsonrpc_id(body) {
+                                        *in_flight = Some(InFlightRequest {
+                                            id_raw,
+                                            method: effective_method_for_classification(m, body).to_owned(),
+                                            framed: framed.clone(),
+                                            delivery: DeliveryState::Sent,
+                                        });
+                                    }
+                                }
+                                None => {}
                             }
                             parse_offset = next;
                         }
 
                         // Forward the full accumulated buffer to the daemon.
-                        if send_half.write_all(&stdin_buf).await.is_err() {
+                        if send_half.write_all(stdin_buf).await.is_err()
+                            || send_half.flush().await.is_err()
+                        {
                             eprintln!(
                                 "attic: lost connection to daemon; will reconnect"
                             );
@@ -707,19 +891,16 @@ async fn run_relay_with_cache(
                         // matches our tracked in-flight request, clear it —
                         // the operation completed successfully.
                         if let Some(req) = in_flight.as_ref() {
-                            if let Some(hdr_end) = daemon_tmp[..n]
-                                .windows(4)
-                                .position(|w| w == b"\r\n\r\n")
+                            let body = extract_body_slice(&daemon_tmp[..n]);
+                            if let Some(resp_id) = extract_jsonrpc_id(body)
+                                && resp_id == req.id_raw
                             {
-                                let body = &daemon_tmp[hdr_end + 4..n];
-                                if let Some(resp_id) = extract_jsonrpc_id(body) {
-                                    if resp_id == req.id_raw {
-                                        *in_flight = None;
-                                    }
-                                }
+                                *in_flight = None;
                             }
                         }
-                        if stdout.write_all(&daemon_tmp[..n]).await.is_err() {
+                        if stdout.write_all(&daemon_tmp[..n]).await.is_err()
+                            || stdout.flush().await.is_err()
+                        {
                             break RelayExit::StdinClosed;
                         }
                     }
@@ -736,32 +917,52 @@ async fn run_relay_with_cache(
 ///
 /// 1. Re-run [`elect`]: if another process has already become the new daemon
 ///    we just `Relay`-connect to it.  If no daemon exists and this relay wins
-///    the election we return `Some(DaemonHandle)` so that the higher-level
-///    lifecycle layer (in `main.rs`) can start a replacement daemon through
-///    the same normal production initialization path.
+///    the election we return [`RelaySupervisionOutcome::PromoteToDaemon`] so
+///    that the higher-level lifecycle layer (in `main.rs`) can start a
+///    replacement daemon through the same normal production initialization
+///    path while **keeping the existing relay alive**.
 /// 2. Replay the cached MCP `initialize` / `notifications/initialized`
 ///    frames onto the new connection.
 /// 3. Phase 7: handle the interrupted in-flight request — retry read-only
 ///    requests once; synthesize a JSON-RPC error for mutations.
 /// 4. Resume normal splicing.
 ///
-/// Returns `Ok(None)` when the MCP client exits normally, or
-/// `Ok(Some(DaemonHandle))` when this relay won the daemon election and the
-/// caller must use the handle to spin up a replacement `AtticServer`.
+/// Returns [`RelaySupervisionOutcome::ClientClosed`] when the MCP client
+/// exits normally, [`RelaySupervisionOutcome::PromoteToDaemon`] when this
+/// relay won the daemon election and the caller must start a replacement
+/// daemon while keeping the relay alive, or
+/// [`RelaySupervisionOutcome::Fatal`] on unrecoverable error.
 pub(crate) async fn run_relay_supervised(
     relay: RelayHandle,
     db_path: &Path,
-) -> anyhow::Result<Option<DaemonHandle>> {
+) -> RelaySupervisionOutcome {
     use tokio::io::AsyncWriteExt;
 
     let mut cache = RelaySessionCache::default();
     // Phase 7: one in-flight request slot (MCP stdio is serial).
     let mut in_flight: Option<InFlightRequest> = None;
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut stdin_buf: Vec<u8> = Vec::with_capacity(4096);
 
     // First run — use the relay handle we were given.
-    match run_relay_with_cache(relay, &mut cache, &mut in_flight).await? {
-        RelayExit::StdinClosed => return Ok(None),
-        RelayExit::DaemonClosed => {} // fall through to recovery loop
+    match run_relay_with_cache(
+        relay,
+        &mut cache,
+        &mut in_flight,
+        &mut stdin,
+        &mut stdout,
+        &mut stdin_buf,
+    )
+    .await
+    {
+        Ok(RelayExit::StdinClosed) => return RelaySupervisionOutcome::ClientClosed,
+        Ok(RelayExit::DaemonClosed) => {} // fall through to recovery loop
+        Err(e) => {
+            return RelaySupervisionOutcome::Fatal {
+                error: e.context("relay initial connection failed"),
+            };
+        }
     }
 
     // Recovery loop — bounded by RELAY_RECOVERY_BUDGET.
@@ -770,10 +971,12 @@ pub(crate) async fn run_relay_supervised(
 
     loop {
         if Instant::now() >= recovery_deadline {
-            anyhow::bail!(
-                "attic: relay could not reconnect to a daemon within \
-                 {RELAY_RECOVERY_BUDGET:?}; giving up"
-            );
+            return RelaySupervisionOutcome::Fatal {
+                error: anyhow::anyhow!(
+                    "attic: relay could not reconnect to a daemon within \
+                     {RELAY_RECOVERY_BUDGET:?}; giving up"
+                ),
+            };
         }
 
         // Back-off before retrying election.
@@ -790,23 +993,43 @@ pub(crate) async fn run_relay_supervised(
             recovery_deadline.saturating_duration_since(Instant::now()),
         );
 
-        match elect(db_path).await? {
-            // ── relay wins election: caller must start the replacement daemon ──
-            ElectionResult::Daemon(handle) => {
-                info!("relay: won daemon election; returning handle to lifecycle layer");
-                return Ok(Some(handle));
+        match elect(db_path).await {
+            Err(e) => {
+                return RelaySupervisionOutcome::Fatal {
+                    error: e.context("relay recovery: election failed"),
+                };
+            }
+
+            // ── relay wins election: return promotion outcome with recovery state ──
+            Ok(ElectionResult::Daemon(handle)) => {
+                info!(
+                    "relay: won daemon election; returning PromoteToDaemon \
+                     (relay will remain alive for existing MCP client)"
+                );
+                return RelaySupervisionOutcome::PromoteToDaemon {
+                    daemon_handle: handle,
+                    recovery_state: RelayRecoveryState {
+                        session_cache: cache,
+                        interrupted_request: in_flight,
+                        stdin,
+                        stdout,
+                        pending_stdin: stdin_buf,
+                    },
+                };
             }
 
             // ── fallback: no IPC, serve inline — relay cannot do this ──
-            ElectionResult::Fallback(_lock) => {
-                anyhow::bail!(
-                    "attic: relay won the daemon lock but IPC setup failed; \
-                     cannot continue in relay mode"
-                );
+            Ok(ElectionResult::Fallback(_lock)) => {
+                return RelaySupervisionOutcome::Fatal {
+                    error: anyhow::anyhow!(
+                        "attic: relay won the daemon lock but IPC setup failed; \
+                         cannot continue in relay mode"
+                    ),
+                };
             }
 
             // ── connected to a (new) daemon: replay session + resume ──
-            ElectionResult::Relay(new_relay) => {
+            Ok(ElectionResult::Relay(new_relay)) => {
                 let mut stream = new_relay.stream;
 
                 // Replay MCP initialization onto the new daemon connection.
@@ -832,7 +1055,9 @@ pub(crate) async fn run_relay_supervised(
                             "relay: retrying in-flight read-only request \
                              against new daemon (max 1 retry)"
                         );
-                        if stream.write_all(&req.framed).await.is_err() {
+                        if stream.write_all(&req.framed).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
                             warn!(
                                 "relay: retry write failed; new daemon connection \
                                  already broken"
@@ -859,7 +1084,8 @@ pub(crate) async fn run_relay_supervised(
                              flight. Its completion state is unknown. The operation \
                              was not automatically retried.",
                         );
-                        let _ = tokio::io::stdout().write_all(&err_bytes).await;
+                        let _ = stdout.write_all(&err_bytes).await;
+                        let _ = stdout.flush().await;
                         warn!(
                             method = %req.method,
                             id    = %req.id_raw,
@@ -874,13 +1100,21 @@ pub(crate) async fn run_relay_supervised(
                     RelayHandle { stream },
                     &mut cache,
                     &mut in_flight,
+                    &mut stdin,
+                    &mut stdout,
+                    &mut stdin_buf,
                 )
-                .await?
+                .await
                 {
-                    RelayExit::StdinClosed => return Ok(None),
-                    RelayExit::DaemonClosed => {
+                    Ok(RelayExit::StdinClosed) => return RelaySupervisionOutcome::ClientClosed,
+                    Ok(RelayExit::DaemonClosed) => {
                         // Another disconnect — keep looping within the budget.
                         warn!("relay: new daemon connection also closed; continuing recovery loop");
+                    }
+                    Err(e) => {
+                        return RelaySupervisionOutcome::Fatal {
+                            error: e.context("relay: connection error during recovery"),
+                        };
                     }
                 }
             }
@@ -940,8 +1174,13 @@ async fn handle_connection(
     let _guard = ConnectionGuard::new(active);
     debug!("daemon: new IPC connection accepted");
     let (read_half, write_half) = stream.split();
-    if let Err(e) = server.serve((read_half, write_half)).await {
-        warn!("daemon: connection ended with error: {e}");
+    match server.serve((read_half, write_half)).await {
+        Ok(running) => {
+            let _ = running.waiting().await;
+        }
+        Err(e) => {
+            warn!("daemon: connection ended with error: {e}");
+        }
     }
     debug!("daemon: IPC connection closed");
     // Wake up the idle-timeout check in run_daemon_accept_loop.
@@ -969,10 +1208,167 @@ impl Drop for ConnectionGuard {
 /// `ATTIC_NO_DAEMON=0` that wins election still reads from its own stdin.
 #[allow(dead_code)]
 pub(crate) async fn handle_stdio_connection(server: AtticServer) -> anyhow::Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    server.serve((stdin, stdout)).await?;
+    let running = server.serve(rmcp::transport::stdio()).await?;
+    let _ = running.waiting().await;
     Ok(())
+}
+
+/// Spawn the daemon accept loop on a background task so the caller retains
+/// control of the current async flow. The returned `JoinHandle` completes
+/// when the daemon accept loop exits (idle timeout, shutdown signal, or
+/// error).
+///
+/// The `ready_tx` oneshot is sent `()` as soon as the daemon listener is
+/// known to be ready for connections (which is immediately, since
+/// `DaemonHandle` already holds a bound listener). This explicit readiness
+/// signal avoids arbitrary sleeps.
+///
+/// # Arguments
+/// * `server`  — fully constructed `AtticServer` (normal production path).
+/// * `semantic_enricher` — optional background enrichment worker.
+/// * `handle`  — the `DaemonHandle` from winning the election.
+/// * `ready_tx` — oneshot sender signaling listener readiness.
+pub(crate) fn spawn_daemon(
+    server: AtticServer,
+    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
+    handle: DaemonHandle,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        // The listener in `handle` is already bound — it was created during
+        // election (try_become_daemon). Signal readiness immediately.
+        let _ = ready_tx.send(());
+        info!("daemon: spawned replacement daemon accept loop");
+        run_daemon_accept_loop(server, semantic_enricher, handle, false).await
+    })
+}
+
+/// Resume the relay after this process was promoted to daemon during
+/// recovery. Connects the relay to the replacement daemon via local IPC,
+/// replays the MCP session, handles any interrupted request, and then
+/// continues forwarding stdin/stdout traffic until the MCP client
+/// disconnects.
+///
+/// This function blocks until the MCP client closes stdin (normal relay
+/// exit). The caller should await both this and the daemon task's
+/// `JoinHandle`.
+///
+/// # Arguments
+/// * `db_path` — path to `attic.db` (used to derive the IPC socket name).
+/// * `recovery` — session cache + interrupted request from the pre-promotion
+///   relay session.
+pub(crate) async fn resume_relay_after_promotion(
+    db_path: &Path,
+    recovery: RelayRecoveryState,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let RelayRecoveryState {
+        mut session_cache,
+        mut interrupted_request,
+        mut stdin,
+        mut stdout,
+        mut pending_stdin,
+    } = recovery;
+
+    // Connect to the replacement daemon using the same IPC mechanism as
+    // a normal relay. The daemon was already started and signaled readiness
+    // before this function is called.
+    let socket_name = derive_socket_name(db_path);
+    info!(
+        socket = %socket_name,
+        "relay promotion: connecting to replacement daemon via local IPC"
+    );
+
+    let mut stream = connect_stream(&socket_name).await.map_err(|e| {
+        anyhow::anyhow!(
+            "relay promotion: failed to connect to replacement daemon \
+             at socket '{socket_name}': {e}"
+        )
+    })?;
+
+    info!("relay promotion: connected to replacement daemon");
+
+    // Replay MCP initialization onto the new daemon connection.
+    if !session_cache.replay_to(&mut stream).await {
+        anyhow::bail!(
+            "relay promotion: failed to replay MCP initialization \
+             to replacement daemon"
+        );
+    }
+    info!("relay promotion: MCP initialization replayed successfully");
+
+    // Phase 7: handle the interrupted in-flight request.
+    if let Some(req) = interrupted_request.take() {
+        if is_safe_readonly_method(&req.method) {
+            info!(
+                method = %req.method,
+                id    = %req.id_raw,
+                "relay promotion: retrying safe read-only in-flight request"
+            );
+            if stream.write_all(&req.framed).await.is_err() || stream.flush().await.is_err() {
+                warn!(
+                    "relay promotion: retry write failed; \
+                     replacement daemon connection broken"
+                );
+                anyhow::bail!(
+                    "relay promotion: replacement daemon connection \
+                     broke during in-flight retry"
+                );
+            }
+            // Re-arm for completeness (the response will flow through
+            // run_relay_supervised's own in-flight tracker below).
+            #[allow(unused_assignments)]
+            {
+                interrupted_request = Some(InFlightRequest {
+                    id_raw: req.id_raw,
+                    method: req.method,
+                    framed: req.framed,
+                    delivery: DeliveryState::Sent,
+                });
+            }
+        } else {
+            // Mutation or unknown method — synthesize error, never replay.
+            let err_bytes = make_jsonrpc_error_response(
+                &req.id_raw,
+                -32603,
+                "The daemon disconnected while this operation was in \
+                 flight. Its completion state is unknown. The operation \
+                 was not automatically retried.",
+            );
+            let _ = stdout.write_all(&err_bytes).await;
+            let _ = stdout.flush().await;
+            warn!(
+                method = %req.method,
+                id    = %req.id_raw,
+                "relay promotion: synthesized error for unsafe in-flight request"
+            );
+        }
+    }
+
+    info!("relay promotion: resuming normal relay forwarding");
+
+    // Splice traffic between the existing stdio client and the replacement daemon.
+    let relay = RelayHandle { stream };
+    match run_relay_with_cache(
+        relay,
+        &mut session_cache,
+        &mut interrupted_request,
+        &mut stdin,
+        &mut stdout,
+        &mut pending_stdin,
+    )
+    .await?
+    {
+        RelayExit::StdinClosed => {
+            info!("relay promotion: MCP client closed normally");
+            Ok(())
+        }
+        RelayExit::DaemonClosed => {
+            warn!("relay promotion: replacement daemon closed connection");
+            Ok(())
+        }
+    }
 }
 
 /// Accept loop run by the daemon process.  Accepts IPC connections from relay
@@ -986,6 +1382,7 @@ pub(crate) async fn run_daemon_accept_loop(
     server: AtticServer,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
     handle: DaemonHandle,
+    serve_stdio: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -1015,8 +1412,7 @@ pub(crate) async fn run_daemon_accept_loop(
 
     // Internal shutdown-signal channel — used to ask the loop to stop
     // cleanly (e.g. on Ctrl+C).
-    let (shutdown_tx, mut shutdown_rx) =
-        tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Ctrl+C / SIGINT handler — mirrors serve_until_closed.
     let _ctrl_c = tokio::spawn(async move {
@@ -1030,6 +1426,31 @@ pub(crate) async fn run_daemon_accept_loop(
     let active_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let idle_timeout = idle_timeout();
     let mut idle_since: Option<Instant> = None;
+
+    // When launched directly as the primary daemon (serve_stdio = true),
+    // this process's own caller is talking to it over stdin/stdout (e.g. AI
+    // client or integration test runner). Serve that stdio connection
+    // concurrently with the IPC accept loop, tracking it in active_connections
+    // so idle-timeout triggers only after both stdio and all IPC relays close.
+    if serve_stdio {
+        let stdin_server = server.clone();
+        let stdin_active = Arc::clone(&active_connections);
+        let stdin_handles = Arc::clone(&handles);
+        tokio::spawn(async move {
+            let _guard = ConnectionGuard::new(stdin_active);
+            debug!("daemon: starting own stdio MCP session");
+            match stdin_server.serve(rmcp::transport::stdio()).await {
+                Ok(running) => {
+                    let _ = running.waiting().await;
+                }
+                Err(e) => {
+                    debug!("daemon: own stdio connection ended: {e}");
+                }
+            }
+            debug!("daemon: own stdio connection closed");
+            drop(stdin_handles);
+        });
+    }
 
     loop {
         // Idle-timeout check.
@@ -1097,15 +1518,14 @@ pub(crate) async fn run_daemon_accept_loop(
     //
     // `Arc::try_unwrap` may fail if a connection task is still running;
     // fall back to a clone so shutdown still proceeds rather than hanging.
-    let sh = Arc::try_unwrap(handles)
-        .unwrap_or_else(|arc| ShutdownHandles {
-            writer: arc.writer.clone(),
-            db_path: arc.db_path.clone(),
-            watches: arc.watches.clone(),
-            bootstrap_jobs: arc.bootstrap_jobs.clone(),
-            scheduler: arc.scheduler.clone(),
-            rss_sampler: None, // already cancelled above via the Arc'd copy
-        });
+    let sh = Arc::try_unwrap(handles).unwrap_or_else(|arc| ShutdownHandles {
+        writer: arc.writer.clone(),
+        db_path: arc.db_path.clone(),
+        watches: arc.watches.clone(),
+        bootstrap_jobs: arc.bootstrap_jobs.clone(),
+        scheduler: arc.scheduler.clone(),
+        rss_sampler: None, // already cancelled above via the Arc'd copy
+    });
 
     run_shutdown_sequence(sh, semantic_enricher, "daemon accept loop exited").await;
     Ok(())
@@ -1129,4 +1549,116 @@ pub(crate) fn relay_recovery_info() -> HashMap<&'static str, String> {
             .join(","),
     );
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_readonly_method_allowlist() {
+        // Safe read-only methods must return true
+        assert!(is_safe_readonly_method("initialize"));
+        assert!(is_safe_readonly_method("ping"));
+        assert!(is_safe_readonly_method("tools/list"));
+        assert!(is_safe_readonly_method("resources/list"));
+        assert!(is_safe_readonly_method("resources/read"));
+        assert!(is_safe_readonly_method("prompts/list"));
+        assert!(is_safe_readonly_method("prompts/get"));
+        assert!(is_safe_readonly_method("search"));
+        assert!(is_safe_readonly_method("search/semantic"));
+        assert!(is_safe_readonly_method("search/keyword"));
+        assert!(is_safe_readonly_method("search/hybrid"));
+        assert!(is_safe_readonly_method("context"));
+        assert!(is_safe_readonly_method("symbols"));
+        assert!(is_safe_readonly_method("definition"));
+        assert!(is_safe_readonly_method("hover"));
+        assert!(is_safe_readonly_method("references"));
+        assert!(is_safe_readonly_method("status"));
+        assert!(is_safe_readonly_method("health"));
+        assert!(is_safe_readonly_method("diagnostics"));
+        assert!(is_safe_readonly_method("index/status"));
+        assert!(is_safe_readonly_method("workspace/list"));
+        assert!(is_safe_readonly_method("workspace/status"));
+    }
+
+    #[test]
+    fn test_mutation_and_unknown_methods_not_retried() {
+        // Mutations must never be retried
+        assert!(!is_safe_readonly_method("workspace"));
+        assert!(!is_safe_readonly_method("workspace/add"));
+        assert!(!is_safe_readonly_method("workspace/remove"));
+        assert!(!is_safe_readonly_method("workspace/set"));
+        assert!(!is_safe_readonly_method("logging"));
+
+        // Unknown / arbitrary tools must never be retried (fail-safe opt-in allowlist)
+        assert!(!is_safe_readonly_method("unknown_tool"));
+        assert!(!is_safe_readonly_method("arbitrary/action"));
+        assert!(!is_safe_readonly_method(""));
+    }
+
+    #[test]
+    fn test_extract_jsonrpc_id_and_method() {
+        let msg = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"status\"}";
+        assert_eq!(extract_jsonrpc_id(msg), Some("42".to_string()));
+        assert_eq!(extract_jsonrpc_method(msg), Some("status"));
+
+        let str_id = b"{\"jsonrpc\":\"2.0\",\"id\":\"req-abc-123\",\"method\":\"search\"}";
+        assert_eq!(
+            extract_jsonrpc_id(str_id),
+            Some("\"req-abc-123\"".to_string())
+        );
+        assert_eq!(extract_jsonrpc_method(str_id), Some("search"));
+
+        let no_id = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        assert_eq!(extract_jsonrpc_id(no_id), None);
+        assert_eq!(
+            extract_jsonrpc_method(no_id),
+            Some("notifications/initialized")
+        );
+    }
+
+    #[test]
+    fn test_make_jsonrpc_error_response() {
+        let err = make_jsonrpc_error_response("42", -32603, "Daemon disconnected");
+        let err_str = std::str::from_utf8(&err).expect("valid utf8");
+        assert!(err_str.ends_with('\n'));
+        assert!(err_str.contains("\"id\":42"));
+        assert!(err_str.contains("\"code\":-32603"));
+        assert!(err_str.contains("\"Daemon disconnected\""));
+    }
+
+    #[test]
+    fn test_parse_one_framed_message() {
+        // Content-Length framing (LSP style)
+        let body = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}";
+        let raw = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let parsed = parse_one_framed_message(raw.as_bytes(), 0);
+        assert!(parsed.is_some());
+        let (framed, next) = parsed.unwrap();
+        assert_eq!(framed, raw.as_bytes());
+        assert_eq!(next, raw.len());
+
+        // Newline-delimited framing (MCP style)
+        let mcp_raw = format!("{body}\n");
+        let parsed_mcp = parse_one_framed_message(mcp_raw.as_bytes(), 0);
+        assert!(parsed_mcp.is_some());
+        let (framed_mcp, next_mcp) = parsed_mcp.unwrap();
+        assert_eq!(framed_mcp, mcp_raw.as_bytes());
+        assert_eq!(next_mcp, mcp_raw.len());
+    }
+
+    #[test]
+    fn test_relay_recovery_info() {
+        let info = relay_recovery_info();
+        assert_eq!(info.get("recovery_budget_secs").unwrap(), "30");
+        assert_eq!(info.get("backoff_steps_ms").unwrap(), "100,250,500,1000");
+    }
+
+    #[test]
+    fn test_derive_socket_name_deterministic() {
+        let p1 = Path::new("C:/test/path/attic.db");
+        let p2 = Path::new("C:/test/path/attic.db");
+        assert_eq!(derive_socket_name(p1), derive_socket_name(p2));
+    }
 }

@@ -8,8 +8,8 @@
 // - update_effective_limits: called from refresh_process_memory and
 //   announce_pressure_change to keep all effective counters in sync.
 
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use attic_core::ResourcePressure;
@@ -178,7 +178,7 @@ fn ceil_frac(n: usize, numer: usize, denom: usize) -> usize {
     if n == 0 || numer == 0 {
         return 0;
     }
-    (n.saturating_mul(numer) + denom - 1) / denom
+    n.saturating_mul(numer).div_ceil(denom)
 }
 
 /// Compute the effective maximum indexing-heavy permits given `max` and current `pressure`.
@@ -281,6 +281,8 @@ pub struct ResourceMonitor {
     // Phase 93+: Condvar notifications
     indexing_capacity_notify: Arc<(Mutex<()>, Condvar)>,
     embedding_capacity_notify: Arc<(Mutex<()>, Condvar)>,
+    // Phase 96: deterministic testing hooks
+    forced_pressure_tier: AtomicU64,
 }
 
 // ── RAII guards ────────────────────────────────────────────────────────────
@@ -374,14 +376,32 @@ impl ResourceMonitor {
                 .unwrap_or(resources::MIN_FREE_MEMORY_MIB),
         );
         let default_embedding_batch = 64usize;
-        Self {
+        let forced_val = match std::env::var("ATTIC_FORCE_RESOURCE_PRESSURE")
+            .ok()
+            .as_deref()
+        {
+            Some("normal") => 1,
+            Some("warning") => 2,
+            Some("critical") => 3,
+            Some("emergency") => 4,
+            _ => 0,
+        };
+        let init_tier = match forced_val {
+            1 => TIER_NORMAL,
+            2 => TIER_WARNING,
+            3 => TIER_CRITICAL,
+            4 => TIER_EMERGENCY,
+            _ => TIER_NORMAL,
+        };
+        let is_emergency = forced_val == 4;
+        let monitor = Self {
             memory_used: AtomicU64::new(0),
             process_rss_mib: AtomicU64::new(0),
             peak_memory_used: AtomicU64::new(0),
             last_rss_sample_ms: AtomicU64::new(0),
             foreground_slots: AtomicUsize::new(0),
             background_slots: AtomicUsize::new(0),
-            emergency_mode: AtomicBool::new(false),
+            emergency_mode: AtomicBool::new(is_emergency),
             start_time: Instant::now(),
             max_memory_mib: AtomicU64::new(max_memory_mib),
             per_repo_memory_mib: AtomicU64::new(
@@ -392,7 +412,7 @@ impl ResourceMonitor {
             min_free_memory_mib: AtomicU64::new(min_free_memory_mib),
             foreground_capacity: AtomicUsize::new(foreground),
             background_capacity: AtomicUsize::new(background),
-            hysteresis_tier: AtomicU64::new(TIER_NORMAL),
+            hysteresis_tier: AtomicU64::new(init_tier),
             hysteresis_exit_eligible_ms: AtomicU64::new(0),
             indexing_heavy_active: AtomicUsize::new(0),
             max_indexing_heavy: AtomicUsize::new(background),
@@ -408,7 +428,12 @@ impl ResourceMonitor {
             daemon_reconnect_count: AtomicU64::new(0),
             indexing_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
             embedding_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
+            forced_pressure_tier: AtomicU64::new(forced_val),
+        };
+        if forced_val != 0 {
+            monitor.update_effective_limits();
         }
+        monitor
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -512,7 +537,14 @@ impl ResourceMonitor {
         let now = self.elapsed_ms();
         let stable_for = now.saturating_sub(since_ms);
 
-        if stable_for >= stage.stability_required_ms() {
+        let required_ms = if let Ok(fast) = std::env::var("ATTIC_FAST_RECOVERY_MS") {
+            fast.parse::<u64>()
+                .unwrap_or_else(|_| stage.stability_required_ms())
+        } else {
+            stage.stability_required_ms()
+        };
+
+        if stable_for >= required_ms {
             let next = stage.advance();
             self.recovery_stage.store(next.as_u64(), Ordering::Release);
             self.recovery_stage_since_ms.store(now, Ordering::Release);
@@ -522,6 +554,42 @@ impl ResourceMonitor {
                 stable_for_ms = stable_for,
                 "recovery stage advanced"
             );
+        }
+    }
+
+    fn check_file_pressure_override(&self) {
+        let mut paths = Vec::new();
+        if let Ok(p) = std::env::var("ATTIC_PRESSURE_OVERRIDE_FILE") {
+            paths.push(std::path::PathBuf::from(p));
+        }
+        if let Ok(home) = std::env::var("ATTIC_HOME") {
+            paths.push(std::path::PathBuf::from(home).join("pressure_override"));
+        }
+        if let Ok(db) = std::env::var("ATTIC_DB_PATH")
+            && let Some(parent) = std::path::Path::new(&db).parent()
+        {
+            paths.push(parent.join("pressure_override"));
+        }
+
+        for p in paths {
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                let trimmed = content.trim().to_lowercase();
+                let forced = match trimmed.as_str() {
+                    "normal" => Some(ResourcePressure::Normal),
+                    "warning" => Some(ResourcePressure::Warning),
+                    "critical" => Some(ResourcePressure::Critical),
+                    "emergency" => Some(ResourcePressure::Emergency),
+                    _ => None,
+                };
+                self.set_forced_pressure_for_testing(forced);
+                return;
+            }
+        }
+
+        if std::env::var("ATTIC_FORCE_RESOURCE_PRESSURE").is_err()
+            && self.forced_pressure_tier.load(Ordering::Relaxed) != 0
+        {
+            self.set_forced_pressure_for_testing(None);
         }
     }
 
@@ -539,6 +607,14 @@ impl ResourceMonitor {
             return;
         }
         self.last_rss_sample_ms.store(now, Ordering::Relaxed);
+
+        self.check_file_pressure_override();
+
+        if self.forced_pressure_tier.load(Ordering::Relaxed) != 0 {
+            self.update_effective_limits();
+            return;
+        }
+
         if let Some(rss) = sample_process_rss_mib() {
             self.process_rss_mib.store(rss, Ordering::Relaxed);
             let accounted = self.memory_used.load(Ordering::Relaxed);
@@ -564,10 +640,7 @@ impl ResourceMonitor {
         let now = self.elapsed_ms();
 
         // Compute instantaneous raw pressure.
-        let raw = if max == 0 {
-            ResourcePressure::Normal
-        } else {
-            let used_pct = effective_mib.saturating_mul(100) / max;
+        let raw = if let Some(used_pct) = effective_mib.saturating_mul(100).checked_div(max) {
             let free_mib = max.saturating_sub(effective_mib);
             if free_mib <= min_free {
                 ResourcePressure::Emergency
@@ -578,6 +651,8 @@ impl ResourceMonitor {
             } else {
                 ResourcePressure::Normal
             }
+        } else {
+            ResourcePressure::Normal
         };
 
         let current_tier = self.hysteresis_tier.load(Ordering::Relaxed);
@@ -607,11 +682,10 @@ impl ResourceMonitor {
             };
 
             let max_for_pct = self.max_memory_mib.load(Ordering::Relaxed);
-            let pct = if max_for_pct == 0 {
-                0
-            } else {
-                effective_mib.saturating_mul(100) / max_for_pct
-            };
+            let pct = effective_mib
+                .saturating_mul(100)
+                .checked_div(max_for_pct)
+                .unwrap_or(0);
 
             if pct >= exit_pct {
                 // Not yet below the exit band.
@@ -639,11 +713,7 @@ impl ResourceMonitor {
         }
     }
 
-    fn announce_pressure_change(
-        &self,
-        old: ResourcePressure,
-        new: ResourcePressure,
-    ) {
+    fn announce_pressure_change(&self, old: ResourcePressure, new: ResourcePressure) {
         info!(
             old_pressure = ?old,
             new_pressure = ?new,
@@ -680,7 +750,10 @@ impl ResourceMonitor {
 
     /// Record a decrease in accountable memory usage by `mib` MiB.
     pub fn record_memory_decrease(&self, mib: u64) {
-        self.memory_used.fetch_sub(mib.min(self.memory_used.load(Ordering::Relaxed)), Ordering::AcqRel);
+        self.memory_used.fetch_sub(
+            mib.min(self.memory_used.load(Ordering::Relaxed)),
+            Ordering::AcqRel,
+        );
     }
 
     // ── Foreground slot management ─────────────────────────────────────────
@@ -707,6 +780,7 @@ impl ResourceMonitor {
     /// Try to acquire a foreground slot, returning `Some(guard)` or `None` if capacity
     /// is exhausted.
     pub fn try_foreground(&self) -> Option<ForegroundSlotGuard<'_>> {
+        self.refresh_process_memory();
         self.acquire_foreground_slot()
     }
 
@@ -967,11 +1041,60 @@ impl ResourceMonitor {
         self.update_effective_limits();
     }
 
+    /// Manually force a resource pressure tier for deterministic testing.
+    ///
+    /// Pass `Some(tier)` to override dynamic RSS/hysteresis tracking, or `None`
+    /// to resume normal dynamic tracking.
+    pub fn set_forced_pressure_for_testing(&self, pressure: Option<ResourcePressure>) {
+        let old = self.guidance_pressure();
+        let val = match pressure {
+            None => 0,
+            Some(ResourcePressure::Normal) => 1,
+            Some(ResourcePressure::Warning) => 2,
+            Some(ResourcePressure::Critical) => 3,
+            Some(ResourcePressure::Emergency) => 4,
+        };
+        self.forced_pressure_tier.store(val, Ordering::Release);
+        if let Some(p) = pressure {
+            self.hysteresis_tier
+                .store(tier_from_pressure(p), Ordering::Release);
+            if matches!(p, ResourcePressure::Emergency) {
+                self.emergency_mode.store(true, Ordering::Release);
+            } else {
+                self.emergency_mode.store(false, Ordering::Release);
+            }
+            if old != p {
+                self.announce_pressure_change(old, p);
+            }
+        } else {
+            self.emergency_mode.store(false, Ordering::Release);
+            self.hysteresis_tier.store(TIER_NORMAL, Ordering::Release);
+            if old != ResourcePressure::Normal {
+                self.announce_pressure_change(old, ResourcePressure::Normal);
+            }
+        }
+        self.update_effective_limits();
+    }
+
+    /// Manually set the recovery stage for deterministic testing.
+    pub fn set_recovery_stage_for_testing(&self, stage: RecoveryStage) {
+        self.recovery_stage.store(stage.as_u64(), Ordering::Release);
+        self.recovery_stage_since_ms
+            .store(self.elapsed_ms(), Ordering::Release);
+        self.update_effective_limits();
+    }
+
     // ── Pressure accessors ─────────────────────────────────────────────────
 
     /// Return the raw hysteresis-smoothed pressure tier (internal helper).
     pub fn guidance_pressure(&self) -> ResourcePressure {
-        pressure_from_tier(self.hysteresis_tier.load(Ordering::Relaxed))
+        match self.forced_pressure_tier.load(Ordering::Relaxed) {
+            1 => ResourcePressure::Normal,
+            2 => ResourcePressure::Warning,
+            3 => ResourcePressure::Critical,
+            4 => ResourcePressure::Emergency,
+            _ => pressure_from_tier(self.hysteresis_tier.load(Ordering::Relaxed)),
+        }
     }
 
     /// Return the stable hysteresis-smoothed [`ResourcePressure`] tier.
@@ -1048,15 +1171,11 @@ impl ResourceConfig {
     /// Validate the configuration, returning an error string if any field is
     /// out of range.
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(v) = self.total_memory_budget_mib {
-            if v == 0 {
-                return Err("total_memory_budget_mib must be > 0".to_string());
-            }
+        if let Some(0) = self.total_memory_budget_mib {
+            return Err("total_memory_budget_mib must be > 0".to_string());
         }
-        if let Some(v) = self.max_foreground_queries {
-            if v == 0 {
-                return Err("max_foreground_queries must be > 0".to_string());
-            }
+        if let Some(0) = self.max_foreground_queries {
+            return Err("max_foreground_queries must be > 0".to_string());
         }
         Ok(())
     }
@@ -1284,5 +1403,56 @@ mod tests {
         assert_eq!(m.daemon_reconnect_count.load(Ordering::Relaxed), 0);
         m.daemon_reconnect_count.fetch_add(1, Ordering::Relaxed);
         assert_eq!(m.daemon_reconnect_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_set_forced_pressure_for_testing() {
+        let m = monitor_with_budget(8192);
+        m.apply_resource_policy(8, 6, 64);
+        assert_eq!(m.pressure(), ResourcePressure::Normal);
+        assert_eq!(m.effective_indexing_heavy_limit(), 8);
+
+        m.set_forced_pressure_for_testing(Some(ResourcePressure::Warning));
+        assert_eq!(m.pressure(), ResourcePressure::Warning);
+        assert_eq!(m.effective_indexing_heavy_limit(), 6);
+        assert_eq!(m.current_embedding_batch(), 32);
+
+        m.set_forced_pressure_for_testing(Some(ResourcePressure::Critical));
+        assert_eq!(m.pressure(), ResourcePressure::Critical);
+        assert_eq!(m.effective_indexing_heavy_limit(), 2);
+        assert_eq!(m.current_embedding_batch(), 16);
+
+        m.set_forced_pressure_for_testing(Some(ResourcePressure::Emergency));
+        assert_eq!(m.pressure(), ResourcePressure::Emergency);
+        assert!(m.is_emergency());
+        assert_eq!(m.effective_indexing_heavy_limit(), 0);
+        assert_eq!(m.current_embedding_batch(), 0);
+
+        m.set_forced_pressure_for_testing(None);
+        assert_eq!(m.pressure(), ResourcePressure::Normal);
+        assert!(!m.is_emergency());
+        assert_eq!(m.effective_indexing_heavy_limit(), 8);
+    }
+
+    #[test]
+    fn test_set_recovery_stage_for_testing() {
+        let m = monitor_with_budget(8192);
+        m.apply_resource_policy(8, 6, 64);
+
+        m.set_recovery_stage_for_testing(RecoveryStage::Step1);
+        assert_eq!(m.recovery_stage(), RecoveryStage::Step1);
+        assert_eq!(m.effective_indexing_heavy_limit(), 2);
+
+        m.set_recovery_stage_for_testing(RecoveryStage::Step2);
+        assert_eq!(m.recovery_stage(), RecoveryStage::Step2);
+        assert_eq!(m.effective_indexing_heavy_limit(), 4);
+
+        m.set_recovery_stage_for_testing(RecoveryStage::Step3);
+        assert_eq!(m.recovery_stage(), RecoveryStage::Step3);
+        assert_eq!(m.effective_indexing_heavy_limit(), 6);
+
+        m.set_recovery_stage_for_testing(RecoveryStage::Full);
+        assert_eq!(m.recovery_stage(), RecoveryStage::Full);
+        assert_eq!(m.effective_indexing_heavy_limit(), 8);
     }
 }

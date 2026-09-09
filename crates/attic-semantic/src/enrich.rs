@@ -408,10 +408,7 @@ impl BackgroundEnricher {
                 while !stop2.is_cancelled() {
                     if let Some(monitor) = resource_monitor.as_ref() {
                         use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
-                        if matches!(
-                            current_advisory(monitor),
-                            ResourceAdvisory::Restricted
-                        ) {
+                        if matches!(current_advisory(monitor), ResourceAdvisory::Restricted) {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
                         }
@@ -477,34 +474,35 @@ impl BackgroundEnricher {
                     // skipping the advisory check entirely.
                     let _embed_permit;
                     let effective_cfg;
-                    let drive_cfg: &EnrichmentConfig =
-                        if let Some(monitor) = resource_monitor.as_ref() {
-                            let dynamic_batch = monitor.current_embedding_batch();
-                            match monitor.acquire_embedding_heavy_blocking(|| stop2.is_cancelled()) {
-                                Some(permit) => {
-                                    _embed_permit = Some(permit);
-                                    effective_cfg = EnrichmentConfig {
-                                        batch_size: dynamic_batch,
-                                        ..cfg.clone()
-                                    };
-                                    &effective_cfg
-                                }
-                                None => {
-                                    // Cancelled (stop2) or Emergency — sleep
-                                    // and retry rather than driving with no
-                                    // permit.
-                                    _embed_permit = None;
-                                    std::thread::sleep(jittered(Duration::from_millis(200)));
-                                    continue;
-                                }
+                    let drive_cfg: &EnrichmentConfig = if let Some(monitor) =
+                        resource_monitor.as_ref()
+                    {
+                        let dynamic_batch = monitor.current_embedding_batch();
+                        match monitor.acquire_embedding_heavy_blocking(|| stop2.is_cancelled()) {
+                            Some(permit) => {
+                                _embed_permit = Some(permit);
+                                effective_cfg = EnrichmentConfig {
+                                    batch_size: dynamic_batch,
+                                    ..cfg.clone()
+                                };
+                                &effective_cfg
                             }
-                        } else {
-                            // No resource monitor (tests / no-daemon mode) —
-                            // use the static config unchanged.
-                            _embed_permit = None;
-                            effective_cfg = cfg.clone();
-                            &effective_cfg
-                        };
+                            None => {
+                                // Cancelled (stop2) or Emergency — sleep
+                                // and retry rather than driving with no
+                                // permit.
+                                _embed_permit = None;
+                                std::thread::sleep(jittered(Duration::from_millis(200)));
+                                continue;
+                            }
+                        }
+                    } else {
+                        // No resource monitor (tests / no-daemon mode) —
+                        // use the static config unchanged.
+                        _embed_permit = None;
+                        effective_cfg = cfg.clone();
+                        &effective_cfg
+                    };
 
                     match drive(
                         &conn,

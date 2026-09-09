@@ -3261,6 +3261,7 @@ fn validate_configured_roots(raw_roots: Vec<PathBuf>) -> RootValidation {
 /// for the full election design). Each variant carries whatever guard must
 /// be kept alive for the remainder of `main`'s lifetime — in both cases,
 /// the `attic.lock` advisory lock.
+#[allow(clippy::large_enum_variant)]
 enum Ownership {
     /// `ATTIC_NO_DAEMON=1`: today's single-process behavior, unchanged — a
     /// second launch against the same database still hard-fails.
@@ -3268,10 +3269,47 @@ enum Ownership {
     /// This process won the daemon election; `daemon::run_daemon_accept_loop`
     /// takes over instead of `serve_until_closed`.
     Daemon(daemon::DaemonHandle),
+    /// This relay won the daemon election during recovery. The process must
+    /// start the replacement daemon **and** keep the existing relay alive so
+    /// the MCP client's stdin/stdout session is preserved.
+    Promoted {
+        daemon_handle: daemon::DaemonHandle,
+        recovery_state: daemon::RelayRecoveryState,
+    },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Real process entry point. Deliberately NOT `#[tokio::main] async fn main()`:
+/// that expansion builds a `Runtime`, runs `run()` on it, then drops the
+/// `Runtime` before the process exits — and dropping a multi-threaded tokio
+/// runtime BLOCKS until every outstanding task finishes, including tasks
+/// parked in tokio's blocking-I/O thread pool (e.g. an in-flight
+/// `tokio::io::stdin()` read whose Rust-level future was cancelled but whose
+/// underlying OS read syscall is still parked waiting for input that will
+/// never arrive because the writer end is still open). A relay that hits its
+/// bounded recovery timeout and returns `Err` from `run()` would log the
+/// error correctly and then hang indefinitely in that runtime-drop, because
+/// nothing ever forces the process to actually exit — confirmed directly via
+/// `recovery_is_bounded_when_daemon_cannot_start` (§17 item 10): the fatal
+/// error logged at ~40s, but the OS process was still alive at 90s.
+/// `std::process::exit()` sidesteps this entirely: it terminates the process
+/// immediately, running no destructors at all, so the runtime's blocking drop
+/// (and whatever it might be stuck waiting on) never gets a chance to run.
+fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime");
+    let result = rt.block_on(run());
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     // Phase 7: platform-appropriate data/cache/temp policy (see
     // attic_core::paths).  The data root is user-global (OS application-data
     // directory); workspaces are never written to.
@@ -3387,45 +3425,53 @@ async fn main() -> anyhow::Result<()> {
         // "promote relay to daemon" logic: if this process wins, it falls
         // through to the same `Ownership::Daemon` path below as any launch
         // that won on its first try.
-        loop {
-            match daemon::elect(db_path).await? {
-                daemon::ElectionResult::Relay(relay) => {
-                    info!(
-                        "attic relay: another instance already owns database '{}'; \
-                         splicing stdio to its daemon (supervised recovery enabled)",
-                        db_path.display()
-                    );
-                    // Phase 6/7: run_relay_supervised handles bounded
-                    // exponential-backoff re-election and MCP session-cache
-                    // replay internally. Returns Ok(None) when stdin is
-                    // closed (normal exit) or the recovery budget is
-                    // exhausted (unrecoverable — exit cleanly so the client
-                    // sees the disconnect immediately rather than spinning
-                    // here). Returns Ok(Some(handle)) when this relay won
-                    // the daemon election during recovery — fall through to
-                    // the server-construction path below, identical to a
-                    // direct Daemon win at startup.
-                    if let Some(daemon_handle) =
-                        daemon::run_relay_supervised(relay, db_path).await?
-                    {
-                        // Phase 6: relay won daemon election during recovery.
-                        // Use the same production AtticServer construction
-                        // and run_daemon_accept_loop path as a normal Daemon
-                        // election win — no duplicate initialization logic.
-                        break Ownership::Daemon(daemon_handle);
+        match daemon::elect(db_path).await? {
+            daemon::ElectionResult::Relay(relay) => {
+                info!(
+                    "attic relay: another instance already owns database '{}'; \
+                     splicing stdio to its daemon (supervised recovery enabled)",
+                    db_path.display()
+                );
+                // Phase 96: run_relay_supervised handles bounded
+                // exponential-backoff re-election and MCP session-cache
+                // replay internally. Returns an explicit outcome:
+                //
+                // - ClientClosed: stdin closed (normal exit).
+                // - PromoteToDaemon: this relay won election; caller must
+                //   start replacement daemon AND keep relay alive.
+                // - Fatal: unrecoverable error (budget exhausted, etc).
+                match daemon::run_relay_supervised(relay, db_path).await {
+                    daemon::RelaySupervisionOutcome::ClientClosed => {
+                        return Ok(());
                     }
-                    return Ok(());
+                    daemon::RelaySupervisionOutcome::PromoteToDaemon {
+                        daemon_handle,
+                        recovery_state,
+                    } => {
+                        // Phase 96: relay won daemon election during
+                        // recovery. Use the new Promoted ownership
+                        // variant so the lifecycle layer can start the
+                        // daemon AND resume the relay concurrently.
+                        Ownership::Promoted {
+                            daemon_handle,
+                            recovery_state,
+                        }
+                    }
+                    daemon::RelaySupervisionOutcome::Fatal { error } => {
+                        error!("relay supervision failed: {error:#}");
+                        return Err(error);
+                    }
                 }
-                daemon::ElectionResult::Daemon(handle) => break Ownership::Daemon(handle),
-                // [FIX] Daemon socket/IPC setup failed even though this process
-                // already safely holds `attic.lock` (e.g. the local socket/named
-                // pipe bind or the `attic.ipc` write failed). Rather than
-                // hard-killing the whole launch, fall back to the same legacy
-                // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
-                // the lock guard this process already won instead of
-                // re-acquiring it.
-                daemon::ElectionResult::Fallback(lock_file) => break Ownership::Legacy(lock_file),
             }
+            daemon::ElectionResult::Daemon(handle) => Ownership::Daemon(handle),
+            // [FIX] Daemon socket/IPC setup failed even though this process
+            // already safely holds `attic.lock` (e.g. the local socket/named
+            // pipe bind or the `attic.ipc` write failed). Rather than
+            // hard-killing the whole launch, fall back to the same legacy
+            // single-process stdio path `ATTIC_NO_DAEMON=1` takes, reusing
+            // the lock guard this process already won instead of
+            // re-acquiring it.
+            daemon::ElectionResult::Fallback(lock_file) => Ownership::Legacy(lock_file),
         }
     };
 
@@ -3751,7 +3797,79 @@ async fn main() -> anyhow::Result<()> {
     match ownership {
         Ownership::Legacy(_lock_guard) => serve_until_closed(server, semantic_enricher).await,
         Ownership::Daemon(handle) => {
-            daemon::run_daemon_accept_loop(server, semantic_enricher, handle).await
+            daemon::run_daemon_accept_loop(server, semantic_enricher, handle, true).await
+        }
+        Ownership::Promoted {
+            daemon_handle,
+            recovery_state,
+        } => {
+            // Phase 96: This relay won the daemon election during recovery.
+            // The existing MCP client is still connected over stdin/stdout.
+            //
+            // Strategy:
+            //   1. Spawn the daemon accept loop as a background task.
+            //   2. Wait for it to signal listener readiness.
+            //   3. Resume the relay: connect to the replacement daemon via
+            //      local IPC, replay MCP initialization, handle interrupted
+            //      requests, and continue forwarding client traffic.
+            //   4. When the relay finishes (client closes stdin), await the
+            //      daemon task for clean shutdown.
+
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+            info!(
+                "relay promotion: spawning replacement daemon + resuming relay \
+                 (existing MCP client stays connected)"
+            );
+
+            let daemon_task =
+                daemon::spawn_daemon(server, semantic_enricher, daemon_handle, ready_tx);
+
+            // Wait for the daemon to signal readiness before connecting
+            // the relay. This is immediate since the listener was already
+            // bound during election, but we use an explicit signal to
+            // avoid any timing assumptions.
+            if ready_rx.await.is_err() {
+                error!("relay promotion: daemon task failed before signaling readiness");
+                // Try to collect the daemon error.
+                match daemon_task.await {
+                    Ok(Err(e)) => return Err(e.context("daemon failed during promotion")),
+                    Err(e) => return Err(anyhow::anyhow!("daemon task panicked: {e}")),
+                    Ok(Ok(())) => {
+                        return Err(anyhow::anyhow!("daemon exited without signaling readiness"));
+                    }
+                }
+            }
+
+            // Resume the relay: connect to the replacement daemon, replay
+            // session state, handle interrupted requests, then continue
+            // forwarding until the MCP client disconnects.
+            let relay_result = daemon::resume_relay_after_promotion(db_path, recovery_state).await;
+
+            // The relay has finished (client disconnected or error).
+            // The daemon may still be serving other IPC clients — let it
+            // shut down via its own idle timeout / shutdown mechanisms.
+            // But if the relay hit an error, log it.
+            if let Err(ref e) = relay_result {
+                warn!("relay promotion: relay ended with error: {e:#}");
+            }
+
+            // Wait for the daemon task to finish. It will shut down when
+            // idle (no more connected clients) or on Ctrl+C.
+            info!("relay promotion: relay finished; waiting for daemon task");
+            match daemon_task.await {
+                Ok(Ok(())) => {
+                    info!("relay promotion: daemon exited cleanly");
+                }
+                Ok(Err(e)) => {
+                    warn!("relay promotion: daemon exited with error: {e:#}");
+                }
+                Err(e) => {
+                    warn!("relay promotion: daemon task panicked: {e}");
+                }
+            }
+
+            relay_result
         }
     }
 }
