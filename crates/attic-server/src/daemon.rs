@@ -529,26 +529,16 @@ fn is_safe_readonly_method(method: &str) -> bool {
 /// owned string. Returns the literal text — a number like `"42"` or a quoted
 /// string like `"\"abc\""` — so number vs string ids are distinguished.
 fn extract_jsonrpc_id(body: &[u8]) -> Option<String> {
-    let s = std::str::from_utf8(body).ok()?;
-    let key = "\"id\"";
-    let key_pos = s.find(key)?;
-    let after_key = s[key_pos + key.len()..].trim_start_matches([' ', '\t', ':']);
-    if after_key.is_empty() {
-        return None;
+    #[derive(serde::Deserialize)]
+    struct JsonRpcIdHeader {
+        id: Option<serde_json::Value>,
     }
-    if let Some(inner) = after_key.strip_prefix('"') {
-        let end = inner.find('"')?;
-        Some(format!("\"{}\"", &inner[..end]))
-    } else {
-        let end = after_key
-            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
-            .unwrap_or(after_key.len());
-        let raw = after_key[..end].trim();
-        if raw.is_empty() {
-            None
-        } else {
-            Some(raw.to_string())
-        }
+    let h: JsonRpcIdHeader = serde_json::from_slice(body).ok()?;
+    match h.id? {
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(format!("\"{s}\"")),
+        serde_json::Value::Null => Some("null".to_string()),
+        _ => None,
     }
 }
 
@@ -703,38 +693,28 @@ fn parse_one_framed_message(buf: &[u8], offset: usize) -> Option<(Vec<u8>, usize
 }
 
 /// Look for the JSON-RPC `method` field value in a raw UTF-8 body slice.
-/// Returns `Some(method)` on a best-effort parse without pulling in a full
-/// JSON library at this layer. Only called on the tiny subset of messages
-/// needed for cache decisions.
-fn extract_jsonrpc_method(body: &[u8]) -> Option<&str> {
-    let s = std::str::from_utf8(body).ok()?;
-    let key = "\"method\"";
-    let key_pos = s.find(key)?;
-    let after_key = s[key_pos + key.len()..].trim_start_matches([' ', '\t', ':']);
-    if !after_key.starts_with('"') {
-        return None;
+fn extract_jsonrpc_method(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct JsonRpcMethodHeader {
+        method: Option<String>,
     }
-    let inner = &after_key[1..];
-    let end = inner.find('"')?;
-    Some(&inner[..end])
+    let h: JsonRpcMethodHeader = serde_json::from_slice(body).ok()?;
+    h.method
 }
 
 /// Look for a `"params":{"name": "..."}` tool name in a raw UTF-8 body slice
-/// — the shape of every real MCP `tools/call` request. Same best-effort,
-/// no-JSON-library parsing style as [`extract_jsonrpc_method`].
-fn extract_tools_call_name(body: &[u8]) -> Option<&str> {
-    let s = std::str::from_utf8(body).ok()?;
-    let params_pos = s.find("\"params\"")?;
-    let after_params = &s[params_pos..];
-    let name_key = "\"name\"";
-    let key_pos = after_params.find(name_key)?;
-    let after_key = after_params[key_pos + name_key.len()..].trim_start_matches([' ', '\t', ':']);
-    if !after_key.starts_with('"') {
-        return None;
+/// — the shape of every real MCP `tools/call` request.
+fn extract_tools_call_name(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ToolParams {
+        name: Option<String>,
     }
-    let inner = &after_key[1..];
-    let end = inner.find('"')?;
-    Some(&inner[..end])
+    #[derive(serde::Deserialize)]
+    struct ToolCallHeader {
+        params: Option<ToolParams>,
+    }
+    let h: ToolCallHeader = serde_json::from_slice(body).ok()?;
+    h.params?.name
 }
 
 /// Resolve the *effective* method used for retry-safety classification
@@ -747,11 +727,11 @@ fn extract_tools_call_name(body: &[u8]) -> Option<&str> {
 /// Direct JSON-RPC methods (`"initialize"`, `"ping"`, `"tools/list"`, ...)
 /// pass through unchanged. Falls back to `"tools/call"` itself (never on the
 /// allowlist, i.e. fail-safe/never-retried) if the tool name can't be parsed.
-fn effective_method_for_classification<'a>(method: &'a str, body: &'a [u8]) -> &'a str {
+fn effective_method_for_classification(method: &str, body: &[u8]) -> String {
     if method == "tools/call" {
-        extract_tools_call_name(body).unwrap_or(method)
+        extract_tools_call_name(body).unwrap_or_else(|| method.to_owned())
     } else {
-        method
+        method.to_owned()
     }
 }
 
@@ -782,46 +762,6 @@ async fn run_relay_with_cache(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut recv_half, mut send_half) = relay.stream.split();
-
-    // If there were any buffered bytes from before (e.g. read before previous daemon died),
-    // flush them to the daemon now.
-    if !stdin_buf.is_empty() {
-        let mut parse_offset = 0usize;
-        while let Some((framed, next)) = parse_one_framed_message(stdin_buf, parse_offset) {
-            let body = extract_body_slice(&framed);
-            let method = extract_jsonrpc_method(body).map(str::to_owned);
-            match method.as_deref() {
-                Some("initialize") => {
-                    if cache.initialize_request.is_none() {
-                        cache.initialize_request = Some(framed.clone());
-                    }
-                }
-                Some("notifications/initialized") => {
-                    if cache.initialized_notification.is_none() {
-                        cache.initialized_notification = Some(framed.clone());
-                    }
-                }
-                Some(m) => {
-                    if let Some(id_raw) = extract_jsonrpc_id(body) {
-                        *in_flight = Some(InFlightRequest {
-                            id_raw,
-                            method: effective_method_for_classification(m, body).to_owned(),
-                            framed: framed.clone(),
-                            delivery: DeliveryState::Sent,
-                        });
-                    }
-                }
-                None => {}
-            }
-            parse_offset = next;
-        }
-
-        if send_half.write_all(stdin_buf).await.is_err() || send_half.flush().await.is_err() {
-            eprintln!("attic: lost connection to daemon; will reconnect");
-            return Ok(RelayExit::DaemonClosed);
-        }
-        stdin_buf.clear();
-    }
 
     // Two separate read buffers — tokio::select! evaluates both future
     // expressions before polling, which means both `stdin.read(&mut buf)`
@@ -854,7 +794,7 @@ async fn run_relay_with_cache(
                             parse_one_framed_message(stdin_buf, parse_offset)
                         {
                             let body = extract_body_slice(&framed);
-                            let method = extract_jsonrpc_method(body).map(str::to_owned);
+                            let method = extract_jsonrpc_method(body);
                             match method.as_deref() {
                                 Some("initialize") => {
                                     if cache.initialize_request.is_none() {
@@ -869,11 +809,11 @@ async fn run_relay_with_cache(
                                     }
                                 }
                                 Some(m) => {
-                                    // Phase 7: track in-flight request.
+                                    // Track in-flight request for retry or error synthesis.
                                     if let Some(id_raw) = extract_jsonrpc_id(body) {
                                         *in_flight = Some(InFlightRequest {
                                             id_raw,
-                                            method: effective_method_for_classification(m, body).to_owned(),
+                                            method: effective_method_for_classification(m, body),
                                             framed: framed.clone(),
                                             delivery: DeliveryState::Sent,
                                         });
@@ -888,6 +828,7 @@ async fn run_relay_with_cache(
                         if send_half.write_all(stdin_buf).await.is_err()
                             || send_half.flush().await.is_err()
                         {
+                            stdin_buf.clear();
                             eprintln!(
                                 "attic: lost connection to daemon; will reconnect"
                             );
@@ -995,6 +936,20 @@ async fn replay_session_and_resolve_inflight(
     true
 }
 
+async fn observe_and_clean_owned_daemon(owned_daemon: &mut Option<OwnedDaemon>) {
+    if let Some(owned) = owned_daemon.take() {
+        if owned.task.is_finished() {
+            match owned.task.await {
+                Ok(Ok(())) => info!("relay recovery: previously owned daemon task exited cleanly"),
+                Ok(Err(e)) => warn!("relay recovery: previously owned daemon task exited with error: {e:#}"),
+                Err(e) => warn!("relay recovery: previously owned daemon task panicked: {e}"),
+            }
+        } else {
+            *owned_daemon = Some(owned);
+        }
+    }
+}
+
 /// Encapsulates one daemon recovery attempt during reconnect/re-election.
 async fn recover_daemon(
     db_path: &Path,
@@ -1002,17 +957,8 @@ async fn recover_daemon(
     daemon_starter: Option<&DaemonStarter>,
     attempt: usize,
 ) -> anyhow::Result<RecoveredTarget> {
-    // Observe and clean up previously owned daemon task if it completed
-    if let Some(owned) = owned_daemon.as_mut()
-        && owned.task.is_finished()
-    {
-        match (&mut owned.task).await {
-            Ok(Ok(())) => info!("relay recovery: previously owned daemon task exited cleanly"),
-            Ok(Err(e)) => warn!("relay recovery: previously owned daemon task exited with error: {e:#}"),
-            Err(e) => warn!("relay recovery: previously owned daemon task panicked: {e}"),
-        }
-        *owned_daemon = None;
-    }
+    // Observe and clean up previously owned daemon task if it completed before backoff
+    observe_and_clean_owned_daemon(owned_daemon).await;
 
     // Bounded backoff
     let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
@@ -1028,9 +974,13 @@ async fn recover_daemon(
         }
     }
 
+    // Re-check after backoff sleep gives the previous daemon time to complete shutdown
+    observe_and_clean_owned_daemon(owned_daemon).await;
+
     match elect(db_path).await? {
         ElectionResult::Relay(new_relay) => {
             // Another daemon won or already exists.
+            observe_and_clean_owned_daemon(owned_daemon).await;
             if owned_daemon.is_some() {
                 *owned_daemon = None;
             }
@@ -1038,6 +988,7 @@ async fn recover_daemon(
         }
         ElectionResult::Daemon(handle) => {
             if let Some(starter) = daemon_starter {
+                observe_and_clean_owned_daemon(owned_daemon).await;
                 info!("relay: won daemon election during recovery; starting replacement daemon inline");
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let socket_name = derive_socket_name(db_path);
@@ -1425,7 +1376,13 @@ pub(crate) async fn resume_relay_after_promotion(
                         .get(attempt)
                         .copied()
                         .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("relay promotion: SIGINT/Ctrl+C received during recovery backoff; cancelling recovery");
+                            return Err(anyhow::anyhow!("relay recovery cancelled by SIGINT"));
+                        }
+                    }
                     attempt += 1;
 
                     match elect(db_path).await {
@@ -1693,20 +1650,32 @@ mod tests {
     fn test_extract_jsonrpc_id_and_method() {
         let msg = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"status\"}";
         assert_eq!(extract_jsonrpc_id(msg), Some("42".to_string()));
-        assert_eq!(extract_jsonrpc_method(msg), Some("status"));
+        assert_eq!(extract_jsonrpc_method(msg).as_deref(), Some("status"));
 
         let str_id = b"{\"jsonrpc\":\"2.0\",\"id\":\"req-abc-123\",\"method\":\"search\"}";
         assert_eq!(
             extract_jsonrpc_id(str_id),
             Some("\"req-abc-123\"".to_string())
         );
-        assert_eq!(extract_jsonrpc_method(str_id), Some("search"));
+        assert_eq!(extract_jsonrpc_method(str_id).as_deref(), Some("search"));
 
         let no_id = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
         assert_eq!(extract_jsonrpc_id(no_id), None);
         assert_eq!(
-            extract_jsonrpc_method(no_id),
+            extract_jsonrpc_method(no_id).as_deref(),
             Some("notifications/initialized")
+        );
+
+        // Nested id in params should NOT be mistaken for top-level JSON-RPC id
+        let nested_id = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"id\":\"nested-item\"}},\"id\":99}";
+        assert_eq!(extract_jsonrpc_id(nested_id), Some("99".to_string()));
+        assert_eq!(
+            extract_jsonrpc_method(nested_id).as_deref(),
+            Some("tools/call")
+        );
+        assert_eq!(
+            effective_method_for_classification("tools/call", nested_id),
+            "status"
         );
     }
 
