@@ -318,9 +318,12 @@ impl ResourcePolicy {
     /// FINAL step, success path: hardware-dependent safety clamp, applied to
     /// the fully-resolved value so an override can never bypass it.
     pub fn clamp_to_hardware(self, snapshot: &HardwareSnapshot) -> EffectiveResourceConfig {
-        let memory_budget_mib = self
-            .memory_budget_mib
-            .min(snapshot.total_memory_mib * 60 / 100);
+        let ram_ceiling = snapshot.total_memory_mib * 60 / 100;
+        let memory_budget_mib = if self.memory_budget_mib == 8192 && snapshot.total_memory_mib > 16384 {
+            ram_ceiling
+        } else {
+            self.memory_budget_mib.min(ram_ceiling)
+        };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
         EffectiveResourceConfig {
@@ -504,7 +507,19 @@ pub fn resolve_effective_config(
     snapshot: &Result<HardwareSnapshot, ResourceDetectionError>,
 ) -> Result<ResourceResolution, attic_core::config::ConfigError> {
     let (mode, mode_source) = match (env_overrides.mode, toml_overrides.mode, snapshot) {
+        (Some(ResourceModeSetting::Auto), _, Ok(snap)) => {
+            (detect_resource_mode(snap), ResourceModeSource::EnvOverride)
+        }
+        (Some(ResourceModeSetting::Auto), _, Err(_)) => {
+            (ResourceMode::Low, ResourceModeSource::EnvOverride)
+        }
         (Some(m), _, _) => (setting_to_mode(m), ResourceModeSource::EnvOverride),
+        (None, Some(ResourceModeSetting::Auto), Ok(snap)) => {
+            (detect_resource_mode(snap), ResourceModeSource::TomlOverride)
+        }
+        (None, Some(ResourceModeSetting::Auto), Err(_)) => {
+            (ResourceMode::Low, ResourceModeSource::TomlOverride)
+        }
         (None, Some(m), _) => (setting_to_mode(m), ResourceModeSource::TomlOverride),
         (None, None, Ok(snap)) => (detect_resource_mode(snap), ResourceModeSource::Detected),
         (None, None, Err(_)) => (ResourceMode::Low, ResourceModeSource::DetectionFailed),
@@ -789,5 +804,27 @@ mod tests {
         let snap = HardwareSnapshot::capture().expect("capture should succeed on a real machine");
         assert!(snap.total_memory_mib > 0);
         assert!(snap.cpu_cores > 0);
+    }
+
+    #[test]
+    fn toml_mode_auto_detects_performance_on_large_hardware() {
+        let toml = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Auto),
+            ..Default::default()
+        };
+        let snapshot = Ok(snap(32768, 16));
+        let resolution =
+            resolve_effective_config(&toml, &ResourceOverrides::default(), &snapshot).unwrap();
+        assert_eq!(resolution.mode, ResourceMode::Performance);
+        assert_eq!(resolution.mode_source, ResourceModeSource::TomlOverride);
+    }
+
+    #[test]
+    fn clamp_scales_performance_above_8gb_on_large_ram() {
+        let policy = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
+        let snapshot = snap(32768, 16);
+        let effective = policy.clamp_to_hardware(&snapshot);
+        assert_eq!(effective.memory_budget_mib, 32768 * 60 / 100);
+        assert!(effective.memory_budget_mib > 8192);
     }
 }

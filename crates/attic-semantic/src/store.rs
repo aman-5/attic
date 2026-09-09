@@ -19,12 +19,19 @@ use crate::embedding_profile::{
     ClaimOutcome, EmbeddingIntentSource, EmbeddingProfile, EmbeddingSpaceDescriptor,
 };
 use crate::error::SemanticError;
-use crate::provider::CancelFlag;
+use crate::generation::{GenerationManager, GenerationRecord};
+use crate::provider::{CancelFlag, EmbeddingFingerprint};
 use rusqlite::{Connection, params};
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
 const SEMANTIC_MIGRATION_0002: &str =
     include_str!("../../../migrations/semantic/0002_embedding_profile.sql");
+const SEMANTIC_MIGRATION_0003: &str =
+    include_str!("../../../migrations/semantic/0003_semantic_generations.sql");
+const SEMANTIC_MIGRATION_0004: &str =
+    include_str!("../../../migrations/semantic/0004_learned_tuning.sql");
+const SEMANTIC_MIGRATION_0005: &str =
+    include_str!("../../../migrations/semantic/0005_vector_index_scale.sql");
 
 /// One stored embedding with full lineage.
 #[derive(Debug, Clone)]
@@ -171,6 +178,12 @@ impl SemanticStore {
         panic!("intentional poison");
     }
 
+    /// TEST/BENCHMARK SUPPORT ONLY: acquires the database guard directly.
+    #[doc(hidden)]
+    pub fn guard_for_test(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SemanticError> {
+        self.guard()
+    }
+
     fn migrate(conn: &Connection) -> Result<(), SemanticError> {
         // `semantic.db` is intentionally separate from canonical `attic.db`,
         // but its durable schema is still migration-owned.  Keeping the SQL
@@ -178,6 +191,42 @@ impl SemanticStore {
         // without contaminating the canonical database with semantic tables.
         conn.execute_batch(SEMANTIC_MIGRATION_0001)?;
         conn.execute_batch(SEMANTIC_MIGRATION_0002)?;
+
+        let applied_0003: bool = conn
+            .query_row(
+                "SELECT 1 FROM sem_schema_migrations WHERE id = '0003_semantic_generations'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !applied_0003 {
+            conn.execute_batch(SEMANTIC_MIGRATION_0003)?;
+        }
+
+        let applied_0004: bool = conn
+            .query_row(
+                "SELECT 1 FROM sem_schema_migrations WHERE id = '0004_learned_tuning'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !applied_0004 {
+            conn.execute_batch(SEMANTIC_MIGRATION_0004)?;
+        }
+
+        let applied_0005: bool = conn
+            .query_row(
+                "SELECT 1 FROM sem_schema_migrations WHERE id = '0005_vector_index_scale'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !applied_0005 {
+            conn.execute_batch(SEMANTIC_MIGRATION_0005)?;
+        }
         Ok(())
     }
 
@@ -260,6 +309,35 @@ impl SemanticStore {
         } else {
             Ok(ClaimOutcome::AdoptedRace { adopted: winning })
         }
+    }
+
+    // ── learned tuning (Final Master Plan V2 §25, CP17) ───────────────────
+
+    /// Read learned tuning matching the specified key.
+    pub fn read_learned_tuning(
+        &self,
+        key: &crate::learned_tuning::TuningKey,
+    ) -> Result<Option<crate::learned_tuning::LearnedTuningRecord>, SemanticError> {
+        let conn = self.guard()?;
+        crate::learned_tuning::LearnedTuningManager.read_tuning(&conn, key)
+    }
+
+    /// Save learned optimal execution tuning.
+    pub fn save_learned_tuning(
+        &self,
+        record: &crate::learned_tuning::LearnedTuningRecord,
+    ) -> Result<(), SemanticError> {
+        let conn = self.guard()?;
+        crate::learned_tuning::LearnedTuningManager.save_tuning(&conn, record)
+    }
+
+    /// Invalidate learned tuning for a specific key.
+    pub fn invalidate_learned_tuning(
+        &self,
+        key: &crate::learned_tuning::TuningKey,
+    ) -> Result<bool, SemanticError> {
+        let conn = self.guard()?;
+        crate::learned_tuning::LearnedTuningManager.invalidate_tuning(&conn, key)
     }
 
     // ── embeddings ─────────────────────────────────────────────────────────
@@ -553,6 +631,175 @@ impl SemanticStore {
             );
         }
         Ok(out)
+    }
+
+    // ── semantic generations (Phase V2 §51–§55) ───────────────────────────
+
+    /// Retrieve the currently ACTIVE generation, if any.
+    pub fn get_active_generation(&self) -> Result<Option<GenerationRecord>, SemanticError> {
+        let conn = self.guard()?;
+        GenerationManager::get_active_generation(&conn)
+    }
+
+    /// Retrieve the currently BUILDING generation, if any.
+    pub fn get_building_generation(&self) -> Result<Option<GenerationRecord>, SemanticError> {
+        let conn = self.guard()?;
+        GenerationManager::get_building_generation(&conn)
+    }
+
+    /// Start a new semantic generation in BUILDING state.
+    pub fn start_new_generation(
+        &self,
+        fingerprint: &EmbeddingFingerprint,
+    ) -> Result<GenerationRecord, SemanticError> {
+        let conn = self.guard()?;
+        GenerationManager::start_new_generation(&conn, fingerprint)
+    }
+
+    /// Atomically activate a generation, superseding the previously active generation.
+    pub fn activate_generation(&self, target_generation_id: i64) -> Result<(), SemanticError> {
+        let mut conn = self.guard()?;
+        GenerationManager::activate_generation(&mut conn, target_generation_id)
+    }
+
+    /// Roll back to the most recent superseded complete generation.
+    pub fn rollback_generation(&self) -> Result<Option<GenerationRecord>, SemanticError> {
+        let mut conn = self.guard()?;
+        GenerationManager::rollback_to_previous(&mut conn)
+    }
+
+    /// Prune old superseded generations according to retention policy.
+    pub fn prune_generations(&self, keep_max: usize) -> Result<usize, SemanticError> {
+        let mut conn = self.guard()?;
+        GenerationManager::prune_old_generations(&mut conn, keep_max)
+    }
+
+    /// Insert a batch of embedding records tagged with a specific generation ID (§52).
+    pub fn put_batch_for_generation(
+        &self,
+        records: &[EmbeddingRecord],
+        generation_id: i64,
+    ) -> Result<(), SemanticError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.guard()?;
+        let tx = conn.transaction()?;
+
+        {
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO sem_embeddings
+                     (retrieval_unit_id, repository_id, source_revision_id,
+                      index_generation_id, selection_version, provider_id, model_id,
+                      content_hash, dim, norm, vector, created_at_ms, generation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )?;
+            let mut mark_stmt =
+                tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
+
+            let now = Self::now_ms();
+            for rec in records {
+                let norm: f32 = rec.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let mut blob = Vec::with_capacity(rec.vector.len() * 4);
+                for v in &rec.vector {
+                    blob.extend_from_slice(&v.to_le_bytes());
+                }
+                insert_stmt.execute(params![
+                    rec.retrieval_unit_id,
+                    rec.repository_id,
+                    rec.source_revision_id,
+                    rec.index_generation_id,
+                    rec.selection_version,
+                    rec.provider_id,
+                    rec.model_id,
+                    rec.content_hash,
+                    rec.dim as i64,
+                    norm,
+                    blob,
+                    now,
+                    generation_id,
+                ])?;
+                mark_stmt.execute(params![rec.retrieval_unit_id, Q_DONE])?;
+            }
+
+            tx.execute(
+                "UPDATE sem_generations SET unit_count = unit_count + ?1 WHERE generation_id = ?2",
+                params![records.len() as i64, generation_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Search nearest neighbors strictly isolated within a specific semantic generation (§52).
+    pub fn knn_search_generation(
+        &self,
+        generation_id: i64,
+        query: &[f32],
+        k: usize,
+        repository_filter: Option<&str>,
+        budget: &ScanBudget<'_>,
+    ) -> Result<KnnResult, SemanticError> {
+        let qnorm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if qnorm <= 0.0 || k == 0 || budget.exhausted(0) {
+            return Ok(KnnResult {
+                hits: Vec::new(),
+                rows_scanned: 0,
+                truncated_by_budget: budget.max_rows > 0 || budget.deadline.is_some(),
+            });
+        }
+        let conn = self.guard()?;
+        let mut stmt = conn.prepare(
+            "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
+              WHERE generation_id = ?1
+                AND (?2 IS NULL OR repository_id = ?2)",
+        )?;
+        let mut rows = stmt.query(params![generation_id, repository_filter])?;
+        let mut top: Vec<(f32, String)> = Vec::with_capacity(k + 1);
+        let mut scanned: u64 = 0;
+        let mut truncated = false;
+        while let Some(r) = rows.next()? {
+            if budget.exhausted(scanned) {
+                truncated = true;
+                break;
+            }
+            scanned += 1;
+            let unit_id: String = r.get(0)?;
+            let stored_norm: f32 = r.get(1)?;
+            let blob: Vec<u8> = r.get(2)?;
+            if stored_norm <= 0.0 || blob.len() != query.len() * 4 {
+                continue;
+            }
+            let mut dot = 0.0f32;
+            let floats = blob.as_chunks::<4>().0;
+            for (i, chunk) in floats.iter().enumerate() {
+                let b = f32::from_le_bytes(*chunk);
+                dot += query[i] * b;
+            }
+            let sim = dot / (qnorm * stored_norm);
+            if top.len() == k && sim <= top.last().map_or(f32::MIN, |(s, _)| *s) {
+                continue;
+            }
+            let pos = top.partition_point(|(s, _)| *s >= sim);
+            top.insert(pos, (sim, unit_id));
+            if top.len() > k {
+                top.pop();
+            }
+        }
+        let hits: Vec<NearestHit> = top
+            .into_iter()
+            .map(|(sim, id)| NearestHit {
+                retrieval_unit_id: id,
+                similarity: sim,
+            })
+            .collect();
+        Ok(KnnResult {
+            hits,
+            rows_scanned: scanned,
+            truncated_by_budget: truncated,
+        })
     }
 
     // ── enrichment queue ───────────────────────────────────────────────────
@@ -1133,4 +1380,137 @@ mod tests {
         // cleanly.
         s.guard().unwrap().execute_batch("ROLLBACK").unwrap();
     }
+
+    #[test]
+    fn semantic_generations_isolation_and_rollback_lifecycle() {
+        let store = SemanticStore::open_in_memory().unwrap();
+        let cancel = CancelFlag::new();
+        let budget = ScanBudget::unbounded(&cancel);
+
+        // Gen 1: BGE
+        let fp1 = EmbeddingFingerprint {
+            provider: "bge".to_string(),
+            model_id: "bge-base".to_string(),
+            model_revision: "rev1".to_string(),
+            dimension: 2,
+            pooling_version: "cls_v1".to_string(),
+            normalization_version: "l2_unit_v1".to_string(),
+            tokenizer_version: "tok_v1".to_string(),
+            chunking_version: "ast_v1".to_string(),
+            query_instruction_version: "none".to_string(),
+        };
+        let gen1 = store.start_new_generation(&fp1).unwrap();
+        assert_eq!(gen1.generation_id, 1);
+        store.activate_generation(gen1.generation_id).unwrap();
+
+        // Insert unit A in Gen 1
+        let rec_a = EmbeddingRecord {
+            retrieval_unit_id: "unit_a".to_string(),
+            repository_id: "repo1".to_string(),
+            source_revision_id: "s1".to_string(),
+            index_generation_id: "i1".to_string(),
+            selection_version: "v1".to_string(),
+            provider_id: "bge".to_string(),
+            model_id: "bge-base".to_string(),
+            content_hash: "hash_a".to_string(),
+            dim: 2,
+            vector: vec![1.0, 0.0],
+        };
+        store.put_batch_for_generation(&[rec_a], 1).unwrap();
+
+        // Query Gen 1
+        let res1 = store
+            .knn_search_generation(1, &[1.0, 0.0], 5, None, &budget)
+            .unwrap();
+        assert_eq!(res1.hits.len(), 1);
+        assert_eq!(res1.hits[0].retrieval_unit_id, "unit_a");
+
+        // Start Gen 2: Qwen3
+        let fp2 = EmbeddingFingerprint {
+            provider: "qwen3".to_string(),
+            model_id: "qwen3-0.6b".to_string(),
+            model_revision: "rev2".to_string(),
+            dimension: 2,
+            pooling_version: "last_token_v1".to_string(),
+            normalization_version: "l2_unit_v1".to_string(),
+            tokenizer_version: "qwen_tok".to_string(),
+            chunking_version: "ast_v1".to_string(),
+            query_instruction_version: "code_retrieval_v1".to_string(),
+        };
+        let gen2 = store.start_new_generation(&fp2).unwrap();
+        assert_eq!(gen2.generation_id, 2);
+
+        // While Gen 2 is building, insert unit B in Gen 2
+        let rec_b = EmbeddingRecord {
+            retrieval_unit_id: "unit_b".to_string(),
+            repository_id: "repo1".to_string(),
+            source_revision_id: "s1".to_string(),
+            index_generation_id: "i1".to_string(),
+            selection_version: "v1".to_string(),
+            provider_id: "qwen3".to_string(),
+            model_id: "qwen3-0.6b".to_string(),
+            content_hash: "hash_b".to_string(),
+            dim: 2,
+            vector: vec![0.0, 1.0],
+        };
+        store.put_batch_for_generation(&[rec_b], 2).unwrap();
+
+        // Query Gen 1 again: MUST NOT contain unit B (zero cross-space mixing!)
+        let res1_again = store
+            .knn_search_generation(1, &[0.0, 1.0], 5, None, &budget)
+            .unwrap();
+        assert_eq!(res1_again.hits.len(), 1);
+        assert_eq!(res1_again.hits[0].retrieval_unit_id, "unit_a");
+
+        // Activate Gen 2 atomically
+        store.activate_generation(2).unwrap();
+        let active_gen = store.get_active_generation().unwrap().unwrap();
+        assert_eq!(active_gen.generation_id, 2);
+
+        // Query Gen 2
+        let res2 = store
+            .knn_search_generation(2, &[0.0, 1.0], 5, None, &budget)
+            .unwrap();
+        assert_eq!(res2.hits.len(), 1);
+        assert_eq!(res2.hits[0].retrieval_unit_id, "unit_b");
+
+        // Roll back to Gen 1
+        let rolled_back = store.rollback_generation().unwrap().unwrap();
+        assert_eq!(rolled_back.generation_id, 1);
+        let active_after_rollback = store.get_active_generation().unwrap().unwrap();
+        assert_eq!(active_after_rollback.generation_id, 1);
+    }
+
+    #[test]
+    fn learned_tuning_store_roundtrip_and_invalidation() {
+        let store = SemanticStore::open_in_memory().unwrap();
+        let key = crate::learned_tuning::TuningKey {
+            cpu_architecture: "x86_64".into(),
+            os_name: "windows".into(),
+            model_id: "qwen3-embedding-0.6b".into(),
+            model_revision: "pinned_sha".into(),
+            dimension: 1024,
+            runtime_version: "0.1.0".into(),
+        };
+
+        // None initially
+        assert!(store.read_learned_tuning(&key).unwrap().is_none());
+
+        // Save tuning
+        let rec = crate::learned_tuning::LearnedTuningRecord::new(key.clone(), 4, 32, 4, 210.0);
+        store.save_learned_tuning(&rec).unwrap();
+
+        // Read back
+        let read = store.read_learned_tuning(&key).unwrap().unwrap();
+        assert_eq!(read.recommended_lanes, 4);
+        assert_eq!(read.recommended_batch_size, 32);
+        assert_eq!(read.recommended_cpu_threads, 4);
+        assert!((read.observed_chunks_per_sec - 210.0).abs() < 1e-3);
+
+        // Invalidate
+        let invalidated = store.invalidate_learned_tuning(&key).unwrap();
+        assert!(invalidated);
+        assert!(store.read_learned_tuning(&key).unwrap().is_none());
+    }
 }
+

@@ -2297,6 +2297,55 @@ fn handle_status(
         compute_re_index_recommended(phase8.attic_config, active_profile.as_ref());
     payload["re_index_recommended"] = json!(re_index_recommended);
 
+    // Phase V2 CP18: Semantic progress, ETA, and "why slow" diagnostics (§61, §62).
+    if let Some(stack) = phase8.semantic {
+        let qcounts = stack.store.queue_counts().unwrap_or_default();
+        let pending = *qcounts.get(attic_semantic::store::Q_PENDING).unwrap_or(&0);
+        let inflight = *qcounts.get(attic_semantic::store::Q_INFLIGHT).unwrap_or(&0);
+        let done = *qcounts.get(attic_semantic::store::Q_DONE).unwrap_or(&0);
+        let failed = *qcounts.get(attic_semantic::store::Q_FAILED).unwrap_or(&0);
+        let active_gen = stack.store.get_active_generation().ok().flatten().map(|g| g.generation_id);
+        let building_gen = stack.store.get_building_generation().ok().flatten().map(|g| g.generation_id);
+        let cache_state = if stack.provider.available() { "ready" } else { "loading" };
+
+        let progress = attic_semantic::SemanticProgressSnapshot::compute(
+            pending,
+            inflight,
+            done,
+            failed,
+            50.0,
+            200.0,
+            active_gen,
+            building_gen,
+            cache_state,
+        );
+        payload["semantic_progress"] = json!(progress);
+
+        let diag_ctx = attic_semantic::DiagnosticContext {
+            disk_emergency: false,
+            disk_warning: false,
+            resource_pressure_restricted: resource_monitor.is_some_and(|m| {
+                matches!(
+                    attic_storage::resource_manager::current_advisory(m),
+                    attic_storage::resource_manager::ResourceAdvisory::Restricted
+                )
+            }),
+            available_ram_mib: resource_monitor.map(|m| m.min_free_memory_mib()).unwrap_or(4096),
+            queue_depth: pending + inflight,
+            queue_backpressure_active: (pending + inflight) >= 5000,
+            canonical_indexing_active: resource_monitor.is_some_and(|m| m.indexing_heavy_active() > 0),
+            semantic_inference_active: resource_monitor.is_some_and(|m| m.embedding_heavy_active() > 0),
+            model_loading_or_warmup: !stack.provider.available(),
+            mcp_high_latency: false,
+            user_caps_active: phase8.attic_config.has_explicit_embedding_override(),
+        };
+        let why_slow = attic_semantic::diagnose_why_slow(&diag_ctx);
+        payload["diagnostics"] = json!({
+            "why_slow": why_slow.explanation,
+            "bottleneck_code": why_slow.code,
+        });
+    }
+
     // Membership-authoritative scoping: ONLY repositories that belong to the
     // configured logical workspace are reported as current/active. Historical
     // repositories still present in the DB but no longer configured must not
@@ -5168,6 +5217,47 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0]["state"], "DISABLED");
         assert_eq!(repos[0]["watcher"]["error"], "synthetic watcher failure");
+    }
+
+    #[test]
+    fn status_reports_semantic_progress_and_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
+        let provider = Arc::new(attic_semantic::providers::HashingEmbedder::new());
+        let stack = attic_retrieval::semantic::SemanticStack {
+            store: store.clone(),
+            provider,
+        };
+
+        // Enqueue some work
+        store.queue_enqueue(&["unit1".to_string(), "unit2".to_string()], 1.0).unwrap();
+
+        let mut res_status = test_resource_status();
+        res_status.semantic = Some(&stack);
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &res_status,
+        )
+        .unwrap();
+
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert!(v.get("semantic_progress").is_some());
+        assert_eq!(v["semantic_progress"]["queue_pending"], 2);
+        assert_eq!(v["semantic_progress"]["total_queue_depth"], 2);
+        assert!(v.get("diagnostics").is_some());
+        assert!(v["diagnostics"]["why_slow"].is_string());
+        assert_eq!(v["diagnostics"]["bottleneck_code"], "nominal");
     }
 
     /// The residual case (no bootstrap in progress, no recorded watcher

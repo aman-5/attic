@@ -460,6 +460,57 @@ impl SemanticProvider for BgeEmbedder {
     }
 }
 
+impl crate::provider::EmbeddingProvider for BgeEmbedder {
+    fn model_fingerprint(&self) -> crate::provider::EmbeddingFingerprint {
+        crate::provider::EmbeddingFingerprint {
+            provider: Self::PROVIDER_ID.to_string(),
+            model_id: Self::MODEL_NAME.to_string(),
+            model_revision: self.descriptor.model_revision.clone(),
+            dimension: self.dims,
+            pooling_version: "cls_v1".to_string(),
+            normalization_version: "l2_unit_v1".to_string(),
+            tokenizer_version: "bert_wp_v1".to_string(),
+            chunking_version: "ast_boundary_v1".to_string(),
+            query_instruction_version: "none".to_string(),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.dims
+    }
+
+    fn warm_up(&self, _budget: &crate::provider::EmbeddingExecutionBudget) -> Result<(), SemanticError> {
+        let _ = self.embed_sub_batch(&["warm up probe"])?;
+        Ok(())
+    }
+
+    fn embed_documents(
+        &self,
+        inputs: &[EmbeddingInput],
+        budget: &crate::provider::EmbeddingExecutionBudget,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+        let cancel = CancelFlag::new();
+        let mut usage = ResourceUsage::default();
+        self.embed_batch(inputs, &cancel, &mut usage, budget.deadline)
+    }
+
+    fn embed_query(
+        &self,
+        query: &str,
+        budget: &crate::provider::EmbeddingExecutionBudget,
+    ) -> Result<Vec<f32>, SemanticError> {
+        let input = EmbeddingInput {
+            unit_key: "query".to_string(),
+            text: query.to_string(),
+        };
+        let docs = self.embed_documents(&[input], budget)?;
+        docs.into_iter()
+            .next()
+            .map(|o| o.vector)
+            .ok_or_else(|| SemanticError::EmbeddingFailed("empty query embedding output".to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,8 @@
 //!   items may still be returned alongside the error.
 //! * Resource accounting is observable, never hidden inside the provider.
 
+use serde::{Deserialize, Serialize};
+
 use crate::embedding_profile::EmbeddingSpaceDescriptor;
 use crate::error::SemanticError;
 
@@ -125,3 +127,90 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
         .sum::<f32>()
         .clamp(-1.0, 1.0)
 }
+
+/// Comprehensive architectural fingerprint of an active embedding vector space (Final Master Plan V2 §51).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingFingerprint {
+    /// Identifier of the provider (e.g. "bge", "qwen3", "hashing").
+    pub provider: String,
+    /// Identifier of the neural model (e.g. "bge-base-en-v1.5", "qwen3-embedding-0.6b").
+    pub model_id: String,
+    /// Exact pinned git revision or weights SHA.
+    pub model_revision: String,
+    /// Output vector dimensionality.
+    pub dimension: usize,
+    /// Pooling algorithm and version (e.g. "cls_v1", "last_token_v1", "mean_v1").
+    pub pooling_version: String,
+    /// Normalization strategy (e.g. "l2_unit_v1").
+    pub normalization_version: String,
+    /// Tokenizer vocabulary/code version.
+    pub tokenizer_version: String,
+    /// Chunking/windowing strategy version.
+    pub chunking_version: String,
+    /// Query instruction template version (e.g. "code_retrieval_v1").
+    pub query_instruction_version: String,
+}
+
+/// Resource limits allocated to an embedding inference call (Final Master Plan V2 §27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingExecutionBudget {
+    /// Dedicated CPU threads allocated for this inference pass.
+    pub cpu_threads: usize,
+    /// Maximum number of items in a single forward pass.
+    pub max_batch_size: usize,
+    /// Optional hard deadline for cooperative cancellation.
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl Default for EmbeddingExecutionBudget {
+    fn default() -> Self {
+        Self {
+            cpu_threads: 2,
+            max_batch_size: 16,
+            deadline: None,
+        }
+    }
+}
+
+/// Provider thread-safety and concurrency contract (Master Plan V2 §20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderConcurrencyContract {
+    /// A single instance safely supports concurrent calls from multiple threads.
+    SharedConcurrent,
+    /// Calls to a single instance are serialized internally (e.g. via mutex).
+    Serialized,
+    /// Concurrent callers require a bounded pool of lane instances.
+    PooledLanes { max_lanes: usize },
+}
+
+/// Master embedding provider contract (Final Master Plan V2 §27).
+pub trait EmbeddingProvider: Send + Sync {
+    /// Return the immutable architectural fingerprint of the vector space.
+    fn model_fingerprint(&self) -> EmbeddingFingerprint;
+
+    /// Fixed dimensionality of vectors produced by this provider.
+    fn dimension(&self) -> usize;
+
+    /// Explicitly declares the concurrency contract of this provider (§20).
+    fn concurrency_contract(&self) -> ProviderConcurrencyContract {
+        ProviderConcurrencyContract::Serialized
+    }
+
+    /// Warm up model tensors and runtime resources before high-throughput batching.
+    fn warm_up(&self, budget: &EmbeddingExecutionBudget) -> Result<(), SemanticError>;
+
+    /// Embed a batch of documents under the given execution budget.
+    fn embed_documents(
+        &self,
+        inputs: &[EmbeddingInput],
+        budget: &EmbeddingExecutionBudget,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError>;
+
+    /// Embed a single query string for interactive semantic search.
+    fn embed_query(
+        &self,
+        query: &str,
+        budget: &EmbeddingExecutionBudget,
+    ) -> Result<Vec<f32>, SemanticError>;
+}
+

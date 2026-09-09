@@ -18,15 +18,21 @@ pub mod error;
 pub mod fts;
 pub mod indexing_publication;
 pub mod invalidation_ops;
+pub mod machine_telemetry;
 pub mod migration;
 pub mod ops_tasks;
 pub mod repository;
 pub mod resource_manager;
+pub mod resource_orchestrator;
 pub mod resource_policy;
 pub mod retrieval_reads;
 pub mod semantic_reads;
 pub mod server_state;
 pub mod writer;
+
+pub use machine_telemetry::{MachineTelemetry, MachineTelemetrySampler};
+pub use resource_orchestrator::{AutoModeState, AutoStateMachine, ResourceOrchestrator};
+pub use attic_core::config::{ModePolicy, ResourceAllocation, SemanticConfig};
 
 pub use analysis_cache::{
     CachedFileAnalysis, bulk_load_analysis_cache, clear_analysis_cache,

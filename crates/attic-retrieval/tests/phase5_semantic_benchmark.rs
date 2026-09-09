@@ -25,12 +25,7 @@ use attic_semantic::{EnrichmentConfig, HashingEmbedder};
 use common::Fixture;
 use common::bench::{cases, evaluate_tier, path_order, recall_at, served_paths};
 
-const FULL: EnrichmentConfig = EnrichmentConfig {
-    batch_size: 16,
-    max_attempts: 3,
-    budget_ms: 10_000,
-    embedding_worker_count: 1,
-};
+const FULL: EnrichmentConfig = EnrichmentConfig::standalone(16, 3, 10_000, 1);
 
 #[test]
 fn phase5_semantic_benchmark_gate() {

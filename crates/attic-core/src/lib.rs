@@ -27,7 +27,8 @@ pub mod paths;
 
 pub use config::{
     ATTIC_TOML_TEMPLATE, AtticConfig, ConfigError, EmbeddingOverride, IndexingOverride,
-    ResourceModeSetting, ResourceOverrides,
+    MachineSnapshot, ModePolicy, PowerSource, ResourceAllocation, ResourceModeSetting,
+    ResourceOverrides, SemanticConfig, WorkloadSnapshot,
 };
 pub use constants::{
     ANALYZER_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, resources,

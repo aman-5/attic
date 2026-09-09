@@ -101,6 +101,58 @@ pub struct EnrichmentConfig {
     /// `BackgroundEnricher::spawn` spins up (mirrors
     /// `attic_storage::ResourcePolicy::embedding_worker_count`).
     pub embedding_worker_count: usize,
+    /// Optional dynamic resource allocation handle from ResourceOrchestrator (Master Plan §12, §15, CP15).
+    pub dynamic_allocation: Option<Arc<std::sync::RwLock<attic_storage::ResourceAllocation>>>,
+}
+
+impl EnrichmentConfig {
+    /// Construct a standalone config with no dynamic orchestrator allocation.
+    pub const fn standalone(
+        batch_size: usize,
+        max_attempts: u32,
+        budget_ms: u64,
+        embedding_worker_count: usize,
+    ) -> Self {
+        Self {
+            batch_size,
+            max_attempts,
+            budget_ms,
+            embedding_worker_count,
+            dynamic_allocation: None,
+        }
+    }
+
+    /// Effective batch size after checking dynamic orchestrator allocation.
+    pub fn effective_batch_size(&self) -> usize {
+        if let Some(ref alloc) = self.dynamic_allocation {
+            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
+            if guard.semantic_batch_size == 0 {
+                return 0;
+            }
+            return guard.semantic_batch_size.min(self.batch_size);
+        }
+        self.batch_size
+    }
+
+    /// Effective prefetch limit after checking dynamic orchestrator allocation.
+    pub fn effective_prefetch_limit(&self) -> usize {
+        if let Some(ref alloc) = self.dynamic_allocation {
+            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
+            return guard.semantic_prefetch_limit;
+        }
+        self.batch_size * 2
+    }
+}
+
+impl EnrichmentConfig {
+    /// Effective CPU threads granted by orchestrator.
+    pub fn effective_cpu_threads(&self) -> usize {
+        if let Some(ref alloc) = self.dynamic_allocation {
+            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
+            return guard.semantic_cpu_threads;
+        }
+        2
+    }
 }
 
 impl Default for EnrichmentConfig {
@@ -110,6 +162,7 @@ impl Default for EnrichmentConfig {
             max_attempts: 3,
             budget_ms: 2_000,
             embedding_worker_count: 1,
+            dynamic_allocation: None,
         }
     }
 }
@@ -152,7 +205,11 @@ pub fn drive(
         if cancel.is_cancelled() || Instant::now() >= deadline {
             break;
         }
-        let items = store.queue_take_batch(cfg.batch_size)?;
+        let batch_size = cfg.effective_batch_size();
+        if batch_size == 0 {
+            break;
+        }
+        let items = store.queue_take_batch(batch_size)?;
         if items.is_empty() {
             break;
         }
@@ -546,6 +603,30 @@ impl BackgroundEnricher {
         Self { stop, handles }
     }
 
+    /// Spawn background enrichment workers wired directly to the ResourceOrchestrator (§12, §15, CP15).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_orchestrator(
+        canonical_db_path: std::path::PathBuf,
+        store: std::sync::Arc<SemanticStore>,
+        provider: std::sync::Arc<dyn SemanticProvider>,
+        mut cfg: EnrichmentConfig,
+        resource_monitor: Option<std::sync::Arc<attic_storage::resource_manager::ResourceMonitor>>,
+        intent_source: EmbeddingIntentSource,
+        write_generation: Arc<AtomicU64>,
+        orchestrator: &attic_storage::ResourceOrchestrator,
+    ) -> Self {
+        cfg.dynamic_allocation = Some(orchestrator.shared_allocation());
+        Self::spawn(
+            canonical_db_path,
+            store,
+            provider,
+            cfg,
+            resource_monitor,
+            intent_source,
+            write_generation,
+        )
+    }
+
     /// Request stop and join every worker thread against a SHARED timeout
     /// budget; true only when ALL of them exited within it (matching the
     /// original single-handle contract, generalized to N handles).
@@ -691,5 +772,34 @@ mod ensure_profile_claimed_tests {
             proceed,
             "a recommendation-only mismatch must not refuse to proceed"
         );
+    }
+
+    #[test]
+    fn effective_batch_size_obeys_dynamic_allocation_and_clamps() {
+        use std::sync::{Arc, RwLock};
+
+        let mut cfg = EnrichmentConfig {
+            batch_size: 16,
+            ..EnrichmentConfig::default()
+        };
+        assert_eq!(cfg.effective_batch_size(), 16);
+
+        let alloc = Arc::new(RwLock::new(attic_storage::ResourceAllocation {
+            semantic_batch_size: 32,
+            ..Default::default()
+        }));
+
+        cfg.dynamic_allocation = Some(alloc.clone());
+        // Dynamic batch is 32, but cfg.batch_size is 16 (e.g. from ResourceMonitor clamp),
+        // so min(32, 16) = 16.
+        assert_eq!(cfg.effective_batch_size(), 16);
+
+        // If cfg.batch_size is higher (e.g. 64), then dynamic allocation of 32 limits it to 32.
+        cfg.batch_size = 64;
+        assert_eq!(cfg.effective_batch_size(), 32);
+
+        // If dynamic allocation sets semantic_batch_size to 0 (emergency halt), effective is 0.
+        alloc.write().unwrap().semantic_batch_size = 0;
+        assert_eq!(cfg.effective_batch_size(), 0);
     }
 }

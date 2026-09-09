@@ -25,6 +25,8 @@ pub enum PoolingStrategy {
     Cls,
     /// Mean-pool over all token positions.
     Mean,
+    /// Use the last non-padded token position (standard for causal / decoder-only embedders like Qwen3).
+    LastToken,
 }
 
 /// How inputs longer than `max_tokens` are handled.
@@ -85,6 +87,7 @@ impl EmbeddingSpaceDescriptor {
         buf.push(match self.pooling {
             PoolingStrategy::Cls => 0,
             PoolingStrategy::Mean => 1,
+            PoolingStrategy::LastToken => 2,
         });
         buf.push(self.normalize as u8);
         buf.push(match self.truncation {

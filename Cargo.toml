@@ -79,7 +79,7 @@ rmcp               = { version = "3.1.4",   features = ["server", "transport-io"
 anyhow             = "1"
 # Phase 7: cross-platform process memory measurement (real RSS, not counters).
 # default-features = false avoids gui/web deps; only the `system` feature is needed.
-sysinfo            = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo            = { version = "0.33", default-features = false, features = ["system", "disk"] }
 # Test utilities
 tempfile           = "3"
 # Phase 8: attic.toml resource/embedding tunables (pure parsing, no I/O)

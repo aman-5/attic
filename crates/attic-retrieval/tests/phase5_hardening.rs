@@ -193,12 +193,7 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
             &conn,
             &stack.store,
             stack.provider.as_ref(),
-            &EnrichmentConfig {
-                budget_ms: 300,
-                batch_size: 4,
-                max_attempts: 3,
-                embedding_worker_count: 1,
-            },
+            &EnrichmentConfig::standalone(4, 3, 300, 1),
             &CancelFlag::new(),
             attic_semantic::EmbeddingIntentSource::Recommendation,
         )

@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use crate::error::SemanticError;
 use crate::provider::{
-    CancelFlag, EmbeddingInput, EmbeddingOutput, ResourceUsage, SemanticProvider,
+    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
 
 /// Deterministic feature-hashing embedder ("hashing", model "hashed-ngram-v1").
@@ -150,6 +151,52 @@ impl SemanticProvider for HashingEmbedder {
         usage.input_bytes += inputs.iter().map(|i| i.text.len() as u64).sum::<u64>();
         usage.elapsed_ms += t0.elapsed().as_millis() as u64;
         Ok(out)
+    }
+}
+
+impl EmbeddingProvider for HashingEmbedder {
+    fn model_fingerprint(&self) -> EmbeddingFingerprint {
+        EmbeddingFingerprint {
+            provider: Self::ID.to_string(),
+            model_id: Self::MODEL.to_string(),
+            model_revision: "v1".to_string(),
+            dimension: self.dims,
+            pooling_version: "ngram_hash_v1".to_string(),
+            normalization_version: "l2_unit_v1".to_string(),
+            tokenizer_version: "word_char_ngram_v1".to_string(),
+            chunking_version: "retrieval_unit_v1".to_string(),
+            query_instruction_version: "none".to_string(),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.dims
+    }
+
+    fn concurrency_contract(&self) -> ProviderConcurrencyContract {
+        ProviderConcurrencyContract::SharedConcurrent
+    }
+
+    fn warm_up(&self, _budget: &EmbeddingExecutionBudget) -> Result<(), SemanticError> {
+        Ok(())
+    }
+
+    fn embed_documents(
+        &self,
+        inputs: &[EmbeddingInput],
+        budget: &EmbeddingExecutionBudget,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+        let cancel = CancelFlag::new();
+        let mut usage = ResourceUsage::default();
+        self.embed_batch(inputs, &cancel, &mut usage, budget.deadline)
+    }
+
+    fn embed_query(
+        &self,
+        query: &str,
+        _budget: &EmbeddingExecutionBudget,
+    ) -> Result<Vec<f32>, SemanticError> {
+        Ok(self.embed_one(query))
     }
 }
 

@@ -28,12 +28,7 @@ fn file_stack(fx: &Fixture) -> (Arc<SemanticStack>, std::path::PathBuf) {
     (stack, path)
 }
 
-const FULL: EnrichmentConfig = EnrichmentConfig {
-    batch_size: 16,
-    max_attempts: 3,
-    budget_ms: 10_000,
-    embedding_worker_count: 1,
-};
+const FULL: EnrichmentConfig = EnrichmentConfig::standalone(16, 3, 10_000, 1);
 
 // ── §12/§13: candidate generation + hybrid fusion ────────────────────────────
 
@@ -275,12 +270,7 @@ fn slow_provider_honors_drive_budget_and_leaves_nothing_inflight() {
         &conn,
         &stack.store,
         stack.provider.as_ref(),
-        &EnrichmentConfig {
-            budget_ms: 60,
-            batch_size: 2,
-            max_attempts: 3,
-            embedding_worker_count: 1,
-        },
+        &EnrichmentConfig::standalone(2, 3, 60, 1),
         &CancelFlag::new(),
         attic_semantic::EmbeddingIntentSource::Recommendation,
     )
@@ -314,12 +304,7 @@ fn cancellation_flag_stops_embedding_without_quarantine() {
         &conn,
         &stack.store,
         stack.provider.as_ref(),
-        &EnrichmentConfig {
-            budget_ms: 1_000,
-            batch_size: 4,
-            max_attempts: 3,
-            embedding_worker_count: 1,
-        },
+        &EnrichmentConfig::standalone(4, 3, 1_000, 1),
         &cancel,
         attic_semantic::EmbeddingIntentSource::Recommendation,
     )
@@ -355,12 +340,7 @@ fn crash_between_drives_retains_committed_and_reschedules_rest() {
             &conn,
             &stack.store,
             stack.provider.as_ref(),
-            &EnrichmentConfig {
-                budget_ms: 120,
-                batch_size: 4,
-                max_attempts: 3,
-                embedding_worker_count: 1,
-            },
+            &EnrichmentConfig::standalone(4, 3, 120, 1),
             &CancelFlag::new(),
             attic_semantic::EmbeddingIntentSource::Recommendation,
         )
@@ -632,12 +612,7 @@ fn secret_bearing_unit_text_never_reaches_the_provider() {
         &conn,
         &stack.store,
         stack.provider.as_ref(),
-        &EnrichmentConfig {
-            budget_ms: 5_000,
-            batch_size: 8,
-            max_attempts: 3,
-            embedding_worker_count: 1,
-        },
+        &EnrichmentConfig::standalone(8, 3, 5_000, 1),
         &CancelFlag::new(),
         attic_semantic::EmbeddingIntentSource::Recommendation,
     )
@@ -670,12 +645,7 @@ fn foreground_queries_answer_during_background_enrichment() {
         fx.db_path.clone(),
         stack.store.clone(),
         stack.provider.clone(),
-        EnrichmentConfig {
-            budget_ms: 200,
-            batch_size: 4,
-            max_attempts: 3,
-            embedding_worker_count: 1,
-        },
+        EnrichmentConfig::standalone(4, 3, 200, 1),
         None,
         attic_semantic::EmbeddingIntentSource::Recommendation,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
