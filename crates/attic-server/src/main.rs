@@ -557,6 +557,18 @@ impl AtticServer {
         // attic.toml > detected mode > built-in default, then hardware-
         // clamped) rather than a separate ATTIC_*-env-only `ResourceConfig`.
         let resource_monitor = ResourceMonitor::from_config(&effective.as_resource_config());
+        // Phase 1 (Plan §6.2): seed the adaptive limits from the mode-specific
+        // maximums derived from `EffectiveResourceConfig`.  Without this call
+        // `max_indexing_heavy` defaults to the generic `background_capacity`
+        // value from `ResourceConfig`, not to `scheduler_workers`, and
+        // `max_embedding_batch` defaults to a hardcoded 64 rather than the
+        // mode-derived `embedding_batch_size`.  This is the single location
+        // that wires EffectiveResourceConfig into the adaptive-limit subsystem.
+        resource_monitor.apply_resource_policy(
+            effective.scheduler_workers,
+            effective.embedding_worker_count,
+            effective.embedding_batch_size,
+        );
         Ok(AtticServer {
             pool,
             writer,
