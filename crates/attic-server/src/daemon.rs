@@ -891,6 +891,7 @@ pub(crate) async fn run_relay_supervised(
 /// Low-level relay that simply splices `stdin ↔ stream` byte-for-byte with
 /// no session caching. Used only for the `ATTIC_NO_DAEMON` fast-path and in
 /// tests that don't need Phase 6/7 recovery.
+#[allow(dead_code)]
 pub(crate) async fn run_relay(relay: RelayHandle) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -966,6 +967,7 @@ impl Drop for ConnectionGuard {
 /// Handle one accepted stdio connection on the daemon side.  Used when the
 /// daemon is invoked directly (no relay) — i.e. the first launch with
 /// `ATTIC_NO_DAEMON=0` that wins election still reads from its own stdin.
+#[allow(dead_code)]
 pub(crate) async fn handle_stdio_connection(server: AtticServer) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
