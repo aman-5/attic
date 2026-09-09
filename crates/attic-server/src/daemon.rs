@@ -993,9 +993,12 @@ async fn recover_daemon(
         ElectionResult::Relay(new_relay) => {
             // Another daemon won or already exists.
             observe_and_clean_owned_daemon(owned_daemon).await;
-            if owned_daemon.is_some() {
-                *owned_daemon = None;
+
+            if let Some(owned) = owned_daemon.take() {
+                owned.task.abort();
+                let _ = owned.task.await;
             }
+
             Ok(RecoveredTarget::Connected(new_relay.stream))
         }
         ElectionResult::Daemon(handle) => {
