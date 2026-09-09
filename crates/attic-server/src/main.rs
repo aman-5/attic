@@ -3519,23 +3519,23 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
 
-            let relay_result = daemon::resume_relay_after_promotion(db_path, recovery_state).await;
+            let db_path_buf = db_path.to_path_buf();
+            let paths_clone = paths.clone();
+            let daemon_starter: daemon::DaemonStarter = Arc::new(move |daemon_handle, ready_tx| {
+                let (srv, enricher) = build_server_and_enricher(&db_path_buf, &paths_clone)?;
+                Ok(daemon::spawn_daemon(srv, enricher, daemon_handle, ready_tx))
+            });
+
+            let relay_result = daemon::resume_relay_after_promotion(
+                db_path,
+                recovery_state,
+                Some(daemon_starter),
+                Some(daemon::OwnedDaemon { task: daemon_task }),
+            )
+            .await;
 
             if let Err(ref e) = relay_result {
                 warn!("relay promotion: relay ended with error: {e:#}");
-            }
-
-            info!("relay promotion: relay finished; waiting for daemon task");
-            match daemon_task.await {
-                Ok(Ok(())) => {
-                    info!("relay promotion: daemon exited cleanly");
-                }
-                Ok(Err(e)) => {
-                    warn!("relay promotion: daemon exited with error: {e:#}");
-                }
-                Err(e) => {
-                    warn!("relay promotion: daemon task panicked: {e}");
-                }
             }
 
             relay_result

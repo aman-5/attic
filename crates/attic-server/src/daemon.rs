@@ -174,16 +174,16 @@ pub(crate) enum RelaySupervisionOutcome {
 /// losing the stdin/stdout pipe.
 pub(crate) struct RelayRecoveryState {
     /// Cached MCP initialization frames for replay.
-    session_cache: RelaySessionCache,
+    pub(crate) session_cache: RelaySessionCache,
     /// The request that was in-flight (sent to the old daemon but whose
     /// response was never received) at the moment of daemon disconnect.
-    interrupted_request: Option<InFlightRequest>,
+    pub(crate) interrupted_request: Option<InFlightRequest>,
     /// Persistent stdin handle (retained across recovery so Windows pipe state is preserved).
-    stdin: tokio::io::Stdin,
+    pub(crate) stdin: tokio::io::Stdin,
     /// Persistent stdout handle (retained across recovery).
-    stdout: tokio::io::Stdout,
+    pub(crate) stdout: tokio::io::Stdout,
     /// Unparsed or pending stdin bytes from before promotion.
-    pending_stdin: Vec<u8>,
+    pub(crate) pending_stdin: Vec<u8>,
 }
 
 /// Tracks a daemon accept-loop background task owned by a relay that won
@@ -454,28 +454,31 @@ pub(crate) enum RelayExit {
 /// "queued but not yet written" from "bytes flushed to the socket" without a
 /// schema change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryState {
+pub(crate) enum DeliveryState {
     /// The framed request bytes were successfully written to the daemon socket.
     Sent,
 }
 
 /// One MCP request that was forwarded to the daemon but whose response has not
 /// yet been observed. Kept until the daemon sends back a matching `id`.
-struct InFlightRequest {
+pub(crate) struct InFlightRequest {
     /// Raw JSON-RPC id value (number literal or `"quoted string"`) extracted
     /// from the request JSON. Used to match the daemon response so the entry
     /// can be cleared.
-    id_raw: String,
+    pub(crate) id_raw: String,
     /// JSON-RPC `method` string — used to classify retry safety after a
     /// daemon disconnect.
-    method: String,
+    pub(crate) method: String,
     /// Complete Content-Length–framed bytes of the original request, stored
     /// so an eligible read-only request can be retried exactly once against
     /// the replacement daemon.
-    framed: Vec<u8>,
+    pub(crate) framed: Vec<u8>,
     /// Delivery state at the moment the daemon disconnected.
     #[allow(dead_code)]
-    delivery: DeliveryState,
+    pub(crate) delivery: DeliveryState,
+    /// Whether this request has already been retried once across daemon recovery.
+    /// Invariant: request_retry_count <= 1 across all daemon deaths.
+    pub(crate) retried: bool,
 }
 
 /// Methods that are **explicitly known to be safe, read-only, and
@@ -581,7 +584,7 @@ fn make_jsonrpc_error_response(id_raw: &str, code: i32, message: &str) -> Vec<u8
 /// notification are cached; in-flight non-initialization requests are tracked
 /// separately via [`InFlightRequest`].
 #[derive(Default)]
-struct RelaySessionCache {
+pub(crate) struct RelaySessionCache {
     /// Raw bytes of the client's `initialize` request, exactly as received
     /// from stdin. Replayed verbatim to a fresh daemon socket before resuming
     /// the normal byte-level splice. `None` until the first `initialize` message
@@ -816,6 +819,7 @@ async fn run_relay_with_cache(
                                             method: effective_method_for_classification(m, body),
                                             framed: framed.clone(),
                                             delivery: DeliveryState::Sent,
+                                            retried: false,
                                         });
                                     }
                                 }
@@ -893,11 +897,11 @@ async fn replay_session_and_resolve_inflight(
 
     // Handle the interrupted in-flight request.
     // Safety rule (opt-in allowlist): only methods explicitly listed in
-    // `is_safe_readonly_method` may be retried once. Everything else —
-    // mutations, unknown/future tools, and anything with unclear idempotency —
-    // receives a synthesized JSON-RPC error.
+    // `is_safe_readonly_method` may be retried once (request_retry_count <= 1).
+    // Everything else — mutations, unknown/future tools, and requests that
+    // have already been retried once — receives a synthesized JSON-RPC error.
     if let Some(req) = in_flight.take() {
-        if is_safe_readonly_method(&req.method) {
+        if !req.retried && is_safe_readonly_method(&req.method) {
             info!(
                 method = %req.method,
                 id    = %req.id_raw,
@@ -907,28 +911,36 @@ async fn replay_session_and_resolve_inflight(
                 warn!("relay: retry write failed; new daemon connection already broken");
                 return false;
             }
-            // Re-arm for completeness so the response clears the in-flight slot.
+            // Re-arm with retried = true so that if daemon dies again, it is never retried a second time.
             *in_flight = Some(InFlightRequest {
                 id_raw: req.id_raw,
                 method: req.method,
                 framed: req.framed,
                 delivery: DeliveryState::Sent,
+                retried: true,
             });
         } else {
-            // Mutation or unknown method — synthesize error, never replay.
+            // Already retried once or mutation / unknown method — synthesize error, never replay.
+            let reason = if req.retried {
+                "The daemon disconnected while this operation was in flight after a retry attempt. \
+                 Its completion state is unknown. The operation was not automatically retried again."
+            } else {
+                "The daemon disconnected while this operation was in flight. \
+                 Its completion state is unknown. The operation was not automatically retried."
+            };
             let err_bytes = make_jsonrpc_error_response(
                 &req.id_raw,
                 -32603,
-                "The daemon disconnected while this operation was in flight. \
-                 Its completion state is unknown. The operation was not automatically retried.",
+                reason,
             );
             let _ = stdout.write_all(&err_bytes).await;
             let _ = stdout.flush().await;
             warn!(
                 method = %req.method,
                 id    = %req.id_raw,
+                retried = req.retried,
                 "relay: in-flight request had ambiguous delivery; \
-                 synthesized error to client (method not on read-only allowlist)"
+                 synthesized error to client"
             );
         }
     }
@@ -1039,26 +1051,28 @@ async fn recover_daemon(
 /// 7. When the external MCP client disconnects, if this process owns a running replacement daemon,
 ///    it awaits the daemon task allowing it to serve any other connected clients according
 ///    to standard idle policy.
-pub(crate) async fn run_relay_supervised(
+pub(crate) async fn run_relay_supervised_internal(
     relay: RelayHandle,
     db_path: &Path,
     daemon_starter: Option<DaemonStarter>,
+    recovery: RelayRecoveryState,
+    mut owned_daemon: Option<OwnedDaemon>,
 ) -> RelaySupervisionOutcome {
-    let mut cache = RelaySessionCache::default();
-    // One in-flight request slot (MCP stdio is serial).
-    let mut in_flight: Option<InFlightRequest> = None;
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut owned_daemon: Option<OwnedDaemon> = None;
+    let RelayRecoveryState {
+        mut session_cache,
+        mut interrupted_request,
+        mut stdin,
+        mut stdout,
+        pending_stdin: mut stdin_buf,
+    } = recovery;
 
     let mut current_stream = relay.stream;
 
     loop {
         match run_relay_with_cache(
             RelayHandle { stream: current_stream },
-            &mut cache,
-            &mut in_flight,
+            &mut session_cache,
+            &mut interrupted_request,
             &mut stdin,
             &mut stdout,
             &mut stdin_buf,
@@ -1123,8 +1137,8 @@ pub(crate) async fn run_relay_supervised(
                     return RelaySupervisionOutcome::PromoteToDaemon {
                         daemon_handle: handle,
                         recovery_state: RelayRecoveryState {
-                            session_cache: cache,
-                            interrupted_request: in_flight,
+                            session_cache,
+                            interrupted_request,
                             stdin,
                             stdout,
                             pending_stdin: stdin_buf,
@@ -1134,8 +1148,8 @@ pub(crate) async fn run_relay_supervised(
                 Ok(RecoveredTarget::Connected(mut stream)) => {
                     if replay_session_and_resolve_inflight(
                         &mut stream,
-                        &cache,
-                        &mut in_flight,
+                        &session_cache,
+                        &mut interrupted_request,
                         &mut stdout,
                     )
                     .await
@@ -1165,6 +1179,21 @@ pub(crate) async fn run_relay_supervised(
             }
         }
     }
+}
+
+pub(crate) async fn run_relay_supervised(
+    relay: RelayHandle,
+    db_path: &Path,
+    daemon_starter: Option<DaemonStarter>,
+) -> RelaySupervisionOutcome {
+    let recovery = RelayRecoveryState {
+        session_cache: RelaySessionCache::default(),
+        interrupted_request: None,
+        stdin: tokio::io::stdin(),
+        stdout: tokio::io::stdout(),
+        pending_stdin: Vec::with_capacity(4096),
+    };
+    run_relay_supervised_internal(relay, db_path, daemon_starter, recovery, None).await
 }
 
 /// Low-level relay that simply splices `stdin ↔ stream` byte-for-byte with
@@ -1305,14 +1334,15 @@ pub(crate) fn spawn_daemon(
 pub(crate) async fn resume_relay_after_promotion(
     db_path: &Path,
     recovery: RelayRecoveryState,
+    daemon_starter: Option<DaemonStarter>,
+    owned_daemon: Option<OwnedDaemon>,
 ) -> anyhow::Result<()> {
-
     let RelayRecoveryState {
-        mut session_cache,
-        mut interrupted_request,
-        mut stdin,
+        session_cache,
+        interrupted_request,
+        stdin,
         mut stdout,
-        mut pending_stdin,
+        pending_stdin,
     } = recovery;
 
     // Connect to the replacement daemon using the same IPC mechanism as
@@ -1333,11 +1363,13 @@ pub(crate) async fn resume_relay_after_promotion(
 
     info!("relay promotion: connected to replacement daemon");
 
+    let mut current_in_flight = interrupted_request;
+
     // Replay MCP initialization + in-flight request onto the new daemon connection.
     if !replay_session_and_resolve_inflight(
         &mut stream,
         &session_cache,
-        &mut interrupted_request,
+        &mut current_in_flight,
         &mut stdout,
     )
     .await
@@ -1345,78 +1377,30 @@ pub(crate) async fn resume_relay_after_promotion(
         anyhow::bail!("relay promotion: initial replay failed on replacement daemon");
     }
 
-    info!("relay promotion: resuming normal relay forwarding");
+    info!("relay promotion: resuming normal relay forwarding via unified supervisor");
 
-    let mut current_stream = stream;
+    let updated_recovery = RelayRecoveryState {
+        session_cache,
+        interrupted_request: current_in_flight,
+        stdin,
+        stdout,
+        pending_stdin,
+    };
 
-    loop {
-        let relay = RelayHandle { stream: current_stream };
-        match run_relay_with_cache(
-            relay,
-            &mut session_cache,
-            &mut interrupted_request,
-            &mut stdin,
-            &mut stdout,
-            &mut pending_stdin,
-        )
-        .await?
-        {
-            RelayExit::StdinClosed => {
-                info!("relay promotion: MCP client closed normally");
-                return Ok(());
-            }
-            RelayExit::DaemonClosed => {
-                warn!("relay promotion: replacement daemon closed connection; attempting recovery");
-                let recovery_deadline = Instant::now() + RELAY_RECOVERY_BUDGET;
-                let mut attempt = 0usize;
-                let mut reconnected = None;
-
-                while Instant::now() < recovery_deadline {
-                    let backoff_ms = RELAY_RECOVERY_BACKOFFS_MS
-                        .get(attempt)
-                        .copied()
-                        .unwrap_or(*RELAY_RECOVERY_BACKOFFS_MS.last().unwrap());
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("relay promotion: SIGINT/Ctrl+C received during recovery backoff; cancelling recovery");
-                            return Err(anyhow::anyhow!("relay recovery cancelled by SIGINT"));
-                        }
-                    }
-                    attempt += 1;
-
-                    match elect(db_path).await {
-                        Ok(ElectionResult::Relay(new_relay)) => {
-                            let mut s = new_relay.stream;
-                            if replay_session_and_resolve_inflight(
-                                &mut s,
-                                &session_cache,
-                                &mut interrupted_request,
-                                &mut stdout,
-                            )
-                            .await
-                            {
-                                reconnected = Some(s);
-                                break;
-                            }
-                        }
-                        Ok(ElectionResult::Daemon(_handle)) => {
-                            warn!("relay promotion: won election during second recovery; retrying connection");
-                        }
-                        Ok(ElectionResult::Fallback(_)) => break,
-                        Err(e) => {
-                            warn!("relay promotion: election attempt failed: {e}");
-                        }
-                    }
-                }
-
-                if let Some(s) = reconnected {
-                    current_stream = s;
-                    continue;
-                }
-                anyhow::bail!("relay promotion: could not recover after replacement daemon closed");
-            }
+    match run_relay_supervised_internal(
+        RelayHandle { stream },
+        db_path,
+        daemon_starter,
+        updated_recovery,
+        owned_daemon,
+    )
+    .await
+    {
+        RelaySupervisionOutcome::ClientClosed => Ok(()),
+        RelaySupervisionOutcome::PromoteToDaemon { .. } => {
+            anyhow::bail!("relay promotion: won election during recovery but no daemon starter available")
         }
+        RelaySupervisionOutcome::Fatal { error } => Err(error),
     }
 }
 
@@ -1721,5 +1705,158 @@ mod tests {
         let p1 = Path::new("C:/test/path/attic.db");
         let p2 = Path::new("C:/test/path/attic.db");
         assert_eq!(derive_socket_name(p1), derive_socket_name(p2));
+    }
+
+    #[tokio::test]
+    async fn test_inflight_request_retried_at_most_once_invariant() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("attic.db");
+        let socket_name = derive_socket_name(&db_path);
+
+        // Stand up a test listener
+        let listener = ListenerOptions::new()
+            .name(socket_name.as_str().to_ns_name::<GenericNamespaced>().expect("ns name"))
+            .create_tokio()
+            .expect("create listener");
+
+        let handle = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            stream
+        });
+
+        let mut client_stream = connect_stream(&socket_name).await.expect("connect");
+        let _server_stream = handle.await.expect("server stream");
+
+        let cache = RelaySessionCache::default();
+        let mut stdout = tokio::io::stdout();
+
+        // 1. Safe read-only request, first time (retried: false)
+        let body = b"{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"status\"}";
+        let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), std::str::from_utf8(body).unwrap());
+        let mut in_flight = Some(InFlightRequest {
+            id_raw: "101".to_string(),
+            method: "status".to_string(),
+            framed: framed.into_bytes(),
+            delivery: DeliveryState::Sent,
+            retried: false,
+        });
+
+        let ok = replay_session_and_resolve_inflight(
+            &mut client_stream,
+            &cache,
+            &mut in_flight,
+            &mut stdout,
+        )
+        .await;
+        assert!(ok);
+        // After first retry, in_flight must be re-armed with retried = true
+        assert!(in_flight.is_some());
+        let req = in_flight.as_ref().unwrap();
+        assert!(req.retried, "request must be marked retried after first retry");
+
+        // 2. Safe read-only request, second time (retried: true)
+        // Daemon dies again before answering! On subsequent recovery, it must NOT be retried again.
+        let ok2 = replay_session_and_resolve_inflight(
+            &mut client_stream,
+            &cache,
+            &mut in_flight,
+            &mut stdout,
+        )
+        .await;
+        assert!(ok2);
+        // It must have synthesized an error and cleared in_flight (taken)
+        assert!(in_flight.is_none(), "already-retried request must not be retried a second time");
+
+        // 3. Mutation request (retried: false) must NEVER be retried
+        let mut mutation_flight = Some(InFlightRequest {
+            id_raw: "102".to_string(),
+            method: "workspace/add".to_string(),
+            framed: b"dummy mutation".to_vec(),
+            delivery: DeliveryState::Sent,
+            retried: false,
+        });
+        let ok3 = replay_session_and_resolve_inflight(
+            &mut client_stream,
+            &cache,
+            &mut mutation_flight,
+            &mut stdout,
+        )
+        .await;
+        assert!(ok3);
+        assert!(mutation_flight.is_none(), "mutation must never be retried");
+
+        // 4. Unknown method (retried: false) must NEVER be retried
+        let mut unknown_flight = Some(InFlightRequest {
+            id_raw: "103".to_string(),
+            method: "custom_unknown_method".to_string(),
+            framed: b"dummy unknown".to_vec(),
+            delivery: DeliveryState::Sent,
+            retried: false,
+        });
+        let ok4 = replay_session_and_resolve_inflight(
+            &mut client_stream,
+            &cache,
+            &mut unknown_flight,
+            &mut stdout,
+        )
+        .await;
+        assert!(ok4);
+        assert!(unknown_flight.is_none(), "unknown method must never be retried");
+    }
+
+    #[tokio::test]
+    async fn test_recover_daemon_starts_daemon_and_returns_connected() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("attic.db");
+        let mut owned_daemon: Option<OwnedDaemon> = None;
+
+        let starter_called = Arc::new(AtomicUsize::new(0));
+        let starter_called_clone = starter_called.clone();
+
+        let daemon_starter: DaemonStarter = Arc::new(move |daemon_handle, ready_tx| {
+            starter_called_clone.fetch_add(1, Ordering::SeqCst);
+            let task = tokio::spawn(async move {
+                let _ = ready_tx.send(());
+                // Hold listener alive for a short time
+                let _handle = daemon_handle;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            });
+            Ok(task)
+        });
+
+        // Failure 1: First recovery
+        let res = recover_daemon(&db_path, &mut owned_daemon, Some(&daemon_starter), 0).await;
+        assert!(res.is_ok(), "first recovery must succeed");
+        match res.unwrap() {
+            RecoveredTarget::Connected(_stream) => {}
+            RecoveredTarget::WonElection(_) => panic!("expected Connected when daemon_starter is present"),
+        }
+        assert_eq!(starter_called.load(Ordering::SeqCst), 1);
+        assert!(owned_daemon.is_some());
+
+        // Simulate Daemon #2 dying:
+        let old_owned = owned_daemon.take().unwrap();
+        let _ = old_owned.task.await;
+
+        // Failure 2: Second recovery — SAME relay wins election again!
+        // It must NOT discard the handle and must NOT fail. It must call daemon_starter a second time!
+        let res2 = recover_daemon(&db_path, &mut owned_daemon, Some(&daemon_starter), 0).await;
+        assert!(res2.is_ok(), "second recovery must succeed");
+        match res2.unwrap() {
+            RecoveredTarget::Connected(_stream) => {}
+            RecoveredTarget::WonElection(_) => panic!("expected Connected on second recovery"),
+        }
+        assert_eq!(starter_called.load(Ordering::SeqCst), 2, "daemon_starter must be called for Daemon #3");
+        assert!(owned_daemon.is_some());
+
+        // Failure 3: Third sequential recovery
+        let old_owned2 = owned_daemon.take().unwrap();
+        let _ = old_owned2.task.await;
+
+        let res3 = recover_daemon(&db_path, &mut owned_daemon, Some(&daemon_starter), 0).await;
+        assert!(res3.is_ok(), "third recovery must succeed");
+        assert_eq!(starter_called.load(Ordering::SeqCst), 3, "daemon_starter must be called for Daemon #4");
+        assert!(owned_daemon.is_some());
     }
 }
