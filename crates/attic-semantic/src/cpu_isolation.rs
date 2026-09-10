@@ -112,4 +112,54 @@ mod tests {
             assert_eq!(threads_used, plan.threads_per_lane);
         }
     }
+
+    #[test]
+    fn plan_candle_native_math_confinement_across_allocations() {
+        use candle_core::{Device, Tensor};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Validate real execution under dynamic Orchestrator allocations: 8 -> 4 -> 2 -> 6
+        let transitions = [(8, 2), (4, 4), (2, 2), (6, 2)];
+
+        for &(granted, lanes) in &transitions {
+            let plan = CpuIsolationPlan::compute(granted, lanes);
+            let threads_budget = plan.threads_per_lane;
+
+            // Execute real Candle CPU matrix multiplications inside execute_isolated
+            let result = plan.execute_isolated(|| {
+                let a = Tensor::randn(0f32, 1f32, (128, 128), &Device::Cpu).unwrap();
+                let b = Tensor::randn(0f32, 1f32, (128, 128), &Device::Cpu).unwrap();
+                let c = a.matmul(&b).unwrap();
+                c.to_vec2::<f32>().unwrap()
+            });
+            assert_eq!(result.len(), 128);
+
+            // Verify that create_lane_pool builds exactly the requested thread budget
+            let pool = plan.create_lane_pool().unwrap();
+            assert_eq!(pool.current_num_threads(), threads_budget);
+
+            // Execute parallel Candle tensor math across dedicated pool workers
+            let observed_threads = Arc::new(Mutex::new(HashSet::new()));
+            let observed_clone = Arc::clone(&observed_threads);
+
+            pool.broadcast(|ctx| {
+                let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+                let index = ctx.index();
+                observed_clone.lock().unwrap().insert((index, name));
+
+                // Perform real native tensor operations inside every worker
+                let t1 = Tensor::zeros((64, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
+                let t2 = Tensor::ones((64, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
+                let _ = t1.add(&t2).unwrap();
+            });
+
+            let observed = observed_threads.lock().unwrap();
+            assert_eq!(observed.len(), threads_budget);
+
+            for (idx, name) in observed.iter() {
+                assert_eq!(name, &format!("attic-qwen-lane-{}", idx));
+            }
+        }
+    }
 }

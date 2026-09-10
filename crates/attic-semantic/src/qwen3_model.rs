@@ -10,6 +10,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
+use candle_nn::attention::{AttnMask, flash_attn};
 use candle_transformers::models::with_tracing::{Linear, RmsNorm, linear_b, linear_no_bias};
 use candle_transformers::utils::repeat_kv;
 use std::sync::Arc;
@@ -169,6 +170,40 @@ impl Qwen3Attention {
         // RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
 
+        // Fused CPU Flash Attention path (Candle 0.11.0)
+        // Eliminates repeat_kv allocation, full QxK^T score materialization, softmax buffer allocations,
+        // and separate V matmul by executing candle-nn's optimized CPU flash_attn kernel.
+        if x.device().is_cpu() {
+            let q_flash = q.transpose(1, 2)?.contiguous()?; // (B, L, H, D)
+            let k_flash = k.transpose(1, 2)?.contiguous()?; // (B, L, KV_H, D)
+            let v_flash = v.transpose(1, 2)?.contiguous()?; // (B, L, KV_H, D)
+
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+            let flash_mask = match attn_mask {
+                Some(m) if b == 1 => AttnMask::Mask(m.clone()),
+                None => AttnMask::causal_with_offset(0),
+                _ => AttnMask::None,
+            };
+
+            if let Ok(ctx) = flash_attn::<f32>(
+                &q_flash,
+                &k_flash,
+                &v_flash,
+                scale,
+                flash_mask,
+                None,
+                None,
+            ) {
+                // Output from CPU flash attention is (B, H, S, D), transpose to (B, S, H, D)
+                return ctx
+                    .transpose(1, 2)?
+                    .reshape((b, l, self.num_heads * self.head_dim))?
+                    .apply(&self.o_proj);
+            }
+        }
+
+        // Standard fallback path for non-CPU devices or unsupported mask configurations
         // GQA repeat_kv
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;

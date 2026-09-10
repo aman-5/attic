@@ -120,9 +120,9 @@ toml               = "1"
 # reference-compatibility test (cosine >=0.999 against sentence-transformers
 # output) still passes on 0.9.1. CPU-only (no cuda/mkl/metal features) to
 # match the "no exotic backend" release profile above.
-candle-core        = "0.9.1"
-candle-nn          = "0.9.1"
-candle-transformers = "0.9.1"
+candle-core        = "0.11.0"
+candle-nn          = "0.11.0"
+candle-transformers = "0.11.0"
 # `fancy-regex` (pure Rust), NOT `onig` (a C library requiring a C compiler
 # toolchain) — the tokenizers crate requires one of the two; Qwen3's byte-level BPE
 # tokenizer needs neither's advanced regex features, so the pure-Rust option

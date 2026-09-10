@@ -28,10 +28,10 @@ This audit verifies all 45 architectural invariants defined in Master Plan V2 §
 | 14 | **Model baseline memory accounted** | `ModelLifecycleManager` verifies resident memory requirements before spawning inference lanes, ensuring model weight overhead does not breach process memory budgets. | **PASS** |
 | 15 | **Shared model strategy** | Single shared model instance per process; all workspaces and repositories share the same provider instance. | **PASS** |
 | 16 | **Provider concurrency defined** | `ProviderConcurrencyContract` (`SharedConcurrent`, `Serialized`, `PooledLanes`) explicitly declared on `EmbeddingProvider`. | **PASS** |
-| 17 | **Candle cannot bypass CPU budget** | `CpuIsolationPlan` (`crates/attic-semantic/src/cpu_isolation.rs`) divides granted CPU threads across lanes and exports thread bounds to math backends (`RAYON_NUM_THREADS`, `OMP_NUM_THREADS`). | **PASS** |
+| 17 | **Candle cannot bypass CPU budget** | `CpuIsolationPlan` (`crates/attic-semantic/src/cpu_isolation.rs`) divides granted CPU threads across lanes and enforces execution inside dedicated scoped `rayon::ThreadPool` instances (`execute_isolated`), strictly bounding Rayon/gemm/Candle CPU thread utilization to the granted budget. | **PASS** |
 | 18 | **Startup/warm-up policy** | `ThroughputController` requires model tensor warm-up before entering high-throughput batching. | **PASS** |
 | 19 | **Throughput controller bounded** | Hill-climbing candidate exploration is bounded by stabilization windows, cooldown periods, and rollback on diminishing returns (`min_meaningful_gain_ratio`). | **PASS** |
-| 20 | **Tuning persistence/invalidation** | `LearnedTuningManager` with `0004_learned_tuning.sql` persists optimal parameters keyed by `(cpu_arch, os, model_id, revision, dimension, runtime_version)` with BLAKE3 composite hash; automatically invalidates on environment change. | **PASS** |
+| 20 | **Tuning persistence/invalidation** | `LearnedTuningManager` with `sem_learned_tuning` schema in baseline `0001_initial.sql` persists optimal parameters keyed by `(cpu_arch, os, model_id, revision, dimension, runtime_version)` with BLAKE3 composite hash; automatically invalidates on environment change. | **PASS** |
 | 21 | **Shared semantic engine** | Single global `SemanticStore` and `BackgroundEnricher` handle all repositories in the workspace. | **PASS** |
 | 22 | **Deterministic hierarchical fairness** | `SemanticFairScheduler` orders work deterministically by `(priority_class -> workspace -> repo -> deterministic FIFO)`. | **PASS** |
 | 23 | **Bounded queue** | Queue depth bounded by high watermark (10,000) and low watermark (5,000) hysteresis. | **PASS** |
@@ -52,7 +52,7 @@ This audit verifies all 45 architectural invariants defined in Master Plan V2 §
 | 38 | **Dedup policy defined** | Identical content hash with same fingerprint avoids duplicate embedding forward passes. | **PASS** |
 | 39 | **Canonical readiness independent** | System reports canonical `READY` even while semantic generation is `BUILDING`. | **PASS** |
 | 40 | **Semantic failures isolated** | Inference failures gracefully degrade semantic candidate generation without crashing the MCP daemon or affecting canonical search. | **PASS** |
-| 41 | **Vector search scalability measured** | Verified in CP20: 30k, 100k, and 500k→1M+ deadline benchmarks pass with `0005_vector_index_scale.sql` composite indexing. | **PASS** |
+| 41 | **Vector search scalability measured** | Verified in CP20: 30k, 100k, and 500k→1M+ deadline benchmarks pass with `idx_sem_embeddings_gen_repo` composite indexing in baseline `0001_initial.sql`. | **PASS** |
 | 42 | **Progress/ETA/why-slow available** | Verified in CP18: `SemanticProgressSnapshot` and `diagnose_why_slow` integrated into server `status` output. | **PASS** |
 | 43 | **External MCP remains stdio** | `attic-server` communicates strictly over standard input/output using JSON-RPC. | **PASS** |
 | 44 | **Phase 100 daemon recovery preserved** | Daemon lifecycle, PID files, lockfiles, and stdio recovery mechanisms preserved intact. | **PASS** |
