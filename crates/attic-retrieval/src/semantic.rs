@@ -378,11 +378,13 @@ pub fn enrich_to_completion(
     let stats = attic_semantic::drive(conn, &stack.store, stack.provider.as_ref(), cfg, &cancel)
         .map_err(|e| e.to_string())?;
 
-    if stats.queue_remaining == 0 {
-        if let Ok(Some(g)) = stack.store.get_building_generation() {
-            let _ = stack.store.activate_generation(g.generation_id);
-            let _ = stack.store.ensure_candidate_index_synced(conn, g.generation_id);
-        }
+    if stats.queue_remaining == 0
+        && let Ok(Some(g)) = stack.store.get_building_generation()
+    {
+        let _ = stack.store.activate_generation(g.generation_id);
+        let _ = stack
+            .store
+            .ensure_candidate_index_synced(conn, g.generation_id);
     }
     Ok(stats)
 }

@@ -5,11 +5,12 @@
 //!   deleting it must never affect canonical intelligence (tested).
 //! * Canonical SQLite entities are NOT contaminated with provider-specific
 //!   vector assumptions; this file can be dropped and rebuilt at any time.
-//! * Nearest-neighbor search is a bounded brute-force scan over the ACTIVE
-//!   model's rows with cached norms. At Phase 5 scales (≤ tens of thousands
-//!   of SELECTED units) measured latency is sub-millisecond; an external
-//!   vector database would add operational cost without measured need
-//!   (value gate §24). Revisit only with benchmark evidence (OQ-023).
+//! * Nearest-neighbor search uses a per-generation in-memory HNSW index
+//!   (`hnsw_rs`, `DistCosine`) for O(log N) candidate retrieval at 30k–1M+
+//!   vector scales, followed by exact full-dimension cosine reranking over
+//!   SQLite B-tree lookups (ADR-015).  `semantic.db` remains the durable
+//!   source of truth; the HNSW index is rebuilt incrementally on demand and
+//!   is never persisted separately.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,8 +19,8 @@ use std::sync::Mutex;
 use crate::error::SemanticError;
 use crate::generation::{GenerationManager, GenerationRecord};
 use crate::provider::{CancelFlag, EmbeddingFingerprint};
-use rusqlite::{Connection, params};
 use hnsw_rs::prelude::*;
+use rusqlite::{Connection, params};
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
 
@@ -127,10 +128,17 @@ struct CandidateEntry {
 }
 
 /// Generation-isolated candidate index backed by HNSW for O(log N) fast retrieval.
+///
+/// Uses `DistCosine` rather than `DistDot` because L2-normalised embedding
+/// vectors produced by neural models (Qwen3, etc.) contain negative
+/// components.  `DistDot` in the underlying `anndists` crate asserts
+/// `dot >= 0.0`, which panics on any such vector.  `DistCosine` has no sign
+/// restriction and correctly orders nearest neighbours for signed float32
+/// embeddings.
 struct GenerationIndex {
     #[allow(dead_code)]
     generation_id: i64,
-    hnsw: Hnsw<'static, f32, DistDot>,
+    hnsw: Hnsw<'static, f32, DistCosine>,
     metadata: HashMap<usize, CandidateEntry>,
     last_synced_rowid: i64,
     next_ann_id: usize,
@@ -150,9 +158,11 @@ impl GenerationIndex {
     pub fn new(generation_id: i64) -> Self {
         Self {
             generation_id,
-            // Configure HNSW parameters for up to 1M items
-            // max_nb_connection: 16, max_elements: 1_000_000, max_layer: 16, ef_construction: 200
-            hnsw: Hnsw::new(16, 1_000_000, 16, 200, DistDot{}),
+            // Configure HNSW parameters for up to 1M items.
+            // max_nb_connection: 16, max_elements: 1_000_000, max_layer: 16, ef_construction: 200.
+            // DistCosine is safe for signed float32 vectors; DistDot would panic on negative dot
+            // products that arise naturally from L2-normalised neural embeddings.
+            hnsw: Hnsw::new(16, 1_000_000, 16, 200, DistCosine {}),
             metadata: HashMap::new(),
             last_synced_rowid: 0,
             next_ann_id: 1,
@@ -188,7 +198,7 @@ impl GenerationIndex {
 
         let mut truncated = false;
         let mut top_candidates = Vec::with_capacity(candidate_limit);
-        
+
         // Start with a reasonable search budget and double it if filtering rejects too many
         let mut ef_search = candidate_limit.max(64);
         let max_ef_search = 10000;
@@ -199,22 +209,22 @@ impl GenerationIndex {
                 truncated = true;
                 break;
             }
-            if let Some(d) = budget.deadline {
-                if std::time::Instant::now() >= d {
-                    truncated = true;
-                    break;
-                }
+            if let Some(d) = budget.deadline
+                && std::time::Instant::now() >= d
+            {
+                truncated = true;
+                break;
             }
 
             let neighbors = self.hnsw.search(&q_coarse, candidate_limit, ef_search);
             top_candidates.clear();
-            
+
             for neighbor in neighbors {
                 if let Some(entry) = self.metadata.get(&neighbor.d_id) {
-                    if let Some(repo) = repository_filter {
-                        if entry.repository_id != repo {
-                            continue;
-                        }
+                    if let Some(repo) = repository_filter
+                        && entry.repository_id != repo
+                    {
+                        continue;
                     }
                     top_candidates.push(entry.rowid);
                     if top_candidates.len() >= candidate_limit {
@@ -228,7 +238,7 @@ impl GenerationIndex {
             if top_candidates.len() >= candidate_limit || ef_search >= max_ef_search {
                 break;
             }
-            
+
             // Not enough candidates found after metadata filtering; increase search depth
             ef_search = (ef_search * 2).min(max_ef_search);
         }
@@ -503,8 +513,6 @@ impl SemanticStore {
         })
     }
 
-
-
     /// Delete ALL embeddings whose (provider, model) differ from the active
     /// pair — model-change invalidation without touching canonical data.
     pub fn purge_inactive_models(
@@ -596,9 +604,40 @@ impl SemanticStore {
     }
 
     /// Prune old superseded generations according to retention policy.
+    ///
+    /// In addition to deleting DB rows via [`GenerationManager::prune_old_generations`],
+    /// this also evicts the corresponding in-memory HNSW entries from
+    /// `candidate_index` so the memory they hold (HNSW graph + metadata map)
+    /// is promptly released.  The eviction query runs while `conn` is still
+    /// held so that the surviving-ID set is consistent with the post-prune DB
+    /// state; `conn` is then dropped before acquiring `candidate_index` to
+    /// preserve the established lock ordering (conn → candidate_index).
     pub fn prune_generations(&self, keep_max: usize) -> Result<usize, SemanticError> {
         let mut conn = self.guard()?;
-        GenerationManager::prune_old_generations(&mut conn, keep_max)
+        let pruned = GenerationManager::prune_old_generations(&mut conn, keep_max)?;
+
+        if pruned > 0 {
+            // Collect the generation IDs that still exist post-prune.
+            let surviving: std::collections::HashSet<i64> = {
+                let mut stmt = conn.prepare("SELECT generation_id FROM sem_generations")?;
+                let mut rows = stmt.query([])?;
+                let mut set = std::collections::HashSet::new();
+                while let Some(r) = rows.next()? {
+                    set.insert(r.get::<_, i64>(0)?);
+                }
+                set
+            };
+            // Release the DB lock before acquiring candidate_index to maintain
+            // the consistent conn → candidate_index lock order.
+            drop(conn);
+
+            let mut index_guard = self.candidate_index.lock().map_err(|_| {
+                SemanticError::StoreUnavailable("candidate index mutex poisoned".into())
+            })?;
+            index_guard.retain(|gen_id, _| surviving.contains(gen_id));
+        }
+
+        Ok(pruned)
     }
 
     /// Insert a batch of embedding records tagged with a specific generation ID (§52).
@@ -704,15 +743,18 @@ impl SemanticStore {
                     *val *= inv_norm;
                 }
             }
-            
+
             let ann_id = gen_idx.next_ann_id;
             gen_idx.next_ann_id += 1;
-            
+
             gen_idx.hnsw.insert((&coarse, ann_id));
-            gen_idx.metadata.insert(ann_id, CandidateEntry {
-                rowid,
-                repository_id: repo_id,
-            });
+            gen_idx.metadata.insert(
+                ann_id,
+                CandidateEntry {
+                    rowid,
+                    repository_id: repo_id,
+                },
+            );
             gen_idx.last_synced_rowid = rowid;
         }
         Ok(())
@@ -1178,8 +1220,6 @@ mod tests {
         assert_eq!(counts.get(Q_INFLIGHT).copied().unwrap_or(0), 0);
         assert_eq!(counts.get(Q_PENDING).copied().unwrap_or(0), 0);
     }
-
-
 
     #[test]
     fn purge_inactive_models_keeps_active_pair() {

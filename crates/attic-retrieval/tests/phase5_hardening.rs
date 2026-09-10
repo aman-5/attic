@@ -39,13 +39,7 @@ fn poisoned_store_mutex_degrades_to_canonical_retrieval() {
     assert!(err.to_string().contains("unavailable"), "{err}");
     let qerr = stack
         .store
-        .knn_search_generation(
-            1,
-            &[1.0, 0.0],
-            4,
-            None,
-            &ScanBudget::unbounded(&cancel),
-        )
+        .knn_search_generation(1, &[1.0, 0.0], 4, None, &ScanBudget::unbounded(&cancel))
         .unwrap_err();
     assert!(qerr.to_string().contains("unavailable"), "{qerr}");
 
@@ -74,8 +68,6 @@ fn poisoned_store_mutex_degrades_to_canonical_retrieval() {
     );
     assert!(!out.plan.policy_trace.semantic_invoked);
 }
-
-
 
 // ── 3. Provider deadline contract: slow backend cannot exceed budget ───────
 

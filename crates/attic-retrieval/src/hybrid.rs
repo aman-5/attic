@@ -261,8 +261,13 @@ impl<'a> HybridSearcher<'a> {
             Ok(Some(g)) => g,
             Ok(None) => return (Vec::new(), Some(SemanticDegradationReason::NoEmbeddings)),
             Err(e) => {
-                tracing::warn!("hybrid search: semantic store unavailable (get_active_generation): {e}");
-                return (Vec::new(), Some(SemanticDegradationReason::StoreUnavailable));
+                tracing::warn!(
+                    "hybrid search: semantic store unavailable (get_active_generation): {e}"
+                );
+                return (
+                    Vec::new(),
+                    Some(SemanticDegradationReason::StoreUnavailable),
+                );
             }
         };
 
