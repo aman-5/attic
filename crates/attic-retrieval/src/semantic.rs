@@ -352,13 +352,6 @@ pub fn enrich_to_completion(
     // Test/bootstrap convenience — no explicit override provenance is
     // relevant here, so this always claims (if applicable) as a
     // Recommendation, matching the provider's own default identity.
-    attic_semantic::drive(
-        conn,
-        &stack.store,
-        stack.provider.as_ref(),
-        cfg,
-        &cancel,
-        attic_semantic::EmbeddingIntentSource::Recommendation,
-    )
-    .map_err(|e| e.to_string())
+    attic_semantic::drive(conn, &stack.store, stack.provider.as_ref(), cfg, &cancel)
+        .map_err(|e| e.to_string())
 }

@@ -131,8 +131,7 @@ pub struct ResourcePolicy {
     pub min_free_memory_mib: u64,
     /// `ResourceMonitor` foreground admission capacity.
     pub max_foreground_queries: usize,
-    /// Embedding batch size (consumed by a future `SemanticProvider`
-    /// implementation; not yet consumed by `HashingEmbedder`).
+    /// Embedding batch size (consumed by `SemanticProvider` / `Qwen3Embedder`).
     pub embedding_batch_size: usize,
     /// Number of concurrent background embedding worker threads
     /// (`BackgroundEnricher::spawn`).

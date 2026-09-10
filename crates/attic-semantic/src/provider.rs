@@ -13,7 +13,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::embedding_profile::EmbeddingSpaceDescriptor;
 use crate::error::SemanticError;
 
 /// Cooperative cancellation flag shared between coordinator and provider.
@@ -85,13 +84,8 @@ pub trait SemanticProvider: Send + Sync {
         true
     }
 
-    /// The resolved, immutable vector-space identity this provider actually
-    /// produces (Low-Level Design §3) — `None` for providers with no
-    /// persisted-identity concept (e.g. `HashingEmbedder`, test doubles).
-    /// Only a `Some` return causes the enrichment worker to claim/compare an
-    /// `EmbeddingProfile` before real embedding work; a provider that never
-    /// overrides this default never participates in profile claiming at all.
-    fn embedding_descriptor(&self) -> Option<EmbeddingSpaceDescriptor> {
+    /// Return the immutable architectural fingerprint of the vector space, if known.
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
         None
     }
 

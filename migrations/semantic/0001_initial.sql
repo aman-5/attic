@@ -1,11 +1,10 @@
 -- Semantic database migration: 0001_initial
 --
--- Attic Phase 101 Clean Final Architecture baseline schema.
+-- Attic Phase 102 Clean Final Architecture baseline schema.
 -- Contains the complete unified durable state for Qwen3-based semantic intelligence:
 --   - Vector embeddings with generation isolation and repository-scoped composite indexes
 --   - Durable crash-safe queue with priority and retry tracking
 --   - Query demand tracking
---   - Singleton active embedding profile
 --   - Semantic generations lifecycle
 --   - Learned resource and throughput tuning per hardware/model/runtime
 
@@ -58,13 +57,6 @@ CREATE TABLE IF NOT EXISTS sem_query_demand (
     path       TEXT PRIMARY KEY,
     hits       INTEGER NOT NULL DEFAULT 0,
     last_at_ms INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS sem_embedding_profile (
-    singleton_guard INTEGER PRIMARY KEY CHECK (singleton_guard = 1),
-    profile_id      TEXT NOT NULL,
-    config_json     TEXT NOT NULL,
-    claimed_at_ms   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sem_generations (

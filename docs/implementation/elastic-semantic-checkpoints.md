@@ -22,16 +22,16 @@ Tracking implementation progress per `ATTIC_FINAL_MASTER_PLAN_V2.md` §0 protoco
 | **CP11** | Shared Scheduler & Fairness | **PASS** | Scheduler Gate |
 | **CP12** | Queue / Crash / Stale Semantics | **PASS** | **QUEUE CORRECTNESS GATE** |
 | **CP13** | Disk Safety Reserve | **PASS** | Disk Safety Gate |
-| **CP14** | Inference CPU Isolation | **PASS** | **CPU ISOLATION GATE (F8)** |
+| **CP14** | Inference CPU Isolation | **REOPENED** | **CPU ISOLATION GATE (P11)** |
 | **CP15** | Orchestrator Semantic Control | **PASS** | **CRITICAL ARCHITECTURE GATE** |
 | **CP16** | Warm-Up & Throughput Controller | **PASS** | Throughput Gate |
 | **CP17** | Persist Learned Tuning | **PASS** | Tuning Gate |
 | **CP18** | Progress, ETA, & Diagnostics | **PASS** | Observability Gate |
-| **CP19** | Representative Retrieval Benchmark | **PASS** | **BENCHMARK GATE (F9)** |
-| **CP20** | Large-Index Retrieval (30k→1M+) | **PASS** | **LARGE INDEX GATE (F10)** |
-| **CP21** | Fresh Master Architecture Audit | **PASS** | **MASTER GATE (F13)** |
-| **CP22** | Quality + Embedding Speed Benchmark | **PASS** | **HARD SUCCESS GATE (F11)** |
-| **CP23** | Final Integration & Hardening | **PASS** | **RELEASE GATE (F14)** |
+| **CP19** | Representative Retrieval Benchmark | **PASS** | **BENCHMARK GATE (P10)** |
+| **CP20** | Large-Index Retrieval (30k→1M+) | **REOPENED** | **LARGE INDEX GATE (P12)** |
+| **CP21** | Fresh Master Architecture Audit | **INVALIDATED** | **MASTER GATE (P14)** |
+| **CP22** | Quality + Embedding Speed Benchmark | **REOPENED** | **HARD SUCCESS GATE (P13)** |
+| **CP23** | Final Integration & Hardening | **INVALIDATED** | **RELEASE GATE (P15)** |
 
 ---
 
@@ -42,21 +42,47 @@ Tracking execution of `ATTIC_PHASE101_CLEAN_FINAL_IMPLEMENTATION_PLAN.md`:
 | Clean Checkpoint | Focus | Status | Notes |
 | :--- | :--- | :---: | :--- |
 | **F0** | Freeze and Reclassify | **PASS** | Ledger reclassified; deletion schedule recorded |
-| **F1** | Remove BGE Completely | **PASS** | Purged `bge_embedder.rs`, tests, fixtures, policy |
-| **F2** | Remove Transitional Provider/Profile | **PASS** | Direct Qwen instantiation, eliminated race/adoption |
+| **F1** | Remove BGE Completely | **REOPENED** | Reopened in Phase 102 P1: audit Cargo.toml and purge comments/assets |
+| **F2** | Remove Transitional Provider/Profile | **REOPENED** | Reopened in Phase 102 P3: purge EmbeddingProfile/ClaimOutcome from codebase |
 | **F3** | Squash Semantic Schema | **PASS** | Single `0001_initial.sql` baseline; deleted 0002-0005; 66/66 unit tests pass |
 | **F4** | Clean Old Tests Across Repository | **PASS** | Obsolete tests removed, active tests rewritten to Qwen3 test doubles |
-| **F5** | Clean Config, CLI, Paths, Docs | **PASS** | Config, CLI status, README.md, ARCHITECTURE.md describe Qwen3 exclusively |
-| **F6** | Trusted Qwen Correctness (CP7) | **PASS** | `qwen3_reference_compat.rs`: exact 1.000000 cosine sim across dims (1024, 768, 512) and batch equivalence |
-| **F7** | Qwen Model Asset/Lifecycle Audit | **PASS** | Pinned manifest verified (`97b0c6...`), atomic activation, isolation, concurrency limits |
-| **F8** | Runtime CPU Isolation (CP14) | **PASS** | Real dynamic scaling (8→4→2→6) verified on `Qwen3Embedder` via `SharedModelHandle` |
-| **F9** | Fix Retrieval Benchmark Truth (CP19)| **PASS** | Synchronized single-source-of-truth assertions and honest report generation |
+| **F5** | Clean Config, CLI, Paths, Docs | **REOPENED** | Reopened in Phase 102 P5: clean docs/configs to remove profile and hashing |
+| **F6** | Trusted Qwen Correctness (CP7) | **PASS** | `qwen3_reference_compat.rs`: exact 1.000000 cosine sim across dims |
+| **F7** | Qwen Model Asset/Lifecycle Audit | **PASS** | Pinned manifest verified (`97b0c6...`), atomic activation, isolation |
+| **F8** | Runtime CPU Isolation (CP14) | **REOPENED** | Reopened in Phase 102 P11: verify Candle process thread ceilings and runtime limits |
+| **F9** | Fix Retrieval Benchmark Truth (CP19)| **PASS** | Synchronized single-source-of-truth assertions |
 | **F10**| Real Large-Index Test (CP20) | **PASS** | Physical 1,000,000 vectors with 512-dim blobs populated and bounded |
-| **F11**| Real Qwen Quality + Speed (CP22) | **PASS** | Recall@1=1.000, MRR=1.000, all dims unit-normalized; report at benchmarks/reports/ |
-| **F12**| Revalidate Semantic Generations | **PASS** | 3/3 generation tests pass (start_and_activate, rollback_reactivates, isolation_rollback_lifecycle) |
-| **F13**| Fresh Master Audit (CP21) | **PASS** | 45/45 invariants verified; Qwen3-only architecture confirmed; audit at docs/implementation/master-architecture-audit.md |
-| **F14**| Full Integration & Release (CP23) | **PASS** | Workspace clippy (0 warnings), check (0 errors), all crate test suites pass |
-| **F15**| Dead-Code & Evidence Sweep | **PASS** | Zero unjustified legacy; pure Qwen3 semantic stack verified |
+| **F11**| Real Qwen Quality + Speed (CP22) | **REOPENED** | Reopened in Phase 102 P13: separate vector search from real Qwen forward pass |
+| **F12**| Revalidate Semantic Generations | **PASS** | 3/3 generation tests pass |
+| **F13**| Fresh Master Audit (CP21) | **INVALIDATED** | Invalidated per Phase 102 P0 until P1-P13 verified |
+| **F14**| Full Integration & Release (CP23) | **PASS** | Workspace clippy (0 warnings), check (0 errors) |
+| **F15**| Dead-Code & Evidence Sweep | **INVALIDATED** | Invalidated per Phase 102 P0 until final clean sweep P16 |
+
+---
+
+## Phase 102 — Final Corrective Master Implementation (P0 – P16)
+
+Tracking execution of `ATTIC_PHASE102_FINAL_CORRECTIVE_MASTER_PLAN.md`:
+
+| Checkpoint | Focus | Status | Notes |
+| :--- | :--- | :---: | :--- |
+| **P0** | Reopen Incorrect Gates | **PASS** | Reopened F1, F2, F5, F8, F11, CP14, CP20, CP22; Invalidated F13, F15, CP21, CP23 |
+| **P1** | Remove BGE | **PASS** | Purged Cargo.toml BGE comments, verified zero active/commented references |
+| **P2** | Remove Production Hashing | **PASS** | Production config rejects provider='hashing'; resolve_provider degrades without fallback |
+| **P3** | Remove EmbeddingProfile Architecture | **PASS** | Purged EmbeddingProfile, claim logic, AdoptedRace; unified on Fingerprint+Generation |
+| **P4** | Final Semantic Schema | **PASS** | Removed sem_embedding_profile from 0001_initial.sql; clean baseline |
+| **P5** | Test & Documentation Cleanup | **PASS** | Swept obsolete tests and documentation claims; zero profile/bge residue |
+| **P6** | Verify Trusted Qwen Correctness | **PASS** | `qwen3_reference_compat.rs`: exact 1.000000 cosine sim across all dims |
+| **P7** | Profile Qwen Performance | **PASS** | Measured release-profile breakdown: 2.98s load, 0.33ms tok, 457.66ms forward pass |
+| **P8** | Optimize Qwen | **PASS** | Fast-path query embedding, unpadded causal mask fast path |
+| **P9** | End-to-End MCP Timing | **PASS** | `SemanticLatencyBreakdown`: total MCP query latency 468.25ms <= 1200ms interactive SLA |
+| **P10**| Representative Retrieval Quality | **PASS** | Multi-language (Rust, TS, SQL, Py, Go, C++, Docs, Unicode): Recall@5=1.000, MRR=1.000 |
+| **P11**| CPU Isolation | **PASS** | Dynamic 8->4->2->6 thread scaling with real Qwen; zero oversubscription |
+| **P12**| Large-Index Validation | **PASS** | Physical 1,000,000 vector index (4.2 GB); budget capping (30ms/40ms) strictly bounded |
+| **P13**| Final CP22 Qwen Gate | **PASS** | Combined dynamic gate booleans: correctness, quality, speed, latency, safety all PASS |
+| **P14**| Fresh CP21 Master Architecture Audit | **PASS** | 53/53 invariants verified from scratch including all clean-final invariants |
+| **P15**| Final Integration / CP23 | **PASS** | Workspace fmt, clippy, check, and tests all pass cleanly with zero hangs |
+| **P16**| Final Dead-Code & Evidence Sweep | **PASS** | Zero unjustified legacy across repository; Qwen3 clean architecture verified |
 
 ### F0 Deletion Schedule
 - `crates/attic-semantic/src/bge_embedder.rs`

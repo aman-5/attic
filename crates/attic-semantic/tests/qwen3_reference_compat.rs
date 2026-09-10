@@ -81,6 +81,7 @@ fn load_fixture() -> Fixture {
 }
 
 #[test]
+#[ignore = "expensive real Qwen3 neural model execution; run explicitly with `cargo test -p attic-semantic --test qwen3_reference_compat -- --ignored`"]
 fn test_qwen3_reference_compatibility_all_dimensions() {
     let fixture = load_fixture();
     assert_eq!(fixture.model_revision, PINNED_REVISION);
@@ -161,6 +162,7 @@ fn test_qwen3_reference_compatibility_all_dimensions() {
 }
 
 #[test]
+#[ignore = "expensive real Qwen3 neural model execution; run explicitly with `cargo test -p attic-semantic --test qwen3_reference_compat -- --ignored`"]
 fn test_qwen3_batch_equivalence() {
     let fixture = load_fixture();
     let cache_dir = resolve_cache_dir();
@@ -213,6 +215,7 @@ fn test_qwen3_batch_equivalence() {
 }
 
 #[test]
+#[ignore = "expensive real Qwen3 neural model execution; run explicitly with `cargo test -p attic-semantic --test qwen3_reference_compat -- --ignored`"]
 fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
     use attic_semantic::cpu_isolation::CpuIsolationPlan;
     use attic_semantic::model_lifecycle::SharedModelHandle;

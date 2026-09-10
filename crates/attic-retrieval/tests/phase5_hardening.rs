@@ -195,7 +195,6 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
             stack.provider.as_ref(),
             &EnrichmentConfig::standalone(4, 3, 300, 1),
             &CancelFlag::new(),
-            attic_semantic::EmbeddingIntentSource::Recommendation,
         )
         .unwrap();
     }

@@ -350,7 +350,15 @@ impl AtticConfig {
     /// Parse `attic.toml` contents. Pure — does no I/O; the caller
     /// (`attic-server`) reads the file and hands the contents here.
     pub fn parse_str(contents: &str) -> Result<Self, ConfigError> {
-        toml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))
+        let cfg: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if let Some(ref p) = cfg.embedding.provider
+            && p == "hashing"
+        {
+            return Err(ConfigError::Parse(
+                "provider = \"hashing\" is rejected: hashing is a test-only double and cannot be configured in production".into(),
+            ));
+        }
+        Ok(cfg)
     }
 
     /// True only when the user explicitly named a provider in `[embedding]`
@@ -410,10 +418,19 @@ mod tests {
     }
 
     #[test]
+    fn production_config_cannot_select_hashing() {
+        let result = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n");
+        assert!(
+            result.is_err(),
+            "production config must reject provider = 'hashing'"
+        );
+    }
+
+    #[test]
     fn explicit_provider_is_an_override() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n").unwrap();
+        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"qwen3\"\n").unwrap();
         assert!(cfg.has_explicit_embedding_override());
-        assert_eq!(cfg.embedding.provider.as_deref(), Some("hashing"));
+        assert_eq!(cfg.embedding.provider.as_deref(), Some("qwen3"));
     }
 
     #[test]

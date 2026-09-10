@@ -176,6 +176,53 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
     }
 }
 
+/// Authoritative semantic query latency breakdown (Final Master Plan V2 §5.9, Checkpoint P9).
+///
+/// Encapsulates the entire production latency pipeline:
+/// query prep + tokenization + Qwen embedding + vector search + filtering/ranking + handler overhead = total.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticLatencyBreakdown {
+    pub query_prepare_ms: f64,
+    pub tokenization_ms: f64,
+    pub query_embedding_ms: f64,
+    pub vector_search_ms: f64,
+    pub filtering_ranking_ms: f64,
+    pub handler_overhead_ms: f64,
+    pub total_ms: f64,
+}
+
+impl SemanticLatencyBreakdown {
+    pub fn new(
+        query_prepare_ms: f64,
+        tokenization_ms: f64,
+        query_embedding_ms: f64,
+        vector_search_ms: f64,
+        filtering_ranking_ms: f64,
+        handler_overhead_ms: f64,
+    ) -> Self {
+        let total_ms = query_prepare_ms
+            + tokenization_ms
+            + query_embedding_ms
+            + vector_search_ms
+            + filtering_ranking_ms
+            + handler_overhead_ms;
+        Self {
+            query_prepare_ms,
+            tokenization_ms,
+            query_embedding_ms,
+            vector_search_ms,
+            filtering_ranking_ms,
+            handler_overhead_ms,
+            total_ms,
+        }
+    }
+
+    /// Evaluates if total end-to-end latency meets SLA (never derived only from vector_search_ms).
+    pub fn is_within_sla(&self, sla_ms: f64) -> bool {
+        self.total_ms <= sla_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

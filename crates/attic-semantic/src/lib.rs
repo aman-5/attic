@@ -18,7 +18,6 @@
 pub mod cpu_isolation;
 pub mod diagnostics;
 pub mod disk_safety;
-pub mod embedding_profile;
 pub mod enrich;
 pub mod error;
 pub mod generation;
@@ -39,13 +38,10 @@ pub mod throughput_controller;
 
 pub use cpu_isolation::CpuIsolationPlan;
 pub use diagnostics::{
-    DiagnosticContext, SemanticProgressSnapshot, WhySlowDiagnostic, diagnose_why_slow,
+    DiagnosticContext, SemanticLatencyBreakdown, SemanticProgressSnapshot, WhySlowDiagnostic,
+    diagnose_why_slow,
 };
 pub use disk_safety::{DiskClearance, DiskFootprintSummary, DiskSafetyConfig, DiskSafetyGuard};
-pub use embedding_profile::{
-    ClaimOutcome, EmbeddingIntentSource, EmbeddingProfile, EmbeddingSpaceDescriptor,
-    PoolingStrategy, ProfileCheck, TruncationPolicy, check_requested_profile,
-};
 pub use enrich::{BackgroundEnricher, EnrichStats, EnrichmentConfig, drive};
 pub use error::SemanticError;
 pub use generation::{GenerationManager, GenerationRecord, GenerationStatus};

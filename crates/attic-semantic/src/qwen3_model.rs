@@ -308,14 +308,23 @@ impl Qwen3Model {
         let b_sz = attention_mask_rows.len();
         let mut mask_data = Vec::with_capacity(b_sz * seq_len * seq_len);
         for row in attention_mask_rows {
-            for i in 0..seq_len {
-                for j in 0..seq_len {
-                    let is_active = row.get(j).copied().unwrap_or(0) > 0;
-                    let is_causal = j <= i;
-                    if is_active && is_causal {
-                        mask_data.push(0.0f32);
-                    } else {
-                        mask_data.push(-1e4f32);
+            let all_active = row.len() >= seq_len && row[..seq_len].iter().all(|&v| v > 0);
+            if all_active {
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        mask_data.push(if j <= i { 0.0f32 } else { -1e4f32 });
+                    }
+                }
+            } else {
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        let is_active = row.get(j).copied().unwrap_or(0) > 0;
+                        let is_causal = j <= i;
+                        mask_data.push(if is_active && is_causal {
+                            0.0f32
+                        } else {
+                            -1e4f32
+                        });
                     }
                 }
             }

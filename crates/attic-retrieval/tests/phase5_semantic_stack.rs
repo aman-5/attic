@@ -143,7 +143,6 @@ fn partially_enriched_workspace_still_answers_lexically_without_stalling() {
                 ..Default::default()
             },
             &CancelFlag::new(),
-            attic_semantic::EmbeddingIntentSource::Recommendation,
         )
         .unwrap();
     }
@@ -228,7 +227,6 @@ fn failing_provider_quarantines_after_attempts_without_corruption() {
             ..Default::default()
         },
         &CancelFlag::new(),
-        attic_semantic::EmbeddingIntentSource::Recommendation,
     )
     .unwrap();
     assert!(stats.failed_items > 0, "failures must be observable");
@@ -272,7 +270,6 @@ fn slow_provider_honors_drive_budget_and_leaves_nothing_inflight() {
         stack.provider.as_ref(),
         &EnrichmentConfig::standalone(2, 3, 60, 1),
         &CancelFlag::new(),
-        attic_semantic::EmbeddingIntentSource::Recommendation,
     )
     .unwrap();
     assert!(stats.elapsed_ms < 5_000, "budget bound must hold");
@@ -306,7 +303,6 @@ fn cancellation_flag_stops_embedding_without_quarantine() {
         stack.provider.as_ref(),
         &EnrichmentConfig::standalone(4, 3, 1_000, 1),
         &cancel,
-        attic_semantic::EmbeddingIntentSource::Recommendation,
     )
     .unwrap();
     assert_eq!(stats.embedded, 0);
@@ -342,7 +338,6 @@ fn crash_between_drives_retains_committed_and_reschedules_rest() {
             stack.provider.as_ref(),
             &EnrichmentConfig::standalone(4, 3, 120, 1),
             &CancelFlag::new(),
-            attic_semantic::EmbeddingIntentSource::Recommendation,
         )
         .unwrap();
     }
@@ -614,7 +609,6 @@ fn secret_bearing_unit_text_never_reaches_the_provider() {
         stack.provider.as_ref(),
         &EnrichmentConfig::standalone(8, 3, 5_000, 1),
         &CancelFlag::new(),
-        attic_semantic::EmbeddingIntentSource::Recommendation,
     )
     .unwrap();
     assert_eq!(stats.skipped_secret, 1, "the poisoned unit must be refused");
@@ -647,7 +641,6 @@ fn foreground_queries_answer_during_background_enrichment() {
         stack.provider.clone(),
         EnrichmentConfig::standalone(4, 3, 200, 1),
         None,
-        attic_semantic::EmbeddingIntentSource::Recommendation,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     for _ in 0..3 {

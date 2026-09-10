@@ -18,74 +18,36 @@ use std::time::{Duration, Instant};
 use attic_discovery::secrets;
 use rusqlite::Connection;
 
-use crate::embedding_profile::{ClaimOutcome, EmbeddingIntentSource};
 use crate::error::SemanticError;
 use crate::identity::SemanticUnitIdentity;
 use crate::invalidate::reconcile;
-use crate::provider::{CancelFlag, EmbeddingInput, ResourceUsage, SemanticProvider};
+use crate::provider::{
+    CancelFlag, EmbeddingFingerprint, EmbeddingInput, ResourceUsage, SemanticProvider,
+};
 use crate::selection::{SEMANTIC_SELECTION_VERSION, SelectionConfig};
 use crate::store::{EmbeddingRecord, SemanticStore};
 
-/// Claim/verify this provider's `EmbeddingProfile` before the FIRST real
-/// embedding work in this store's lifetime (Low-Level Design §3) — never at
-/// startup or on a mere `status` check. `provider.embedding_descriptor()`
-/// returning `None` (the baseline `HashingEmbedder`, test doubles) means
-/// this provider has no persisted-identity concept; profile claiming is
-/// skipped entirely for it, unchanged from today's behavior.
-///
-/// `claim_embedding_profile_if_absent` is idempotent (`ON CONFLICT DO
-/// NOTHING`), so calling this once per non-empty drive iteration is cheap
-/// and safe — it only ever performs a real write the very first time.
-///
-/// Returns `true` when it is safe to proceed with this batch, `false` on a
-/// genuine `Conflict` (this provider's identity lost a first-claim race, or
-/// disagrees with an already-persisted profile). KNOWN LIMITATION, flagged
-/// honestly rather than silently handled: on `Conflict` this process does
-/// NOT hot-swap to the winning provider — it simply stops embedding and
-/// leaves the batch `PENDING` for a future restart, which re-resolves the
-/// correct provider from the persisted profile at startup (see
-/// `attic-server`'s `new_with_semantic_opt`). Self-healing across a restart,
-/// not mid-process — acceptable because this is a narrow, transient race
-/// between two cold-starting processes, not the steady-state path.
-///
-/// SECOND KNOWN LIMITATION on the `AdoptedRace` branch specifically: since
-/// this process's `SemanticProvider` was already constructed at startup
-/// (before any claim happens — see `resolve_semantic_provider`), "adopt the
-/// winner" here does NOT hot-swap the provider instance either; it only
-/// means "the DB row now reflects the winner, and this call still returns
-/// `true`." This process's embeddings continue to be tagged with ITS OWN
-/// actual `provider.id()`/`model_id()` (never a false identity — `store.put`
-/// always uses the real computing provider's own strings), so there is no
-/// silent corruption. The narrow real consequence is index fragmentation:
-/// in the rare window where two cold-starting processes raced with
-/// different (but both merely-recommended) providers, each keeps embedding
-/// under its own tag until a restart converges both onto the persisted
-/// winner. Accepted as out of scope for the same reason as the `Conflict`
-/// case — a transient race, not the steady-state path.
-fn ensure_profile_claimed(
+/// Ensure an active or building generation is ready to receive vectors for this fingerprint.
+/// Returns the generation ID to tag the batch with.
+fn ensure_generation_for_fingerprint(
     store: &SemanticStore,
-    provider: &dyn SemanticProvider,
-    intent_source: EmbeddingIntentSource,
-) -> Result<bool, SemanticError> {
-    let Some(descriptor) = provider.embedding_descriptor() else {
-        return Ok(true);
-    };
-    match store.claim_embedding_profile_if_absent(descriptor, intent_source)? {
-        ClaimOutcome::Claimed(p) => {
-            tracing::info!(profile_id = %p.id, "claimed embedding profile at first real indexing work");
-            Ok(true)
-        }
-        ClaimOutcome::ExistingMatched(_) | ClaimOutcome::AdoptedRace { .. } => Ok(true),
-        ClaimOutcome::Conflict { requested, adopted } => {
-            tracing::warn!(
-                requested_model = %requested.model,
-                adopted_model = %adopted.config.model,
-                "embedding profile conflict: this process's provider does not match the \
-                 persisted profile; pausing enrichment until restart (re-index required)"
-            );
-            Ok(false)
-        }
+    fp: &EmbeddingFingerprint,
+) -> Result<i64, SemanticError> {
+    if let Some(active) = store.get_active_generation()?
+        && active.fingerprint == *fp
+    {
+        return Ok(active.generation_id);
     }
+    if let Some(building) = store.get_building_generation()?
+        && building.fingerprint == *fp
+    {
+        return Ok(building.generation_id);
+    }
+    let new_gen = store.start_new_generation(fp)?;
+    if store.get_active_generation()?.is_none() {
+        store.activate_generation(new_gen.generation_id)?;
+    }
+    Ok(new_gen.generation_id)
 }
 
 /// Inspectable enrichment knobs.
@@ -176,13 +138,6 @@ pub struct EnrichStats {
     pub cancelled: bool,
     pub elapsed_ms: u64,
     pub queue_remaining: u64,
-    /// [FIX] Set when this drive stopped early because
-    /// `ensure_profile_claimed` hit a `Conflict` — the batch was reset to
-    /// `PENDING`, not drained. Only a restart can resolve this (see
-    /// `ensure_profile_claimed`'s docs), so `BackgroundEnricher` backs off
-    /// far longer than its normal idle-poll interval when this is set,
-    /// instead of retrying the same doomed check every ~50ms forever.
-    pub blocked_by_conflict: bool,
 }
 
 /// Drive the enrichment queue until empty or budget/cancellation bounds hit.
@@ -195,7 +150,6 @@ pub fn drive(
     provider: &dyn SemanticProvider,
     cfg: &EnrichmentConfig,
     cancel: &CancelFlag,
-    intent_source: EmbeddingIntentSource,
 ) -> Result<EnrichStats, SemanticError> {
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_millis(cfg.budget_ms.max(1));
@@ -213,16 +167,10 @@ pub fn drive(
         if items.is_empty() {
             break;
         }
-        if !ensure_profile_claimed(store, provider, intent_source)? {
-            // Conflict: leave this batch PENDING and stop driving for now —
-            // see `ensure_profile_claimed`'s docs for why this self-heals on
-            // restart rather than hot-swapping providers mid-process.
-            for it in &items {
-                store.queue_reset(&it.retrieval_unit_id)?;
-            }
-            stats.blocked_by_conflict = true;
-            break;
-        }
+        let target_gen_id = match provider.fingerprint() {
+            Some(ref fp) => Some(ensure_generation_for_fingerprint(store, fp)?),
+            None => None,
+        };
         let ids: Vec<String> = items.iter().map(|i| i.retrieval_unit_id.clone()).collect();
         let rows = attic_storage::semantic_units_by_ids(conn, &ids)?;
 
@@ -288,7 +236,11 @@ pub fn drive(
                     }
                 }
                 stats.embedded += batch_records.len() as u64;
-                store.put_batch_and_mark_done(&batch_records)?;
+                if let Some(gen_id) = target_gen_id {
+                    store.put_batch_for_generation(&batch_records, gen_id)?;
+                } else {
+                    store.put_batch_and_mark_done(&batch_records)?;
+                }
             }
             Err(SemanticError::Cancelled { .. }) => {
                 // Cancellation is NOT failure: by contract the provider
@@ -420,7 +372,6 @@ impl BackgroundEnricher {
         provider: std::sync::Arc<dyn SemanticProvider>,
         cfg: EnrichmentConfig,
         resource_monitor: Option<std::sync::Arc<attic_storage::resource_manager::ResourceMonitor>>,
-        intent_source: EmbeddingIntentSource,
         write_generation: Arc<AtomicU64>,
     ) -> Self {
         let stop = std::sync::Arc::new(CancelFlag::new());
@@ -561,30 +512,7 @@ impl BackgroundEnricher {
                         &effective_cfg
                     };
 
-                    match drive(
-                        &conn,
-                        &store,
-                        provider.as_ref(),
-                        drive_cfg,
-                        &stop2,
-                        intent_source,
-                    ) {
-                        // [FIX] A Conflict can only ever be resolved by a
-                        // restart (see ensure_profile_claimed's docs) — retrying
-                        // the same doomed claim check every ~50ms forever just
-                        // burns DB round trips for no possible gain. Back off far
-                        // longer; still cooperatively cancellable via `stop2`.
-                        Ok(s) if s.blocked_by_conflict => {
-                            tracing::warn!(
-                                "semantic enrichment blocked by an embedding-profile conflict; \
-                                 backing off until restart (see status for re_index_recommended)"
-                            );
-                            let backoff = Duration::from_secs(30);
-                            let deadline = Instant::now() + backoff;
-                            while Instant::now() < deadline && !stop2.is_cancelled() {
-                                std::thread::sleep(jittered(Duration::from_millis(200)));
-                            }
-                        }
+                    match drive(&conn, &store, provider.as_ref(), drive_cfg, &stop2) {
                         Ok(s) if s.embedded == 0 && !s.cancelled => {
                             // Queue drained; idle-poll so we stay responsive to
                             // new enqueues without spinning hot.
@@ -604,14 +532,12 @@ impl BackgroundEnricher {
     }
 
     /// Spawn background enrichment workers wired directly to the ResourceOrchestrator (§12, §15, CP15).
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_orchestrator(
         canonical_db_path: std::path::PathBuf,
         store: std::sync::Arc<SemanticStore>,
         provider: std::sync::Arc<dyn SemanticProvider>,
         mut cfg: EnrichmentConfig,
         resource_monitor: Option<std::sync::Arc<attic_storage::resource_manager::ResourceMonitor>>,
-        intent_source: EmbeddingIntentSource,
         write_generation: Arc<AtomicU64>,
         orchestrator: &attic_storage::ResourceOrchestrator,
     ) -> Self {
@@ -622,7 +548,6 @@ impl BackgroundEnricher {
             provider,
             cfg,
             resource_monitor,
-            intent_source,
             write_generation,
         )
     }
@@ -653,22 +578,19 @@ impl BackgroundEnricher {
 }
 
 #[cfg(test)]
-mod ensure_profile_claimed_tests {
+mod generation_driven_enrichment_tests {
     use super::*;
-    use crate::embedding_profile::{EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy};
-    use crate::provider::{CancelFlag, EmbeddingOutput};
+    use crate::provider::{CancelFlag, EmbeddingFingerprint, EmbeddingOutput};
 
-    /// Minimal provider whose only purpose is returning a fixed
-    /// `EmbeddingSpaceDescriptor` — exercises `ensure_profile_claimed`
-    /// without needing a real `Qwen3Embedder` (network/model weights).
-    struct DescriptorProvider(EmbeddingSpaceDescriptor);
+    #[allow(dead_code)]
+    struct FingerprintedProvider(EmbeddingFingerprint);
 
-    impl SemanticProvider for DescriptorProvider {
+    impl SemanticProvider for FingerprintedProvider {
         fn id(&self) -> &'static str {
-            "descriptor-test"
+            "fingerprinted-test"
         }
         fn model_id(&self) -> &str {
-            "descriptor-test-v1"
+            "fingerprinted-test-v1"
         }
         fn dimensions(&self) -> usize {
             4
@@ -676,7 +598,7 @@ mod ensure_profile_claimed_tests {
         fn max_input_bytes(&self) -> usize {
             4096
         }
-        fn embedding_descriptor(&self) -> Option<EmbeddingSpaceDescriptor> {
+        fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
             Some(self.0.clone())
         }
         fn embed_batch(
@@ -690,88 +612,60 @@ mod ensure_profile_claimed_tests {
         }
     }
 
-    fn descriptor(model: &str) -> EmbeddingSpaceDescriptor {
-        EmbeddingSpaceDescriptor {
-            schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: "qwen3".into(),
-            model: model.into(),
-            model_revision: "rev1".into(),
-            tokenizer_revision: "rev1".into(),
-            pooling: PoolingStrategy::LastToken,
-            normalize: true,
-            truncation: TruncationPolicy::Truncate,
-            max_tokens: 512,
+    fn test_fp(model: &str) -> EmbeddingFingerprint {
+        EmbeddingFingerprint {
+            provider: "qwen3".to_string(),
+            model_id: model.to_string(),
+            model_revision: "rev1".to_string(),
+            dimension: 512,
+            pooling_version: "last_token_v1".to_string(),
+            normalization_version: "l2_unit_v1".to_string(),
+            tokenizer_version: "tok_v1".to_string(),
+            chunking_version: "ast_v1".to_string(),
+            query_instruction_version: "code_retrieval_v1".to_string(),
         }
     }
 
     #[test]
-    fn provider_with_no_descriptor_never_claims_anything() {
+    fn initial_fingerprint_creates_and_activates_generation() {
         let store = SemanticStore::open_in_memory().unwrap();
-        let provider = crate::providers::HashingEmbedder::new();
-        assert!(
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
-                .unwrap()
-        );
-        assert!(store.read_embedding_profile().unwrap().is_none());
+        let fp = test_fp("qwen3-0.6b");
+        let gen_id = ensure_generation_for_fingerprint(&store, &fp).unwrap();
+        assert_eq!(gen_id, 1);
+        let active = store.get_active_generation().unwrap().unwrap();
+        assert_eq!(active.generation_id, 1);
+        assert_eq!(active.fingerprint, fp);
     }
 
     #[test]
-    fn first_real_work_claims_the_profile() {
+    fn matching_fingerprint_reuses_active_generation() {
         let store = SemanticStore::open_in_memory().unwrap();
-        let provider = DescriptorProvider(descriptor("qwen3-embedding-0.6b"));
-        assert!(
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
-                .unwrap()
-        );
-        let persisted = store.read_embedding_profile().unwrap().unwrap();
-        assert_eq!(persisted.config.model, "qwen3-embedding-0.6b");
+        let fp = test_fp("qwen3-0.6b");
+        let gen_id1 = ensure_generation_for_fingerprint(&store, &fp).unwrap();
+        let gen_id2 = ensure_generation_for_fingerprint(&store, &fp).unwrap();
+        assert_eq!(gen_id1, gen_id2);
     }
 
     #[test]
-    fn conflicting_explicit_provider_refuses_to_embed() {
+    fn differing_fingerprint_starts_building_generation_without_disturbing_active() {
         let store = SemanticStore::open_in_memory().unwrap();
-        // A different process already claimed "qwen3-embedding-0.6b".
-        store
-            .claim_embedding_profile_if_absent(
-                descriptor("qwen3-embedding-0.6b"),
-                EmbeddingIntentSource::Recommendation,
-            )
-            .unwrap();
-        // This process's provider is explicitly configured for a different model.
-        let provider = DescriptorProvider(descriptor("qwen3-large-custom"));
-        let proceed =
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::TomlOverride).unwrap();
-        assert!(
-            !proceed,
-            "an explicit-intent conflict must refuse to embed under the wrong identity"
-        );
-        // The persisted profile must remain the original — never silently overwritten.
-        let persisted = store.read_embedding_profile().unwrap().unwrap();
-        assert_eq!(persisted.config.model, "qwen3-embedding-0.6b");
-    }
+        let fp1 = test_fp("qwen3-0.6b");
+        let gen1 = ensure_generation_for_fingerprint(&store, &fp1).unwrap();
+        assert_eq!(gen1, 1);
 
-    #[test]
-    fn conflicting_recommendation_only_adopts_the_winner_and_proceeds() {
-        let store = SemanticStore::open_in_memory().unwrap();
-        store
-            .claim_embedding_profile_if_absent(
-                descriptor("qwen3-embedding-0.6b"),
-                EmbeddingIntentSource::Recommendation,
-            )
-            .unwrap();
-        // This process's own descriptor differs but was only ever a
-        // recommendation (no explicit user intent) — safe to proceed. NOTE:
-        // this does NOT hot-swap the provider instance (see
-        // ensure_profile_claimed's doc comment, "SECOND KNOWN LIMITATION") —
-        // it only verifies the call returns true rather than refusing.
-        let provider = DescriptorProvider(descriptor("qwen3-large-custom"));
-        let proceed =
-            ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
-                .unwrap();
-        assert!(
-            proceed,
-            "a recommendation-only mismatch must not refuse to proceed"
-        );
+        let fp2 = test_fp("qwen3-1.5b");
+        let gen2 = ensure_generation_for_fingerprint(&store, &fp2).unwrap();
+        assert_eq!(gen2, 2);
+
+        // Active generation must still be Gen 1
+        let active = store.get_active_generation().unwrap().unwrap();
+        assert_eq!(active.generation_id, 1);
+        assert_eq!(active.fingerprint, fp1);
+
+        // Building generation must be Gen 2
+        let building = store.get_building_generation().unwrap().unwrap();
+        assert_eq!(building.generation_id, 2);
+        assert_eq!(building.fingerprint, fp2);
     }
 
     #[test]

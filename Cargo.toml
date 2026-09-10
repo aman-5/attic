@@ -109,7 +109,7 @@ sysinfo            = { version = "0.33", default-features = false, features = ["
 tempfile           = "3"
 # Phase 8: attic.toml resource/embedding tunables (pure parsing, no I/O)
 toml               = "1"
-# Phase 9: BgeEmbedder — real neural semantic embeddings (BAAI/bge-base-en-v1.5, 768d).
+# Production Neural Embedder: Qwen3Embedder (Qwen/Qwen3-Embedding-0.6B).
 # Pinned to 0.9.1, NOT the newer 0.10.0+/0.11.0 releases: starting at 0.10.0,
 # candle-core unconditionally depends on `tokenizers` with the `onig` feature
 # (a C library requiring a C compiler toolchain) on every non-wasm target —
@@ -124,7 +124,7 @@ candle-core        = "0.9.1"
 candle-nn          = "0.9.1"
 candle-transformers = "0.9.1"
 # `fancy-regex` (pure Rust), NOT `onig` (a C library requiring a C compiler
-# toolchain) — the tokenizers crate requires one of the two; BGE's WordPiece
+# toolchain) — the tokenizers crate requires one of the two; Qwen3's byte-level BPE
 # tokenizer needs neither's advanced regex features, so the pure-Rust option
 # is strictly better here and keeps this dependency C-toolchain-free, matching
 # the reason Candle was chosen over ONNX-based alternatives in the first place.

@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::embedding_profile::{EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy};
 use crate::error::SemanticError;
 use crate::instruction::{CODE_RETRIEVAL_V1_ID, format_query_instruction};
 use crate::provider::{
@@ -65,7 +64,6 @@ pub struct Qwen3Embedder {
     target_dims: usize,
     max_tokens: usize,
     pooling: QwenPooling,
-    descriptor: EmbeddingSpaceDescriptor,
     fingerprint: EmbeddingFingerprint,
 }
 
@@ -105,6 +103,35 @@ impl Qwen3Embedder {
             );
         }
         Self::download_and_build(cache_dir, batch_size, None, dimension_override, pooling)
+    }
+
+    /// Construct a `Qwen3Embedder` exclusively from a local cache directory.
+    /// Fails immediately if model files are not present, with zero network calls.
+    pub fn from_local_cache(
+        cache_dir: &Path,
+        batch_size: usize,
+        dimension_override: Option<usize>,
+        pooling: QwenPooling,
+    ) -> Result<Self, SemanticError> {
+        if let Some((config, tokenizer, weights, revision)) = Self::try_local_cache(cache_dir, None)
+        {
+            return Self::build(
+                config,
+                tokenizer,
+                weights,
+                revision,
+                batch_size,
+                dimension_override,
+                pooling,
+            );
+        }
+        Err(SemanticError::ProviderUnavailable {
+            provider: QWEN_PROVIDER_ID.into(),
+            reason: format!(
+                "Qwen3 model weights not found in local cache '{}'",
+                cache_dir.display()
+            ),
+        })
     }
 
     /// Construct a `Qwen3Embedder` pinned to an exact commit revision.
@@ -300,21 +327,6 @@ impl Qwen3Embedder {
                 reason: format!("failed to configure tokenizer truncation: {e}"),
             })?;
 
-        let descriptor = EmbeddingSpaceDescriptor {
-            schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: QWEN_PROVIDER_ID.into(),
-            model: QWEN_MODEL_ID.into(),
-            model_revision: resolved_revision.clone(),
-            tokenizer_revision: resolved_revision.clone(),
-            pooling: match pooling {
-                QwenPooling::LastToken => PoolingStrategy::LastToken,
-                QwenPooling::Mean => PoolingStrategy::Mean,
-            },
-            normalize: true,
-            truncation: TruncationPolicy::Truncate,
-            max_tokens,
-        };
-
         let fingerprint = EmbeddingFingerprint {
             provider: QWEN_PROVIDER_ID.into(),
             model_id: QWEN_MODEL_ID.into(),
@@ -336,9 +348,13 @@ impl Qwen3Embedder {
             target_dims,
             max_tokens,
             pooling,
-            descriptor,
             fingerprint,
         })
+    }
+
+    /// Access the underlying tokenizer.
+    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
     }
 
     /// Extract last non-padding token representation for each item in the batch.
@@ -481,8 +497,8 @@ impl SemanticProvider for Qwen3Embedder {
         true
     }
 
-    fn embedding_descriptor(&self) -> Option<EmbeddingSpaceDescriptor> {
-        Some(self.descriptor.clone())
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        Some(self.fingerprint.clone())
     }
 
     fn embed_batch(
@@ -584,16 +600,17 @@ impl EmbeddingProvider for Qwen3Embedder {
     fn embed_query(
         &self,
         query: &str,
-        budget: &EmbeddingExecutionBudget,
+        _budget: &EmbeddingExecutionBudget,
     ) -> Result<Vec<f32>, SemanticError> {
-        // Query instruction prepending specifically for queries (Master Plan §30, §31)
         let instructed = format_query_instruction(CODE_RETRIEVAL_V1_ID, query);
-        let input = EmbeddingInput {
-            unit_key: "query".to_string(),
-            text: instructed,
-        };
-        let docs = self.embed_documents(&[input], budget)?;
-        docs.into_iter().next().map(|o| o.vector).ok_or_else(|| {
+        if instructed.len() > self.max_input_bytes() {
+            return Err(SemanticError::InputTooLarge {
+                len: instructed.len(),
+                max: self.max_input_bytes(),
+            });
+        }
+        let mut vectors = self.embed_sub_batch(&[&instructed])?;
+        vectors.pop().ok_or_else(|| {
             SemanticError::EmbeddingFailed("empty query embedding output".to_string())
         })
     }

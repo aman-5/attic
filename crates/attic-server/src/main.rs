@@ -185,12 +185,6 @@ pub(crate) struct AtticServer {
     pending_index_failed: Arc<std::sync::Mutex<HashMap<PathBuf, String>>>,
     /// Phase 5 disposable semantic layer (present when `semantic.db` opens).
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
-    /// Phase 9: provenance of the embedding descriptor `semantic`'s provider
-    /// was resolved with (recommendation vs. explicit override) — passed to
-    /// the background enrichment worker so first-indexing profile claims
-    /// record the right `EmbeddingIntentSource`. `None` iff `semantic` is
-    /// `None`.
-    semantic_intent_source: Option<attic_semantic::EmbeddingIntentSource>,
     /// Phase 6 cross-repo subsystem health.  `true` = degraded: sync
     /// failed or has not yet completed.  Cross-repo-dependent answers are
     /// prevented until this clears.
@@ -238,170 +232,87 @@ pub(crate) struct AtticServer {
 /// Phase 9: decide which `SemanticProvider` to actually construct.
 ///
 /// Reconstructs the persisted or configured semantic provider for Attic.
+/// Reconstructs the configured semantic provider for Attic.
 ///
-/// In Phase 101 Clean Final Architecture, `Qwen3Embedder` is the sole production
-/// neural provider. If a profile is already persisted, this reconstructs the exact
-/// pinned revision. If unavailable (e.g. offline with no cached weights), it degrades
-/// to `UnavailableProvider`, never corrupting the vector space.
+/// In Phase 102 Clean Final Architecture, `Qwen3Embedder` is the sole production
+/// neural provider. If unavailable (e.g. offline with no cached weights), it degrades
+/// to `UnavailableProvider`, never corrupting the vector space and never falling back to Hashing.
 fn resolve_semantic_provider(
-    store: &attic_semantic::SemanticStore,
     attic_config: &attic_core::AtticConfig,
     batch_size: usize,
     model_cache_dir: &Path,
-) -> (
-    Arc<dyn attic_semantic::SemanticProvider>,
-    attic_semantic::EmbeddingIntentSource,
-) {
-    use attic_semantic::EmbeddingIntentSource;
-
-    if let Some(profile) = store.read_embedding_profile().ok().flatten() {
-        let provider: Arc<dyn attic_semantic::SemanticProvider> =
-            match profile.config.provider.as_str() {
-                id if id == attic_semantic::QWEN_PROVIDER_ID => {
-                    match attic_semantic::Qwen3Embedder::new_pinned(
-                        model_cache_dir,
-                        batch_size,
-                        &profile.config.model_revision,
-                        None,
-                        attic_semantic::QwenPooling::LastToken,
-                    ) {
-                        Ok(embedder) => Arc::new(embedder),
-                        Err(e) => {
-                            tracing::warn!(
-                                "persisted profile requires '{id}' but Qwen3Embedder failed to \
-                                 construct ({e}); semantic layer DEGRADED"
-                            );
-                            Arc::new(attic_semantic::UnavailableProvider {
-                                reason: e.to_string(),
-                            })
-                        }
-                    }
-                }
-                id if id == attic_semantic::HashingEmbedder::ID => {
-                    Arc::new(attic_semantic::HashingEmbedder::new())
-                }
-                id => {
-                    tracing::warn!(
-                        "persisted profile names unrecognized provider '{id}'; semantic layer \
-                         DEGRADED"
-                    );
-                    Arc::new(attic_semantic::UnavailableProvider {
-                        reason: format!("unrecognized persisted provider id '{id}'"),
-                    })
-                }
-            };
-        return (provider, EmbeddingIntentSource::Recommendation);
-    }
-
-    let explicit = attic_config.has_explicit_embedding_override();
+) -> Arc<dyn attic_semantic::SemanticProvider> {
     let requested_provider = attic_config
         .embedding
         .provider
         .as_deref()
         .unwrap_or(attic_semantic::QWEN_PROVIDER_ID);
-    let source = if explicit {
-        EmbeddingIntentSource::TomlOverride
-    } else {
-        EmbeddingIntentSource::Recommendation
-    };
 
-    if requested_provider == attic_semantic::HashingEmbedder::ID {
-        return (Arc::new(attic_semantic::HashingEmbedder::new()), source);
+    if requested_provider != attic_semantic::QWEN_PROVIDER_ID {
+        tracing::warn!(
+            "requested provider '{requested_provider}' is not supported in production; degrading to unavailable provider"
+        );
+        return Arc::new(attic_semantic::UnavailableProvider {
+            reason: format!(
+                "provider '{requested_provider}' is not supported in production; only '{}' is valid",
+                attic_semantic::QWEN_PROVIDER_ID
+            ),
+        });
     }
-    match attic_semantic::Qwen3Embedder::new(
-        model_cache_dir,
-        batch_size,
-        None,
-        attic_semantic::QwenPooling::LastToken,
-    ) {
-        Ok(embedder) => (Arc::new(embedder), source),
-        Err(e) => {
-            tracing::warn!("Qwen3Embedder unavailable ({e}); degrading to unavailable provider");
-            (
-                Arc::new(attic_semantic::UnavailableProvider {
-                    reason: e.to_string(),
-                }),
-                source,
-            )
+
+    // Candidate directories to search for local cached weights:
+    let mut candidate_dirs = vec![model_cache_dir.to_path_buf()];
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        candidate_dirs.push(PathBuf::from(hf_home).join("hub"));
+    }
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        candidate_dirs.push(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+
+    for dir in candidate_dirs {
+        if let Ok(embedder) = attic_semantic::Qwen3Embedder::from_local_cache(
+            &dir,
+            batch_size,
+            None,
+            attic_semantic::QwenPooling::LastToken,
+        ) {
+            return Arc::new(embedder);
         }
     }
-}
 
-/// Cheap, name-level comparison only (provider string) — never a full
-/// `EmbeddingSpaceDescriptor` resolution, which would require a network/
-/// hf-hub call `status` must never make. [FIX] `model` is no longer a
-/// configurable override (see `EmbeddingOverride`'s doc comment — V1 has
-/// exactly one loadable model per provider, so a model-name comparison here
-/// could only ever produce a permanently-unsatisfiable mismatch). The only
-/// real trigger left is an explicit `provider` override that differs from
-/// what's already persisted — never a downgrade-recommendation path, per
-/// the High-Level Design's re-index-recommended semantics.
-fn compute_re_index_recommended(
-    attic_config: &attic_core::AtticConfig,
-    active_profile: Option<&attic_semantic::EmbeddingProfile>,
-) -> bool {
-    attic_config.has_explicit_embedding_override()
-        && active_profile.is_some_and(|p| {
-            let requested_provider = attic_config
-                .embedding
-                .provider
-                .as_deref()
-                .unwrap_or(&p.config.provider);
-            requested_provider != p.config.provider
-        })
+    tracing::warn!(
+        "Qwen3Embedder weights not present in local cache; degrading to unavailable provider"
+    );
+    Arc::new(attic_semantic::UnavailableProvider {
+        reason: "Qwen3 model weights not found in local cache; auto-download disabled to preserve startup latency".into(),
+    })
 }
 
 #[cfg(test)]
-mod re_index_recommended_tests {
-    use super::compute_re_index_recommended;
+mod resolve_provider_tests {
     use attic_core::AtticConfig;
-    use attic_semantic::{
-        EmbeddingProfile, EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy,
-    };
-
-    fn profile(provider: &str, model: &str) -> EmbeddingProfile {
-        let config = EmbeddingSpaceDescriptor {
-            schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: provider.into(),
-            model: model.into(),
-            model_revision: "rev1".into(),
-            tokenizer_revision: "rev1".into(),
-            pooling: PoolingStrategy::Cls,
-            normalize: true,
-            truncation: TruncationPolicy::Truncate,
-            max_tokens: 512,
-        };
-        EmbeddingProfile {
-            id: config.profile_id(),
-            config,
-        }
-    }
 
     #[test]
-    fn no_override_is_never_recommended_even_with_a_profile() {
-        let cfg = AtticConfig::default();
-        let p = profile("qwen3", "qwen3-embedding-0.6b");
-        assert!(!compute_re_index_recommended(&cfg, Some(&p)));
-    }
-
-    #[test]
-    fn no_persisted_profile_is_never_recommended_even_with_an_override() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n").unwrap();
-        assert!(!compute_re_index_recommended(&cfg, None));
-    }
-
-    #[test]
-    fn explicit_override_matching_persisted_profile_is_not_recommended() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"qwen3\"\n").unwrap();
-        let p = profile("qwen3", "qwen3-embedding-0.6b");
-        assert!(!compute_re_index_recommended(&cfg, Some(&p)));
-    }
-
-    #[test]
-    fn explicit_override_differing_from_persisted_profile_is_recommended() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n").unwrap();
-        let p = profile("qwen3", "qwen3-embedding-0.6b");
-        assert!(compute_re_index_recommended(&cfg, Some(&p)));
+    fn resolve_provider_never_falls_back_to_hashing_when_qwen_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let mut cfg = AtticConfig::default();
+        cfg.embedding.provider = Some("unknown_legacy_provider".to_string());
+        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir);
+        assert!(
+            !provider.available(),
+            "provider must be unavailable when non-qwen provider is requested"
+        );
+        assert_ne!(
+            provider.id(),
+            "hashing",
+            "provider must never be hashing test double in production"
+        );
     }
 }
 
@@ -509,11 +420,10 @@ impl AtticServer {
         let model_cache_dir = std::env::var("ATTIC_MODEL_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| db_path.with_file_name("models"));
-        let (semantic, semantic_intent_source) = if semantic_opt_in {
+        let semantic = if semantic_opt_in {
             match attic_semantic::SemanticStore::open(&semantic_path) {
                 Ok(store) => {
-                    let (provider, intent_source) = resolve_semantic_provider(
-                        &store,
+                    let provider = resolve_semantic_provider(
                         &attic_config,
                         effective.embedding_batch_size,
                         &model_cache_dir,
@@ -521,21 +431,21 @@ impl AtticServer {
                     info!(
                         provider = provider.id(),
                         model = provider.model_id(),
-                        "semantic layer ENABLED (experimental)"
+                        "semantic layer ENABLED"
                     );
                     let stack = attic_retrieval::semantic::SemanticStack {
                         store: Arc::new(store),
                         provider,
                     };
-                    (Some(Arc::new(stack)), Some(intent_source))
+                    Some(Arc::new(stack))
                 }
                 Err(e) => {
                     tracing::warn!("semantic layer unavailable ({e}); running non-semantic");
-                    (None, None)
+                    None
                 }
             }
         } else {
-            (None, None)
+            None
         };
         // Phase 8: the resource monitor is now driven by the SAME
         // hardware-aware `EffectiveResourceConfig` resolved above (env >
@@ -569,7 +479,6 @@ impl AtticServer {
             unavailable_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             pending_index_failed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             semantic,
-            semantic_intent_source,
             crossrepo_degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             db_path: db_path.to_path_buf(),
             resource_monitor: Some(Arc::new(resource_monitor)),
@@ -2244,42 +2153,20 @@ fn handle_status(
         "provider": attic_semantic::QWEN_PROVIDER_ID,
         "model": attic_semantic::QWEN_MODEL_ID,
     });
-    // Distinguishes "Attic recommends X" from "the user explicitly asked for
-    // Y" — required so `re_index_recommended`'s semantics can tell a
-    // recommendation apart from an explicit request (see High-Level Design).
+    // Distinguishes default provider recommendation from an explicit user override.
     payload["embedding_override_configured"] =
         json!(phase8.attic_config.has_explicit_embedding_override());
-    // `embedding_recommendation` above is always cheap/unresolved (no network
-    // lookup). `active_embedding_profile` is `null` until a profile is
-    // actually claimed at first real indexing work (see
-    // `enrich::ensure_profile_claimed`) — opening the DB or answering this
-    // `status` call never claims one itself, per Low-Level Design §3.
-    let (semantic_health, active_profile) = match phase8.semantic {
-        None => ("disabled", None),
+    let semantic_health = match phase8.semantic {
+        None => "disabled",
         Some(stack) => {
-            let health = if stack.provider.available() {
+            if stack.provider.available() {
                 "active"
             } else {
                 "degraded"
-            };
-            let profile = stack.store.read_embedding_profile().ok().flatten();
-            (health, profile)
+            }
         }
     };
     payload["semantic_health"] = json!(semantic_health);
-    payload["active_embedding_profile"] = active_profile
-        .as_ref()
-        .map(|p| {
-            json!({
-                "id": p.id,
-                "provider": p.config.provider,
-                "model": p.config.model,
-            })
-        })
-        .unwrap_or(Value::Null);
-    let re_index_recommended =
-        compute_re_index_recommended(phase8.attic_config, active_profile.as_ref());
-    payload["re_index_recommended"] = json!(re_index_recommended);
 
     // Phase V2 CP18: Semantic progress, ETA, and "why slow" diagnostics (§61, §62).
     if let Some(stack) = phase8.semantic {
@@ -3612,9 +3499,6 @@ pub(crate) fn build_server_and_enricher(
     // blocks foreground queries (they only read the store).
     let mut semantic_enricher: Option<attic_semantic::BackgroundEnricher> = None;
     if let Some(stack) = server.semantic.clone() {
-        let intent_source = server
-            .semantic_intent_source
-            .unwrap_or(attic_semantic::EmbeddingIntentSource::Recommendation);
         let enrichment_cfg = attic_semantic::EnrichmentConfig {
             batch_size: server.effective_resources.embedding_batch_size,
             embedding_worker_count: server.effective_resources.embedding_worker_count,
@@ -3626,7 +3510,6 @@ pub(crate) fn build_server_and_enricher(
             stack.provider.clone(),
             enrichment_cfg,
             server.resource_monitor.clone(),
-            intent_source,
             server.writer.generation(),
         ));
         info!("semantic background enrichment worker started");

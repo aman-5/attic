@@ -345,11 +345,10 @@ and `context` are backed by `Qwen3Embedder` — a real, Candle-backed neural
 embedder (`Qwen/Qwen3-Embedding-0.6B`) — by default; `HashingEmbedder`, a
 deterministic feature-hashing baseline, serves strictly as an offline
 test double. Canonical (lexical/structural)
-retrieval never depends on either. The `status` tool reports which provider
-is actually active (`embedding_recommendation`, `active_embedding_profile`,
-`semantic_health`, `re_index_recommended`) — a model/provider change never
-silently takes effect on an existing corpus; it surfaces "re-index
-recommended" instead.
+retrieval never depends on either. The `status` tool reports semantic subsystem
+state (`embedding_recommendation`, `semantic_health`, queue progress, and background
+diagnostics). Vector space compatibility is strictly governed by embedding
+fingerprints and semantic generations.
 
 **Offline / airgapped machines:** `Qwen3Embedder` downloads `Qwen/Qwen3-Embedding-0.6B`
 from Hugging Face on first use and caches it — no network access is
