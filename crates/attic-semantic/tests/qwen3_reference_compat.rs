@@ -249,10 +249,13 @@ fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
         assert_eq!(handle.max_concurrency(), plan.inference_lanes);
         plan.apply_environment_hints();
 
-        // Perform real Qwen inference under the dynamic plan
-        let vec = handle
-            .embed_query("fn authenticate_user(token: &str) -> bool", &budget)
-            .expect("real Qwen inference failed under dynamic CPU isolation plan");
+        // Perform real Qwen inference under the dynamic plan strictly isolated in scoped pool
+        let vec = plan.execute_isolated(|| {
+            assert_eq!(rayon::current_num_threads(), plan.threads_per_lane);
+            handle
+                .embed_query("fn authenticate_user(token: &str) -> bool", &budget)
+                .expect("real Qwen inference failed under dynamic CPU isolation plan")
+        });
 
         assert_eq!(vec.len(), 512);
         assert!(vec.iter().all(|v| v.is_finite()));

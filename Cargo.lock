@@ -255,6 +255,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "hf-hub",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",

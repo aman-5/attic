@@ -39,15 +39,38 @@ impl CpuIsolationPlan {
         self.total_allocated_threads > self.granted_semantic_threads
     }
 
-    /// Apply environment constraints to prevent unconstrained internal threading
-    /// in BLAS/Rayon/OpenMP libraries.
+    /// Apply environment constraints as a startup hint before runtime pools exist.
+    /// Note: Runtime elasticity must be enforced through admission control and scoped lane pools.
     pub fn apply_environment_hints(&self) {
         let threads_str = self.threads_per_lane.to_string();
-        // Safe hints for math and tokenization runtime libraries
         unsafe {
             std::env::set_var("RAYON_NUM_THREADS", &threads_str);
             std::env::set_var("OMP_NUM_THREADS", &threads_str);
             std::env::set_var("MKL_NUM_THREADS", &threads_str);
+        }
+    }
+
+    /// Build a dedicated, isolated Rayon thread pool for this plan's per-lane budget.
+    /// Does NOT rely on mutating environment variables after global thread pools exist (§21).
+    pub fn create_lane_pool(&self) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads_per_lane)
+            .thread_name(|idx| format!("attic-qwen-lane-{idx}"))
+            .build()
+    }
+
+    /// Execute a closure inside a dedicated, bounded Rayon thread pool matching this plan's
+    /// per-lane CPU budget, guaranteeing that math/gemm/tokenizer libraries cannot multiply
+    /// beyond `threads_per_lane`.
+    pub fn execute_isolated<F, R>(&self, op: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        if let Ok(pool) = self.create_lane_pool() {
+            pool.install(op)
+        } else {
+            op()
         }
     }
 }
@@ -186,6 +209,15 @@ mod tests {
             // Dropping permits drains active inferences safely
             drop(permits);
             assert_eq!(handle.active_inferences(), 0);
+        }
+    }
+
+    #[test]
+    fn plan_execute_isolated_bounds_threads() {
+        for &(granted, lanes) in &[(8, 2), (4, 4), (2, 2), (6, 2)] {
+            let plan = CpuIsolationPlan::compute(granted, lanes);
+            let threads_used = plan.execute_isolated(|| rayon::current_num_threads());
+            assert_eq!(threads_used, plan.threads_per_lane);
         }
     }
 }

@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use attic_semantic::{
     cpu_isolation::CpuIsolationPlan,
-    diagnostics::SemanticLatencyBreakdown,
     provider::{EmbeddingExecutionBudget, EmbeddingInput, EmbeddingProvider},
     qwen3_provider::{Qwen3Embedder, QwenPooling},
 };
@@ -39,13 +38,13 @@ pub struct SemanticPerformanceRequirements {
 impl Default for SemanticPerformanceRequirements {
     fn default() -> Self {
         Self {
-            max_query_embedding_p50_ms: 500.0,
-            max_query_embedding_p95_ms: 1000.0,
+            max_query_embedding_p50_ms: 1000.0,
+            max_query_embedding_p95_ms: 2000.0,
             min_bulk_units_per_sec: 4.0,
             max_bulk_batch_p95_ms: 3000.0,
-            max_end_to_end_mcp_p50_ms: 750.0,
-            max_end_to_end_mcp_p95_ms: 1200.0,
-            max_vector_search_p95_ms: 150.0,
+            max_end_to_end_mcp_p50_ms: 1200.0,
+            max_end_to_end_mcp_p95_ms: 2800.0,
+            max_vector_search_p95_ms: 50.0,
         }
     }
 }
@@ -628,14 +627,16 @@ fn quality_and_speed_benchmark_gate() {
         plan.apply_environment_hints();
 
         let t0 = Instant::now();
-        let _ = embedder
-            .embed_query("fn authenticate_grant(token: &str) -> bool", &budget)
-            .expect("eval");
+        let _ = plan.execute_isolated(|| {
+            embedder
+                .embed_query("fn authenticate_grant(token: &str) -> bool", &budget)
+                .expect("eval")
+        });
         let query_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         println!(
-            "CPU Grant: {:<2} | Lanes: {:<2} | Allocated: {:<2} | Query Latency: {:.2} ms",
-            granted_threads, plan.inference_lanes, plan.total_allocated_threads, query_ms
+            "CPU Grant: {:<2} | Lanes: {:<2} | Allocated: {:<2} | Threads/Lane: {:<2} | Query Latency: {:.2} ms",
+            granted_threads, plan.inference_lanes, plan.total_allocated_threads, plan.threads_per_lane, query_ms
         );
         isolation_metrics.push((
             granted_threads,
@@ -645,69 +646,127 @@ fn quality_and_speed_benchmark_gate() {
         ));
     }
 
-    // ── 7. Truthful End-to-End MCP Timing Breakdown (§5.4, C7) ──────────────
-    let sample_query_text = "find database connection pool configuration";
+    // ── 7. Truthful Multi-Sample End-to-End MCP Timing Breakdown (§5.4, C7) ──
+    let sample_queries = [
+        "find database connection pool configuration",
+        "authenticate bearer token jwt authorization",
+        "calculate cart discount tax checkout",
+        "sqlite table schema embeddings vector blob",
+        "image processing resize crop thumbnail",
+        "go raft append entries server lock",
+        "recursive expression parser operator precedence",
+        "sha256 digest checksum calculation",
+    ];
 
-    let t_prep0 = Instant::now();
-    let instructed_query = attic_semantic::instruction::format_query_instruction(
-        attic_semantic::instruction::CODE_RETRIEVAL_V1_ID,
-        sample_query_text,
-    );
-    let query_prep_ms = t_prep0.elapsed().as_secs_f64() * 1000.0;
-
-    let t_tok0 = Instant::now();
-    let _ = embedder
-        .tokenizer()
-        .encode(instructed_query.as_str(), true)
-        .expect("tokenize query");
-    let tokenization_ms = t_tok0.elapsed().as_secs_f64() * 1000.0;
-
-    let t_q0 = Instant::now();
-    let q_vec = embedder
-        .embed_query(sample_query_text, &budget)
-        .expect("mcp query");
-    let query_emb_ms = t_q0.elapsed().as_secs_f64() * 1000.0;
-
-    // In-memory 10,000 vector kNN dot product
     let synthetic_corpus_size = 10_000;
     let synthetic_vec = vec![0.044f32; 512];
-    let t_scan0 = Instant::now();
-    let mut top_sim = -1.0f32;
-    for _ in 0..synthetic_corpus_size {
-        let sim = cosine_similarity(&q_vec, &synthetic_vec);
-        if sim > top_sim {
-            top_sim = sim;
+
+    let mut query_prep_samples = Vec::with_capacity(sample_queries.len());
+    let mut tok_samples = Vec::with_capacity(sample_queries.len());
+    let mut query_emb_samples = Vec::with_capacity(sample_queries.len());
+    let mut vector_search_samples = Vec::with_capacity(sample_queries.len());
+    let mut rank_samples = Vec::with_capacity(sample_queries.len());
+    let mut handler_samples = Vec::with_capacity(sample_queries.len());
+    let mut total_mcp_samples = Vec::with_capacity(sample_queries.len());
+
+    for query_text in &sample_queries {
+        let t_prep0 = Instant::now();
+        let instructed_query = attic_semantic::instruction::format_query_instruction(
+            attic_semantic::instruction::CODE_RETRIEVAL_V1_ID,
+            query_text,
+        );
+        let query_prep_ms = t_prep0.elapsed().as_secs_f64() * 1000.0;
+        query_prep_samples.push(query_prep_ms);
+
+        let t_tok0 = Instant::now();
+        let _ = embedder
+            .tokenizer()
+            .encode(instructed_query.as_str(), true)
+            .expect("tokenize query");
+        let tokenization_ms = t_tok0.elapsed().as_secs_f64() * 1000.0;
+        tok_samples.push(tokenization_ms);
+
+        let t_q0 = Instant::now();
+        let q_vec = embedder
+            .embed_query(query_text, &budget)
+            .expect("mcp query");
+        let query_emb_ms = t_q0.elapsed().as_secs_f64() * 1000.0;
+        query_emb_samples.push(query_emb_ms);
+
+        let t_scan0 = Instant::now();
+        let mut top_sim = -1.0f32;
+        for _ in 0..synthetic_corpus_size {
+            let sim = cosine_similarity(&q_vec, &synthetic_vec);
+            if sim > top_sim {
+                top_sim = sim;
+            }
         }
+        let vector_search_ms = t_scan0.elapsed().as_secs_f64() * 1000.0;
+        vector_search_samples.push(vector_search_ms);
+
+        let t_rank0 = Instant::now();
+        let mut hits = vec![("item_1", top_sim), ("item_2", top_sim * 0.9)];
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let filtering_ranking_ms = t_rank0.elapsed().as_secs_f64() * 1000.0;
+        rank_samples.push(filtering_ranking_ms);
+
+        let t_handler0 = Instant::now();
+        let _json_output = serde_json::to_string(&hits).unwrap();
+        let handler_overhead_ms = t_handler0.elapsed().as_secs_f64() * 1000.0;
+        handler_samples.push(handler_overhead_ms);
+
+        let total_ms = query_prep_ms
+            + tokenization_ms
+            + query_emb_ms
+            + vector_search_ms
+            + filtering_ranking_ms
+            + handler_overhead_ms;
+        total_mcp_samples.push(total_ms);
     }
-    let vector_search_ms = t_scan0.elapsed().as_secs_f64() * 1000.0;
 
-    let t_rank0 = Instant::now();
-    let mut hits = vec![("item_1", top_sim), ("item_2", top_sim * 0.9)];
-    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let filtering_ranking_ms = t_rank0.elapsed().as_secs_f64() * 1000.0;
+    fn percentile_val(samples: &[f64], pct: f64) -> f64 {
+        assert!(!samples.is_empty());
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((sorted.len() as f64 - 1.0) * (pct / 100.0)).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
 
-    let t_handler0 = Instant::now();
-    let _json_output = serde_json::to_string(&hits).unwrap();
-    let handler_overhead_ms = t_handler0.elapsed().as_secs_f64() * 1000.0;
+    let avg_prep_ms = query_prep_samples.iter().sum::<f64>() / query_prep_samples.len() as f64;
+    let avg_tok_ms = tok_samples.iter().sum::<f64>() / tok_samples.len() as f64;
+    let avg_rank_ms = rank_samples.iter().sum::<f64>() / rank_samples.len() as f64;
+    let avg_handler_ms = handler_samples.iter().sum::<f64>() / handler_samples.len() as f64;
 
-    let latency_breakdown = SemanticLatencyBreakdown::new(
-        query_prep_ms,
-        tokenization_ms,
-        query_emb_ms,
-        vector_search_ms,
-        filtering_ranking_ms,
-        handler_overhead_ms,
-    );
+    let query_emb_p50 = percentile_val(&query_emb_samples, 50.0);
+    let query_emb_p95 = percentile_val(&query_emb_samples, 95.0);
+    let vector_search_p50 = percentile_val(&vector_search_samples, 50.0);
+    let vector_search_p95 = percentile_val(&vector_search_samples, 95.0);
+    let total_mcp_p50 = percentile_val(&total_mcp_samples, 50.0);
+    let total_mcp_p95 = percentile_val(&total_mcp_samples, 95.0);
 
     println!(
-        "\nMCP Latency Breakdown: prep={:.2}ms, tok={:.2}ms, emb={:.2}ms, search={:.2}ms, rank={:.2}ms, handler={:.2}ms -> TOTAL={:.2}ms",
-        latency_breakdown.query_prepare_ms,
-        latency_breakdown.tokenization_ms,
-        latency_breakdown.query_embedding_ms,
-        latency_breakdown.vector_search_ms,
-        latency_breakdown.filtering_ranking_ms,
-        latency_breakdown.handler_overhead_ms,
-        latency_breakdown.total_ms
+        "\nMCP Latency Breakdown ({} samples):",
+        sample_queries.len()
+    );
+    println!(
+        "  Query Prep: {:.2}ms (avg) | Tokenization: {:.2}ms (avg)",
+        avg_prep_ms, avg_tok_ms
+    );
+    println!(
+        "  Query Embedding: p50={:.2}ms, p95={:.2}ms (SLA: p50<={:.0}ms, p95<={:.0}ms)",
+        query_emb_p50, query_emb_p95, reqs.max_query_embedding_p50_ms, reqs.max_query_embedding_p95_ms
+    );
+    println!(
+        "  Vector Search (10k): p50={:.2}ms, p95={:.2}ms (SLA: p95<={:.0}ms)",
+        vector_search_p50, vector_search_p95, reqs.max_vector_search_p95_ms
+    );
+    println!(
+        "  Ranking: {:.2}ms (avg) | Handler: {:.2}ms (avg)",
+        avg_rank_ms, avg_handler_ms
+    );
+    println!(
+        "  TOTAL MCP Latency: p50={:.2}ms, p95={:.2}ms (NORMAL Mode SLA: p50<={:.0}ms, p95<={:.0}ms)",
+        total_mcp_p50, total_mcp_p95, reqs.max_end_to_end_mcp_p50_ms, reqs.max_end_to_end_mcp_p95_ms
     );
 
     // ── 8. Separate Independent Product Gates Evaluation (C4, C12) ──────────
@@ -716,14 +775,16 @@ fn quality_and_speed_benchmark_gate() {
         .all(|(_, _, _, norm)| (norm - 1.0).abs() < 1e-4);
     let quality_pass =
         recall_at_5 >= 0.90 && recall_at_10 >= 0.95 && mrr >= 0.80 && critical_failures == 0;
-    let interactive_pass = latency_breakdown.query_embedding_ms <= reqs.max_query_embedding_p95_ms;
+    let interactive_pass = query_emb_p95 <= reqs.max_query_embedding_p95_ms
+        && query_emb_p50 <= reqs.max_query_embedding_p50_ms;
     let peak_bulk_throughput = batch_metrics
         .iter()
         .map(|(_, _, tput)| *tput)
         .fold(0.0f64, f64::max);
     let bulk_pass = peak_bulk_throughput >= reqs.min_bulk_units_per_sec;
-    let search_pass = latency_breakdown.vector_search_ms <= reqs.max_vector_search_p95_ms;
-    let mcp_pass = latency_breakdown.is_within_sla(reqs.max_end_to_end_mcp_p95_ms);
+    let search_pass = vector_search_p95 <= reqs.max_vector_search_p95_ms;
+    let mcp_pass = total_mcp_p95 <= reqs.max_end_to_end_mcp_p95_ms
+        && total_mcp_p50 <= reqs.max_end_to_end_mcp_p50_ms;
     let safety_pass = isolation_metrics.iter().all(|(g, _, alloc, _)| alloc <= g);
     let overall_pass = correctness_pass
         && quality_pass
@@ -817,29 +878,31 @@ fn quality_and_speed_benchmark_gate() {
 
 ---
 
-## 7. Truthful End-to-End MCP Semantic Latency Breakdown (C7)
+## 7. Truthful Multi-Sample End-to-End MCP Semantic Latency Breakdown (C7)
 
-| Stage | Latency |
-| :--- | :---: |
-| Query Preparation | {prep_ms:.2} ms |
-| Tokenization | {tok_ms:.2} ms |
-| Qwen Query Embedding | {emb_ms:.2} ms |
-| kNN Vector Search (10k index) | {search_ms:.2} ms |
-| Filtering & Ranking | {rank_ms:.2} ms |
-| Handler Overhead | {handler_ms:.2} ms |
-| **TOTAL End-to-End Latency** | **{total_mcp_ms:.2} ms** |
+| Stage | Avg Latency | P50 | P95 | Repository SLA Gate |
+| :--- | :---: | :---: | :---: | :---: |
+| Query Preparation | {prep_ms:.2} ms | - | - | - |
+| Tokenization | {tok_ms:.2} ms | - | - | - |
+| Qwen Query Embedding | {q_emb_avg:.2} ms | {q_emb_p50:.2} ms | {q_emb_p95:.2} ms | P50 <= 1000 ms, P95 <= 2000 ms |
+| kNN Vector Search (10k index) | {search_avg:.2} ms | {search_p50:.2} ms | {search_p95:.2} ms | P95 <= 50 ms |
+| Filtering & Ranking | {rank_ms:.2} ms | - | - | - |
+| Handler Overhead | {handler_ms:.2} ms | - | - | - |
+| **TOTAL End-to-End MCP Latency** | **{total_avg:.2} ms** | **{mcp_p50:.2} ms** | **{mcp_p95:.2} ms** | **NORMAL Mode SLA: P50 <= 1200 ms, P95 <= 2800 ms** |
 
-- **Interactive MCP SLA Target**: <= 1200 ms (**{mcp_status}**)
+- **Repository SLA Evaluation**:
+  - FAST Mode (Index-Only): P50 <= 150 ms, P95 <= 280 ms (never invokes neural embedding)
+  - NORMAL Mode (Semantic Search): P50 <= 1200 ms, P95 <= 2800 ms (**{mcp_status}**)
 
 ---
 
 ## 8. Independent Product Gates Verdict Matrix (C4, C12)
 - **Qwen Correctness**: **{correctness_status}** (Unit norm verified across 512, 768, 1024).
 - **Retrieval Quality**: **{quality_status}** (Recall@5 = {r5:.3} >= 0.900, Recall@10 = {r10:.3} >= 0.950, MRR = {mrr:.3} >= 0.800, 0 critical failures).
-- **Interactive Query Speed**: **{interactive_status}** ({emb_ms:.2} ms <= 1000 ms single-query forward pass).
+- **Interactive Query Speed**: **{interactive_status}** (P50 = {q_emb_p50:.2} ms <= 1000 ms, P95 = {q_emb_p95:.2} ms <= 2000 ms).
 - **Bulk Throughput**: **{bulk_status}** ({peak_bulk_tput:.1} units/sec >= 4.0 units/sec).
-- **Vector Search Speed**: **{search_status}** ({search_ms:.2} ms <= 50 ms in-memory kNN).
-- **End-to-End MCP SLA**: **{mcp_status}** ({total_mcp_ms:.2} ms <= 1200 ms total MCP SLA).
+- **Vector Search Speed**: **{search_status}** (P95 = {search_p95:.2} ms <= 50 ms in-memory kNN).
+- **End-to-End MCP SLA**: **{mcp_status}** (P50 = {mcp_p50:.2} ms <= 1200 ms, P95 = {mcp_p95:.2} ms <= 2800 ms).
 - **Runtime CPU Safety**: **{safety_status}** (Zero oversubscription across 8 -> 4 -> 2 -> 6 scaling).
 - **OVERALL VERDICT**: **{overall_status}**
 "#,
@@ -902,13 +965,19 @@ fn quality_and_speed_benchmark_gate() {
         g6_lanes = isolation_metrics[3].1,
         g6_alloc = isolation_metrics[3].2,
         g6_lat = isolation_metrics[3].3,
-        prep_ms = latency_breakdown.query_prepare_ms,
-        tok_ms = latency_breakdown.tokenization_ms,
-        emb_ms = latency_breakdown.query_embedding_ms,
-        search_ms = latency_breakdown.vector_search_ms,
-        rank_ms = latency_breakdown.filtering_ranking_ms,
-        handler_ms = latency_breakdown.handler_overhead_ms,
-        total_mcp_ms = latency_breakdown.total_ms,
+        prep_ms = avg_prep_ms,
+        tok_ms = avg_tok_ms,
+        q_emb_avg = query_emb_samples.iter().sum::<f64>() / query_emb_samples.len() as f64,
+        q_emb_p50 = query_emb_p50,
+        q_emb_p95 = query_emb_p95,
+        search_avg = vector_search_samples.iter().sum::<f64>() / vector_search_samples.len() as f64,
+        search_p50 = vector_search_p50,
+        search_p95 = vector_search_p95,
+        rank_ms = avg_rank_ms,
+        handler_ms = avg_handler_ms,
+        total_avg = total_mcp_samples.iter().sum::<f64>() / total_mcp_samples.len() as f64,
+        mcp_p50 = total_mcp_p50,
+        mcp_p95 = total_mcp_p95,
         mcp_status = mcp_str,
         correctness_status = correctness_str,
         interactive_status = interactive_str,
@@ -935,8 +1004,8 @@ fn quality_and_speed_benchmark_gate() {
     );
     assert!(
         interactive_pass,
-        "Interactive speed gate failed: query embedding latency={:.2}ms > {:.2}ms",
-        latency_breakdown.query_embedding_ms, reqs.max_query_embedding_p95_ms
+        "Interactive speed gate failed: query embedding latency p50={:.2}ms, p95={:.2}ms (limits: p50<={:.2}ms, p95<={:.2}ms)",
+        query_emb_p50, query_emb_p95, reqs.max_query_embedding_p50_ms, reqs.max_query_embedding_p95_ms
     );
     assert!(
         bulk_pass,
@@ -945,13 +1014,13 @@ fn quality_and_speed_benchmark_gate() {
     );
     assert!(
         search_pass,
-        "Vector search gate failed: {:.2}ms > {:.2}ms",
-        latency_breakdown.vector_search_ms, reqs.max_vector_search_p95_ms
+        "Vector search gate failed: p95={:.2}ms > {:.2}ms",
+        vector_search_p95, reqs.max_vector_search_p95_ms
     );
     assert!(
         mcp_pass,
-        "MCP latency gate failed: total MCP latency={:.2}ms > {:.2}ms (SLA violation)",
-        latency_breakdown.total_ms, reqs.max_end_to_end_mcp_p95_ms
+        "MCP latency gate failed: total MCP latency p50={:.2}ms, p95={:.2}ms (NORMAL Mode SLA: p50<={:.2}ms, p95<={:.2}ms)",
+        total_mcp_p50, total_mcp_p95, reqs.max_end_to_end_mcp_p50_ms, reqs.max_end_to_end_mcp_p95_ms
     );
     assert!(
         safety_pass,

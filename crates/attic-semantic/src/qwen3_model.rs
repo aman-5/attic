@@ -153,30 +153,25 @@ impl Qwen3Attention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let q = q.reshape((b, l, self.num_heads, self.head_dim))?;
+        let k = k.reshape((b, l, self.num_kv_heads, self.head_dim))?;
         let v = v
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Per-head RMSNorm
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
-        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        // Per-head RMSNorm directly on contiguous (b, l, heads, head_dim) before transpose
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
 
         // RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
 
         // GQA repeat_kv
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = repeat_kv(k, self.num_kv_groups)?;
+        let v = repeat_kv(v, self.num_kv_groups)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -306,30 +301,44 @@ impl Qwen3Model {
         device: &Device,
     ) -> Result<Tensor> {
         let b_sz = attention_mask_rows.len();
-        let mut mask_data = Vec::with_capacity(b_sz * seq_len * seq_len);
-        for row in attention_mask_rows {
-            let all_active = row.len() >= seq_len && row[..seq_len].iter().all(|&v| v > 0);
-            if all_active {
-                for i in 0..seq_len {
-                    for j in 0..seq_len {
-                        mask_data.push(if j <= i { 0.0f32 } else { -1e4f32 });
-                    }
+        let all_active_global = attention_mask_rows
+            .iter()
+            .all(|row| row.len() >= seq_len && row[..seq_len].iter().all(|&v| v > 0));
+
+        if all_active_global {
+            let mut mask_data = Vec::with_capacity(seq_len * seq_len);
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    mask_data.push(if j <= i { 0.0f32 } else { -1e4f32 });
                 }
-            } else {
-                for i in 0..seq_len {
-                    for j in 0..seq_len {
-                        let is_active = row.get(j).copied().unwrap_or(0) > 0;
-                        let is_causal = j <= i;
-                        mask_data.push(if is_active && is_causal {
-                            0.0f32
-                        } else {
-                            -1e4f32
-                        });
+            }
+            Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)
+        } else {
+            let mut mask_data = Vec::with_capacity(b_sz * seq_len * seq_len);
+            for row in attention_mask_rows {
+                let row_all_active = row.len() >= seq_len && row[..seq_len].iter().all(|&v| v > 0);
+                if row_all_active {
+                    for i in 0..seq_len {
+                        for j in 0..seq_len {
+                            mask_data.push(if j <= i { 0.0f32 } else { -1e4f32 });
+                        }
+                    }
+                } else {
+                    for i in 0..seq_len {
+                        for j in 0..seq_len {
+                            let is_active = row.get(j).copied().unwrap_or(0) > 0;
+                            let is_causal = j <= i;
+                            mask_data.push(if is_active && is_causal {
+                                0.0f32
+                            } else {
+                                -1e4f32
+                            });
+                        }
                     }
                 }
             }
+            Tensor::from_vec(mask_data, (b_sz, 1, seq_len, seq_len), device)
         }
-        Tensor::from_vec(mask_data, (b_sz, 1, seq_len, seq_len), device)
     }
 
     pub fn forward(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {

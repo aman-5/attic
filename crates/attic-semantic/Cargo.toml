@@ -21,6 +21,7 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 tokenizers = { workspace = true }
 hf-hub = { workspace = true }
+rayon = "1.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
