@@ -295,19 +295,6 @@ impl ResourceOverrides {
     }
 }
 
-/// Explicit embedding provider override (`[embedding]` in `attic.toml`).
-///
-/// Optional provider override (`[embedding]` in `attic.toml`).
-///
-/// In Phase 101 Clean Final Architecture, `Qwen3Embedder` is the standard neural model.
-/// `provider = "hashing"` can be specified in test configurations.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddingOverride {
-    /// Explicit provider id (`"qwen3"` or `"hashing"`).
-    pub provider: Option<String>,
-}
-
 /// User-tunable indexing/discovery overrides (`[indexing]` in `attic.toml`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -322,7 +309,7 @@ pub struct IndexingOverride {
     pub exclude: Vec<String>,
 }
 
-/// Parsed `attic.toml` — resource/embedding/indexing tunables only.
+/// Parsed `attic.toml` — resource/semantic/indexing tunables only.
 ///
 /// Never contains workspace-membership (`[[repositories]]`); that stays on
 /// the existing, separate `<ATTIC_HOME>/config.toml` and its hand-rolled
@@ -332,11 +319,6 @@ pub struct AtticConfig {
     /// `[resources]` table.
     #[serde(default)]
     pub resources: ResourceOverrides,
-    /// `[embedding]` table. Unconditionally present (itself `Default`, both
-    /// fields `None`) rather than `Option<EmbeddingOverride>` — explicit
-    /// intent is a value-level check, never a presence-level one.
-    #[serde(default)]
-    pub embedding: EmbeddingOverride,
     /// `[semantic]` table. Controls modern semantic engine settings (Master Plan V2 §26).
     #[serde(default)]
     pub semantic: SemanticConfig,
@@ -350,21 +332,13 @@ impl AtticConfig {
     /// Parse `attic.toml` contents. Pure — does no I/O; the caller
     /// (`attic-server`) reads the file and hands the contents here.
     pub fn parse_str(contents: &str) -> Result<Self, ConfigError> {
-        let cfg: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        if let Some(ref p) = cfg.embedding.provider
-            && p == "hashing"
-        {
+        if contents.contains("[embedding]") {
             return Err(ConfigError::Parse(
-                "provider = \"hashing\" is rejected: hashing is a test-only double and cannot be configured in production".into(),
+                "the [embedding] table and generic provider selection are removed; configure the semantic engine using [semantic] (e.g. model = \"qwen3-embedding-0.6b\")".into(),
             ));
         }
+        let cfg: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(cfg)
-    }
-
-    /// True only when the user explicitly named a provider in `[embedding]`
-    /// — never inferred from whether the TOML table exists.
-    pub fn has_explicit_embedding_override(&self) -> bool {
-        self.embedding.provider.is_some()
     }
 }
 
@@ -405,41 +379,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_no_explicit_embedding_override() {
+    fn default_config_has_default_semantic() {
         let cfg = AtticConfig::default();
-        assert!(!cfg.has_explicit_embedding_override());
+        assert!(cfg.semantic.enabled);
+        assert_eq!(cfg.semantic.model, "qwen3-embedding-0.6b");
         assert!(cfg.resources.mode.is_none());
     }
 
     #[test]
-    fn empty_embedding_table_is_not_an_override() {
-        let cfg = AtticConfig::parse_str("[resources]\nmode = \"auto\"\n\n[embedding]\n").unwrap();
-        assert!(!cfg.has_explicit_embedding_override());
-    }
-
-    #[test]
-    fn production_config_cannot_select_hashing() {
+    fn production_config_rejects_legacy_embedding_and_hashing() {
         let result = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n");
         assert!(
             result.is_err(),
-            "production config must reject provider = 'hashing'"
+            "production config must reject [embedding] / hashing"
         );
-    }
-
-    #[test]
-    fn explicit_provider_is_an_override() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"qwen3\"\n").unwrap();
-        assert!(cfg.has_explicit_embedding_override());
-        assert_eq!(cfg.embedding.provider.as_deref(), Some("qwen3"));
-    }
-
-    #[test]
-    fn unknown_embedding_key_fails_to_parse() {
-        let result = AtticConfig::parse_str("[embedding]\nunknown_field = \"val\"\n");
+        let result2 = AtticConfig::parse_str("[embedding]\nprovider = \"qwen3\"\n");
         assert!(
-            result.is_err(),
-            "unknown [embedding] keys must be rejected, not silently ignored"
+            result2.is_err(),
+            "production config must reject legacy [embedding] table entirely"
         );
+    }
+
+    #[test]
+    fn production_config_accepts_semantic_table() {
+        let cfg = AtticConfig::parse_str(
+            "[semantic]\nenabled = true\nmodel = \"qwen3-embedding-0.6b\"\ndimension = 512\n",
+        )
+        .unwrap();
+        assert!(cfg.semantic.enabled);
+        assert_eq!(cfg.semantic.model, "qwen3-embedding-0.6b");
+        assert_eq!(cfg.semantic.dimension, Some(512));
+    }
+
+    #[test]
+    fn semantic_disabled_config_parses() {
+        let cfg = AtticConfig::parse_str("[semantic]\nenabled = false\n").unwrap();
+        assert!(!cfg.semantic.enabled);
     }
 
     #[test]
@@ -460,7 +435,8 @@ mod tests {
             Some(ResourceModeSetting::Auto)
         ));
         assert!(cfg.resources.total_memory_budget_mib.is_none());
-        assert!(!cfg.has_explicit_embedding_override());
+        assert!(cfg.semantic.enabled);
+        assert_eq!(cfg.semantic.model, "qwen3-embedding-0.6b");
     }
 
     #[test]

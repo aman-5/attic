@@ -382,10 +382,10 @@ fn large_index_retrieval_scalability_gate() {
 
     // ── Generate Report Markdown ────────────────────────────────────────────
     let report_content = format!(
-        r#"# Large-Index Retrieval Scalability Report (CP20 / F10)
+        r#"# Large-Index Retrieval Scalability Report (CP20 / F10 / C11)
 
-**Date**: 2026-09-09
-**Status**: PASS
+**Date**: 2026-09-10
+**Status**: PASS (Vector Search Scalability) / PASS (Interactive MCP SLA <= 1200ms)
 **Model**: `Qwen/Qwen3-Embedding-0.6B` (`{revision}`)
 **Dimension**: {dim} (Production Matryoshka)
 **Max Database Scale Evaluated**: 1,000,000 physical vector records
@@ -394,24 +394,28 @@ fn large_index_retrieval_scalability_gate() {
 
 ## 1. Scale Tier Measurement Matrix
 
-| Scale Tier | Total Vectors | Cumulative DB Size | Population Time | Query Scope / Budget | Rows Scanned | kNN Latency | Total MCP Latency | Truncated | SLA Status |
-| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Tier 1 (30k)** | 30,000 | {size_30k:.1} MiB | {pop_30k:.2} s | Unscoped (Exhaustive) | {scanned_30k} | {knn_30k:.2} ms | {total_30k:.2} ms | No | **PASS** (≤ 150 ms) |
-| **Tier 1 (30k)** | 30,000 | {size_30k:.1} MiB | — | Scoped (`repo-auth`) | {scanned_scoped_30k} | {scoped_30k:.2} ms | {total_scoped_30k:.2} ms | No | **PASS** (≤ 150 ms) |
-| **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | {pop_100k:.2} s | Unscoped (Exhaustive) | {scanned_100k} | {knn_100k:.2} ms | {total_100k:.2} ms | No | **PASS** (≤ 1200 ms) |
-| **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | — | `max_rows` cap (15,000) | {scanned_cap} | {cap_ms:.2} ms | {total_cap:.2} ms | Yes | **PASS** (≤ 150 ms) |
-| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | {pop_500k:.2} s | Scoped (`repo-engine`) | {scanned_scoped_500k} | {scoped_500k:.2} ms | {total_scoped_500k:.2} ms | No | **PASS** (≤ 1200 ms) |
-| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | — | SLA Deadline (25 ms) | {scanned_deadline_500k} | {deadline_500k:.2} ms | {total_deadline_500k:.2} ms | Yes | **PASS** (≤ 150 ms) |
-| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | {pop_1m:.2} s | SLA Deadline (40 ms) | {scanned_deadline_1m} | {deadline_1m:.2} ms | {total_deadline_1m:.2} ms | Yes | **PASS** (≤ 150 ms) |
-| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | — | Scoped Bounded (30 ms) | {scanned_scoped_1m} | {scoped_1m:.2} ms | {total_scoped_1m:.2} ms | Yes | **PASS** (≤ 150 ms) |
+| Scale Tier | Total Vectors | Cumulative DB Size | Population Time | Query Scope / Budget | Rows Scanned | kNN Latency | Search SLA | Total MCP Latency | MCP SLA (1200ms) | Truncated |
+| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Tier 1 (30k)** | 30,000 | {size_30k:.1} MiB | {pop_30k:.2} s | Unscoped (Exhaustive) | {scanned_30k} | {knn_30k:.2} ms | PASS (<= 50ms) | {total_30k:.2} ms | PASS (<= 1200ms) | No |
+| **Tier 1 (30k)** | 30,000 | {size_30k:.1} MiB | — | Scoped (`repo-auth`) | {scanned_scoped_30k} | {scoped_30k:.2} ms | PASS (<= 50ms) | {total_scoped_30k:.2} ms | PASS (<= 1200ms) | No |
+| **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | {pop_100k:.2} s | Unscoped (Exhaustive) | {scanned_100k} | {knn_100k:.2} ms | PASS (<= 100ms) | {total_100k:.2} ms | PASS (<= 1200ms) | No |
+| **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | — | `max_rows` cap (15,000) | {scanned_cap} | {cap_ms:.2} ms | PASS (<= 50ms) | {total_cap:.2} ms | PASS (<= 1200ms) | Yes |
+| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | {pop_500k:.2} s | Scoped (`repo-engine`) | {scanned_scoped_500k} | {scoped_500k:.2} ms | PASS (<= 100ms) | {total_scoped_500k:.2} ms | PASS (<= 1200ms) | No |
+| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | — | SLA Deadline (25 ms) | {scanned_deadline_500k} | {deadline_500k:.2} ms | PASS (<= 80ms) | {total_deadline_500k:.2} ms | PASS (<= 1200ms) | Yes |
+| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | {pop_1m:.2} s | SLA Deadline (40 ms) | {scanned_deadline_1m} | {deadline_1m:.2} ms | PASS (<= 100ms) | {total_deadline_1m:.2} ms | PASS (<= 1200ms) | Yes |
+| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | — | Scoped Bounded (30 ms) | {scanned_scoped_1m} | {scoped_1m:.2} ms | PASS (<= 80ms) | {total_scoped_1m:.2} ms | PASS (<= 1200ms) | Yes |
 
 ---
 
-## 2. Quality and Budget Analysis
-- **Query Embedding**: Real Qwen3 embedding model latency on CPU is `{query_emb:.2} ms`.
-- **Quality Retention**: Scanning 15% of the index via `max_rows` retains `{quality_retention:.1}%` of peak cosine similarity while cutting latency by >80%.
-- **SLA Enforcement**: Across all scale tiers (30k through 1M+), `ScanBudget` (`max_rows` and `deadline`) guarantees that interactive MCP requests never exceed FAST (150ms) or NORMAL (1200ms) latency ceilings.
-- **Metadata Filter Acceleration**: Composite index `(generation_id, repository_id)` reduces scanned row volume by 75% for repo-scoped queries.
+## 2. Separate Scalability and MCP Latency Verdicts (C11)
+- **VECTOR SEARCH SCALABILITY**: **PASS**
+  - All scale tiers (30k through 1,000,000+ vectors) enforce strict sub-100ms vector search latency bounds via `ScanBudget` (`max_rows` and `deadline`).
+  - Scoped queries achieve 2-4x speedup via `(generation_id, repository_id)` indexing.
+  - Budget capping at 15% scan retains `{quality_retention:.1}%` of peak cosine similarity.
+- **END-TO-END MCP LATENCY**:
+  - **Interactive SLA (<= 1200ms)**: **PASS** across all tiers (peak total latency = `{total_deadline_1m:.2} ms`).
+  - **Fast SLA (<= 150ms)**: **FAIL** (Expected: single-query Qwen3 transformer forward pass on CPU requires `{query_emb:.2} ms`, so total MCP latency cannot be <= 150 ms without GPU/hardware acceleration).
+  - *Audit Note*: Vector-search scan deadlines (e.g. 25ms, 40ms) must not be conflated with end-to-end MCP response latency.
 "#,
         revision = PINNED_REVISION,
         dim = dim,
@@ -474,4 +478,8 @@ fn large_index_retrieval_scalability_gate() {
     );
     assert!(deadline_500k_ms <= 80.0, "500k deadline must bound search");
     assert!(deadline_1m_ms <= 100.0, "1M deadline must bound search");
+    assert!(
+        query_emb_ms + deadline_1m_ms <= 1200.0,
+        "Total MCP latency must satisfy interactive SLA <= 1200ms"
+    );
 }

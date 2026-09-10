@@ -363,14 +363,26 @@ impl Qwen3Embedder {
         attention_mask: &[Vec<u32>],
     ) -> candle_core::Result<Tensor> {
         let (batch_size, seq_len, _hidden_size) = hidden_states.dims3()?;
+        if batch_size == 1 && !attention_mask.is_empty() {
+            let mask_row = &attention_mask[0];
+            let mut last_idx = seq_len.saturating_sub(1);
+            for (idx, &val) in mask_row.iter().enumerate().rev() {
+                if val > 0 && idx < seq_len {
+                    last_idx = idx;
+                    break;
+                }
+            }
+            return hidden_states.i((0, last_idx, ..))?.unsqueeze(0);
+        }
+
         let mut pooled_items: Vec<Tensor> = Vec::with_capacity(batch_size);
 
         for (b, mask_row) in attention_mask.iter().enumerate() {
-            // Find the last index where token is active (mask == 1)
             let mut last_idx = 0;
-            for (idx, &val) in mask_row.iter().enumerate() {
+            for (idx, &val) in mask_row.iter().enumerate().rev() {
                 if val > 0 && idx < seq_len {
                     last_idx = idx;
+                    break;
                 }
             }
             let item_vec = hidden_states.i((b, last_idx, ..))?; // shape: (hidden_size)

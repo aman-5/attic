@@ -234,7 +234,7 @@ pub(crate) struct AtticServer {
 /// Reconstructs the persisted or configured semantic provider for Attic.
 /// Reconstructs the configured semantic provider for Attic.
 ///
-/// In Phase 102 Clean Final Architecture, `Qwen3Embedder` is the sole production
+/// In Phase 103 Clean Final Architecture, `Qwen3Embedder` is the sole production
 /// neural provider. If unavailable (e.g. offline with no cached weights), it degrades
 /// to `UnavailableProvider`, never corrupting the vector space and never falling back to Hashing.
 fn resolve_semantic_provider(
@@ -242,20 +242,25 @@ fn resolve_semantic_provider(
     batch_size: usize,
     model_cache_dir: &Path,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
-    let requested_provider = attic_config
-        .embedding
-        .provider
-        .as_deref()
-        .unwrap_or(attic_semantic::QWEN_PROVIDER_ID);
+    if !attic_config.semantic.enabled {
+        tracing::info!("semantic intelligence is disabled in configuration");
+        return Arc::new(attic_semantic::UnavailableProvider {
+            reason:
+                "semantic intelligence is disabled in configuration ([semantic] enabled = false)"
+                    .into(),
+        });
+    }
 
-    if requested_provider != attic_semantic::QWEN_PROVIDER_ID {
+    if attic_config.semantic.model != attic_semantic::QWEN_MODEL_ID {
         tracing::warn!(
-            "requested provider '{requested_provider}' is not supported in production; degrading to unavailable provider"
+            "requested model '{}' is not supported in production; degrading to unavailable provider",
+            attic_config.semantic.model
         );
         return Arc::new(attic_semantic::UnavailableProvider {
             reason: format!(
-                "provider '{requested_provider}' is not supported in production; only '{}' is valid",
-                attic_semantic::QWEN_PROVIDER_ID
+                "model '{}' is not supported in production; only '{}' is valid",
+                attic_config.semantic.model,
+                attic_semantic::QWEN_MODEL_ID
             ),
         });
     }
@@ -278,7 +283,7 @@ fn resolve_semantic_provider(
         if let Ok(embedder) = attic_semantic::Qwen3Embedder::from_local_cache(
             &dir,
             batch_size,
-            None,
+            attic_config.semantic.dimension,
             attic_semantic::QwenPooling::LastToken,
         ) {
             return Arc::new(embedder);
@@ -302,7 +307,7 @@ mod resolve_provider_tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("cache");
         let mut cfg = AtticConfig::default();
-        cfg.embedding.provider = Some("unknown_legacy_provider".to_string());
+        cfg.semantic.model = "unknown_legacy_provider".to_string();
         let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir);
         assert!(
             !provider.available(),
@@ -313,6 +318,20 @@ mod resolve_provider_tests {
             "hashing",
             "provider must never be hashing test double in production"
         );
+    }
+
+    #[test]
+    fn resolve_provider_respects_semantic_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let mut cfg = AtticConfig::default();
+        cfg.semantic.enabled = false;
+        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir);
+        assert!(
+            !provider.available(),
+            "provider must be unavailable when semantic layer is disabled"
+        );
+        assert_ne!(provider.id(), "hashing");
     }
 }
 
@@ -2153,9 +2172,10 @@ fn handle_status(
         "provider": attic_semantic::QWEN_PROVIDER_ID,
         "model": attic_semantic::QWEN_MODEL_ID,
     });
-    // Distinguishes default provider recommendation from an explicit user override.
-    payload["embedding_override_configured"] =
-        json!(phase8.attic_config.has_explicit_embedding_override());
+    // In Phase 103, Qwen3 is the sole production provider and no provider overrides exist.
+    payload["embedding_override_configured"] = json!(false);
+    payload["semantic_configured_enabled"] = json!(phase8.attic_config.semantic.enabled);
+    payload["semantic_configured_model"] = json!(phase8.attic_config.semantic.model);
     let semantic_health = match phase8.semantic {
         None => "disabled",
         Some(stack) => {
@@ -2226,7 +2246,7 @@ fn handle_status(
                 .is_some_and(|m| m.embedding_heavy_active() > 0),
             model_loading_or_warmup: !stack.provider.available(),
             mcp_high_latency: false,
-            user_caps_active: phase8.attic_config.has_explicit_embedding_override(),
+            user_caps_active: false,
         };
         let why_slow = attic_semantic::diagnose_why_slow(&diag_ctx);
         payload["diagnostics"] = json!({
