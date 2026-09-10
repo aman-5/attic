@@ -80,8 +80,12 @@ mod tests {
         assert!(!plan.is_oversubscribed());
     }
 
+    /// Verifies concurrency state machine mechanics for handle permit tracking.
+    /// Note: Authoritative runtime execution evidence using actual Qwen neural model
+    /// is provided by `test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6` in `tests/qwen3_reference_compat.rs`
+    /// and Section 6 of `quality_and_speed_benchmark.rs`.
     #[test]
-    fn dynamic_scaling_8_4_2_6_lifecycle_enforcement() {
+    fn concurrency_handle_lifecycle_enforcement() {
         use crate::error::SemanticError;
         use crate::model_lifecycle::SharedModelHandle;
         use crate::provider::{

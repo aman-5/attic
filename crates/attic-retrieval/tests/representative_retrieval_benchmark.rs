@@ -842,7 +842,7 @@ fn representative_retrieval_benchmark_test() {
     let overall_status = if overall_pass { "PASS" } else { "FAIL" };
 
     // 6. Generate Markdown Report Artifact
-    let report_content = format!(
+    let _report_content = format!(
         r#"# Representative Retrieval Benchmark Report (CP19)
 
 **Date**: 2026-09-09
@@ -920,17 +920,6 @@ fn representative_retrieval_benchmark_test() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-
-    let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("benchmarks/reports/representative_retrieval_benchmark_report.md");
-    if let Some(parent) = report_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&report_path, report_content).expect("write benchmark report");
 
     // 7. Hard Acceptance Gates (§34, §35) — Enforced from single source of truth
     assert!(

@@ -57,6 +57,7 @@ pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
     EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider, cosine,
 };
+/// Test doubles and conformance providers (strictly forbidden in production; test harness only).
 pub use providers::{
     FailingProvider, HashingEmbedder, RecordingProvider, SlowProvider, UnavailableProvider,
 };
