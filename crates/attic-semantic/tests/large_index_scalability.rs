@@ -495,8 +495,14 @@ fn large_index_retrieval_scalability_gate() {
         scoped_30k_ms <= knn_30k_ms * 1.5 || res_scoped_30k.rows_scanned < res_30k.rows_scanned,
         "Scoped query must scan fewer rows or be faster than unscoped"
     );
-    assert!(deadline_500k_ms <= 150.0, "500k vector search latency must be <= 150ms");
-    assert!(deadline_1m_ms <= 150.0, "1M vector search latency must be <= 150ms");
+    assert!(
+        deadline_500k_ms <= 150.0,
+        "500k vector search latency must be <= 150ms"
+    );
+    assert!(
+        deadline_1m_ms <= 150.0,
+        "1M vector search latency must be <= 150ms"
+    );
     assert!(
         query_emb_ms + deadline_1m_ms <= 1200.0,
         "Total MCP latency must satisfy interactive SLA <= 1200ms"

@@ -714,9 +714,13 @@ fn quality_and_speed_benchmark_gate() {
     let correctness_pass = dim_metrics
         .iter()
         .all(|(_, _, _, norm)| (norm - 1.0).abs() < 1e-4);
-    let quality_pass = recall_at_5 >= 0.90 && recall_at_10 >= 0.95 && mrr >= 0.80 && critical_failures == 0;
+    let quality_pass =
+        recall_at_5 >= 0.90 && recall_at_10 >= 0.95 && mrr >= 0.80 && critical_failures == 0;
     let interactive_pass = latency_breakdown.query_embedding_ms <= reqs.max_query_embedding_p95_ms;
-    let peak_bulk_throughput = batch_metrics.iter().map(|(_, _, tput)| *tput).fold(0.0f64, f64::max);
+    let peak_bulk_throughput = batch_metrics
+        .iter()
+        .map(|(_, _, tput)| *tput)
+        .fold(0.0f64, f64::max);
     let bulk_pass = peak_bulk_throughput >= reqs.min_bulk_units_per_sec;
     let search_pass = latency_breakdown.vector_search_ms <= reqs.max_vector_search_p95_ms;
     let mcp_pass = latency_breakdown.is_within_sla(reqs.max_end_to_end_mcp_p95_ms);
