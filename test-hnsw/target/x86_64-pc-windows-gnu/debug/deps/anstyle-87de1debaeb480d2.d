@@ -1,0 +1,10 @@
+c:\Adobe-Projects\EDS\Local\test\attic\test-hnsw\target\x86_64-pc-windows-gnu\debug\deps\anstyle-87de1debaeb480d2.d: C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs
+
+c:\Adobe-Projects\EDS\Local\test\attic\test-hnsw\target\x86_64-pc-windows-gnu\debug\deps\libanstyle-87de1debaeb480d2.rmeta: C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs
+
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\lib.rs:
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\macros.rs:
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\color.rs:
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\effect.rs:
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\reset.rs:
+C:\Users\amanbansal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\anstyle-1.0.14\src\style.rs:

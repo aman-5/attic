@@ -99,13 +99,20 @@ fn phase5_semantic_benchmark_gate() {
                 )
                 .expect("embed query");
             let qv = outs[0].vector.clone();
+            let active_gen = match stack.store.get_active_generation() {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    let b = stack.store.get_building_generation();
+                    panic!("no active gen! building gen: {b:?}");
+                }
+                Err(e) => panic!("error: {e:?}"),
+            };
             let kn = stack
                 .store
-                .knn(
+                .knn_search_generation(
+                    active_gen.generation_id,
                     &qv,
                     10,
-                    "hashing",
-                    "hashed-ngram-v1",
                     None,
                     &attic_semantic::ScanBudget::unbounded(&cancel),
                 )

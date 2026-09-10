@@ -219,18 +219,41 @@ impl SemanticCandidateGenerator {
             ));
         };
 
-        // ── Bounded kNN: deadline/cancel enforced DURING the scan (§20) ────
+        // ── Active Generation Check ───
+        let active_gen = match stack.store.get_active_generation() {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return Ok((
+                    Vec::new(),
+                    SemanticOutcome {
+                        candidates: 0,
+                        fallback: SemanticFallback::NoEmbeddings,
+                    },
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("semantic store unavailable (get_active_generation): {e}");
+                return Ok((
+                    Vec::new(),
+                    SemanticOutcome {
+                        candidates: 0,
+                        fallback: SemanticFallback::StoreUnavailable,
+                    },
+                ));
+            }
+        };
+
+        // ── Bounded ANN Candidate Search: deadline/cancel enforced DURING the search (§20) ────
         let k = (policy.max_semantic_candidates as usize).min(env.limit);
         let scan_budget = attic_semantic::ScanBudget {
             cancel: &cancel,
             deadline: Some(deadline),
-            max_rows: (k.max(1) as u64) * 8, // bounded work even on huge models
+            max_rows: 0, // Unused by HNSW
         };
-        let kn = match stack.store.knn(
+        let kn = match stack.store.knn_search_generation(
+            active_gen.generation_id,
             &qv,
             k,
-            stack.provider.id(),
-            stack.provider.model_id(),
             env.repository_id.as_deref(),
             &scan_budget,
         ) {
@@ -352,6 +375,14 @@ pub fn enrich_to_completion(
     // Test/bootstrap convenience — no explicit override provenance is
     // relevant here, so this always claims (if applicable) as a
     // Recommendation, matching the provider's own default identity.
-    attic_semantic::drive(conn, &stack.store, stack.provider.as_ref(), cfg, &cancel)
-        .map_err(|e| e.to_string())
+    let stats = attic_semantic::drive(conn, &stack.store, stack.provider.as_ref(), cfg, &cancel)
+        .map_err(|e| e.to_string())?;
+
+    if stats.queue_remaining == 0 {
+        if let Ok(Some(g)) = stack.store.get_building_generation() {
+            let _ = stack.store.activate_generation(g.generation_id);
+            let _ = stack.store.ensure_candidate_index_synced(conn, g.generation_id);
+        }
+    }
+    Ok(stats)
 }

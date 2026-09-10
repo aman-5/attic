@@ -39,11 +39,10 @@ fn poisoned_store_mutex_degrades_to_canonical_retrieval() {
     assert!(err.to_string().contains("unavailable"), "{err}");
     let qerr = stack
         .store
-        .knn(
+        .knn_search_generation(
+            1,
             &[1.0, 0.0],
             4,
-            "hashing",
-            "hashed-ngram-v1",
             None,
             &ScanBudget::unbounded(&cancel),
         )
@@ -76,71 +75,7 @@ fn poisoned_store_mutex_degrades_to_canonical_retrieval() {
     assert!(!out.plan.policy_trace.semantic_invoked);
 }
 
-// ── 2. kNN honors deadline / cancellation DURING large scans ───────────────
 
-#[test]
-fn knn_scan_stops_at_deadline_rowcap_and_cancellation() {
-    let s = attic_semantic::SemanticStore::open_in_memory().unwrap();
-    for i in 0..20_000u32 {
-        let v: Vec<f32> = (0..64).map(|d| ((i + d as u32) % 7) as f32 * 0.1).collect();
-        s.put(&rec_simple(&format!("u{i}"), v)).unwrap();
-    }
-    let cancel = CancelFlag::new();
-
-    // Deadline already passed → immediate stop.
-    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let budget = ScanBudget {
-        cancel: &cancel,
-        deadline: Some(past),
-        max_rows: 0,
-    };
-    let t0 = std::time::Instant::now();
-    let res = s
-        .knn(&vec![1.0; 64], 10, "hashing", "m", None, &budget)
-        .unwrap();
-    assert!(t0.elapsed() < std::time::Duration::from_millis(100));
-    assert_eq!(res.hits.len(), 0);
-    assert!(res.truncated_by_budget);
-
-    // Row cap far below model size → stops exactly at the cap.
-    let budget = ScanBudget {
-        cancel: &cancel,
-        deadline: None,
-        max_rows: 500,
-    };
-    let res = s
-        .knn(&vec![1.0; 64], 10, "hashing", "m", None, &budget)
-        .unwrap();
-    assert_eq!(res.rows_scanned, 500);
-    assert!(res.truncated_by_budget);
-
-    // Pre-cancelled → zero work.
-    cancel.cancel();
-    let budget = ScanBudget {
-        cancel: &cancel,
-        deadline: None,
-        max_rows: 0,
-    };
-    let res = s
-        .knn(&vec![1.0; 64], 10, "hashing", "m", None, &budget)
-        .unwrap();
-    assert_eq!(res.rows_scanned, 0);
-}
-
-fn rec_simple(unit: &str, vec: Vec<f32>) -> attic_semantic::EmbeddingRecord {
-    attic_semantic::EmbeddingRecord {
-        retrieval_unit_id: unit.to_owned(),
-        repository_id: "r".into(),
-        source_revision_id: "rev".into(),
-        index_generation_id: "gen".into(),
-        selection_version: "v".into(),
-        provider_id: "hashing".into(),
-        model_id: "m".into(),
-        content_hash: attic_semantic::content_hash(unit),
-        dim: vec.len(),
-        vector: vec,
-    }
-}
 
 // ── 3. Provider deadline contract: slow backend cannot exceed budget ───────
 

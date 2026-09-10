@@ -115,6 +115,20 @@ impl SemanticProvider for HashingEmbedder {
         true // no external resources; always available
     }
 
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        Some(EmbeddingFingerprint {
+            provider: self.id().to_owned(),
+            model_id: self.model_id().to_owned(),
+            model_revision: "v1".to_owned(),
+            dimension: self.dimensions(),
+            pooling_version: "test".to_owned(),
+            normalization_version: "test".to_owned(),
+            tokenizer_version: "test".to_owned(),
+            chunking_version: "test".to_owned(),
+            query_instruction_version: "test".to_owned(),
+        })
+    }
+
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
@@ -222,6 +236,19 @@ impl SemanticProvider for FailingProvider {
     fn available(&self) -> bool {
         true
     }
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        Some(EmbeddingFingerprint {
+            provider: self.id().to_owned(),
+            model_id: self.model_id().to_owned(),
+            model_revision: "v1".to_owned(),
+            dimension: self.dimensions(),
+            pooling_version: "test".to_owned(),
+            normalization_version: "test".to_owned(),
+            tokenizer_version: "test".to_owned(),
+            chunking_version: "test".to_owned(),
+            query_instruction_version: "test".to_owned(),
+        })
+    }
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
@@ -268,6 +295,19 @@ impl SemanticProvider for SlowProvider {
     }
     fn available(&self) -> bool {
         true
+    }
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        Some(EmbeddingFingerprint {
+            provider: self.id().to_owned(),
+            model_id: self.model_id().to_owned(),
+            model_revision: "v1".to_owned(),
+            dimension: self.dimensions(),
+            pooling_version: "test".to_owned(),
+            normalization_version: "test".to_owned(),
+            tokenizer_version: "test".to_owned(),
+            chunking_version: "test".to_owned(),
+            query_instruction_version: "test".to_owned(),
+        })
     }
     fn embed_batch(
         &self,

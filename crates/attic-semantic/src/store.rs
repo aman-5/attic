@@ -19,6 +19,7 @@ use crate::error::SemanticError;
 use crate::generation::{GenerationManager, GenerationRecord};
 use crate::provider::{CancelFlag, EmbeddingFingerprint};
 use rusqlite::{Connection, params};
+use hnsw_rs::prelude::*;
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
 
@@ -123,22 +124,43 @@ const COARSE_INDEX_DIM: usize = 32;
 struct CandidateEntry {
     rowid: i64,
     repository_id: String,
-    coarse: [f32; COARSE_INDEX_DIM],
-    inv_norm: f32,
 }
 
-/// Generation-isolated candidate index.
-#[derive(Debug, Default)]
+/// Generation-isolated candidate index backed by HNSW for O(log N) fast retrieval.
 struct GenerationIndex {
     #[allow(dead_code)]
     generation_id: i64,
-    entries: Vec<CandidateEntry>,
+    hnsw: Hnsw<'static, f32, DistDot>,
+    metadata: HashMap<usize, CandidateEntry>,
     last_synced_rowid: i64,
+    next_ann_id: usize,
+}
+
+impl std::fmt::Debug for GenerationIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationIndex")
+            .field("generation_id", &self.generation_id)
+            .field("last_synced_rowid", &self.last_synced_rowid)
+            .field("next_ann_id", &self.next_ann_id)
+            .finish()
+    }
 }
 
 impl GenerationIndex {
+    pub fn new(generation_id: i64) -> Self {
+        Self {
+            generation_id,
+            // Configure HNSW parameters for up to 1M items
+            // max_nb_connection: 16, max_elements: 1_000_000, max_layer: 16, ef_construction: 200
+            hnsw: Hnsw::new(16, 1_000_000, 16, 200, DistDot{}),
+            metadata: HashMap::new(),
+            last_synced_rowid: 0,
+            next_ann_id: 1,
+        }
+    }
+
     /// Stage 1: Candidate Search + Stage 2: Metadata Filtering
-    /// Returns the top candidate rowids (up to candidate_limit) ordered by coarse similarity.
+    /// Returns the top candidate rowids (up to candidate_limit) using scalable ANN search.
     fn search_candidates(
         &self,
         query: &[f32],
@@ -146,7 +168,7 @@ impl GenerationIndex {
         repository_filter: Option<&str>,
         budget: &ScanBudget<'_>,
     ) -> (Vec<i64>, u64, bool) {
-        if self.entries.is_empty() || candidate_limit == 0 {
+        if self.metadata.is_empty() || candidate_limit == 0 {
             return (Vec::new(), 0, false);
         }
 
@@ -159,53 +181,59 @@ impl GenerationIndex {
             return (Vec::new(), 0, false);
         }
         let inv_qnorm = 1.0 / q_norm;
+        // Normalize the query vector for DistDot (cosine similarity)
+        for val in q_coarse.iter_mut() {
+            *val *= inv_qnorm;
+        }
 
-        let mut top_candidates: Vec<(f32, i64)> = Vec::with_capacity(candidate_limit + 1);
-        let mut min_sim = f32::MIN;
-        let mut scanned: u64 = 0;
         let mut truncated = false;
+        let mut top_candidates = Vec::with_capacity(candidate_limit);
+        
+        // Start with a reasonable search budget and double it if filtering rejects too many
+        let mut ef_search = candidate_limit.max(64);
+        let max_ef_search = 10000;
+        let mut searched_total: u64 = 0;
 
-        for entry in &self.entries {
-            if budget.exhausted(scanned) {
+        loop {
+            if budget.cancel.is_cancelled() {
                 truncated = true;
                 break;
             }
-
-            // Stage 2: Metadata filtering
-            if let Some(repo) = repository_filter
-                && entry.repository_id != repo
-            {
-                continue;
+            if let Some(d) = budget.deadline {
+                if std::time::Instant::now() >= d {
+                    truncated = true;
+                    break;
+                }
             }
 
-            scanned += 1;
-
-            if entry.inv_norm <= 0.0 {
-                continue;
+            let neighbors = self.hnsw.search(&q_coarse, candidate_limit, ef_search);
+            top_candidates.clear();
+            
+            for neighbor in neighbors {
+                if let Some(entry) = self.metadata.get(&neighbor.d_id) {
+                    if let Some(repo) = repository_filter {
+                        if entry.repository_id != repo {
+                            continue;
+                        }
+                    }
+                    top_candidates.push(entry.rowid);
+                    if top_candidates.len() >= candidate_limit {
+                        break;
+                    }
+                }
             }
 
-            let mut dot = 0.0f32;
-            for (q, c) in q_coarse.iter().zip(entry.coarse.iter()) {
-                dot += *q * *c;
-            }
-            let sim = dot * (inv_qnorm * entry.inv_norm);
+            searched_total += ef_search as u64;
 
-            if top_candidates.len() == candidate_limit && sim <= min_sim {
-                continue;
+            if top_candidates.len() >= candidate_limit || ef_search >= max_ef_search {
+                break;
             }
-
-            let pos = top_candidates.partition_point(|(s, _)| *s >= sim);
-            top_candidates.insert(pos, (sim, entry.rowid));
-            if top_candidates.len() > candidate_limit {
-                top_candidates.pop();
-            }
-            if top_candidates.len() == candidate_limit {
-                min_sim = top_candidates.last().unwrap().0;
-            }
+            
+            // Not enough candidates found after metadata filtering; increase search depth
+            ef_search = (ef_search * 2).min(max_ef_search);
         }
 
-        let candidate_rowids = top_candidates.into_iter().map(|(_, rowid)| rowid).collect();
-        (candidate_rowids, scanned, truncated)
+        (top_candidates, searched_total, truncated)
     }
 }
 
@@ -475,82 +503,7 @@ impl SemanticStore {
         })
     }
 
-    /// Bounded brute-force kNN over ONE active (provider, model). Vectors are
-    /// L2-normalized at write time so cosine similarity is the dot product.
-    ///
-    /// The scan honors [`ScanBudget`] DURING iteration: cancellation, a wall
-    /// clock deadline, or the row cap stop the scan immediately and the
-    /// partial result is returned with `truncated_by_budget = true` — the
-    /// caller decides how to degrade (never an unbounded wait).
-    pub fn knn(
-        &self,
-        query: &[f32],
-        k: usize,
-        provider: &str,
-        model: &str,
-        repository_filter: Option<&str>,
-        budget: &ScanBudget<'_>,
-    ) -> Result<KnnResult, SemanticError> {
-        let qnorm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if qnorm <= 0.0 || k == 0 || budget.exhausted(0) {
-            return Ok(KnnResult {
-                hits: Vec::new(),
-                rows_scanned: 0,
-                truncated_by_budget: budget.max_rows > 0 || budget.deadline.is_some(),
-            });
-        }
-        let conn = self.guard()?;
-        let mut stmt = conn.prepare(
-            "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
-              WHERE provider_id=?1 AND model_id=?2
-                AND (?3 IS NULL OR repository_id=?3)",
-        )?;
-        let mut rows = stmt.query(params![provider, model, repository_filter])?;
-        // Bounded top-k via a small sorted list (k is policy-capped).
-        let mut top: Vec<(f32, String)> = Vec::with_capacity(k + 1);
-        let mut scanned: u64 = 0;
-        let mut truncated = false;
-        while let Some(r) = rows.next()? {
-            if budget.exhausted(scanned) {
-                truncated = true;
-                break;
-            }
-            scanned += 1;
-            let unit_id: String = r.get(0)?;
-            let stored_norm: f32 = r.get(1)?;
-            let blob: Vec<u8> = r.get(2)?;
-            if stored_norm <= 0.0 || blob.len() != query.len() * 4 {
-                continue;
-            }
-            let mut dot = 0.0f32;
-            let floats = blob.as_chunks::<4>().0;
-            for (i, chunk) in floats.iter().enumerate() {
-                let b = f32::from_le_bytes(*chunk);
-                dot += query[i] * b;
-            }
-            let sim = dot / (qnorm * stored_norm);
-            if top.len() == k && sim <= top.last().map_or(f32::MIN, |(s, _)| *s) {
-                continue;
-            }
-            let pos = top.partition_point(|(s, _)| *s >= sim);
-            top.insert(pos, (sim, unit_id));
-            if top.len() > k {
-                top.pop();
-            }
-        }
-        let hits: Vec<NearestHit> = top
-            .into_iter()
-            .map(|(sim, id)| NearestHit {
-                retrieval_unit_id: id,
-                similarity: sim,
-            })
-            .collect();
-        Ok(KnnResult {
-            hits,
-            rows_scanned: scanned,
-            truncated_by_budget: truncated,
-        })
-    }
+
 
     /// Delete ALL embeddings whose (provider, model) differ from the active
     /// pair — model-change invalidation without touching canonical data.
@@ -719,11 +672,7 @@ impl SemanticStore {
 
         let gen_idx = index_guard
             .entry(generation_id)
-            .or_insert_with(|| GenerationIndex {
-                generation_id,
-                entries: Vec::new(),
-                last_synced_rowid: 0,
-            });
+            .or_insert_with(|| GenerationIndex::new(generation_id));
 
         let mut stmt = conn.prepare(
             "SELECT rowid, repository_id, norm, substr(vector, 1, 128)
@@ -749,16 +698,20 @@ impl SemanticStore {
                 ]);
             }
             let coarse_norm = coarse.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let inv_norm = if coarse_norm > 0.0 {
-                1.0 / coarse_norm
-            } else {
-                0.0
-            };
-            gen_idx.entries.push(CandidateEntry {
+            if coarse_norm > 0.0 {
+                let inv_norm = 1.0 / coarse_norm;
+                for val in coarse.iter_mut() {
+                    *val *= inv_norm;
+                }
+            }
+            
+            let ann_id = gen_idx.next_ann_id;
+            gen_idx.next_ann_id += 1;
+            
+            gen_idx.hnsw.insert((&coarse, ann_id));
+            gen_idx.metadata.insert(ann_id, CandidateEntry {
                 rowid,
                 repository_id: repo_id,
-                coarse,
-                inv_norm,
             });
             gen_idx.last_synced_rowid = rowid;
         }
@@ -868,11 +821,7 @@ impl SemanticStore {
             let mut index_guard = self.candidate_index.lock().unwrap();
             let gen_idx = index_guard
                 .entry(generation_id)
-                .or_insert_with(|| GenerationIndex {
-                    generation_id,
-                    entries: Vec::new(),
-                    last_synced_rowid: 0,
-                });
+                .or_insert_with(|| GenerationIndex::new(generation_id));
             gen_idx.search_candidates(query, candidate_limit, repository_filter, budget)
         };
 
@@ -1230,45 +1179,7 @@ mod tests {
         assert_eq!(counts.get(Q_PENDING).copied().unwrap_or(0), 0);
     }
 
-    #[test]
-    fn knn_orders_by_similarity_and_filters_model() {
-        let s = SemanticStore::open_in_memory().unwrap();
-        s.put(&rec("near", vec![1.0, 0.0])).unwrap();
-        s.put(&rec("far", vec![0.0, 1.0])).unwrap();
-        let mut other = rec("other-model", vec![1.0, 0.0]);
-        other.model_id = "old-model".into();
-        s.put(&other).unwrap();
 
-        let cancel = crate::provider::CancelFlag::new();
-        let hits = s
-            .knn(
-                &[1.0, 0.0],
-                2,
-                "hashing",
-                "hashed-ngram-v1",
-                None,
-                &ScanBudget::unbounded(&cancel),
-            )
-            .unwrap();
-        assert_eq!(hits.hits.len(), 2);
-        assert!(!hits.truncated_by_budget);
-        assert_eq!(hits.hits[0].retrieval_unit_id, "near");
-        assert!((hits.hits[0].similarity - 1.0).abs() < 1e-6);
-
-        // Old-model row invisible under the active pair.
-        let hits_old = s
-            .knn(
-                &[1.0, 0.0],
-                10,
-                "hashing",
-                "old-model",
-                None,
-                &ScanBudget::unbounded(&cancel),
-            )
-            .unwrap();
-        assert_eq!(hits_old.hits.len(), 1);
-        assert_eq!(hits_old.hits[0].retrieval_unit_id, "other-model");
-    }
 
     #[test]
     fn purge_inactive_models_keeps_active_pair() {

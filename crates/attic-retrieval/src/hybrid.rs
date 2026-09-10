@@ -256,16 +256,25 @@ impl<'a> HybridSearcher<'a> {
             }
         };
 
+        // ── Active Generation Check ───
+        let active_gen = match stack.store.get_active_generation() {
+            Ok(Some(g)) => g,
+            Ok(None) => return (Vec::new(), Some(SemanticDegradationReason::NoEmbeddings)),
+            Err(e) => {
+                tracing::warn!("hybrid search: semantic store unavailable (get_active_generation): {e}");
+                return (Vec::new(), Some(SemanticDegradationReason::StoreUnavailable));
+            }
+        };
+
         let scan_budget = attic_semantic::ScanBudget {
             cancel: &cancel,
             deadline: None,
-            max_rows: (opts.semantic_candidate_depth.max(1) as u64) * 8,
+            max_rows: 0, // Unused by HNSW
         };
-        let kn = match stack.store.knn(
+        let kn = match stack.store.knn_search_generation(
+            active_gen.generation_id,
             &qv,
             opts.semantic_candidate_depth,
-            stack.provider.id(),
-            stack.provider.model_id(),
             opts.repository_id.as_deref(),
             &scan_budget,
         ) {
