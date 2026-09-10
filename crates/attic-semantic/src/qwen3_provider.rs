@@ -16,17 +16,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::embedding_profile::{EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy};
+use crate::error::SemanticError;
+use crate::instruction::{CODE_RETRIEVAL_V1_ID, format_query_instruction};
+use crate::provider::{
+    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+    EmbeddingProvider, ResourceUsage, SemanticProvider,
+};
+use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
-use crate::embedding_profile::{EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy};
-use crate::error::SemanticError;
-use crate::instruction::{format_query_instruction, CODE_RETRIEVAL_V1_ID};
-use crate::provider::{
-    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput,
-    EmbeddingOutput, EmbeddingProvider, ResourceUsage, SemanticProvider,
-};
-use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 
 pub const HF_QWEN_OWNER: &str = "Qwen";
 pub const HF_QWEN_REPO: &str = "Qwen3-Embedding-0.6B";
@@ -77,7 +77,10 @@ impl Qwen3Embedder {
 
     /// Update target Matryoshka dimension without reloading model tensors.
     pub fn set_target_dims(&mut self, dims: usize) {
-        assert!(dims > 0 && dims <= self.native_dims, "target dimension must be <= native dims");
+        assert!(
+            dims > 0 && dims <= self.native_dims,
+            "target dimension must be <= native dims"
+        );
         self.target_dims = dims;
         self.fingerprint.dimension = dims;
     }
@@ -89,7 +92,8 @@ impl Qwen3Embedder {
         dimension_override: Option<usize>,
         pooling: QwenPooling,
     ) -> Result<Self, SemanticError> {
-        if let Some((config, tokenizer, weights, revision)) = Self::try_local_cache(cache_dir, None) {
+        if let Some((config, tokenizer, weights, revision)) = Self::try_local_cache(cache_dir, None)
+        {
             return Self::build(
                 config,
                 tokenizer,
@@ -177,12 +181,15 @@ impl Qwen3Embedder {
         let resolved_revision = match pinned_revision {
             Some(r) => r.to_string(),
             None => {
-                let info = repo.info().send().map_err(|e| SemanticError::ProviderUnavailable {
-                    provider: QWEN_PROVIDER_ID.into(),
-                    reason: format!(
-                        "failed to resolve {HF_QWEN_OWNER}/{HF_QWEN_REPO} revision: {e}"
-                    ),
-                })?;
+                let info = repo
+                    .info()
+                    .send()
+                    .map_err(|e| SemanticError::ProviderUnavailable {
+                        provider: QWEN_PROVIDER_ID.into(),
+                        reason: format!(
+                            "failed to resolve {HF_QWEN_OWNER}/{HF_QWEN_REPO} revision: {e}"
+                        ),
+                    })?;
                 info.sha.ok_or_else(|| SemanticError::ProviderUnavailable {
                     provider: QWEN_PROVIDER_ID.into(),
                     reason: format!(
@@ -258,9 +265,7 @@ impl Qwen3Embedder {
             });
         }
 
-        let max_tokens = qwen_config
-            .max_position_embeddings
-            .min(DEFAULT_MAX_TOKENS);
+        let max_tokens = qwen_config.max_position_embeddings.min(DEFAULT_MAX_TOKENS);
 
         let device = Device::Cpu;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device) }
@@ -432,21 +437,16 @@ impl Qwen3Embedder {
         };
 
         let pooled = match self.pooling {
-            QwenPooling::LastToken => {
-                Self::last_token_pool(&hidden_states, &attention_mask_rows).map_err(|e| {
-                    SemanticError::EmbeddingFailed(format!("last-token pooling failed: {e}"))
-                })?
-            }
-            QwenPooling::Mean => {
-                Self::mean_pool(&hidden_states, &attention_mask_tensor).map_err(|e| {
-                    SemanticError::EmbeddingFailed(format!("mean pooling failed: {e}"))
-                })?
-            }
+            QwenPooling::LastToken => Self::last_token_pool(&hidden_states, &attention_mask_rows)
+                .map_err(|e| {
+                SemanticError::EmbeddingFailed(format!("last-token pooling failed: {e}"))
+            })?,
+            QwenPooling::Mean => Self::mean_pool(&hidden_states, &attention_mask_tensor)
+                .map_err(|e| SemanticError::EmbeddingFailed(format!("mean pooling failed: {e}")))?,
         };
 
-        let normalized = Self::l2_normalize(&pooled).map_err(|e| {
-            SemanticError::EmbeddingFailed(format!("normalization failed: {e}"))
-        })?;
+        let normalized = Self::l2_normalize(&pooled)
+            .map_err(|e| SemanticError::EmbeddingFailed(format!("normalization failed: {e}")))?;
 
         let truncated = Self::apply_matryoshka(&normalized, self.target_dims).map_err(|e| {
             SemanticError::EmbeddingFailed(format!("matryoshka truncation failed: {e}"))
@@ -593,10 +593,9 @@ impl EmbeddingProvider for Qwen3Embedder {
             text: instructed,
         };
         let docs = self.embed_documents(&[input], budget)?;
-        docs.into_iter()
-            .next()
-            .map(|o| o.vector)
-            .ok_or_else(|| SemanticError::EmbeddingFailed("empty query embedding output".to_string()))
+        docs.into_iter().next().map(|o| o.vector).ok_or_else(|| {
+            SemanticError::EmbeddingFailed("empty query embedding output".to_string())
+        })
     }
 }
 
@@ -612,21 +611,18 @@ mod tests {
         // Sequence 1: length 4 (mask: [1, 1, 1, 1])
         let data: Vec<f32> = vec![
             // Seq 0: tokens 0, 1, 2, 3
-            1.0, 1.0, 1.0,  // token 0
-            2.0, 2.0, 2.0,  // token 1 (last active!)
-            9.0, 9.0, 9.0,  // token 2 (padding)
-            9.0, 9.0, 9.0,  // token 3 (padding)
+            1.0, 1.0, 1.0, // token 0
+            2.0, 2.0, 2.0, // token 1 (last active!)
+            9.0, 9.0, 9.0, // token 2 (padding)
+            9.0, 9.0, 9.0, // token 3 (padding)
             // Seq 1: tokens 0, 1, 2, 3
-            3.0, 3.0, 3.0,  // token 0
-            4.0, 4.0, 4.0,  // token 1
-            5.0, 5.0, 5.0,  // token 2
-            6.0, 6.0, 6.0,  // token 3 (last active!)
+            3.0, 3.0, 3.0, // token 0
+            4.0, 4.0, 4.0, // token 1
+            5.0, 5.0, 5.0, // token 2
+            6.0, 6.0, 6.0, // token 3 (last active!)
         ];
         let hidden = Tensor::from_vec(data, (2, 4, 3), &device).unwrap();
-        let mask = vec![
-            vec![1u32, 1, 0, 0],
-            vec![1u32, 1, 1, 1],
-        ];
+        let mask = vec![vec![1u32, 1, 0, 0], vec![1u32, 1, 1, 1]];
 
         let pooled = Qwen3Embedder::last_token_pool(&hidden, &mask).unwrap();
         assert_eq!(pooled.dims(), &[2, 3]);
@@ -678,7 +674,10 @@ mod tests {
         assert_eq!(truncated.dims(), &[1, 2]);
         let vec = truncated.to_vec2::<f32>().unwrap();
         let norm = (vec[0][0].powi(2) + vec[0][1].powi(2)).sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "truncated vector must be re-normalized to 1.0");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "truncated vector must be re-normalized to 1.0"
+        );
     }
 
     #[test]

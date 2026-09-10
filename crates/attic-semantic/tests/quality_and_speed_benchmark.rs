@@ -30,7 +30,10 @@ fn resolve_cache_dir() -> PathBuf {
         }
     }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let p = PathBuf::from(home).join(".cache").join("huggingface").join("hub");
+        let p = PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub");
         if p.exists() {
             return p;
         }
@@ -39,7 +42,11 @@ fn resolve_cache_dir() -> PathBuf {
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "vector lengths must match for cosine similarity");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "vector lengths must match for cosine similarity"
+    );
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -73,10 +80,15 @@ fn quality_and_speed_benchmark_gate() {
     let cold_load_sec = t_load_start.elapsed().as_secs_f64();
     let model_rss_mb = 1200.0; // Baseline Qwen3 0.6B weights in memory
 
-    println!("Cold Model Load: {:.2}s (Baseline Model RSS: {:.0} MB)", cold_load_sec, model_rss_mb);
+    println!(
+        "Cold Model Load: {:.2}s (Baseline Model RSS: {:.0} MB)",
+        cold_load_sec, model_rss_mb
+    );
 
     // Warm-up inference
-    let _ = embedder.embed_query("warmup query for jit and cpu caches", &budget).expect("warmup");
+    let _ = embedder
+        .embed_query("warmup query for jit and cpu caches", &budget)
+        .expect("warmup");
 
     // ── 2. Dimensionality & Matryoshka Evaluation (§32) ─────────────────────
     let dims_to_test = [512usize, 768, 1024];
@@ -86,15 +98,23 @@ fn quality_and_speed_benchmark_gate() {
     for &d in &dims_to_test {
         embedder.set_target_dims(d);
         let t0 = Instant::now();
-        let last_vec = embedder.embed_query(sample_query, &budget).expect("embed query");
+        let last_vec = embedder
+            .embed_query(sample_query, &budget)
+            .expect("embed query");
         let per_query_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let bytes_per_vector = d * 4;
         let mb_per_100k = (bytes_per_vector * 100_000) as f64 / (1024.0 * 1024.0);
 
         let norm = last_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "dim {d} vector must be unit normalized");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "dim {d} vector must be unit normalized"
+        );
 
-        println!("Dimension {:<4} | Latency: {:<6.2} ms | 100k Vectors: {:<6.2} MB | Norm: {:.4}", d, per_query_ms, mb_per_100k, norm);
+        println!(
+            "Dimension {:<4} | Latency: {:<6.2} ms | 100k Vectors: {:<6.2} MB | Norm: {:.4}",
+            d, per_query_ms, mb_per_100k, norm
+        );
         dim_metrics.push((d, per_query_ms, mb_per_100k, norm));
     }
     embedder.set_target_dims(512);
@@ -152,9 +172,7 @@ fn quality_and_speed_benchmark_gate() {
     // Embed queries (prompted with CODE_RETRIEVAL_V1_ID)
     let mut query_vectors = Vec::new();
     for p in &pairs {
-        let q_vec = embedder
-            .embed_query(p.query, &budget)
-            .expect("embed query");
+        let q_vec = embedder.embed_query(p.query, &budget).expect("embed query");
         query_vectors.push(q_vec);
     }
 
@@ -165,7 +183,10 @@ fn quality_and_speed_benchmark_gate() {
     let mut critical_failures = 0;
 
     println!("\nRETRIEVAL QUALITY ANALYSIS (REAL QWEN3):");
-    println!("{:<24} | {:<5} | {:<12} | Top Match", "Target Document", "Rank", "Cosine Sim");
+    println!(
+        "{:<24} | {:<5} | {:<12} | Top Match",
+        "Target Document", "Rank", "Cosine Sim"
+    );
     println!("{:-<24}-|-{:-<5}-|-{:-<12}-|-{:-<20}", "", "", "", "");
 
     for (i, p) in pairs.iter().enumerate() {
@@ -177,7 +198,11 @@ fn quality_and_speed_benchmark_gate() {
             .collect();
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        let rank = scores.iter().position(|(doc_idx, _)| *doc_idx == i).unwrap() + 1;
+        let rank = scores
+            .iter()
+            .position(|(doc_idx, _)| *doc_idx == i)
+            .unwrap()
+            + 1;
         let top_match_name = &pairs[scores[0].0].name;
         let target_sim = scores.iter().find(|(doc_idx, _)| *doc_idx == i).unwrap().1;
 
@@ -194,7 +219,10 @@ fn quality_and_speed_benchmark_gate() {
         }
 
         reciprocal_ranks.push(1.0 / (rank as f64));
-        println!("{:<24} | #{:<4} | {:<12.4} | {}", p.name, rank, target_sim, top_match_name);
+        println!(
+            "{:<24} | #{:<4} | {:<12.4} | {}",
+            p.name, rank, target_sim, top_match_name
+        );
     }
 
     let n = pairs.len() as f64;
@@ -203,8 +231,10 @@ fn quality_and_speed_benchmark_gate() {
     let recall_at_5 = (recall_at_5_count as f64) / n;
     let mrr = reciprocal_ranks.iter().sum::<f64>() / n;
 
-    println!("\nRetrieval Metrics: Recall@1: {:.3} | Recall@3: {:.3} | Recall@5: {:.3} | MRR: {:.3} | Critical Failures: {}",
-        recall_at_1, recall_at_3, recall_at_5, mrr, critical_failures);
+    println!(
+        "\nRetrieval Metrics: Recall@1: {:.3} | Recall@3: {:.3} | Recall@5: {:.3} | MRR: {:.3} | Critical Failures: {}",
+        recall_at_1, recall_at_3, recall_at_5, mrr, critical_failures
+    );
 
     // ── 4. Token Length & Chunking Evaluation (§33) ─────────────────────────
     let token_targets = [128usize, 256, 384, 512];
@@ -219,11 +249,16 @@ fn quality_and_speed_benchmark_gate() {
         let chunk_text = words.join(" ");
 
         let t0 = Instant::now();
-        let _ = embedder.embed_query(&chunk_text, &budget).expect("embed chunk");
+        let _ = embedder
+            .embed_query(&chunk_text, &budget)
+            .expect("embed chunk");
         let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let chars_per_token = (chunk_text.len() as f64) / (len as f64);
 
-        println!("Token Length {:<4} | Latency: {:<6.2} ms | Chars/Token: {:.2}", len, latency_ms, chars_per_token);
+        println!(
+            "Token Length {:<4} | Latency: {:<6.2} ms | Chars/Token: {:.2}",
+            len, latency_ms, chars_per_token
+        );
         token_metrics.push((len, latency_ms, chars_per_token));
     }
 
@@ -241,13 +276,18 @@ fn quality_and_speed_benchmark_gate() {
     for &bs in &batch_sizes {
         let t0 = Instant::now();
         for chunk in items_8.chunks(bs) {
-            let _ = embedder.embed_documents(chunk, &budget).expect("batch embed");
+            let _ = embedder
+                .embed_documents(chunk, &budget)
+                .expect("batch embed");
         }
         let elapsed = t0.elapsed();
         let total_ms = elapsed.as_secs_f64() * 1000.0;
         let units_per_sec = (items_8.len() as f64) / elapsed.as_secs_f64();
 
-        println!("Batch Size {:<2} | Total (8 items): {:<7.2} ms | Throughput: {:<5.1} units/sec", bs, total_ms, units_per_sec);
+        println!(
+            "Batch Size {:<2} | Total (8 items): {:<7.2} ms | Throughput: {:<5.1} units/sec",
+            bs, total_ms, units_per_sec
+        );
         batch_metrics.push((bs, total_ms, units_per_sec));
     }
 
@@ -261,11 +301,15 @@ fn quality_and_speed_benchmark_gate() {
         assert!(plan.total_allocated_threads <= granted_threads);
 
         let t0 = Instant::now();
-        let _ = embedder.embed_query("fn authenticate_grant(token: &str) -> bool", &budget).expect("eval");
+        let _ = embedder
+            .embed_query("fn authenticate_grant(token: &str) -> bool", &budget)
+            .expect("eval");
         let query_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        println!("CPU Threads Granted: {:<2} | Allocated: {:<2} | Query Latency: {:.2} ms",
-            granted_threads, plan.total_allocated_threads, query_ms);
+        println!(
+            "CPU Threads Granted: {:<2} | Allocated: {:<2} | Query Latency: {:.2} ms",
+            granted_threads, plan.total_allocated_threads, query_ms
+        );
         isolation_metrics.push((granted_threads, plan.total_allocated_threads, query_ms));
     }
 
@@ -274,7 +318,9 @@ fn quality_and_speed_benchmark_gate() {
     let synthetic_corpus_size = 10_000;
     let synthetic_vec = vec![0.044f32; 512]; // unit norm ~ 0.044 * sqrt(512) ~ 1.0
     let t_q0 = Instant::now();
-    let q_vec = embedder.embed_query("find database connection pool configuration", &budget).expect("mcp query");
+    let q_vec = embedder
+        .embed_query("find database connection pool configuration", &budget)
+        .expect("mcp query");
     let query_emb_ms = t_q0.elapsed().as_secs_f64() * 1000.0;
 
     // Simulate interactive kNN vector scan (the retrieval SLA budget: FAST <=150ms, NORMAL <=1200ms)
@@ -288,12 +334,18 @@ fn quality_and_speed_benchmark_gate() {
     }
     let knn_scan_ms = t_scan0.elapsed().as_secs_f64() * 1000.0;
     let mcp_total_ms = query_emb_ms + knn_scan_ms;
-    println!("Simulated MCP kNN Scan Latency (10k index): {:.2} ms (SLA FAST: <=150ms)", knn_scan_ms);
-    println!("Total Simulated MCP Query Latency (Embedding + Scan): {:.2} ms", mcp_total_ms);
+    println!(
+        "Simulated MCP kNN Scan Latency (10k index): {:.2} ms (SLA FAST: <=150ms)",
+        knn_scan_ms
+    );
+    println!(
+        "Total Simulated MCP Query Latency (Embedding + Scan): {:.2} ms",
+        mcp_total_ms
+    );
 
     // ── 8. Generate Markdown Report ─────────────────────────────────────────
     let report_content = format!(
-r#"# Quality + Embedding Speed Benchmark Report (CP22 / F11)
+        r#"# Quality + Embedding Speed Benchmark Report (CP22 / F11)
 
 **Date**: 2026-09-09
 **Model**: `Qwen/Qwen3-Embedding-0.6B` (Pinned revision `{rev}`)
@@ -425,7 +477,10 @@ Evaluated across representative multi-language code snippets (Rust, TypeScript, 
     );
 
     let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("benchmarks/reports/quality_and_speed_benchmark_report.md");
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -433,9 +488,18 @@ Evaluated across representative multi-language code snippets (Rust, TypeScript, 
     std::fs::write(&report_path, report_content).expect("write report");
 
     // ── 9. Hard Gate Assertions ─────────────────────────────────────────────
-    assert!(recall_at_5 >= 0.80, "Recall@5 must be >= 0.800, got {recall_at_5}");
+    assert!(
+        recall_at_5 >= 0.80,
+        "Recall@5 must be >= 0.800, got {recall_at_5}"
+    );
     assert!(mrr >= 0.80, "MRR must be >= 0.800, got {mrr}");
     assert_eq!(critical_failures, 0, "Critical query failures must be 0");
-    assert!(knn_scan_ms < 150.0, "Simulated MCP kNN scan latency must be < 150ms (FAST SLA)");
-    println!("\nCP22 / F11 Gate Satisfied in {:.2}s!", t_total_start.elapsed().as_secs_f64());
+    assert!(
+        knn_scan_ms < 150.0,
+        "Simulated MCP kNN scan latency must be < 150ms (FAST SLA)"
+    );
+    println!(
+        "\nCP22 / F11 Gate Satisfied in {:.2}s!",
+        t_total_start.elapsed().as_secs_f64()
+    );
 }

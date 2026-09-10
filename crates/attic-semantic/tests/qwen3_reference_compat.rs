@@ -10,8 +10,8 @@
 //! - Batch embedding equivalence
 //! - Proper L2 normalization and Matryoshka dimension truncation
 
-use std::path::{Path, PathBuf};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 use attic_semantic::provider::{EmbeddingExecutionBudget, EmbeddingInput, EmbeddingProvider};
 use attic_semantic::qwen3_provider::{Qwen3Embedder, QwenPooling};
@@ -47,7 +47,10 @@ fn resolve_cache_dir() -> PathBuf {
         }
     }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let p = PathBuf::from(home).join(".cache").join("huggingface").join("hub");
+        let p = PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub");
         if p.exists() {
             return p;
         }
@@ -56,7 +59,11 @@ fn resolve_cache_dir() -> PathBuf {
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "vector lengths must match for cosine similarity");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "vector lengths must match for cosine similarity"
+    );
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -207,9 +214,9 @@ fn test_qwen3_batch_equivalence() {
 
 #[test]
 fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
-    use std::sync::Arc;
     use attic_semantic::cpu_isolation::CpuIsolationPlan;
     use attic_semantic::model_lifecycle::SharedModelHandle;
+    use std::sync::Arc;
 
     let cache_dir = resolve_cache_dir();
     let embedder = Qwen3Embedder::new_pinned(

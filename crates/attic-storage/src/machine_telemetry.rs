@@ -37,7 +37,10 @@ impl MachineTelemetrySampler {
         let disks = Disks::new_with_refreshed_list();
         let total_memory_mib = sys.total_memory() / (1024 * 1024);
         let available_memory_mib = sys.available_memory() / (1024 * 1024);
-        let attic_rss_mib = sys.process(pid).map(|p| p.memory() / (1024 * 1024)).unwrap_or(0);
+        let attic_rss_mib = sys
+            .process(pid)
+            .map(|p| p.memory() / (1024 * 1024))
+            .unwrap_or(0);
         let logical_cpus = sys.cpus().len().max(1);
         let cpu_utilization = sys.global_cpu_usage();
         let available_cpu_fraction = ((100.0 - cpu_utilization).clamp(0.0, 100.0)) / 100.0;
@@ -129,7 +132,12 @@ impl MachineTelemetrySampler {
         }
 
         best_match
-            .or_else(|| disks.list().first().map(|d| d.available_space() / (1024 * 1024)))
+            .or_else(|| {
+                disks
+                    .list()
+                    .first()
+                    .map(|d| d.available_space() / (1024 * 1024))
+            })
             .unwrap_or(10_240) // 10 GiB fallback if disks cannot be probed
     }
 }

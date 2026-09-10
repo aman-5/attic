@@ -25,7 +25,9 @@ use std::time::Instant;
 
 use attic_discovery::DiscoveryPolicy;
 use attic_indexing::{IndexOptions, IndexingStore, index_repository};
-use attic_retrieval::{AnswerMode, AnswerRequest, RetrievalService, semantic::enrich_to_completion};
+use attic_retrieval::{
+    AnswerMode, AnswerRequest, RetrievalService, semantic::enrich_to_completion,
+};
 use attic_semantic::{EnrichmentConfig, HashingEmbedder};
 use attic_storage::{DbPool, WriterQueue, WriterQueueHandle, open_db, run_migrations};
 use tempfile::TempDir;
@@ -235,7 +237,9 @@ fn generate_large_global_store_ts() -> String {
     s.push_str("export interface GlobalState {\n");
     s.push_str("    auth: { authenticated: boolean; token: string | null };\n");
     s.push_str("    cart: { items: Array<{ id: string; qty: number }> };\n");
-    s.push_str("    checkout: { session: string | null; status: 'idle' | 'pending' | 'completed' };\n");
+    s.push_str(
+        "    checkout: { session: string | null; status: 'idle' | 'pending' | 'completed' };\n",
+    );
     s.push_str("}\n\n");
 
     // Padding lines to make it a realistic large file
@@ -251,7 +255,9 @@ fn generate_large_global_store_ts() -> String {
     s.push_str("        case 'CHECKOUT_SESSION_START':\n");
     s.push_str("            return { ...state, checkout: { session: action.payload.sessionId, status: 'pending' } };\n");
     s.push_str("        case 'CHECKOUT_SESSION_COMPLETE':\n");
-    s.push_str("            return { ...state, checkout: { session: null, status: 'completed' } };\n");
+    s.push_str(
+        "            return { ...state, checkout: { session: null, status: 'completed' } };\n",
+    );
     s.push_str("        default:\n");
     s.push_str("            return state;\n");
     s.push_str("    }\n");
@@ -372,23 +378,63 @@ impl MultiRepoBenchFixture {
         // Seed Repo 1: auth-service
         let auth_root = root.join("auth-service");
         Self::write_file(&auth_root, "config/application.yml", AUTH_APPLICATION_YML);
-        Self::write_file(&auth_root, "src/main/java/com/auth/AuthController.java", AUTH_CONTROLLER_JAVA);
-        Self::write_file(&auth_root, "src/main/java/com/auth/TokenValidator.java", TOKEN_VALIDATOR_JAVA);
-        Self::write_file(&auth_root, "src/test/java/com/auth/TokenValidatorTest.java", TOKEN_VALIDATOR_TEST_JAVA);
+        Self::write_file(
+            &auth_root,
+            "src/main/java/com/auth/AuthController.java",
+            AUTH_CONTROLLER_JAVA,
+        );
+        Self::write_file(
+            &auth_root,
+            "src/main/java/com/auth/TokenValidator.java",
+            TOKEN_VALIDATOR_JAVA,
+        );
+        Self::write_file(
+            &auth_root,
+            "src/test/java/com/auth/TokenValidatorTest.java",
+            TOKEN_VALIDATOR_TEST_JAVA,
+        );
         Self::write_file(&auth_root, "docs/authentication-flow.md", AUTH_FLOW_MD);
 
         // Seed Repo 2: frontend-web
         let frontend_root = root.join("frontend-web");
-        Self::write_file(&frontend_root, "src/components/UserProfile.tsx", USER_PROFILE_TSX);
-        Self::write_file(&frontend_root, "src/generated/api_client.ts", GENERATED_API_CLIENT_TS);
-        Self::write_file(&frontend_root, "src/state/global_store.ts", &global_store_content);
+        Self::write_file(
+            &frontend_root,
+            "src/components/UserProfile.tsx",
+            USER_PROFILE_TSX,
+        );
+        Self::write_file(
+            &frontend_root,
+            "src/generated/api_client.ts",
+            GENERATED_API_CLIENT_TS,
+        );
+        Self::write_file(
+            &frontend_root,
+            "src/state/global_store.ts",
+            &global_store_content,
+        );
 
         // Seed Repo 3: engine-core
         let engine_root = root.join("engine-core");
-        Self::write_file(&engine_root, "crates/engine-core/src/pipeline.rs", ENGINE_PIPELINE_RS);
-        Self::write_file(&engine_root, "crates/engine-core/src/crypto/hasher.rs", ENGINE_HASHER_RS);
-        Self::write_file(&engine_root, "crates/engine-core/src/contracts.rs", ENGINE_CONTRACTS_RS);
-        Self::write_file(&engine_root, "docs/architecture-invariants.md", ARCHITECTURE_INVARIANTS_MD);
+        Self::write_file(
+            &engine_root,
+            "crates/engine-core/src/pipeline.rs",
+            ENGINE_PIPELINE_RS,
+        );
+        Self::write_file(
+            &engine_root,
+            "crates/engine-core/src/crypto/hasher.rs",
+            ENGINE_HASHER_RS,
+        );
+        Self::write_file(
+            &engine_root,
+            "crates/engine-core/src/contracts.rs",
+            ENGINE_CONTRACTS_RS,
+        );
+        Self::write_file(
+            &engine_root,
+            "docs/architecture-invariants.md",
+            ARCHITECTURE_INVARIANTS_MD,
+        );
 
         // Index all 3 repositories into the shared canonical database
         let repos = [
@@ -444,7 +490,12 @@ impl MultiRepoBenchFixture {
         }
     }
 
-    pub fn service_hybrid(&self) -> (RetrievalService, Arc<attic_retrieval::semantic::SemanticStack>) {
+    pub fn service_hybrid(
+        &self,
+    ) -> (
+        RetrievalService,
+        Arc<attic_retrieval::semantic::SemanticStack>,
+    ) {
         let stack = Arc::new(
             attic_retrieval::semantic::SemanticStack::in_memory(Arc::new(HashingEmbedder::new()))
                 .expect("in-memory semantic stack"),
@@ -631,18 +682,16 @@ fn representative_retrieval_benchmark_test() {
     let mut tier_a_results: Vec<(String, Vec<String>, bool, usize)> = Vec::new();
 
     for q in &queries {
-        let outcome = srv_a.answer(&AnswerRequest::new(q.question, AnswerMode::Normal))
+        let outcome = srv_a
+            .answer(&AnswerRequest::new(q.question, AnswerMode::Normal))
             .expect("canonical answer");
         let ctx = outcome.context_text.unwrap_or_default();
         let paths = extract_paths_from_context(&ctx);
-        let rank = paths.iter().position(|p| p.contains(q.expected_path_substr));
+        let rank = paths
+            .iter()
+            .position(|p| p.contains(q.expected_path_substr));
         let hit = rank.is_some_and(|r| r < 5);
-        tier_a_results.push((
-            q.id.to_string(),
-            paths,
-            hit,
-            rank.unwrap_or(usize::MAX),
-        ));
+        tier_a_results.push((q.id.to_string(), paths, hit, rank.unwrap_or(usize::MAX)));
     }
 
     // 2. Enrich semantic layer
@@ -655,27 +704,25 @@ fn representative_retrieval_benchmark_test() {
         embedding_worker_count: 2,
         dynamic_allocation: None,
     };
-    let enrich_stats = enrich_to_completion(&conn, &stack, &enrich_config)
-        .expect("semantic enrichment");
+    let enrich_stats =
+        enrich_to_completion(&conn, &stack, &enrich_config).expect("semantic enrichment");
 
     // 3. Evaluate Hybrid Semantic (Tier C)
     let mut tier_c_results: Vec<(String, Vec<String>, bool, usize)> = Vec::new();
     let mut regression_records = Vec::new();
 
     for (idx, q) in queries.iter().enumerate() {
-        let outcome = srv_c.answer(&AnswerRequest::new(q.question, AnswerMode::Normal))
+        let outcome = srv_c
+            .answer(&AnswerRequest::new(q.question, AnswerMode::Normal))
             .expect("hybrid answer");
         let ctx = outcome.context_text.unwrap_or_default();
         let paths = extract_paths_from_context(&ctx);
-        let rank = paths.iter().position(|p| p.contains(q.expected_path_substr));
+        let rank = paths
+            .iter()
+            .position(|p| p.contains(q.expected_path_substr));
         let hit = rank.is_some_and(|r| r < 5);
         let rank_val = rank.unwrap_or(usize::MAX);
-        tier_c_results.push((
-            q.id.to_string(),
-            paths.clone(),
-            hit,
-            rank_val,
-        ));
+        tier_c_results.push((q.id.to_string(), paths.clone(), hit, rank_val));
 
         // Failure analysis classification
         let failure_cat = if hit {
@@ -708,12 +755,32 @@ fn representative_retrieval_benchmark_test() {
     let n = queries.len() as f64;
     let a_recall1 = tier_a_results.iter().filter(|r| r.3 == 0).count() as f64 / n;
     let a_recall5 = tier_a_results.iter().filter(|r| r.3 < 5).count() as f64 / n;
-    let a_mrr = tier_a_results.iter().map(|r| if r.3 == usize::MAX { 0.0 } else { 1.0 / (r.3 as f64 + 1.0) }).sum::<f64>() / n;
+    let a_mrr = tier_a_results
+        .iter()
+        .map(|r| {
+            if r.3 == usize::MAX {
+                0.0
+            } else {
+                1.0 / (r.3 as f64 + 1.0)
+            }
+        })
+        .sum::<f64>()
+        / n;
 
     let c_recall1 = tier_c_results.iter().filter(|r| r.3 == 0).count() as f64 / n;
     let c_recall5 = tier_c_results.iter().filter(|r| r.3 < 5).count() as f64 / n;
     let c_recall10 = tier_c_results.iter().filter(|r| r.3 < 10).count() as f64 / n;
-    let c_mrr = tier_c_results.iter().map(|r| if r.3 == usize::MAX { 0.0 } else { 1.0 / (r.3 as f64 + 1.0) }).sum::<f64>() / n;
+    let c_mrr = tier_c_results
+        .iter()
+        .map(|r| {
+            if r.3 == usize::MAX {
+                0.0
+            } else {
+                1.0 / (r.3 as f64 + 1.0)
+            }
+        })
+        .sum::<f64>()
+        / n;
 
     println!("\n=================================================================");
     println!("  CP19: REPRESENTATIVE RETRIEVAL BENCHMARK REPORT");
@@ -723,16 +790,44 @@ fn representative_retrieval_benchmark_test() {
     println!("Embedded Units: {}", enrich_stats.embedded);
     println!("Elapsed Time: {:.2}s\n", t0.elapsed().as_secs_f64());
     println!("METRICS COMPARISON:");
-    println!("  Tier A (Canonical Non-Semantic) : Recall@1={:.3}, Recall@5={:.3}, MRR={:.3}", a_recall1, a_recall5, a_mrr);
-    println!("  Tier C (Hybrid Semantic)        : Recall@1={:.3}, Recall@5={:.3}, Recall@10={:.3}, MRR={:.3}", c_recall1, c_recall5, c_recall10, c_mrr);
+    println!(
+        "  Tier A (Canonical Non-Semantic) : Recall@1={:.3}, Recall@5={:.3}, MRR={:.3}",
+        a_recall1, a_recall5, a_mrr
+    );
+    println!(
+        "  Tier C (Hybrid Semantic)        : Recall@1={:.3}, Recall@5={:.3}, Recall@10={:.3}, MRR={:.3}",
+        c_recall1, c_recall5, c_recall10, c_mrr
+    );
 
     println!("\nDETAILED FAILURE & REGRESSION ANALYSIS TABLE (§35):");
-    println!("{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | Query", "ID", "Category", "Tier A", "Tier C", "Failure Category");
-    println!("{:-<5}-|-{:-<22}-|-{:-<8}-|-{:-<8}-|-{:-<20}-|-{:-<35}", "", "", "", "", "", "");
+    println!(
+        "{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | Query",
+        "ID", "Category", "Tier A", "Tier C", "Failure Category"
+    );
+    println!(
+        "{:-<5}-|-{:-<22}-|-{:-<8}-|-{:-<8}-|-{:-<20}-|-{:-<35}",
+        "", "", "", "", "", ""
+    );
     for (id, cat, q, _exp, a_r, c_r, f_cat) in &regression_records {
-        let a_str = if *a_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", a_r + 1) };
-        let c_str = if *c_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", c_r + 1) };
-        println!("{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | {}", id, cat.as_str(), a_str, c_str, f_cat.as_str(), q);
+        let a_str = if *a_r == usize::MAX {
+            "MISS".to_string()
+        } else {
+            format!("Rank {}", a_r + 1)
+        };
+        let c_str = if *c_r == usize::MAX {
+            "MISS".to_string()
+        } else {
+            format!("Rank {}", c_r + 1)
+        };
+        println!(
+            "{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | {}",
+            id,
+            cat.as_str(),
+            a_str,
+            c_str,
+            f_cat.as_str(),
+            q
+        );
     }
 
     // 5. Evaluate Acceptance Gates (Single source of truth for report and assertions)
@@ -748,7 +843,7 @@ fn representative_retrieval_benchmark_test() {
 
     // 6. Generate Markdown Report Artifact
     let report_content = format!(
-r#"# Representative Retrieval Benchmark Report (CP19)
+        r#"# Representative Retrieval Benchmark Report (CP19)
 
 **Date**: 2026-09-09
 **Status**: {overall_status}
@@ -798,15 +893,39 @@ r#"# Representative Retrieval Benchmark Report (CP19)
         c_mrr = c_mrr,
         d_mrr = c_mrr - a_mrr,
         mrr_status = mrr_status,
-        table_rows = regression_records.iter().map(|(id, cat, q, exp, a_r, c_r, f_cat)| {
-            let a_str = if *a_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", a_r + 1) };
-            let c_str = if *c_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", c_r + 1) };
-            format!("| **{}** | {} | `{}` | `{}` | {} | {} | {} |", id, cat.as_str(), q, exp, a_str, c_str, f_cat.as_str())
-        }).collect::<Vec<_>>().join("\n")
+        table_rows = regression_records
+            .iter()
+            .map(|(id, cat, q, exp, a_r, c_r, f_cat)| {
+                let a_str = if *a_r == usize::MAX {
+                    "MISS".to_string()
+                } else {
+                    format!("Rank {}", a_r + 1)
+                };
+                let c_str = if *c_r == usize::MAX {
+                    "MISS".to_string()
+                } else {
+                    format!("Rank {}", c_r + 1)
+                };
+                format!(
+                    "| **{}** | {} | `{}` | `{}` | {} | {} | {} |",
+                    id,
+                    cat.as_str(),
+                    q,
+                    exp,
+                    a_str,
+                    c_str,
+                    f_cat.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("benchmarks/reports/representative_retrieval_benchmark_report.md");
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -814,7 +933,15 @@ r#"# Representative Retrieval Benchmark Report (CP19)
     std::fs::write(&report_path, report_content).expect("write benchmark report");
 
     // 7. Hard Acceptance Gates (§34, §35) — Enforced from single source of truth
-    assert!(r5_pass, "Tier C Recall@5 must be >= Tier A Recall@5 and >= 0.85 (Tier C: {:.3}, Tier A: {:.3})", c_recall5, a_recall5);
-    assert!(r10_pass, "Tier C Recall@10 must be >= 0.90 (got {:.3})", c_recall10);
+    assert!(
+        r5_pass,
+        "Tier C Recall@5 must be >= Tier A Recall@5 and >= 0.85 (Tier C: {:.3}, Tier A: {:.3})",
+        c_recall5, a_recall5
+    );
+    assert!(
+        r10_pass,
+        "Tier C Recall@10 must be >= 0.90 (got {:.3})",
+        c_recall10
+    );
     assert!(mrr_pass, "Tier C MRR must be >= 0.80 (got {:.3})", c_mrr);
 }

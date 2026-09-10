@@ -6,8 +6,8 @@
 //! - Invalidation: automatically invalidates cached tuning when any component of the tuning key changes,
 //!   or on explicit reset.
 
-use rusqlite::{Connection, params};
 use crate::error::SemanticError;
+use rusqlite::{Connection, params};
 
 /// Multi-attribute key identifying the exact execution context (hardware, model, runtime).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +22,11 @@ pub struct TuningKey {
 
 impl TuningKey {
     /// Capture current machine environment with specified model and dimension.
-    pub fn current(model_id: impl Into<String>, model_revision: impl Into<String>, dimension: usize) -> Self {
+    pub fn current(
+        model_id: impl Into<String>,
+        model_revision: impl Into<String>,
+        dimension: usize,
+    ) -> Self {
         Self {
             cpu_architecture: std::env::consts::ARCH.to_string(),
             os_name: std::env::consts::OS.to_string(),
@@ -216,8 +220,10 @@ mod tests {
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../../migrations/semantic/0001_initial.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!(
+            "../../../migrations/semantic/0001_initial.sql"
+        ))
+        .unwrap();
         conn
     }
 
@@ -282,7 +288,10 @@ mod tests {
         mgr.save_tuning(&conn, &rec).unwrap();
 
         // Read back
-        let read = mgr.read_tuning(&conn, &key).unwrap().expect("should find saved record");
+        let read = mgr
+            .read_tuning(&conn, &key)
+            .unwrap()
+            .expect("should find saved record");
         assert_eq!(read.recommended_lanes, 2);
         assert_eq!(read.recommended_batch_size, 32);
         assert_eq!(read.recommended_cpu_threads, 4);

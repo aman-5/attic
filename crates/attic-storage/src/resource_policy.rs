@@ -319,11 +319,12 @@ impl ResourcePolicy {
     /// the fully-resolved value so an override can never bypass it.
     pub fn clamp_to_hardware(self, snapshot: &HardwareSnapshot) -> EffectiveResourceConfig {
         let ram_ceiling = snapshot.total_memory_mib * 60 / 100;
-        let memory_budget_mib = if self.memory_budget_mib == 8192 && snapshot.total_memory_mib > 16384 {
-            ram_ceiling
-        } else {
-            self.memory_budget_mib.min(ram_ceiling)
-        };
+        let memory_budget_mib =
+            if self.memory_budget_mib == 8192 && snapshot.total_memory_mib > 16384 {
+                ram_ceiling
+            } else {
+                self.memory_budget_mib.min(ram_ceiling)
+            };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
         EffectiveResourceConfig {

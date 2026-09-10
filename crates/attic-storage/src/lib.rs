@@ -30,9 +30,9 @@ pub mod semantic_reads;
 pub mod server_state;
 pub mod writer;
 
+pub use attic_core::config::{ModePolicy, ResourceAllocation, SemanticConfig};
 pub use machine_telemetry::{MachineTelemetry, MachineTelemetrySampler};
 pub use resource_orchestrator::{AutoModeState, AutoStateMachine, ResourceOrchestrator};
-pub use attic_core::config::{ModePolicy, ResourceAllocation, SemanticConfig};
 
 pub use analysis_cache::{
     CachedFileAnalysis, bulk_load_analysis_cache, clear_analysis_cache,

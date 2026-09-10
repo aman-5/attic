@@ -213,4 +213,3 @@ pub trait EmbeddingProvider: Send + Sync {
         budget: &EmbeddingExecutionBudget,
     ) -> Result<Vec<f32>, SemanticError>;
 }
-

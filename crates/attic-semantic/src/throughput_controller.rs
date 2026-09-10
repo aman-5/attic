@@ -8,9 +8,9 @@
 //! 4. Interactive MCP latency guard: immediate rollback when interactive MCP latency exceeds threshold.
 //! 5. Cooldown and bounded exploration frequency: prevents continuous experimentation.
 
-use std::time::{Duration, Instant};
 use crate::error::SemanticError;
 use crate::provider::{EmbeddingExecutionBudget, EmbeddingProvider};
+use std::time::{Duration, Instant};
 
 /// Configuration knobs for the bounded throughput controller.
 #[derive(Debug, Clone)]
@@ -107,7 +107,10 @@ pub struct ThroughputController {
 
 impl ThroughputController {
     /// Create a new controller with conservative initial allocation.
-    pub fn new(config: ThroughputControllerConfig, initial_allocation: CandidateAllocation) -> Self {
+    pub fn new(
+        config: ThroughputControllerConfig,
+        initial_allocation: CandidateAllocation,
+    ) -> Self {
         Self {
             config,
             phase: ControllerPhase::StartupWarmup,
@@ -251,10 +254,14 @@ impl ThroughputController {
                         0.0
                     };
 
-                    let candidate = self.candidate_allocation.take().unwrap_or(self.baseline_allocation);
+                    let candidate = self
+                        .candidate_allocation
+                        .take()
+                        .unwrap_or(self.baseline_allocation);
 
                     // Evaluate gain relative to baseline (§22, §24)
-                    let min_required = self.baseline_throughput * (1.0 + self.config.min_meaningful_gain_ratio);
+                    let min_required =
+                        self.baseline_throughput * (1.0 + self.config.min_meaningful_gain_ratio);
 
                     if measured_tput >= min_required || self.baseline_throughput == 0.0 {
                         // Meaningful gain achieved; retain candidate!
@@ -375,15 +382,24 @@ mod tests {
         assert_eq!(ctrl.phase(), ControllerPhase::Stabilizing);
 
         // 1 stabilization batch (discarded)
-        assert_eq!(ctrl.record_batch(32, Duration::from_millis(200), None), ControllerAction::None);
+        assert_eq!(
+            ctrl.record_batch(32, Duration::from_millis(200), None),
+            ControllerAction::None
+        );
         assert_eq!(ctrl.phase(), ControllerPhase::Evaluating);
 
         // 2 evaluation batches with superior throughput (e.g. 150 chunks/sec, > 110 required)
-        assert_eq!(ctrl.record_batch(30, Duration::from_millis(200), None), ControllerAction::None);
+        assert_eq!(
+            ctrl.record_batch(30, Duration::from_millis(200), None),
+            ControllerAction::None
+        );
         let final_action = ctrl.record_batch(30, Duration::from_millis(200), None);
 
         match final_action {
-            ControllerAction::RetainCandidate { allocation, chunks_per_sec } => {
+            ControllerAction::RetainCandidate {
+                allocation,
+                chunks_per_sec,
+            } => {
                 assert_eq!(allocation, candidate);
                 assert!(chunks_per_sec >= 140.0);
             }
@@ -429,12 +445,18 @@ mod tests {
         let final_action = ctrl.record_batch(45, Duration::from_millis(500), None);
 
         match final_action {
-            ControllerAction::Rollback { rollback_to, reason } => {
-                assert_eq!(rollback_to, CandidateAllocation {
-                    batch_size: 16,
-                    inference_lanes: 1,
-                    cpu_threads: 2,
-                });
+            ControllerAction::Rollback {
+                rollback_to,
+                reason,
+            } => {
+                assert_eq!(
+                    rollback_to,
+                    CandidateAllocation {
+                        batch_size: 16,
+                        inference_lanes: 1,
+                        cpu_threads: 2,
+                    }
+                );
                 assert!(reason.contains("diminishing throughput"));
             }
             other => panic!("expected Rollback, got {other:?}"),
@@ -466,7 +488,10 @@ mod tests {
         // High MCP latency observed (120ms > 50ms)
         let action = ctrl.record_batch(64, Duration::from_millis(200), Some(120.0));
         match action {
-            ControllerAction::Rollback { rollback_to, reason } => {
+            ControllerAction::Rollback {
+                rollback_to,
+                reason,
+            } => {
                 assert_eq!(rollback_to.batch_size, 16);
                 assert!(reason.contains("MCP latency guard breached"));
             }

@@ -6,7 +6,7 @@
 //! - Atomic generation activation: switching from old to new generation happens in a single transaction (§52, §53).
 //! - Safe rollback: previous complete generations are retained and can be reactivated instantly on failure (§55).
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SemanticError;
@@ -66,7 +66,9 @@ pub struct GenerationManager;
 
 impl GenerationManager {
     /// Retrieve the currently ACTIVE generation, if any.
-    pub fn get_active_generation(conn: &Connection) -> Result<Option<GenerationRecord>, SemanticError> {
+    pub fn get_active_generation(
+        conn: &Connection,
+    ) -> Result<Option<GenerationRecord>, SemanticError> {
         let res = conn
             .query_row(
                 "SELECT generation_id, fingerprint_json, status, unit_count, created_at_ms, activated_at_ms \
@@ -86,9 +88,12 @@ impl GenerationManager {
 
         match res {
             Some((id, fp_json, status_str, unit_count, created_at, activated_at)) => {
-                let fingerprint: EmbeddingFingerprint = serde_json::from_str(&fp_json).map_err(|e| {
-                    SemanticError::StoreUnavailable(format!("corrupt fingerprint JSON in generation: {e}"))
-                })?;
+                let fingerprint: EmbeddingFingerprint =
+                    serde_json::from_str(&fp_json).map_err(|e| {
+                        SemanticError::StoreUnavailable(format!(
+                            "corrupt fingerprint JSON in generation: {e}"
+                        ))
+                    })?;
                 Ok(Some(GenerationRecord {
                     generation_id: id,
                     fingerprint,
@@ -103,7 +108,9 @@ impl GenerationManager {
     }
 
     /// Retrieve the currently BUILDING generation, if any.
-    pub fn get_building_generation(conn: &Connection) -> Result<Option<GenerationRecord>, SemanticError> {
+    pub fn get_building_generation(
+        conn: &Connection,
+    ) -> Result<Option<GenerationRecord>, SemanticError> {
         let res = conn
             .query_row(
                 "SELECT generation_id, fingerprint_json, status, unit_count, created_at_ms, activated_at_ms \
@@ -123,9 +130,12 @@ impl GenerationManager {
 
         match res {
             Some((id, fp_json, status_str, unit_count, created_at, activated_at)) => {
-                let fingerprint: EmbeddingFingerprint = serde_json::from_str(&fp_json).map_err(|e| {
-                    SemanticError::StoreUnavailable(format!("corrupt fingerprint JSON in generation: {e}"))
-                })?;
+                let fingerprint: EmbeddingFingerprint =
+                    serde_json::from_str(&fp_json).map_err(|e| {
+                        SemanticError::StoreUnavailable(format!(
+                            "corrupt fingerprint JSON in generation: {e}"
+                        ))
+                    })?;
                 Ok(Some(GenerationRecord {
                     generation_id: id,
                     fingerprint,
@@ -172,7 +182,10 @@ impl GenerationManager {
     }
 
     /// Atomically activate a generation, superseding any currently active generation.
-    pub fn activate_generation(conn: &mut Connection, target_generation_id: i64) -> Result<(), SemanticError> {
+    pub fn activate_generation(
+        conn: &mut Connection,
+        target_generation_id: i64,
+    ) -> Result<(), SemanticError> {
         let tx = conn.transaction()?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -203,7 +216,9 @@ impl GenerationManager {
     }
 
     /// Roll back to the most recent superseded complete generation (§55).
-    pub fn rollback_to_previous(conn: &mut Connection) -> Result<Option<GenerationRecord>, SemanticError> {
+    pub fn rollback_to_previous(
+        conn: &mut Connection,
+    ) -> Result<Option<GenerationRecord>, SemanticError> {
         let tx = conn.transaction()?;
 
         // Find the latest SUPERSEDED generation
@@ -242,7 +257,10 @@ impl GenerationManager {
     }
 
     /// Prune old superseded and rolled back generations according to bounded retention policy.
-    pub fn prune_old_generations(conn: &mut Connection, keep_max: usize) -> Result<usize, SemanticError> {
+    pub fn prune_old_generations(
+        conn: &mut Connection,
+        keep_max: usize,
+    ) -> Result<usize, SemanticError> {
         let tx = conn.transaction()?;
 
         // Find IDs of superseded/rolled-back generations beyond keep_max
@@ -258,9 +276,15 @@ impl GenerationManager {
         let count = to_prune.len();
         for gen_id in to_prune {
             // Delete vectors belonging to this generation
-            tx.execute("DELETE FROM sem_embeddings WHERE generation_id = ?1", params![gen_id])?;
+            tx.execute(
+                "DELETE FROM sem_embeddings WHERE generation_id = ?1",
+                params![gen_id],
+            )?;
             // Mark or delete generation row
-            tx.execute("DELETE FROM sem_generations WHERE generation_id = ?1", params![gen_id])?;
+            tx.execute(
+                "DELETE FROM sem_generations WHERE generation_id = ?1",
+                params![gen_id],
+            )?;
         }
 
         tx.commit()?;
@@ -304,7 +328,8 @@ mod tests {
                 vector           BLOB NOT NULL,
                 PRIMARY KEY (retrieval_unit_id, generation_id)
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn
     }
 
@@ -318,7 +343,9 @@ mod tests {
 
         // Activate Gen 1
         GenerationManager::activate_generation(&mut conn, 1).unwrap();
-        let active = GenerationManager::get_active_generation(&conn).unwrap().unwrap();
+        let active = GenerationManager::get_active_generation(&conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(active.generation_id, 1);
         assert_eq!(active.status, GenerationStatus::Active);
 
@@ -329,12 +356,16 @@ mod tests {
         assert_eq!(gen2.status, GenerationStatus::Building);
 
         // While Gen 2 is building, active is still Gen 1
-        let active_now = GenerationManager::get_active_generation(&conn).unwrap().unwrap();
+        let active_now = GenerationManager::get_active_generation(&conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(active_now.generation_id, 1);
 
         // Activate Gen 2
         GenerationManager::activate_generation(&mut conn, 2).unwrap();
-        let active_final = GenerationManager::get_active_generation(&conn).unwrap().unwrap();
+        let active_final = GenerationManager::get_active_generation(&conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(active_final.generation_id, 2);
     }
 
@@ -350,11 +381,15 @@ mod tests {
         GenerationManager::activate_generation(&mut conn, 2).unwrap();
 
         // Roll back: should deactivate Gen 2 and reactivate Gen 1
-        let restored = GenerationManager::rollback_to_previous(&mut conn).unwrap().unwrap();
+        let restored = GenerationManager::rollback_to_previous(&mut conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.generation_id, 1);
         assert_eq!(restored.status, GenerationStatus::Active);
 
-        let active = GenerationManager::get_active_generation(&conn).unwrap().unwrap();
+        let active = GenerationManager::get_active_generation(&conn)
+            .unwrap()
+            .unwrap();
         assert_eq!(active.generation_id, 1);
     }
 }

@@ -316,9 +316,7 @@ fn resolve_semantic_provider(
     ) {
         Ok(embedder) => (Arc::new(embedder), source),
         Err(e) => {
-            tracing::warn!(
-                "Qwen3Embedder unavailable ({e}); degrading to unavailable provider"
-            );
+            tracing::warn!("Qwen3Embedder unavailable ({e}); degrading to unavailable provider");
             (
                 Arc::new(attic_semantic::UnavailableProvider {
                     reason: e.to_string(),
@@ -2290,9 +2288,23 @@ fn handle_status(
         let inflight = *qcounts.get(attic_semantic::store::Q_INFLIGHT).unwrap_or(&0);
         let done = *qcounts.get(attic_semantic::store::Q_DONE).unwrap_or(&0);
         let failed = *qcounts.get(attic_semantic::store::Q_FAILED).unwrap_or(&0);
-        let active_gen = stack.store.get_active_generation().ok().flatten().map(|g| g.generation_id);
-        let building_gen = stack.store.get_building_generation().ok().flatten().map(|g| g.generation_id);
-        let cache_state = if stack.provider.available() { "ready" } else { "loading" };
+        let active_gen = stack
+            .store
+            .get_active_generation()
+            .ok()
+            .flatten()
+            .map(|g| g.generation_id);
+        let building_gen = stack
+            .store
+            .get_building_generation()
+            .ok()
+            .flatten()
+            .map(|g| g.generation_id);
+        let cache_state = if stack.provider.available() {
+            "ready"
+        } else {
+            "loading"
+        };
 
         let progress = attic_semantic::SemanticProgressSnapshot::compute(
             pending,
@@ -2316,11 +2328,15 @@ fn handle_status(
                     attic_storage::resource_manager::ResourceAdvisory::Restricted
                 )
             }),
-            available_ram_mib: resource_monitor.map(|m| m.min_free_memory_mib()).unwrap_or(4096),
+            available_ram_mib: resource_monitor
+                .map(|m| m.min_free_memory_mib())
+                .unwrap_or(4096),
             queue_depth: pending + inflight,
             queue_backpressure_active: (pending + inflight) >= 5000,
-            canonical_indexing_active: resource_monitor.is_some_and(|m| m.indexing_heavy_active() > 0),
-            semantic_inference_active: resource_monitor.is_some_and(|m| m.embedding_heavy_active() > 0),
+            canonical_indexing_active: resource_monitor
+                .is_some_and(|m| m.indexing_heavy_active() > 0),
+            semantic_inference_active: resource_monitor
+                .is_some_and(|m| m.embedding_heavy_active() > 0),
             model_loading_or_warmup: !stack.provider.available(),
             mcp_high_latency: false,
             user_caps_active: phase8.attic_config.has_explicit_embedding_override(),
@@ -5217,7 +5233,9 @@ mod tests {
         };
 
         // Enqueue some work
-        store.queue_enqueue(&["unit1".to_string(), "unit2".to_string()], 1.0).unwrap();
+        store
+            .queue_enqueue(&["unit1".to_string(), "unit2".to_string()], 1.0)
+            .unwrap();
 
         let mut res_status = test_resource_status();
         res_status.semantic = Some(&stack);

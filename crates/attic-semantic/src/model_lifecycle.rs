@@ -6,16 +6,16 @@
 //! - Bounded baseline memory accounting reported to the resource orchestrator.
 //! - Orderly lifecycle state transitions (Unloaded -> Loading -> Ready -> Draining -> Cancelled) with safe drain/unload (§50).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 
 use crate::error::SemanticError;
 use crate::provider::{
-    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput,
-    EmbeddingOutput, EmbeddingProvider, ProviderConcurrencyContract,
+    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+    EmbeddingProvider, ProviderConcurrencyContract,
 };
 
 /// Lifecycle state of a shared neural embedding model.

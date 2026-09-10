@@ -113,27 +113,34 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
     if ctx.disk_emergency {
         WhySlowDiagnostic {
             code: "disk_pressure",
-            explanation: "free disk space is below emergency reserve; semantic indexing is halted".to_string(),
+            explanation: "free disk space is below emergency reserve; semantic indexing is halted"
+                .to_string(),
         }
     } else if ctx.resource_pressure_restricted {
         WhySlowDiagnostic {
             code: "resource_monitor_pressure",
-            explanation: "high host memory or CPU pressure; background work is throttled".to_string(),
+            explanation: "high host memory or CPU pressure; background work is throttled"
+                .to_string(),
         }
     } else if ctx.mcp_high_latency {
         WhySlowDiagnostic {
             code: "mcp_priority",
-            explanation: "MCP interactive latency exceeds guard; prioritizing foreground responses".to_string(),
+            explanation: "MCP interactive latency exceeds guard; prioritizing foreground responses"
+                .to_string(),
         }
     } else if ctx.model_loading_or_warmup {
         WhySlowDiagnostic {
             code: "model_warmup",
-            explanation: "model assets are loading and running initial cold warm-up pass".to_string(),
+            explanation: "model assets are loading and running initial cold warm-up pass"
+                .to_string(),
         }
     } else if ctx.queue_backpressure_active {
         WhySlowDiagnostic {
             code: "semantic_queue_backpressure",
-            explanation: format!("enrichment queue depth ({}) exceeded high watermark", ctx.queue_depth),
+            explanation: format!(
+                "enrichment queue depth ({}) exceeded high watermark",
+                ctx.queue_depth
+            ),
         }
     } else if ctx.canonical_indexing_active && ctx.semantic_inference_active {
         WhySlowDiagnostic {
@@ -143,17 +150,23 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
     } else if ctx.semantic_inference_active {
         WhySlowDiagnostic {
             code: "semantic_cpu_inference",
-            explanation: "neural embedding inference is actively executing on allocated CPU threads".to_string(),
+            explanation:
+                "neural embedding inference is actively executing on allocated CPU threads"
+                    .to_string(),
         }
     } else if ctx.available_ram_mib < 2048 {
         WhySlowDiagnostic {
             code: "memory_headroom",
-            explanation: format!("available host RAM is constrained ({} MiB available)", ctx.available_ram_mib),
+            explanation: format!(
+                "available host RAM is constrained ({} MiB available)",
+                ctx.available_ram_mib
+            ),
         }
     } else if ctx.user_caps_active {
         WhySlowDiagnostic {
             code: "advanced_user_cap",
-            explanation: "concurrency or memory is bounded by explicit attic.toml user caps".to_string(),
+            explanation: "concurrency or memory is bounded by explicit attic.toml user caps"
+                .to_string(),
         }
     } else {
         WhySlowDiagnostic {
@@ -174,7 +187,7 @@ mod tests {
             20,
             1000,
             5,
-            50.0, // 50 chunks / sec
+            50.0,  // 50 chunks / sec
             200.0, // 200 ms batch latency
             Some(1),
             Some(2),

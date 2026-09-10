@@ -1491,7 +1491,10 @@ mod tests {
                     |_| Ok(true),
                 )
                 .unwrap_or(false);
-            assert!(exists, "table '{tbl}' must exist in fresh semantic database");
+            assert!(
+                exists,
+                "table '{tbl}' must exist in fresh semantic database"
+            );
         }
 
         // 2. Verify all expected indexes exist
@@ -1511,17 +1514,24 @@ mod tests {
                     |_| Ok(true),
                 )
                 .unwrap_or(false);
-            assert!(exists, "index '{idx}' must exist in fresh semantic database");
+            assert!(
+                exists,
+                "index '{idx}' must exist in fresh semantic database"
+            );
         }
 
         // 3. Verify exactly one baseline migration is recorded
         let migration_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(migration_count, 1);
 
         let migration_id: String = conn
-            .query_row("SELECT id FROM sem_schema_migrations LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT id FROM sem_schema_migrations LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(migration_id, "0001_initial");
     }
@@ -1536,20 +1546,24 @@ mod tests {
             let store = SemanticStore::open(&db_path).expect("first open");
             let conn = store.guard().unwrap();
             let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 1);
         }
 
         // Second open on existing database
         {
-            let store = SemanticStore::open(&db_path).expect("second open must succeed idempotently");
+            let store =
+                SemanticStore::open(&db_path).expect("second open must succeed idempotently");
             let conn = store.guard().unwrap();
             let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(count, 1);
         }
     }
 }
-

@@ -8,8 +8,7 @@
 pub const CODE_RETRIEVAL_V1_ID: &str = "code_retrieval_v1";
 
 /// Canonical query instruction template for V1 code retrieval.
-pub const CODE_RETRIEVAL_V1_TEMPLATE: &str =
-    "Instruct: Given a code search query, retrieve relevant code snippets and documentation\nQuery: ";
+pub const CODE_RETRIEVAL_V1_TEMPLATE: &str = "Instruct: Given a code search query, retrieve relevant code snippets and documentation\nQuery: ";
 
 /// Format a search query string with the centralized retrieval instruction.
 /// Documents are never formatted with instructions (document/query distinction).
@@ -30,7 +29,9 @@ mod tests {
         let formatted = format_query_instruction(CODE_RETRIEVAL_V1_ID, q);
         assert_eq!(
             formatted,
-            format!("Instruct: Given a code search query, retrieve relevant code snippets and documentation\nQuery: {q}")
+            format!(
+                "Instruct: Given a code search query, retrieve relevant code snippets and documentation\nQuery: {q}"
+            )
         );
     }
 

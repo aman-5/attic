@@ -9,10 +9,10 @@
 //! - Stale job protection: rejects commits if source content_hash changed while queued (§44).
 //! - Bad-batch isolation & retry limits: permanently quarantines poisoned units after max_attempts (§45, §46).
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Configuration for the hierarchical fairness scheduler and queue watermarks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +125,8 @@ impl HierarchicalFairnessScheduler {
         }
 
         let total_pending = self.total_pending();
-        self.backpressure.update_watermarks(total_pending, &self.config)
+        self.backpressure
+            .update_watermarks(total_pending, &self.config)
     }
 
     /// Total number of pending units across all repositories.
@@ -154,7 +155,10 @@ impl HierarchicalFairnessScheduler {
 
             let mut drained_from_repo = 0;
             if let Some(queue) = self.repo_queues.get_mut(&repo_id) {
-                let slice_limit = self.config.repo_slice_size.min(max_batch_size - batch.len());
+                let slice_limit = self
+                    .config
+                    .repo_slice_size
+                    .min(max_batch_size - batch.len());
                 while drained_from_repo < slice_limit && !queue.is_empty() {
                     if let Some(item) = queue.pop_front() {
                         batch.push(item);
@@ -164,14 +168,18 @@ impl HierarchicalFairnessScheduler {
             }
 
             // If this repository still has items, rotate it to the back of the round-robin line
-            let has_more = self.repo_queues.get(&repo_id).is_some_and(|q| !q.is_empty());
+            let has_more = self
+                .repo_queues
+                .get(&repo_id)
+                .is_some_and(|q| !q.is_empty());
             if has_more {
                 self.active_repo_order.push_back(repo_id);
             }
         }
 
         let total_pending = self.total_pending();
-        self.backpressure.update_watermarks(total_pending, &self.config);
+        self.backpressure
+            .update_watermarks(total_pending, &self.config);
 
         batch
     }
@@ -266,8 +274,13 @@ mod tests {
 
     #[test]
     fn stale_job_validation_detects_hash_drift() {
-        assert!(HierarchicalFairnessScheduler::validate_stale_job("hash1", "hash1"));
-        assert!(!HierarchicalFairnessScheduler::validate_stale_job("hash1", "hash2_modified"));
+        assert!(HierarchicalFairnessScheduler::validate_stale_job(
+            "hash1", "hash1"
+        ));
+        assert!(!HierarchicalFairnessScheduler::validate_stale_job(
+            "hash1",
+            "hash2_modified"
+        ));
     }
 
     #[test]

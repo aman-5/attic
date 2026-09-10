@@ -38,7 +38,10 @@ fn resolve_cache_dir() -> PathBuf {
         }
     }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let p = PathBuf::from(home).join(".cache").join("huggingface").join("hub");
+        let p = PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub");
         if p.exists() {
             return p;
         }
@@ -138,7 +141,12 @@ fn large_index_retrieval_scalability_gate() {
     let db_path = temp_dir.path().join("semantic_large_index.db");
     let store = SemanticStore::open(&db_path).expect("open semantic store");
 
-    let repos = ["repo-auth", "repo-frontend", "repo-engine", "repo-analytics"];
+    let repos = [
+        "repo-auth",
+        "repo-frontend",
+        "repo-engine",
+        "repo-analytics",
+    ];
     let dim = PROD_DIMENSION;
     let cancel = CancelFlag::new();
     let cache_dir = resolve_cache_dir();
@@ -158,7 +166,10 @@ fn large_index_retrieval_scalability_gate() {
     // Measure real Qwen3 query embedding latency
     let t_emb0 = Instant::now();
     let query_vector = qwen_embedder
-        .embed_query("find authentication token validator implementation", &exec_budget)
+        .embed_query(
+            "find authentication token validator implementation",
+            &exec_budget,
+        )
         .expect("embed query");
     let query_emb_ms = t_emb0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(query_vector.len(), dim);
@@ -174,7 +185,13 @@ fn large_index_retrieval_scalability_gate() {
     // 30k Unscoped kNN
     let t_knn_30k = Instant::now();
     let res_30k = store
-        .knn_search_generation(generation_id, &query_vector, 10, None, &ScanBudget::unbounded(&cancel))
+        .knn_search_generation(
+            generation_id,
+            &query_vector,
+            10,
+            None,
+            &ScanBudget::unbounded(&cancel),
+        )
         .expect("knn 30k");
     let knn_30k_ms = t_knn_30k.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(res_30k.rows_scanned, 30_000);
@@ -183,7 +200,13 @@ fn large_index_retrieval_scalability_gate() {
     // 30k Scoped kNN (1 repo = 7,500 rows)
     let t_scoped_30k = Instant::now();
     let res_scoped_30k = store
-        .knn_search_generation(generation_id, &query_vector, 10, Some("repo-auth"), &ScanBudget::unbounded(&cancel))
+        .knn_search_generation(
+            generation_id,
+            &query_vector,
+            10,
+            Some("repo-auth"),
+            &ScanBudget::unbounded(&cancel),
+        )
         .expect("knn scoped 30k");
     let scoped_30k_ms = t_scoped_30k.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(res_scoped_30k.rows_scanned, 7_500);
@@ -197,7 +220,13 @@ fn large_index_retrieval_scalability_gate() {
     // 100k Unscoped kNN
     let t_knn_100k = Instant::now();
     let res_100k = store
-        .knn_search_generation(generation_id, &query_vector, 10, None, &ScanBudget::unbounded(&cancel))
+        .knn_search_generation(
+            generation_id,
+            &query_vector,
+            10,
+            None,
+            &ScanBudget::unbounded(&cancel),
+        )
         .expect("knn 100k");
     let knn_100k_ms = t_knn_100k.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(res_100k.rows_scanned, 100_000);
@@ -224,7 +253,13 @@ fn large_index_retrieval_scalability_gate() {
     // 500k Scoped kNN (1 repo = 125,000 rows)
     let t_scoped_500k = Instant::now();
     let res_scoped_500k = store
-        .knn_search_generation(generation_id, &query_vector, 10, Some("repo-engine"), &ScanBudget::unbounded(&cancel))
+        .knn_search_generation(
+            generation_id,
+            &query_vector,
+            10,
+            Some("repo-engine"),
+            &ScanBudget::unbounded(&cancel),
+        )
         .expect("knn scoped 500k");
     let scoped_500k_ms = t_scoped_500k.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(res_scoped_500k.rows_scanned, 125_000);
@@ -241,7 +276,10 @@ fn large_index_retrieval_scalability_gate() {
         .expect("knn deadline 500k");
     let deadline_500k_ms = t_deadline_500k.elapsed().as_secs_f64() * 1000.0;
     assert!(res_deadline_500k.truncated_by_budget);
-    assert!(deadline_500k_ms <= 80.0, "deadline SLA must bound search time");
+    assert!(
+        deadline_500k_ms <= 80.0,
+        "deadline SLA must bound search time"
+    );
 
     // ── Tier 4: 1,000,000 Vectors (add 500k) ────────────────────────────────
     println!("Populating Tier 4: 1,000,000 vectors total (+500k)...");
@@ -260,7 +298,10 @@ fn large_index_retrieval_scalability_gate() {
         .expect("knn deadline 1m");
     let deadline_1m_ms = t_deadline_1m.elapsed().as_secs_f64() * 1000.0;
     assert!(res_deadline_1m.truncated_by_budget);
-    assert!(deadline_1m_ms <= 100.0, "1M deadline enforcement must bound search time");
+    assert!(
+        deadline_1m_ms <= 100.0,
+        "1M deadline enforcement must bound search time"
+    );
 
     // 1M Scoped kNN (1 repo = 250,000 rows) with 30ms SLA
     let deadline_scoped_30ms = ScanBudget {
@@ -270,7 +311,13 @@ fn large_index_retrieval_scalability_gate() {
     };
     let t_scoped_1m = Instant::now();
     let res_scoped_1m = store
-        .knn_search_generation(generation_id, &query_vector, 10, Some("repo-analytics"), &deadline_scoped_30ms)
+        .knn_search_generation(
+            generation_id,
+            &query_vector,
+            10,
+            Some("repo-analytics"),
+            &deadline_scoped_30ms,
+        )
         .expect("knn scoped 1m");
     let scoped_1m_ms = t_scoped_1m.elapsed().as_secs_f64() * 1000.0;
 
@@ -288,18 +335,48 @@ fn large_index_retrieval_scalability_gate() {
     println!("=================================================================");
     println!("Model: Qwen/Qwen3-Embedding-0.6B (dim={dim})");
     println!("Total Physical Vectors in DB: 1,000,000");
-    println!("Total Execution Time: {:.2}s", t_total.elapsed().as_secs_f64());
+    println!(
+        "Total Execution Time: {:.2}s",
+        t_total.elapsed().as_secs_f64()
+    );
     println!("Query Embedding Latency: {:.2}ms", query_emb_ms);
     println!("\nScale Tier Measurements:");
-    println!("  30k Tier  : pop={:.2}s, size={:.1}MiB, unscoped_knn={:.2}ms, scoped_knn={:.2}ms", t_pop_30k.as_secs_f64(), db_size_30k, knn_30k_ms, scoped_30k_ms);
-    println!("  100k Tier : pop={:.2}s, size={:.1}MiB, unscoped_knn={:.2}ms, capped_15k={:.2}ms", t_pop_100k.as_secs_f64(), db_size_100k, knn_100k_ms, cap_ms);
-    println!("  500k Tier : pop={:.2}s, size={:.1}MiB, scoped_125k={:.2}ms, deadline_25ms={:.2}ms", t_pop_500k.as_secs_f64(), db_size_500k, scoped_500k_ms, deadline_500k_ms);
-    println!("  1M Tier   : pop={:.2}s, size={:.1}MiB, scoped_bounded={:.2}ms, deadline_40ms={:.2}ms", t_pop_1m.as_secs_f64(), db_size_1m, scoped_1m_ms, deadline_1m_ms);
-    println!("Quality Retention under budget cap: {:.1}%", quality_retention);
+    println!(
+        "  30k Tier  : pop={:.2}s, size={:.1}MiB, unscoped_knn={:.2}ms, scoped_knn={:.2}ms",
+        t_pop_30k.as_secs_f64(),
+        db_size_30k,
+        knn_30k_ms,
+        scoped_30k_ms
+    );
+    println!(
+        "  100k Tier : pop={:.2}s, size={:.1}MiB, unscoped_knn={:.2}ms, capped_15k={:.2}ms",
+        t_pop_100k.as_secs_f64(),
+        db_size_100k,
+        knn_100k_ms,
+        cap_ms
+    );
+    println!(
+        "  500k Tier : pop={:.2}s, size={:.1}MiB, scoped_125k={:.2}ms, deadline_25ms={:.2}ms",
+        t_pop_500k.as_secs_f64(),
+        db_size_500k,
+        scoped_500k_ms,
+        deadline_500k_ms
+    );
+    println!(
+        "  1M Tier   : pop={:.2}s, size={:.1}MiB, scoped_bounded={:.2}ms, deadline_40ms={:.2}ms",
+        t_pop_1m.as_secs_f64(),
+        db_size_1m,
+        scoped_1m_ms,
+        deadline_1m_ms
+    );
+    println!(
+        "Quality Retention under budget cap: {:.1}%",
+        quality_retention
+    );
 
     // ── Generate Report Markdown ────────────────────────────────────────────
     let report_content = format!(
-r#"# Large-Index Retrieval Scalability Report (CP20 / F10)
+        r#"# Large-Index Retrieval Scalability Report (CP20 / F10)
 
 **Date**: 2026-09-09
 **Status**: PASS
@@ -369,7 +446,10 @@ r#"# Large-Index Retrieval Scalability Report (CP20 / F10)
     );
 
     let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("benchmarks/reports/large_index_retrieval_report.md");
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -382,7 +462,10 @@ r#"# Large-Index Retrieval Scalability Report (CP20 / F10)
     assert!(res_cap.truncated_by_budget);
     assert!(res_deadline_500k.truncated_by_budget);
     assert!(res_deadline_1m.truncated_by_budget);
-    assert!(scoped_30k_ms < knn_30k_ms, "Scoped query must be faster than unscoped");
+    assert!(
+        scoped_30k_ms < knn_30k_ms,
+        "Scoped query must be faster than unscoped"
+    );
     assert!(deadline_500k_ms <= 80.0, "500k deadline must bound search");
     assert!(deadline_1m_ms <= 100.0, "1M deadline must bound search");
 }

@@ -8,11 +8,11 @@
 //! - SwiGLU MLP activation
 //! - Completely stateless forward pass (no KV cache accumulation during embedding)
 
-use std::sync::Arc;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::with_tracing::{linear_b, linear_no_bias, Linear, RmsNorm};
+use candle_transformers::models::with_tracing::{Linear, RmsNorm, linear_b, linear_no_bias};
 use candle_transformers::utils::repeat_kv;
+use std::sync::Arc;
 
 fn default_rope_theta() -> f64 {
     1_000_000.0
@@ -224,7 +224,11 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    pub fn new(cfg: &Qwen3Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        cfg: &Qwen3Config,
+        rotary: Arc<Qwen3RotaryEmbedding>,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm =
@@ -275,7 +279,11 @@ impl Qwen3Model {
 
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_root.pp("embed_tokens"))?;
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(DType::F32, cfg, vb_root.device())?);
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(
+            DType::F32,
+            cfg,
+            vb_root.device(),
+        )?);
         let vb_l = vb_root.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {

@@ -82,25 +82,45 @@ mod tests {
 
     #[test]
     fn dynamic_scaling_8_4_2_6_lifecycle_enforcement() {
-        use std::sync::Arc;
+        use crate::error::SemanticError;
         use crate::model_lifecycle::SharedModelHandle;
         use crate::provider::{
-            EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput,
-            EmbeddingOutput, EmbeddingProvider,
+            EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+            EmbeddingProvider,
         };
-        use crate::error::SemanticError;
+        use std::sync::Arc;
 
         struct TestMockProvider {
             fp: EmbeddingFingerprint,
         }
         impl EmbeddingProvider for TestMockProvider {
-            fn model_fingerprint(&self) -> EmbeddingFingerprint { self.fp.clone() }
-            fn dimension(&self) -> usize { self.fp.dimension }
-            fn warm_up(&self, _: &EmbeddingExecutionBudget) -> Result<(), SemanticError> { Ok(()) }
-            fn embed_documents(&self, inputs: &[EmbeddingInput], _: &EmbeddingExecutionBudget) -> Result<Vec<EmbeddingOutput>, SemanticError> {
-                Ok(inputs.iter().map(|i| EmbeddingOutput { unit_key: i.unit_key.clone(), vector: vec![0.1; 128] }).collect())
+            fn model_fingerprint(&self) -> EmbeddingFingerprint {
+                self.fp.clone()
             }
-            fn embed_query(&self, _: &str, _: &EmbeddingExecutionBudget) -> Result<Vec<f32>, SemanticError> {
+            fn dimension(&self) -> usize {
+                self.fp.dimension
+            }
+            fn warm_up(&self, _: &EmbeddingExecutionBudget) -> Result<(), SemanticError> {
+                Ok(())
+            }
+            fn embed_documents(
+                &self,
+                inputs: &[EmbeddingInput],
+                _: &EmbeddingExecutionBudget,
+            ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+                Ok(inputs
+                    .iter()
+                    .map(|i| EmbeddingOutput {
+                        unit_key: i.unit_key.clone(),
+                        vector: vec![0.1; 128],
+                    })
+                    .collect())
+            }
+            fn embed_query(
+                &self,
+                _: &str,
+                _: &EmbeddingExecutionBudget,
+            ) -> Result<Vec<f32>, SemanticError> {
                 Ok(vec![0.1; 128])
             }
         }
@@ -118,7 +138,11 @@ mod tests {
         };
 
         // Shared loaded model instance (single authority)
-        let handle = Arc::new(SharedModelHandle::new(Arc::new(TestMockProvider { fp }), 500, 8));
+        let handle = Arc::new(SharedModelHandle::new(
+            Arc::new(TestMockProvider { fp }),
+            500,
+            8,
+        ));
 
         // Test progression: 8 -> 4 -> 2 -> 6 granted threads with 4 requested worker lanes
         let grant_sequence = vec![8, 4, 2, 6];
@@ -126,7 +150,10 @@ mod tests {
 
         for granted_threads in grant_sequence {
             let plan = CpuIsolationPlan::compute(granted_threads, requested_lanes);
-            assert!(!plan.is_oversubscribed(), "must never oversubscribe granted threads");
+            assert!(
+                !plan.is_oversubscribed(),
+                "must never oversubscribe granted threads"
+            );
             assert!(plan.total_allocated_threads <= granted_threads);
 
             // Dynamically scale handle concurrency to isolation plan
@@ -147,7 +174,10 @@ mod tests {
 
             // Exceeding lane limit must be rejected
             let overflow = handle.acquire_inference_permit();
-            assert!(overflow.is_err(), "cannot exceed dynamic lane concurrency limit");
+            assert!(
+                overflow.is_err(),
+                "cannot exceed dynamic lane concurrency limit"
+            );
 
             // Dropping permits drains active inferences safely
             drop(permits);

@@ -6,8 +6,8 @@
 //!   (model downloads, generation rebuilds, queue processing) while allowing canonical operations to continue.
 //! - Disk footprint accounting: tracks disk usage across model assets, semantic DB, and vector storage.
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Operating clearance status based on available host disk space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +104,9 @@ impl DiskSafetyGuard {
         let model_assets_bytes = Self::calculate_dir_size(&models_dir);
         let staging_bytes = Self::calculate_dir_size(&staging_dir);
         let semantic_db_bytes = if semantic_db.is_file() {
-            std::fs::metadata(&semantic_db).map(|m| m.len()).unwrap_or(0)
+            std::fs::metadata(&semantic_db)
+                .map(|m| m.len())
+                .unwrap_or(0)
         } else {
             0
         };
@@ -136,7 +138,10 @@ mod tests {
         assert!(guard.is_semantic_permitted(5_000));
 
         // Low space warning
-        assert_eq!(guard.evaluate_clearance(2_000), DiskClearance::LowSpaceWarning);
+        assert_eq!(
+            guard.evaluate_clearance(2_000),
+            DiskClearance::LowSpaceWarning
+        );
         assert!(guard.is_semantic_permitted(2_000));
 
         // Emergency halt: strictly protects canonical operation

@@ -68,7 +68,10 @@ impl AutoStateMachine {
         let should_conserve = machine.available_memory_mib < 1536
             || machine.available_cpu_fraction < 0.15
             || matches!(machine.power_source, Some(PowerSource::Battery))
-            || matches!(pressure, ResourcePressure::Critical | ResourcePressure::Emergency);
+            || matches!(
+                pressure,
+                ResourcePressure::Critical | ResourcePressure::Emergency
+            );
 
         if should_conserve {
             if self.current_state != AutoModeState::Conservative {
@@ -85,7 +88,8 @@ impl AutoStateMachine {
             && matches!(pressure, ResourcePressure::Normal);
 
         if can_be_aggressive {
-            if self.current_state == AutoModeState::Conservative && dwell >= AUTO_DWELL_MIN_DURATION {
+            if self.current_state == AutoModeState::Conservative && dwell >= AUTO_DWELL_MIN_DURATION
+            {
                 self.current_state = AutoModeState::Moderate;
                 self.state_entered_at = now;
             } else if self.current_state == AutoModeState::Moderate
@@ -179,8 +183,8 @@ impl ResourceOrchestrator {
         // 2. Compute total usable CPU core pool
         let total_cpus = machine.logical_cpus;
         let available_cpu = (total_cpus as f32 * machine.available_cpu_fraction).max(1.0);
-        let usable_cores = ((available_cpu * policy.cpu_aggressiveness).round() as usize)
-            .clamp(1, total_cpus);
+        let usable_cores =
+            ((available_cpu * policy.cpu_aggressiveness).round() as usize).clamp(1, total_cpus);
 
         // 3. Bounded MCP reserve (Master Plan §14)
         let mcp_reserved = (usable_cores / 4).clamp(1, 4);
@@ -200,7 +204,10 @@ impl ResourceOrchestrator {
             // Both active: enforce minimum canonical share, divide remainder
             let min_canonical = 1;
             let split = (remaining_workers.saturating_sub(min_canonical)) / 2;
-            (min_canonical + split, (remaining_workers - (min_canonical + split)).max(1))
+            (
+                min_canonical + split,
+                (remaining_workers - (min_canonical + split)).max(1),
+            )
         } else {
             // Idle state: conservative baseline
             (1, 1)
@@ -209,13 +216,14 @@ impl ResourceOrchestrator {
         // 5. Semantic inference tuning based on policy and available memory
         let semantic_inference_lanes = (semantic_cpu_threads / 2).clamp(1, 4);
 
-        let base_batch = if policy.memory_aggressiveness > 0.70 && machine.available_memory_mib > 4096 {
-            32
-        } else if policy.memory_aggressiveness > 0.40 && machine.available_memory_mib > 2048 {
-            16
-        } else {
-            8
-        };
+        let base_batch =
+            if policy.memory_aggressiveness > 0.70 && machine.available_memory_mib > 4096 {
+                32
+            } else if policy.memory_aggressiveness > 0.40 && machine.available_memory_mib > 2048 {
+                16
+            } else {
+                8
+            };
 
         let mut allocation = ResourceAllocation {
             indexing_workers,
@@ -256,14 +264,20 @@ impl ResourceOrchestrator {
             );
         }
 
-        let mut current = self.last_allocation.write().unwrap_or_else(|e| e.into_inner());
+        let mut current = self
+            .last_allocation
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         *current = allocation;
         allocation
     }
 
     /// Read the most recent computed allocation.
     pub fn current_allocation(&self) -> ResourceAllocation {
-        let guard = self.last_allocation.read().unwrap_or_else(|e| e.into_inner());
+        let guard = self
+            .last_allocation
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         *guard
     }
 

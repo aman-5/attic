@@ -6,10 +6,10 @@
 //! - Failure isolation: corrupted or partial downloads are pruned; active models remain untouched.
 //! - Non-blocking semantics: canonical indexing proceeds even if assets are downloading or unavailable.
 
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors arising from model asset operations.
@@ -115,7 +115,10 @@ impl ModelAssetManager {
     /// `<base_dir>/models--<owner>--<repo>/snapshots/<revision>/`
     pub fn snapshot_dir(&self) -> PathBuf {
         self.base_dir
-            .join(format!("models--{}--{}", self.manifest.repo_owner, self.manifest.repo_name))
+            .join(format!(
+                "models--{}--{}",
+                self.manifest.repo_owner, self.manifest.repo_name
+            ))
             .join("snapshots")
             .join(&self.manifest.pinned_revision)
     }
@@ -123,12 +126,10 @@ impl ModelAssetManager {
     /// Staging directory path for in-progress preparation:
     /// `<base_dir>/staging/<owner>--<repo>--<revision>/`
     pub fn staging_dir(&self) -> PathBuf {
-        self.base_dir
-            .join("staging")
-            .join(format!(
-                "{}--{}--{}",
-                self.manifest.repo_owner, self.manifest.repo_name, self.manifest.pinned_revision
-            ))
+        self.base_dir.join("staging").join(format!(
+            "{}--{}--{}",
+            self.manifest.repo_owner, self.manifest.repo_name, self.manifest.pinned_revision
+        ))
     }
 
     /// Check current local asset status without network operations.
@@ -192,7 +193,9 @@ impl ModelAssetManager {
                 if meta.len() != expected_size {
                     return Err(ModelAssetError::ValidationFailed(format!(
                         "size mismatch for {}: expected {}, got {}",
-                        file_spec.filename, expected_size, meta.len()
+                        file_spec.filename,
+                        expected_size,
+                        meta.len()
                     )));
                 }
             }
@@ -282,7 +285,9 @@ mod tests {
         fs::write(staging.join("tokenizer.json"), "{}").unwrap();
         fs::write(staging.join("model.safetensors"), "binary-weights").unwrap();
 
-        let active_path = mgr.activate_staging(&staging).expect("activation must succeed");
+        let active_path = mgr
+            .activate_staging(&staging)
+            .expect("activation must succeed");
         assert!(active_path.is_dir());
         assert!(!staging.exists(), "staging dir should be moved");
 
@@ -297,7 +302,10 @@ mod tests {
         // Verify refs/main
         let refs_main = tmp
             .path()
-            .join(format!("models--{}--{}", manifest.repo_owner, manifest.repo_name))
+            .join(format!(
+                "models--{}--{}",
+                manifest.repo_owner, manifest.repo_name
+            ))
             .join("refs")
             .join("main");
         assert_eq!(
@@ -321,7 +329,10 @@ mod tests {
             ModelAssetError::MissingFile(f) => assert_eq!(f, "tokenizer.json"),
             other => panic!("unexpected error: {other:?}"),
         }
-        assert!(staging.exists(), "staging remains for diagnostic inspection");
+        assert!(
+            staging.exists(),
+            "staging remains for diagnostic inspection"
+        );
     }
 
     #[test]
@@ -350,7 +361,10 @@ mod tests {
         assert_eq!(manifest.model_id, "qwen3-embedding-0.6b");
         assert_eq!(manifest.repo_owner, "Qwen");
         assert_eq!(manifest.repo_name, "Qwen3-Embedding-0.6B");
-        assert_eq!(manifest.pinned_revision, "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3");
+        assert_eq!(
+            manifest.pinned_revision,
+            "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+        );
         assert_eq!(manifest.license, "Apache-2.0");
 
         let filenames: Vec<&str> = manifest.files.iter().map(|f| f.filename.as_str()).collect();
