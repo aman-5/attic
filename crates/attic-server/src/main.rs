@@ -3253,6 +3253,12 @@ enum Ownership {
 /// immediately, running no destructors at all, so the runtime's blocking drop
 /// (and whatever it might be stuck waiting on) never gets a chance to run.
 fn main() {
+    // Configure global thread ceilings once at process startup before runtime initialization (§21)
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    attic_semantic::CpuIsolationPlan::configure_startup_thread_ceiling(max_threads);
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

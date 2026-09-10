@@ -636,7 +636,11 @@ fn quality_and_speed_benchmark_gate() {
 
         println!(
             "CPU Grant: {:<2} | Lanes: {:<2} | Allocated: {:<2} | Threads/Lane: {:<2} | Query Latency: {:.2} ms",
-            granted_threads, plan.inference_lanes, plan.total_allocated_threads, plan.threads_per_lane, query_ms
+            granted_threads,
+            plan.inference_lanes,
+            plan.total_allocated_threads,
+            plan.threads_per_lane,
+            query_ms
         );
         isolation_metrics.push((
             granted_threads,
@@ -758,7 +762,10 @@ fn quality_and_speed_benchmark_gate() {
     );
     println!(
         "  Query Embedding: p50={:.2}ms, p95={:.2}ms (SLA: p50<={:.0}ms, p95<={:.0}ms)",
-        query_emb_p50, query_emb_p95, reqs.max_query_embedding_p50_ms, reqs.max_query_embedding_p95_ms
+        query_emb_p50,
+        query_emb_p95,
+        reqs.max_query_embedding_p50_ms,
+        reqs.max_query_embedding_p95_ms
     );
     println!(
         "  Vector Search (10k): p50={:.2}ms, p95={:.2}ms (SLA: p95<={:.0}ms)",
@@ -770,7 +777,10 @@ fn quality_and_speed_benchmark_gate() {
     );
     println!(
         "  TOTAL MCP Latency: p50={:.2}ms, p95={:.2}ms (NORMAL Mode SLA: p50<={:.0}ms, p95<={:.0}ms)",
-        total_mcp_p50, total_mcp_p95, reqs.max_end_to_end_mcp_p50_ms, reqs.max_end_to_end_mcp_p95_ms
+        total_mcp_p50,
+        total_mcp_p95,
+        reqs.max_end_to_end_mcp_p50_ms,
+        reqs.max_end_to_end_mcp_p95_ms
     );
 
     // ── 8. Separate Independent Product Gates Evaluation (C4, C12) ──────────
@@ -1009,7 +1019,10 @@ fn quality_and_speed_benchmark_gate() {
     assert!(
         interactive_pass,
         "Interactive speed gate failed: query embedding latency p50={:.2}ms, p95={:.2}ms (limits: p50<={:.2}ms, p95<={:.2}ms)",
-        query_emb_p50, query_emb_p95, reqs.max_query_embedding_p50_ms, reqs.max_query_embedding_p95_ms
+        query_emb_p50,
+        query_emb_p95,
+        reqs.max_query_embedding_p50_ms,
+        reqs.max_query_embedding_p95_ms
     );
     assert!(
         bulk_pass,
@@ -1024,7 +1037,10 @@ fn quality_and_speed_benchmark_gate() {
     assert!(
         mcp_pass,
         "MCP latency gate failed: total MCP latency p50={:.2}ms, p95={:.2}ms (NORMAL Mode SLA: p50<={:.2}ms, p95<={:.2}ms)",
-        total_mcp_p50, total_mcp_p95, reqs.max_end_to_end_mcp_p50_ms, reqs.max_end_to_end_mcp_p95_ms
+        total_mcp_p50,
+        total_mcp_p95,
+        reqs.max_end_to_end_mcp_p50_ms,
+        reqs.max_end_to_end_mcp_p95_ms
     );
     assert!(
         safety_pass,

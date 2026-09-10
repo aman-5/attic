@@ -39,19 +39,32 @@ impl CpuIsolationPlan {
         self.total_allocated_threads > self.granted_semantic_threads
     }
 
-    /// Apply environment constraints as a startup hint before runtime pools exist.
-    /// Note: Runtime elasticity must be enforced through admission control and scoped lane pools.
-    pub fn apply_environment_hints(&self) {
-        let threads_str = self.threads_per_lane.to_string();
+    /// Configure global Rayon, native math, and BLAS thread ceilings once during startup,
+    /// before runtime initialization. Subsequent thread resizing at runtime via environment
+    /// variables is explicitly forbidden as it is ignored by already initialized pools.
+    pub fn configure_startup_thread_ceiling(max_threads: usize) {
+        let threads = max_threads.max(1);
+        let threads_str = threads.to_string();
         unsafe {
-            std::env::set_var("RAYON_NUM_THREADS", &threads_str);
-            std::env::set_var("OMP_NUM_THREADS", &threads_str);
-            std::env::set_var("MKL_NUM_THREADS", &threads_str);
+            if std::env::var("RAYON_NUM_THREADS").is_err() {
+                std::env::set_var("RAYON_NUM_THREADS", &threads_str);
+            }
+            if std::env::var("OMP_NUM_THREADS").is_err() {
+                std::env::set_var("OMP_NUM_THREADS", &threads_str);
+            }
+            if std::env::var("MKL_NUM_THREADS").is_err() {
+                std::env::set_var("MKL_NUM_THREADS", &threads_str);
+            }
         }
     }
 
-    /// Build a dedicated, isolated Rayon thread pool for this plan's per-lane budget.
-    /// Does NOT rely on mutating environment variables after global thread pools exist (§21).
+    /// Build a dedicated, isolated Rayon thread pool for Attic's per-lane work.
+    ///
+    /// Note on native math concurrency: A local Rayon pool controls Attic tasks and
+    /// Rayon-based operations executed within it, but does not claim to override external
+    /// native BLAS/C runtime pools once initialized. Dynamic Qwen CPU containment is
+    /// governed proactively by `ResourceOrchestrator` admission control and lane throttling,
+    /// backed by startup environment ceilings.
     pub fn create_lane_pool(&self) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads_per_lane)
@@ -59,9 +72,8 @@ impl CpuIsolationPlan {
             .build()
     }
 
-    /// Execute a closure inside a dedicated, bounded Rayon thread pool matching this plan's
-    /// per-lane CPU budget, guaranteeing that math/gemm/tokenizer libraries cannot multiply
-    /// beyond `threads_per_lane`.
+    /// Execute a closure inside a dedicated Rayon thread pool matching this plan's
+    /// per-lane CPU budget.
     pub fn execute_isolated<F, R>(&self, op: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -103,12 +115,11 @@ mod tests {
         assert!(!plan.is_oversubscribed());
     }
 
-
     #[test]
     fn plan_execute_isolated_bounds_threads() {
         for &(granted, lanes) in &[(8, 2), (4, 4), (2, 2), (6, 2)] {
             let plan = CpuIsolationPlan::compute(granted, lanes);
-            let threads_used = plan.execute_isolated(|| rayon::current_num_threads());
+            let threads_used = plan.execute_isolated(rayon::current_num_threads);
             assert_eq!(threads_used, plan.threads_per_lane);
         }
     }
@@ -144,7 +155,10 @@ mod tests {
             let observed_clone = Arc::clone(&observed_threads);
 
             pool.broadcast(|ctx| {
-                let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+                let name = std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string();
                 let index = ctx.index();
                 observed_clone.lock().unwrap().insert((index, name));
 

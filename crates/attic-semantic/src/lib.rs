@@ -28,12 +28,12 @@ pub mod learned_tuning;
 pub mod model_assets;
 pub mod model_lifecycle;
 pub mod provider;
-pub mod testing;
 pub mod qwen3_model;
 pub mod qwen3_provider;
 pub mod scheduler;
 pub mod selection;
 pub mod store;
+pub mod testing;
 pub mod throughput_controller;
 
 pub use cpu_isolation::CpuIsolationPlan;

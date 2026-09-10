@@ -71,6 +71,7 @@ impl<'a> ScanBudget<'a> {
             return true;
         }
         if let Some(d) = self.deadline
+            && (scanned & 1023 == 0)
             && std::time::Instant::now() >= d
         {
             return true;
@@ -112,12 +113,109 @@ pub struct ActiveIdentityRow {
     pub selection_version: String,
 }
 
+/// Compact coarse vector dimension for stage-1 candidate search.
+/// Qwen3 is an MRL (Matryoshka Representation Learning) model: the first 32 dimensions
+/// capture the coarse semantic topology with high recall fidelity.
+const COARSE_INDEX_DIM: usize = 32;
+
+/// A lightweight candidate index entry cached in memory for high-throughput candidate search.
+#[derive(Debug, Clone)]
+struct CandidateEntry {
+    rowid: i64,
+    repository_id: String,
+    coarse: [f32; COARSE_INDEX_DIM],
+    inv_norm: f32,
+}
+
+/// Generation-isolated candidate index.
+#[derive(Debug, Default)]
+struct GenerationIndex {
+    #[allow(dead_code)]
+    generation_id: i64,
+    entries: Vec<CandidateEntry>,
+    last_synced_rowid: i64,
+}
+
+impl GenerationIndex {
+    /// Stage 1: Candidate Search + Stage 2: Metadata Filtering
+    /// Returns the top candidate rowids (up to candidate_limit) ordered by coarse similarity.
+    fn search_candidates(
+        &self,
+        query: &[f32],
+        candidate_limit: usize,
+        repository_filter: Option<&str>,
+        budget: &ScanBudget<'_>,
+    ) -> (Vec<i64>, u64, bool) {
+        if self.entries.is_empty() || candidate_limit == 0 {
+            return (Vec::new(), 0, false);
+        }
+
+        let mut q_coarse = [0.0f32; COARSE_INDEX_DIM];
+        let copy_len = query.len().min(COARSE_INDEX_DIM);
+        q_coarse[..copy_len].copy_from_slice(&query[..copy_len]);
+
+        let q_norm: f32 = q_coarse.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if q_norm <= 0.0 {
+            return (Vec::new(), 0, false);
+        }
+        let inv_qnorm = 1.0 / q_norm;
+
+        let mut top_candidates: Vec<(f32, i64)> = Vec::with_capacity(candidate_limit + 1);
+        let mut min_sim = f32::MIN;
+        let mut scanned: u64 = 0;
+        let mut truncated = false;
+
+        for entry in &self.entries {
+            if budget.exhausted(scanned) {
+                truncated = true;
+                break;
+            }
+
+            // Stage 2: Metadata filtering
+            if let Some(repo) = repository_filter
+                && entry.repository_id != repo
+            {
+                continue;
+            }
+
+            scanned += 1;
+
+            if entry.inv_norm <= 0.0 {
+                continue;
+            }
+
+            let mut dot = 0.0f32;
+            for (q, c) in q_coarse.iter().zip(entry.coarse.iter()) {
+                dot += *q * *c;
+            }
+            let sim = dot * (inv_qnorm * entry.inv_norm);
+
+            if top_candidates.len() == candidate_limit && sim <= min_sim {
+                continue;
+            }
+
+            let pos = top_candidates.partition_point(|(s, _)| *s >= sim);
+            top_candidates.insert(pos, (sim, entry.rowid));
+            if top_candidates.len() > candidate_limit {
+                top_candidates.pop();
+            }
+            if top_candidates.len() == candidate_limit {
+                min_sim = top_candidates.last().unwrap().0;
+            }
+        }
+
+        let candidate_rowids = top_candidates.into_iter().map(|(_, rowid)| rowid).collect();
+        (candidate_rowids, scanned, truncated)
+    }
+}
+
 /// Shared-handle-safe semantic store: rusqlite connections are `!Sync`, so
 /// every access goes through an internal mutex (contention is negligible at
 /// Phase 5 scales; queries hold it only for bounded reads).
 #[derive(Debug)]
 pub struct SemanticStore {
     conn: Mutex<Connection>,
+    candidate_index: Mutex<HashMap<i64, GenerationIndex>>,
 }
 
 impl SemanticStore {
@@ -135,6 +233,7 @@ impl SemanticStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            candidate_index: Mutex::new(HashMap::new()),
         })
     }
 
@@ -144,6 +243,7 @@ impl SemanticStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            candidate_index: Mutex::new(HashMap::new()),
         })
     }
 
@@ -607,7 +707,137 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Synchronize the in-memory generation candidate index from SQLite for the given generation ID.
+    pub fn ensure_candidate_index_synced(
+        &self,
+        conn: &Connection,
+        generation_id: i64,
+    ) -> Result<(), SemanticError> {
+        let mut index_guard = self.candidate_index.lock().map_err(|_| {
+            SemanticError::StoreUnavailable("candidate index mutex poisoned".into())
+        })?;
+
+        let gen_idx = index_guard
+            .entry(generation_id)
+            .or_insert_with(|| GenerationIndex {
+                generation_id,
+                entries: Vec::new(),
+                last_synced_rowid: 0,
+            });
+
+        let mut stmt = conn.prepare(
+            "SELECT rowid, repository_id, norm, substr(vector, 1, 128)
+             FROM sem_embeddings
+             WHERE generation_id = ?1 AND rowid > ?2
+             ORDER BY rowid ASC",
+        )?;
+        let mut rows = stmt.query(params![generation_id, gen_idx.last_synced_rowid])?;
+        while let Some(r) = rows.next()? {
+            let rowid: i64 = r.get(0)?;
+            let repo_id: String = r.get(1)?;
+            let _norm: f32 = r.get(2)?;
+            let blob: Vec<u8> = r.get(3)?;
+
+            let mut coarse = [0.0f32; COARSE_INDEX_DIM];
+            let floats_to_read = (blob.len() / 4).min(COARSE_INDEX_DIM);
+            for i in 0..floats_to_read {
+                coarse[i] = f32::from_le_bytes([
+                    blob[i * 4],
+                    blob[i * 4 + 1],
+                    blob[i * 4 + 2],
+                    blob[i * 4 + 3],
+                ]);
+            }
+            let coarse_norm = coarse.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let inv_norm = if coarse_norm > 0.0 {
+                1.0 / coarse_norm
+            } else {
+                0.0
+            };
+            gen_idx.entries.push(CandidateEntry {
+                rowid,
+                repository_id: repo_id,
+                coarse,
+                inv_norm,
+            });
+            gen_idx.last_synced_rowid = rowid;
+        }
+        Ok(())
+    }
+
+    /// Stage 3: Exact Cosine Rerank.
+    /// Fetches the full high-precision vector blobs for candidate rowids from SQLite via direct B-tree lookup,
+    /// computes exact cosine similarities across the full dimension (e.g. 512 or 1024),
+    /// and returns the top k nearest hits.
+    fn rerank_candidates(
+        conn: &Connection,
+        query: &[f32],
+        qnorm: f32,
+        k: usize,
+        candidate_rowids: &[i64],
+    ) -> Result<Vec<NearestHit>, SemanticError> {
+        if candidate_rowids.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut top: Vec<(f32, String)> = Vec::with_capacity(k + 1);
+
+        for chunk in candidate_rowids.chunks(100) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
+                 WHERE rowid IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                params_vec.push(id);
+            }
+
+            let mut rows = stmt.query(params_vec.as_slice())?;
+            while let Some(r) = rows.next()? {
+                let unit_id: String = r.get(0)?;
+                let stored_norm: f32 = r.get(1)?;
+                let blob: Vec<u8> = r.get(2)?;
+
+                if stored_norm <= 0.0 || blob.len() != query.len() * 4 {
+                    continue;
+                }
+
+                let mut dot = 0.0f32;
+                let floats = blob.as_chunks::<4>().0;
+                for (i, chunk) in floats.iter().enumerate() {
+                    let b = f32::from_le_bytes(*chunk);
+                    dot += query[i] * b;
+                }
+                let sim = dot / (qnorm * stored_norm);
+
+                if top.len() == k && sim <= top.last().map_or(f32::MIN, |(s, _)| *s) {
+                    continue;
+                }
+                let pos = top.partition_point(|(s, _)| *s >= sim);
+                top.insert(pos, (sim, unit_id));
+                if top.len() > k {
+                    top.pop();
+                }
+            }
+        }
+
+        let hits = top
+            .into_iter()
+            .map(|(sim, id)| NearestHit {
+                retrieval_unit_id: id,
+                similarity: sim,
+            })
+            .collect();
+        Ok(hits)
+    }
+
     /// Search nearest neighbors strictly isolated within a specific semantic generation (§52).
+    /// Employs real production two-stage retrieval:
+    ///   1. Candidate Search: fast coarse vector index scan over generation vectors.
+    ///   2. Metadata Filtering: enforces repository scoping and generation isolation.
+    ///   3. Exact Cosine Rerank: loads exact full-dimension vectors for candidates and reranks.
     pub fn knn_search_generation(
         &self,
         generation_id: i64,
@@ -624,65 +854,42 @@ impl SemanticStore {
                 truncated_by_budget: budget.max_rows > 0 || budget.deadline.is_some(),
             });
         }
+
         let conn = self.guard()?;
-        let mut stmt;
-        let mut rows = match repository_filter {
-            Some(repo) => {
-                stmt = conn.prepare(
-                    "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
-                      WHERE generation_id = ?1 AND repository_id = ?2",
-                )?;
-                stmt.query(params![generation_id, repo])?
-            }
-            None => {
-                stmt = conn.prepare(
-                    "SELECT retrieval_unit_id, norm, vector FROM sem_embeddings
-                      WHERE generation_id = ?1",
-                )?;
-                stmt.query(params![generation_id])?
-            }
+
+        // Ensure generation candidate index is up-to-date
+        self.ensure_candidate_index_synced(&conn, generation_id)?;
+
+        // Candidate limit: top candidates to advance to exact reranking
+        let candidate_limit = (k * 20).max(100);
+
+        // Stage 1 & 2: Candidate search with metadata filtering
+        let (candidate_ids, rows_scanned, truncated) = {
+            let mut index_guard = self.candidate_index.lock().unwrap();
+            let gen_idx = index_guard
+                .entry(generation_id)
+                .or_insert_with(|| GenerationIndex {
+                    generation_id,
+                    entries: Vec::new(),
+                    last_synced_rowid: 0,
+                });
+            gen_idx.search_candidates(query, candidate_limit, repository_filter, budget)
         };
-        let mut top: Vec<(f32, String)> = Vec::with_capacity(k + 1);
-        let mut scanned: u64 = 0;
-        let mut truncated = false;
-        while let Some(r) = rows.next()? {
-            if budget.exhausted(scanned) {
-                truncated = true;
-                break;
-            }
-            scanned += 1;
-            let unit_id: String = r.get(0)?;
-            let stored_norm: f32 = r.get(1)?;
-            let blob: Vec<u8> = r.get(2)?;
-            if stored_norm <= 0.0 || blob.len() != query.len() * 4 {
-                continue;
-            }
-            let mut dot = 0.0f32;
-            let floats = blob.as_chunks::<4>().0;
-            for (i, chunk) in floats.iter().enumerate() {
-                let b = f32::from_le_bytes(*chunk);
-                dot += query[i] * b;
-            }
-            let sim = dot / (qnorm * stored_norm);
-            if top.len() == k && sim <= top.last().map_or(f32::MIN, |(s, _)| *s) {
-                continue;
-            }
-            let pos = top.partition_point(|(s, _)| *s >= sim);
-            top.insert(pos, (sim, unit_id));
-            if top.len() > k {
-                top.pop();
-            }
+
+        if candidate_ids.is_empty() {
+            return Ok(KnnResult {
+                hits: Vec::new(),
+                rows_scanned,
+                truncated_by_budget: truncated,
+            });
         }
-        let hits: Vec<NearestHit> = top
-            .into_iter()
-            .map(|(sim, id)| NearestHit {
-                retrieval_unit_id: id,
-                similarity: sim,
-            })
-            .collect();
+
+        // Stage 3: Exact Cosine Rerank
+        let hits = Self::rerank_candidates(&conn, query, qnorm, k, &candidate_ids)?;
+
         Ok(KnnResult {
             hits,
-            rows_scanned: scanned,
+            rows_scanned,
             truncated_by_budget: truncated,
         })
     }

@@ -186,15 +186,9 @@ impl Qwen3Attention {
                 _ => AttnMask::None,
             };
 
-            if let Ok(ctx) = flash_attn::<f32>(
-                &q_flash,
-                &k_flash,
-                &v_flash,
-                scale,
-                flash_mask,
-                None,
-                None,
-            ) {
+            if let Ok(ctx) =
+                flash_attn::<f32>(&q_flash, &k_flash, &v_flash, scale, flash_mask, None, None)
+            {
                 // Output from CPU flash attention is (B, H, S, D), transpose to (B, S, H, D)
                 return ctx
                     .transpose(1, 2)?

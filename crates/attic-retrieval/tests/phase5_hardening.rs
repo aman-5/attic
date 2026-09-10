@@ -10,8 +10,8 @@ use attic_retrieval::{
     AnswerMode, AnswerModePolicy, AnswerRequest, RetrievalService, semantic::SemanticStack,
 };
 use attic_semantic::{
-    CancelFlag, EmbeddingInput, EnrichmentConfig, ResourceUsage, ScanBudget,
-    SemanticProvider, testing::{HashingEmbedder, SlowProvider},
+    CancelFlag, EmbeddingInput, EnrichmentConfig, ResourceUsage, ScanBudget, SemanticProvider,
+    testing::{HashingEmbedder, SlowProvider},
 };
 use common::Fixture;
 

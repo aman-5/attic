@@ -11,8 +11,8 @@
 //!   items may still be returned alongside the error.
 //! * Resource accounting is observable, never hidden inside the provider.
 
-use std::time::Instant;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::error::SemanticError;
 
@@ -244,4 +244,3 @@ impl SemanticProvider for UnavailableProvider {
         })
     }
 }
-

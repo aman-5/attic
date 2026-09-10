@@ -248,7 +248,6 @@ fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
         handle.update_cpu_allocation(granted_threads, requested_lanes);
         let plan = handle.isolation_plan();
         assert_eq!(handle.max_concurrency(), plan.inference_lanes);
-        plan.apply_environment_hints();
 
         // Perform real Qwen inference under the dynamic plan strictly isolated in scoped pool
         let vec = handle

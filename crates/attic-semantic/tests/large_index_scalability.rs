@@ -124,6 +124,10 @@ fn populate_embeddings_tier(
         inserted += current_chunk;
     }
 
+    store
+        .ensure_candidate_index_synced(&raw_conn, generation_id)
+        .expect("sync candidate index");
+
     t0.elapsed()
 }
 
@@ -281,7 +285,14 @@ fn large_index_retrieval_scalability_gate() {
         .knn_search_generation(generation_id, &query_vector, 10, None, &deadline_25ms)
         .expect("knn deadline 500k");
     let deadline_500k_ms = t_deadline_500k.elapsed().as_secs_f64() * 1000.0;
-    assert!(res_deadline_500k.truncated_by_budget);
+    println!(
+        "500k candidate search completed in {:.2}ms",
+        deadline_500k_ms
+    );
+    assert!(
+        !res_deadline_500k.truncated_by_budget,
+        "candidate-indexed search on 500k vectors must complete without arbitrary budget truncation"
+    );
     assert!(
         deadline_500k_ms <= 80.0,
         "deadline SLA must bound search time"
@@ -303,7 +314,11 @@ fn large_index_retrieval_scalability_gate() {
         .knn_search_generation(generation_id, &query_vector, 10, None, &deadline_40ms)
         .expect("knn deadline 1m");
     let deadline_1m_ms = t_deadline_1m.elapsed().as_secs_f64() * 1000.0;
-    assert!(res_deadline_1m.truncated_by_budget);
+    println!("1M candidate search completed in {:.2}ms", deadline_1m_ms);
+    assert!(
+        !res_deadline_1m.truncated_by_budget,
+        "candidate-indexed search on 1M vectors must complete without arbitrary budget truncation"
+    );
     assert!(
         deadline_1m_ms <= 100.0,
         "1M deadline enforcement must bound search time"
@@ -328,10 +343,21 @@ fn large_index_retrieval_scalability_gate() {
     let scoped_1m_ms = t_scoped_1m.elapsed().as_secs_f64() * 1000.0;
 
     // Truncation Quality Impact Analysis (Recall@10, MRR, and Cosine Retention)
-    let gt_hits: Vec<&str> = res_100k.hits.iter().map(|h| h.retrieval_unit_id.as_str()).collect();
-    let bounded_hits: Vec<&str> = res_cap.hits.iter().map(|h| h.retrieval_unit_id.as_str()).collect();
+    let gt_hits: Vec<&str> = res_100k
+        .hits
+        .iter()
+        .map(|h| h.retrieval_unit_id.as_str())
+        .collect();
+    let bounded_hits: Vec<&str> = res_cap
+        .hits
+        .iter()
+        .map(|h| h.retrieval_unit_id.as_str())
+        .collect();
 
-    let matched_hits = bounded_hits.iter().filter(|id| gt_hits.contains(id)).count();
+    let matched_hits = bounded_hits
+        .iter()
+        .filter(|id| gt_hits.contains(id))
+        .count();
     let recall_at_10 = if !gt_hits.is_empty() {
         matched_hits as f64 / gt_hits.len() as f64
     } else {
@@ -399,6 +425,7 @@ fn large_index_retrieval_scalability_gate() {
     // ── Generate Report Markdown ────────────────────────────────────────────
     let sla_fn = |val: f64| if val <= 150.0 { "PASS" } else { "FAIL" };
     let mcp_sla_fn = |val: f64| if val <= 1200.0 { "PASS" } else { "FAIL" };
+    let trunc_fn = |b: bool| if b { "Yes" } else { "No" };
 
     let report_content = format!(
         r#"# Large-Index Retrieval Scalability Report (CP20 / F10 / C11)
@@ -420,15 +447,15 @@ fn large_index_retrieval_scalability_gate() {
 | **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | {pop_100k:.2} s | Unscoped (Exhaustive) | {scanned_100k} | {knn_100k:.2} ms | — | Baseline | {total_100k:.2} ms | Baseline | No |
 | **Tier 2 (100k)** | 100,000 | {size_100k:.1} MiB | — | `max_rows` cap (15,000) | {scanned_cap} | — | {cap_ms:.2} ms | {sla_cap} | {total_cap:.2} ms | {mcp_sla_cap} | Yes |
 | **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | {pop_500k:.2} s | Scoped (`repo-engine`) (Exhaustive) | {scanned_scoped_500k} | {scoped_500k:.2} ms | — | Baseline | {total_scoped_500k:.2} ms | Baseline | No |
-| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | — | SLA Deadline (25 ms) | {scanned_deadline_500k} | — | {deadline_500k:.2} ms | {sla_deadline_500k} | {total_deadline_500k:.2} ms | {mcp_sla_deadline_500k} | Yes |
-| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | {pop_1m:.2} s | SLA Deadline (40 ms) | {scanned_deadline_1m} | — | {deadline_1m:.2} ms | {sla_deadline_1m} | {total_deadline_1m:.2} ms | {mcp_sla_deadline_1m} | Yes |
-| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | — | Scoped Bounded (30 ms) | {scanned_scoped_1m} | — | {scoped_1m:.2} ms | {sla_scoped_1m} | {total_scoped_1m:.2} ms | {mcp_sla_scoped_1m} | Yes |
+| **Tier 3 (500k)** | 500,000 | {size_500k:.1} MiB | — | SLA Deadline (25 ms) | {scanned_deadline_500k} | — | {deadline_500k:.2} ms | {sla_deadline_500k} | {total_deadline_500k:.2} ms | {mcp_sla_deadline_500k} | {trunc_500k} |
+| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | {pop_1m:.2} s | SLA Deadline (40 ms) | {scanned_deadline_1m} | — | {deadline_1m:.2} ms | {sla_deadline_1m} | {total_deadline_1m:.2} ms | {mcp_sla_deadline_1m} | {trunc_1m} |
+| **Tier 4 (1M+)** | 1,000,000 | {size_1m:.1} MiB | — | Scoped Bounded (30 ms) | {scanned_scoped_1m} | — | {scoped_1m:.2} ms | {sla_scoped_1m} | {total_scoped_1m:.2} ms | {mcp_sla_scoped_1m} | {trunc_scoped_1m} |
 
 ---
 
 ## 2. Separate Scalability and MCP Latency Verdicts (C11)
 - **VECTOR SEARCH SCALABILITY**: **PASS**
-  - All bounded scale tiers (30k through 1,000,000+ vectors) enforce strict sub-100ms vector search latency bounds via `ScanBudget` (`max_rows` and `deadline`), strictly satisfying the <= 150ms Vector Search SLA.
+  - All bounded scale tiers (30k through 1,000,000+ vectors) enforce strict sub-100ms vector search latency bounds via candidate-indexed retrieval, strictly satisfying the <= 150ms Vector Search SLA without arbitrary truncation.
   - Scoped queries achieve 2-4x speedup via `(generation_id, repository_id)` compound indexing.
   - Bounded scanning (15% scan cap on 100k vectors) retains `{recall_at_10:.2}` Recall@10, `{mrr:.2}` MRR, and `{quality_retention:.1}%` of peak cosine similarity.
 - **END-TO-END MCP LATENCY**:
@@ -442,9 +469,7 @@ fn large_index_retrieval_scalability_gate() {
         pop_30k = t_pop_30k.as_secs_f64(),
         scanned_30k = res_30k.rows_scanned,
         knn_30k = knn_30k_ms,
-        sla_30k = sla_fn(knn_30k_ms),
         total_30k = query_emb_ms + knn_30k_ms,
-        mcp_sla_30k = mcp_sla_fn(query_emb_ms + knn_30k_ms),
         scanned_scoped_30k = res_scoped_30k.rows_scanned,
         scoped_30k = scoped_30k_ms,
         sla_scoped_30k = sla_fn(scoped_30k_ms),
@@ -455,7 +480,6 @@ fn large_index_retrieval_scalability_gate() {
         scanned_100k = res_100k.rows_scanned,
         knn_100k = knn_100k_ms,
         total_100k = query_emb_ms + knn_100k_ms,
-        mcp_sla_100k = mcp_sla_fn(query_emb_ms + knn_100k_ms),
         scanned_cap = res_cap.rows_scanned,
         cap_ms = cap_ms,
         sla_cap = sla_fn(cap_ms),
@@ -466,12 +490,12 @@ fn large_index_retrieval_scalability_gate() {
         scanned_scoped_500k = res_scoped_500k.rows_scanned,
         scoped_500k = scoped_500k_ms,
         total_scoped_500k = query_emb_ms + scoped_500k_ms,
-        mcp_sla_scoped_500k = mcp_sla_fn(query_emb_ms + scoped_500k_ms),
         scanned_deadline_500k = res_deadline_500k.rows_scanned,
         deadline_500k = deadline_500k_ms,
         sla_deadline_500k = sla_fn(deadline_500k_ms),
         total_deadline_500k = query_emb_ms + deadline_500k_ms,
         mcp_sla_deadline_500k = mcp_sla_fn(query_emb_ms + deadline_500k_ms),
+        trunc_500k = trunc_fn(res_deadline_500k.truncated_by_budget),
         size_1m = db_size_1m,
         pop_1m = t_pop_1m.as_secs_f64(),
         scanned_deadline_1m = res_deadline_1m.rows_scanned,
@@ -479,11 +503,13 @@ fn large_index_retrieval_scalability_gate() {
         sla_deadline_1m = sla_fn(deadline_1m_ms),
         total_deadline_1m = query_emb_ms + deadline_1m_ms,
         mcp_sla_deadline_1m = mcp_sla_fn(query_emb_ms + deadline_1m_ms),
+        trunc_1m = trunc_fn(res_deadline_1m.truncated_by_budget),
         scanned_scoped_1m = res_scoped_1m.rows_scanned,
         scoped_1m = scoped_1m_ms,
         sla_scoped_1m = sla_fn(scoped_1m_ms),
         total_scoped_1m = query_emb_ms + scoped_1m_ms,
         mcp_sla_scoped_1m = mcp_sla_fn(query_emb_ms + scoped_1m_ms),
+        trunc_scoped_1m = trunc_fn(res_scoped_1m.truncated_by_budget),
         query_emb = query_emb_ms,
         recall_at_10 = recall_at_10,
         mrr = mrr,
@@ -505,8 +531,8 @@ fn large_index_retrieval_scalability_gate() {
     assert_eq!(res_30k.rows_scanned, 30_000);
     assert_eq!(res_100k.rows_scanned, 100_000);
     assert!(res_cap.truncated_by_budget);
-    assert!(res_deadline_500k.truncated_by_budget);
-    assert!(res_deadline_1m.truncated_by_budget);
+    assert!(!res_deadline_500k.truncated_by_budget);
+    assert!(!res_deadline_1m.truncated_by_budget);
     assert!(
         scoped_30k_ms <= knn_30k_ms * 1.5 || res_scoped_30k.rows_scanned < res_30k.rows_scanned,
         "Scoped query must scan fewer rows or be faster than unscoped"

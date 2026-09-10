@@ -13,7 +13,9 @@ use attic_retrieval::{
 };
 use attic_semantic::{
     CancelFlag, EnrichmentConfig,
-    testing::{FailingProvider, HashingEmbedder, RecordingProvider, SlowProvider, UnavailableProvider},
+    testing::{
+        FailingProvider, HashingEmbedder, RecordingProvider, SlowProvider, UnavailableProvider,
+    },
 };
 use common::Fixture;
 
