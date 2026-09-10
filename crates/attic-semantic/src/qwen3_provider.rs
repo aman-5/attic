@@ -18,9 +18,7 @@ use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::qwen2::{Config as Qwen2Config, Model as Qwen2Model};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
-
 use crate::embedding_profile::{EmbeddingSpaceDescriptor, PoolingStrategy, TruncationPolicy};
 use crate::error::SemanticError;
 use crate::instruction::{format_query_instruction, CODE_RETRIEVAL_V1_ID};
@@ -28,6 +26,7 @@ use crate::provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput,
     EmbeddingOutput, EmbeddingProvider, ResourceUsage, SemanticProvider,
 };
+use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 
 pub const HF_QWEN_OWNER: &str = "Qwen";
 pub const HF_QWEN_REPO: &str = "Qwen3-Embedding-0.6B";
@@ -58,7 +57,7 @@ impl QwenPooling {
 
 /// A real, Candle-backed provider for Qwen3 embeddings.
 pub struct Qwen3Embedder {
-    model: Mutex<Qwen2Model>,
+    model: Mutex<Qwen3Model>,
     tokenizer: Tokenizer,
     device: Device,
     batch_size: usize,
@@ -74,6 +73,13 @@ impl Qwen3Embedder {
     /// Native hidden dimensionality of the model before Matryoshka truncation.
     pub fn native_dims(&self) -> usize {
         self.native_dims
+    }
+
+    /// Update target Matryoshka dimension without reloading model tensors.
+    pub fn set_target_dims(&mut self, dims: usize) {
+        assert!(dims > 0 && dims <= self.native_dims, "target dimension must be <= native dims");
+        self.target_dims = dims;
+        self.fingerprint.dimension = dims;
     }
 
     /// Construct a `Qwen3Embedder` from a local cache directory or Hugging Face.
@@ -235,29 +241,10 @@ impl Qwen3Embedder {
             }
         })?;
 
-        // Lenient parsing of Qwen2Config to accommodate variations in sliding window fields
-        let mut config_val: serde_json::Value =
+        let qwen_config: Qwen3Config =
             serde_json::from_str(&config_str).map_err(|e| SemanticError::ProviderUnavailable {
                 provider: QWEN_PROVIDER_ID.into(),
-                reason: format!("failed to parse {}: {e}", config_path.display()),
-            })?;
-
-        if let Some(obj) = config_val.as_object_mut() {
-            if !obj.contains_key("sliding_window") || obj["sliding_window"].is_null() {
-                obj.insert("sliding_window".to_string(), serde_json::json!(4096));
-            }
-            if !obj.contains_key("max_window_layers") || obj["max_window_layers"].is_null() {
-                obj.insert("max_window_layers".to_string(), serde_json::json!(28));
-            }
-            if !obj.contains_key("use_sliding_window") {
-                obj.insert("use_sliding_window".to_string(), serde_json::json!(false));
-            }
-        }
-
-        let qwen_config: Qwen2Config =
-            serde_json::from_value(config_val).map_err(|e| SemanticError::ProviderUnavailable {
-                provider: QWEN_PROVIDER_ID.into(),
-                reason: format!("failed to decode Qwen2Config: {e}"),
+                reason: format!("failed to decode Qwen3Config: {e}"),
             })?;
 
         let native_dims = qwen_config.hidden_size;
@@ -283,9 +270,9 @@ impl Qwen3Embedder {
             })?;
 
         let model =
-            Qwen2Model::new(&qwen_config, vb).map_err(|e| SemanticError::ProviderUnavailable {
+            Qwen3Model::new(&qwen_config, vb).map_err(|e| SemanticError::ProviderUnavailable {
                 provider: QWEN_PROVIDER_ID.into(),
-                reason: format!("failed to construct Qwen2Model: {e}"),
+                reason: format!("failed to construct Qwen3Model: {e}"),
             })?;
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
@@ -425,16 +412,22 @@ impl Qwen3Embedder {
         let attention_mask_tensor = Tensor::new(attention_mask_rows.clone(), &self.device)
             .map_err(|e| SemanticError::EmbeddingFailed(format!("tensor build failed: {e}")))?;
 
+        let seq_len = token_ids_tensor.dim(1).map_err(|e| {
+            SemanticError::EmbeddingFailed(format!("failed to get sequence length: {e}"))
+        })?;
+        let causal_mask =
+            Qwen3Model::build_attention_mask(&attention_mask_rows, seq_len, &self.device)
+                .map_err(|e| SemanticError::EmbeddingFailed(format!("mask build failed: {e}")))?;
+
         let hidden_states = {
-            let mut model_guard = self
+            let model_guard = self
                 .model
                 .lock()
                 .map_err(|_| SemanticError::EmbeddingFailed("model mutex poisoned".to_string()))?;
-            model_guard.clear_kv_cache();
             model_guard
-                .forward(&token_ids_tensor, 0, Some(&attention_mask_tensor))
+                .forward(&token_ids_tensor, Some(&causal_mask))
                 .map_err(|e| {
-                    SemanticError::EmbeddingFailed(format!("Qwen2 forward pass failed: {e}"))
+                    SemanticError::EmbeddingFailed(format!("Qwen3 forward pass failed: {e}"))
                 })?
         };
 

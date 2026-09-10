@@ -218,12 +218,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../../migrations/semantic/0001_initial.sql"))
             .unwrap();
-        conn.execute_batch(include_str!("../../../migrations/semantic/0002_embedding_profile.sql"))
-            .unwrap();
-        conn.execute_batch(include_str!("../../../migrations/semantic/0003_semantic_generations.sql"))
-            .unwrap();
-        conn.execute_batch(include_str!("../../../migrations/semantic/0004_learned_tuning.sql"))
-            .unwrap();
         conn
     }
 

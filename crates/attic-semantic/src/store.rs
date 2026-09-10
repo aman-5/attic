@@ -24,14 +24,6 @@ use crate::provider::{CancelFlag, EmbeddingFingerprint};
 use rusqlite::{Connection, params};
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
-const SEMANTIC_MIGRATION_0002: &str =
-    include_str!("../../../migrations/semantic/0002_embedding_profile.sql");
-const SEMANTIC_MIGRATION_0003: &str =
-    include_str!("../../../migrations/semantic/0003_semantic_generations.sql");
-const SEMANTIC_MIGRATION_0004: &str =
-    include_str!("../../../migrations/semantic/0004_learned_tuning.sql");
-const SEMANTIC_MIGRATION_0005: &str =
-    include_str!("../../../migrations/semantic/0005_vector_index_scale.sql");
 
 /// One stored embedding with full lineage.
 #[derive(Debug, Clone)]
@@ -185,48 +177,7 @@ impl SemanticStore {
     }
 
     fn migrate(conn: &Connection) -> Result<(), SemanticError> {
-        // `semantic.db` is intentionally separate from canonical `attic.db`,
-        // but its durable schema is still migration-owned.  Keeping the SQL
-        // under migrations/ makes the complete persistent schema auditable
-        // without contaminating the canonical database with semantic tables.
         conn.execute_batch(SEMANTIC_MIGRATION_0001)?;
-        conn.execute_batch(SEMANTIC_MIGRATION_0002)?;
-
-        let applied_0003: bool = conn
-            .query_row(
-                "SELECT 1 FROM sem_schema_migrations WHERE id = '0003_semantic_generations'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !applied_0003 {
-            conn.execute_batch(SEMANTIC_MIGRATION_0003)?;
-        }
-
-        let applied_0004: bool = conn
-            .query_row(
-                "SELECT 1 FROM sem_schema_migrations WHERE id = '0004_learned_tuning'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !applied_0004 {
-            conn.execute_batch(SEMANTIC_MIGRATION_0004)?;
-        }
-
-        let applied_0005: bool = conn
-            .query_row(
-                "SELECT 1 FROM sem_schema_migrations WHERE id = '0005_vector_index_scale'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !applied_0005 {
-            conn.execute_batch(SEMANTIC_MIGRATION_0005)?;
-        }
         Ok(())
     }
 
@@ -1224,11 +1175,11 @@ mod tests {
     fn test_descriptor(model_revision: &str) -> EmbeddingSpaceDescriptor {
         EmbeddingSpaceDescriptor {
             schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: "bge".into(),
-            model: "bge-small-en-v1.5".into(),
+            provider: "qwen3".into(),
+            model: "qwen3-embedding-0.6b".into(),
             model_revision: model_revision.into(),
             tokenizer_revision: "tok-abc".into(),
-            pooling: crate::embedding_profile::PoolingStrategy::Cls,
+            pooling: crate::embedding_profile::PoolingStrategy::LastToken,
             normalize: true,
             truncation: crate::embedding_profile::TruncationPolicy::Truncate,
             max_tokens: 512,
@@ -1387,17 +1338,17 @@ mod tests {
         let cancel = CancelFlag::new();
         let budget = ScanBudget::unbounded(&cancel);
 
-        // Gen 1: BGE
+        // Gen 1: Qwen3 Revision 1
         let fp1 = EmbeddingFingerprint {
-            provider: "bge".to_string(),
-            model_id: "bge-base".to_string(),
+            provider: "qwen3".to_string(),
+            model_id: "qwen3-embedding-0.6b".to_string(),
             model_revision: "rev1".to_string(),
             dimension: 2,
-            pooling_version: "cls_v1".to_string(),
+            pooling_version: "last_token_v1".to_string(),
             normalization_version: "l2_unit_v1".to_string(),
             tokenizer_version: "tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
-            query_instruction_version: "none".to_string(),
+            query_instruction_version: "code_retrieval_v1".to_string(),
         };
         let gen1 = store.start_new_generation(&fp1).unwrap();
         assert_eq!(gen1.generation_id, 1);
@@ -1410,8 +1361,8 @@ mod tests {
             source_revision_id: "s1".to_string(),
             index_generation_id: "i1".to_string(),
             selection_version: "v1".to_string(),
-            provider_id: "bge".to_string(),
-            model_id: "bge-base".to_string(),
+            provider_id: "qwen3".to_string(),
+            model_id: "qwen3-embedding-0.6b".to_string(),
             content_hash: "hash_a".to_string(),
             dim: 2,
             vector: vec![1.0, 0.0],
@@ -1511,6 +1462,94 @@ mod tests {
         let invalidated = store.invalidate_learned_tuning(&key).unwrap();
         assert!(invalidated);
         assert!(store.read_learned_tuning(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_db_initializes_exact_final_schema() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_semantic.db");
+
+        // Opening fresh DB must apply the single squashed 0001_initial migration
+        let store = SemanticStore::open(&db_path).expect("open fresh semantic store");
+        let conn = store.guard().unwrap();
+
+        // 1. Verify all expected tables exist
+        let expected_tables = [
+            "sem_schema_migrations",
+            "sem_embeddings",
+            "sem_queue",
+            "sem_query_demand",
+            "sem_embedding_profile",
+            "sem_generations",
+            "sem_learned_tuning",
+        ];
+        for tbl in expected_tables {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    params![tbl],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            assert!(exists, "table '{tbl}' must exist in fresh semantic database");
+        }
+
+        // 2. Verify all expected indexes exist
+        let expected_indexes = [
+            "idx_sem_model",
+            "idx_sem_embeddings_gen",
+            "idx_sem_embeddings_gen_repo",
+            "idx_sem_embeddings_model_repo",
+            "idx_sem_queue_state",
+            "idx_sem_gen_status",
+        ];
+        for idx in expected_indexes {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?1",
+                    params![idx],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            assert!(exists, "index '{idx}' must exist in fresh semantic database");
+        }
+
+        // 3. Verify exactly one baseline migration is recorded
+        let migration_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        let migration_id: String = conn
+            .query_row("SELECT id FROM sem_schema_migrations LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(migration_id, "0001_initial");
+    }
+
+    #[test]
+    fn reopening_same_final_db_is_idempotent() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_semantic_idempotent.db");
+
+        // First open
+        {
+            let store = SemanticStore::open(&db_path).expect("first open");
+            let conn = store.guard().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Second open on existing database
+        {
+            let store = SemanticStore::open(&db_path).expect("second open must succeed idempotently");
+            let conn = store.guard().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
     }
 }
 

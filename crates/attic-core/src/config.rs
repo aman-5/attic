@@ -297,23 +297,14 @@ impl ResourceOverrides {
 
 /// Explicit embedding provider override (`[embedding]` in `attic.toml`).
 ///
-/// [FIX] `model` was deliberately removed, not just left unused: V1 has
-/// exactly one loadable model (`BgeEmbedder` is hardcoded to
-/// `bge-base-en-v1.5`, with no parameter to select another), so a `model`
-/// override could never actually change anything — it silently accepted any
-/// value while doing nothing, and worse, would make `re_index_recommended`
-/// report `true` forever with no way to ever satisfy it (comparing a
-/// configured-but-unreachable model name against the one real persisted
-/// model). Rather than fix a knob to nowhere, dropping it entirely is more
-/// honest: `provider` (`"bge"` vs `"hashing"`) is the only real, working
-/// choice, so it's the only one exposed. An entirely absent or empty
-/// `[embedding]` table deserializes to `{ provider: None }`, which
-/// [`AtticConfig::has_explicit_embedding_override`] correctly reads as "no
-/// override" (a value-level check, never a TOML-section-presence check).
+/// Optional provider override (`[embedding]` in `attic.toml`).
+///
+/// In Phase 101 Clean Final Architecture, `Qwen3Embedder` is the standard neural model.
+/// `provider = "hashing"` can be specified in test configurations.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingOverride {
-    /// Explicit provider id (`"bge"` or `"hashing"`).
+    /// Explicit provider id (`"qwen3"` or `"hashing"`).
     pub provider: Option<String>,
 }
 
@@ -390,10 +381,10 @@ mode = "auto"
 # writer_queue_capacity = 512
 # max_io_ops_per_sec = 200
 
-[embedding]
-# Default: Attic's recommended embedding provider ("bge", a real neural
-# embedder). Uncomment to force the deterministic offline baseline instead.
-# provider = "hashing"
+[semantic]
+# Production neural semantic model (Qwen3-Embedding-0.6B).
+enabled = true
+model = "qwen3-embedding-0.6b"
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
@@ -427,10 +418,7 @@ mod tests {
 
     #[test]
     fn unknown_embedding_key_fails_to_parse() {
-        // `model` no longer exists — an attic.toml left over from before this
-        // change (or hand-written against stale docs) must fail loudly, not
-        // silently parse and do nothing, per invariant #5.
-        let result = AtticConfig::parse_str("[embedding]\nmodel = \"bge-large-en-v1.5\"\n");
+        let result = AtticConfig::parse_str("[embedding]\nunknown_field = \"val\"\n");
         assert!(
             result.is_err(),
             "unknown [embedding] keys must be rejected, not silently ignored"

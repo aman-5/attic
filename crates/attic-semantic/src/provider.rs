@@ -131,15 +131,15 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Comprehensive architectural fingerprint of an active embedding vector space (Final Master Plan V2 §51).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingFingerprint {
-    /// Identifier of the provider (e.g. "bge", "qwen3", "hashing").
+    /// Identifier of the provider (e.g. "qwen3", "hashing").
     pub provider: String,
-    /// Identifier of the neural model (e.g. "bge-base-en-v1.5", "qwen3-embedding-0.6b").
+    /// Identifier of the neural model (e.g. "qwen3-embedding-0.6b", "hashed-ngram-v1").
     pub model_id: String,
     /// Exact pinned git revision or weights SHA.
     pub model_revision: String,
     /// Output vector dimensionality.
     pub dimension: usize,
-    /// Pooling algorithm and version (e.g. "cls_v1", "last_token_v1", "mean_v1").
+    /// Pooling algorithm and version (e.g. "last_token_v1", "mean_v1").
     pub pooling_version: String,
     /// Normalization strategy (e.g. "l2_unit_v1").
     pub normalization_version: String,

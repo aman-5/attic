@@ -15,11 +15,9 @@
 //! Every type here is safe to delete; FTS, symbols, structure, evidence and
 //! verification continue to work untouched.
 
-pub mod bge_embedder;
 pub mod cpu_isolation;
 pub mod diagnostics;
 pub mod disk_safety;
-pub mod embedding_policy;
 pub mod embedding_profile;
 pub mod enrich;
 pub mod error;
@@ -32,13 +30,13 @@ pub mod model_assets;
 pub mod model_lifecycle;
 pub mod provider;
 pub mod providers;
+pub mod qwen3_model;
 pub mod qwen3_provider;
 pub mod scheduler;
 pub mod selection;
 pub mod store;
 pub mod throughput_controller;
 
-pub use bge_embedder::BgeEmbedder;
 pub use cpu_isolation::CpuIsolationPlan;
 pub use diagnostics::{
     DiagnosticContext, SemanticProgressSnapshot, WhySlowDiagnostic, diagnose_why_slow,
@@ -57,7 +55,6 @@ pub use throughput_controller::{
     CandidateAllocation, ControllerAction, ControllerPhase, ThroughputController,
     ThroughputControllerConfig,
 };
-pub use embedding_policy::{EmbeddingPolicy, EmbeddingRecommendation};
 pub use embedding_profile::{
     ClaimOutcome, EmbeddingIntentSource, EmbeddingProfile, EmbeddingSpaceDescriptor,
     PoolingStrategy, ProfileCheck, TruncationPolicy, check_requested_profile,

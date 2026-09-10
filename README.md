@@ -314,7 +314,7 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_HOME` | Overrides the Attic application home directory (default: `~/.attic`). Config, database, and runtime state all derive from this location. An empty `ATTIC_HOME` is a startup error — unset it or provide a valid path. |
 | `ATTIC_DB_PATH` | Legacy single-variable override; the data dir is derived from its parent. |
 | `ATTIC_SEMANTIC` | Semantic retrieval is enabled by default; set to `0` to disable it — see [Semantic search](#semantic-search-optional). |
-| `ATTIC_MODEL_CACHE_DIR` | Directory `BgeEmbedder` downloads/caches model files into (default: alongside the database, in a `models` subdirectory). Point this at a pre-populated cache for offline/airgapped use — see [Semantic search](#semantic-search-optional). |
+| `ATTIC_MODEL_CACHE_DIR` | Directory `Qwen3Embedder` downloads/caches model files into (default: alongside the database, in a `models` subdirectory). Point this at a pre-populated cache for offline/airgapped use — see [Semantic search](#semantic-search-optional). |
 | `ATTIC_LOG` / `RUST_LOG` | Log verbosity (`tracing`'s `EnvFilter` syntax); defaults to `info`. `ATTIC_LOG` takes precedence when both are set. |
 | `ATTIC_RESOURCE_MODE` | Force `low` / `balanced` / `performance` resource tuning instead of hardware-detected `auto` (see `attic.toml`'s `[resources]` table for the same override, and the `status` tool's `resource_mode_source` field). |
 | `ATTIC_TOTAL_MEMORY_BUDGET_MIB` | Total memory budget enforced by the resource monitor. |
@@ -341,24 +341,21 @@ Attic home directory.
 ### Semantic search (optional)
 
 Enabled by default (`ATTIC_SEMANTIC=0` to disable). When enabled, `search`
-and `context` are backed by `BgeEmbedder` — a real, Candle-backed neural
-embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — by default; `HashingEmbedder`, a
-deterministic feature-hashing baseline, remains available as an explicit
-`[embedding]` override in `attic.toml` (see below) and is what CI/tests use
-to stay fully offline and byte-deterministic. Canonical (lexical/structural)
+and `context` are backed by `Qwen3Embedder` — a real, Candle-backed neural
+embedder (`Qwen/Qwen3-Embedding-0.6B`) — by default; `HashingEmbedder`, a
+deterministic feature-hashing baseline, serves strictly as an offline
+test double. Canonical (lexical/structural)
 retrieval never depends on either. The `status` tool reports which provider
 is actually active (`embedding_recommendation`, `active_embedding_profile`,
 `semantic_health`, `re_index_recommended`) — a model/provider change never
 silently takes effect on an existing corpus; it surfaces "re-index
 recommended" instead.
 
-**Offline / airgapped machines:** `BgeEmbedder` downloads `BAAI/bge-base-en-v1.5`
-(~438MB) from Hugging Face on first use and caches it — no network access is
+**Offline / airgapped machines:** `Qwen3Embedder` downloads `Qwen/Qwen3-Embedding-0.6B`
+from Hugging Face on first use and caches it — no network access is
 needed on subsequent runs. To use it on a machine without network access,
 pre-populate the cache on a machine that does, then copy that cache directory
-over and point `ATTIC_MODEL_CACHE_DIR` at it. Without network access and
-without a pre-populated cache, semantic search falls back to `HashingEmbedder`
-for that (unclaimed) session rather than failing to start.
+over and point `ATTIC_MODEL_CACHE_DIR` at it.
 
 ### `attic.toml` (optional resource/embedding tuning)
 
@@ -379,18 +376,13 @@ mode = "auto"  # or "low" / "balanced" / "performance" to force a tier
 # writer_queue_capacity = 512
 # max_io_ops_per_sec = 200
 
-[embedding]
-# Default: Attic's recommended provider ("bge", a real neural embedder).
-# Uncomment to force the deterministic offline baseline instead.
-# provider = "hashing"
+[semantic]
+enabled = true
+model = "qwen3-embedding-0.6b"
 ```
 
-There is no `model` override — V1 has exactly one loadable model per provider
-(`bge` → `bge-base-en-v1.5`; hardware-tiered model selection is deferred, not
-user-configurable). `provider` is the only real, working `[embedding]` knob.
-
 Absent, the file defaults to `mode = "auto"` (hardware-detected) and the
-recommended embedding provider. `scheduler_workers`, SQLite `cache`/`mmap`
+production semantic engine. `scheduler_workers`, SQLite `cache`/`mmap`
 sizing, and `embedding_batch_size` are mode-derived/automatic and not
 user-tunable in `attic.toml` by design.
 

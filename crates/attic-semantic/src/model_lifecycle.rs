@@ -40,7 +40,7 @@ pub struct SharedModelHandle {
     active_inferences: Arc<AtomicUsize>,
     cancel_flag: Arc<CancelFlag>,
     baseline_memory_mib: u64,
-    max_concurrency: usize,
+    max_concurrency: AtomicUsize,
 }
 
 impl SharedModelHandle {
@@ -56,7 +56,7 @@ impl SharedModelHandle {
             active_inferences: Arc::new(AtomicUsize::new(0)),
             cancel_flag: Arc::new(CancelFlag::new()),
             baseline_memory_mib,
-            max_concurrency: max_concurrency.max(1),
+            max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
         }
     }
 
@@ -88,7 +88,12 @@ impl SharedModelHandle {
 
     /// Maximum allowed concurrent inference operations.
     pub fn max_concurrency(&self) -> usize {
-        self.max_concurrency
+        self.max_concurrency.load(Ordering::Relaxed)
+    }
+
+    /// Dynamically adjust maximum allowed concurrent inference operations (§21).
+    pub fn update_max_concurrency(&self, new_max: usize) {
+        self.max_concurrency.store(new_max.max(1), Ordering::SeqCst);
     }
 
     /// Cooperative cancellation flag for this model instance.
@@ -162,7 +167,7 @@ impl SharedModelHandle {
         Ok(())
     }
 
-    fn acquire_inference_permit(&self) -> Result<InferencePermit, SemanticError> {
+    pub(crate) fn acquire_inference_permit(&self) -> Result<InferencePermit, SemanticError> {
         let state = *self.state.read().unwrap();
         if state != ModelLifecycleState::Ready {
             return Err(SemanticError::ProviderUnavailable {
@@ -171,14 +176,15 @@ impl SharedModelHandle {
             });
         }
 
+        let max_concurrency = self.max_concurrency.load(Ordering::SeqCst);
         let current = self.active_inferences.fetch_add(1, Ordering::SeqCst);
-        if current >= self.max_concurrency {
+        if current >= max_concurrency {
             self.active_inferences.fetch_sub(1, Ordering::SeqCst);
             return Err(SemanticError::ProviderUnavailable {
                 provider: self.provider.model_fingerprint().provider,
                 reason: format!(
                     "maximum inference lane concurrency ({}) reached",
-                    self.max_concurrency
+                    max_concurrency
                 ),
             });
         }
@@ -190,7 +196,7 @@ impl SharedModelHandle {
 }
 
 /// RAII guard releasing an active inference counter when dropped.
-struct InferencePermit {
+pub(crate) struct InferencePermit {
     active_inferences: Arc<AtomicUsize>,
 }
 

@@ -24,6 +24,31 @@ lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
 
+# Compile compute-heavy tensor dependencies and semantic models with optimization in dev/test
+[profile.dev.package.candle-core]
+opt-level = 3
+
+[profile.dev.package.candle-nn]
+opt-level = 3
+
+[profile.dev.package.candle-transformers]
+opt-level = 3
+
+[profile.dev.package.attic-semantic]
+opt-level = 3
+
+[profile.test.package.candle-core]
+opt-level = 3
+
+[profile.test.package.candle-nn]
+opt-level = 3
+
+[profile.test.package.candle-transformers]
+opt-level = 3
+
+[profile.test.package.attic-semantic]
+opt-level = 3
+
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"

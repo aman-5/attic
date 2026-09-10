@@ -237,16 +237,12 @@ pub(crate) struct AtticServer {
 
 /// Phase 9: decide which `SemanticProvider` to actually construct.
 ///
-/// Never silently switches vector spaces (High-Level Design "Failure
-/// handling"): if a profile is already persisted, this reconstructs the SAME
-/// provider it names — a `BgeEmbedder` construction failure against an
-/// already-`bge` profile degrades to `UnavailableProvider`, NOT a silent
-/// fallback to `HashingEmbedder` (which would write hashing-space vectors
-/// under an identity that claims to be `bge`-space). Only when NO profile is
-/// persisted yet is a `BgeEmbedder` failure allowed to fall back to
-/// `HashingEmbedder` — nothing has been claimed yet, so there is no existing
-/// identity to violate; first indexing later honestly claims whichever
-/// provider actually got constructed here (see `enrich::ensure_profile_claimed`).
+/// Reconstructs the persisted or configured semantic provider for Attic.
+///
+/// In Phase 101 Clean Final Architecture, `Qwen3Embedder` is the sole production
+/// neural provider. If a profile is already persisted, this reconstructs the exact
+/// pinned revision. If unavailable (e.g. offline with no cached weights), it degrades
+/// to `UnavailableProvider`, never corrupting the vector space.
 fn resolve_semantic_provider(
     store: &attic_semantic::SemanticStore,
     attic_config: &attic_core::AtticConfig,
@@ -259,28 +255,21 @@ fn resolve_semantic_provider(
     use attic_semantic::EmbeddingIntentSource;
 
     if let Some(profile) = store.read_embedding_profile().ok().flatten() {
-        // A persisted profile is never explicit user intent for *this*
-        // process — it's a fact being honored, not a request being made.
         let provider: Arc<dyn attic_semantic::SemanticProvider> =
             match profile.config.provider.as_str() {
-                id if id == attic_semantic::BgeEmbedder::PROVIDER_ID => {
-                    // [FIX] new_pinned, not new(): reconstructing an already-
-                    // persisted profile must reproduce the EXACT vector space
-                    // it was created under — pinning to the persisted
-                    // model_revision means this never re-resolves "what's
-                    // current" over the network and can never silently drift
-                    // onto a newer upstream revision.
-                    match attic_semantic::BgeEmbedder::new_pinned(
+                id if id == attic_semantic::QWEN_PROVIDER_ID => {
+                    match attic_semantic::Qwen3Embedder::new_pinned(
                         model_cache_dir,
                         batch_size,
                         &profile.config.model_revision,
+                        None,
+                        attic_semantic::QwenPooling::LastToken,
                     ) {
                         Ok(embedder) => Arc::new(embedder),
                         Err(e) => {
                             tracing::warn!(
-                                "persisted profile requires '{id}' but BgeEmbedder failed to \
-                                 construct ({e}); semantic layer DEGRADED — never falling back to \
-                                 hashing, which would corrupt the persisted vector space"
+                                "persisted profile requires '{id}' but Qwen3Embedder failed to \
+                                 construct ({e}); semantic layer DEGRADED"
                             );
                             Arc::new(attic_semantic::UnavailableProvider {
                                 reason: e.to_string(),
@@ -292,14 +281,9 @@ fn resolve_semantic_provider(
                     Arc::new(attic_semantic::HashingEmbedder::new())
                 }
                 id => {
-                    // Unrecognized persisted provider id (typo, renamed id,
-                    // or an id from a newer build) — same anti-drift rule as
-                    // the bge arm above applies: never silently reinterpret
-                    // it as hashing, which would write hashing-space vectors
-                    // under a mismatched claimed identity.
                     tracing::warn!(
                         "persisted profile names unrecognized provider '{id}'; semantic layer \
-                         DEGRADED — never silently reinterpreting as hashing"
+                         DEGRADED"
                     );
                     Arc::new(attic_semantic::UnavailableProvider {
                         reason: format!("unrecognized persisted provider id '{id}'"),
@@ -309,15 +293,12 @@ fn resolve_semantic_provider(
         return (provider, EmbeddingIntentSource::Recommendation);
     }
 
-    // No profile persisted yet — nothing to violate by falling back if
-    // construction fails. `source` records the provenance of the choice
-    // below, for whichever provider first indexing later actually claims.
     let explicit = attic_config.has_explicit_embedding_override();
     let requested_provider = attic_config
         .embedding
         .provider
         .as_deref()
-        .unwrap_or(attic_semantic::BgeEmbedder::PROVIDER_ID);
+        .unwrap_or(attic_semantic::QWEN_PROVIDER_ID);
     let source = if explicit {
         EmbeddingIntentSource::TomlOverride
     } else {
@@ -327,16 +308,22 @@ fn resolve_semantic_provider(
     if requested_provider == attic_semantic::HashingEmbedder::ID {
         return (Arc::new(attic_semantic::HashingEmbedder::new()), source);
     }
-    match attic_semantic::BgeEmbedder::new(model_cache_dir, batch_size) {
+    match attic_semantic::Qwen3Embedder::new(
+        model_cache_dir,
+        batch_size,
+        None,
+        attic_semantic::QwenPooling::LastToken,
+    ) {
         Ok(embedder) => (Arc::new(embedder), source),
         Err(e) => {
             tracing::warn!(
-                "BgeEmbedder unavailable ({e}); falling back to the hashing baseline for this \
-                 unclaimed session — first indexing will honestly claim whichever provider ran"
+                "Qwen3Embedder unavailable ({e}); degrading to unavailable provider"
             );
             (
-                Arc::new(attic_semantic::HashingEmbedder::new()),
-                EmbeddingIntentSource::Recommendation,
+                Arc::new(attic_semantic::UnavailableProvider {
+                    reason: e.to_string(),
+                }),
+                source,
             )
         }
     }
@@ -395,7 +382,7 @@ mod re_index_recommended_tests {
     #[test]
     fn no_override_is_never_recommended_even_with_a_profile() {
         let cfg = AtticConfig::default();
-        let p = profile("bge", "bge-small-en-v1.5");
+        let p = profile("qwen3", "qwen3-embedding-0.6b");
         assert!(!compute_re_index_recommended(&cfg, Some(&p)));
     }
 
@@ -407,15 +394,15 @@ mod re_index_recommended_tests {
 
     #[test]
     fn explicit_override_matching_persisted_profile_is_not_recommended() {
-        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"bge\"\n").unwrap();
-        let p = profile("bge", "bge-small-en-v1.5");
+        let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"qwen3\"\n").unwrap();
+        let p = profile("qwen3", "qwen3-embedding-0.6b");
         assert!(!compute_re_index_recommended(&cfg, Some(&p)));
     }
 
     #[test]
     fn explicit_override_differing_from_persisted_profile_is_recommended() {
         let cfg = AtticConfig::parse_str("[embedding]\nprovider = \"hashing\"\n").unwrap();
-        let p = profile("bge", "bge-small-en-v1.5");
+        let p = profile("qwen3", "qwen3-embedding-0.6b");
         assert!(compute_re_index_recommended(&cfg, Some(&p)));
     }
 }
@@ -518,7 +505,7 @@ impl AtticServer {
         // degraded semantic layers never affect canonical intelligence
         // (ADR-014 D1).
         let semantic_path = db_path.with_file_name("semantic.db");
-        // Phase 9: model/tokenizer cache dir for BgeEmbedder — a `models`
+        // Model/tokenizer cache dir for Qwen3Embedder — a `models`
         // directory beside the database by default, overridable so multiple
         // Attic instances (or tests) can share one cache.
         let model_cache_dir = std::env::var("ATTIC_MODEL_CACHE_DIR")
@@ -2255,10 +2242,9 @@ fn handle_status(
         "writer_queue_capacity": phase8.effective_resources.writer_queue_capacity,
         "max_io_ops_per_sec": phase8.effective_resources.max_io_ops_per_sec,
     });
-    let recommendation = attic_semantic::EmbeddingPolicy::recommend();
     payload["embedding_recommendation"] = json!({
-        "provider": recommendation.provider,
-        "model": recommendation.model,
+        "provider": attic_semantic::QWEN_PROVIDER_ID,
+        "model": attic_semantic::QWEN_MODEL_ID,
     });
     // Distinguishes "Attic recommends X" from "the user explicitly asked for
     // Y" — required so `re_index_recommended`'s semantics can tell a
@@ -4192,7 +4178,7 @@ mod tests {
     fn make_server(tmp: &TempDir) -> AtticServer {
         // Explicit `false`, not `AtticServer::new()`: `new()` now defaults
         // semantic ON, which would make every handler test using this helper
-        // eagerly build a real BgeEmbedder against a fresh, empty per-test
+        // eagerly build a real Qwen3Embedder against a fresh, empty per-test
         // temp dir (no shared model cache) — i.e. a live network call per
         // test. This helper is for handler tests that don't care about the
         // semantic layer; `semantic_layer_is_opt_in_not_default` below is
@@ -4286,7 +4272,7 @@ mod tests {
             "the materialized file must match the shipped template exactly"
         );
         assert!(written.contains("[resources]"));
-        assert!(written.contains("[embedding]"));
+        assert!(written.contains("[semantic]"));
     }
 
     // ΓöÇΓöÇ Multi-root workspace configuration: parsing + validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

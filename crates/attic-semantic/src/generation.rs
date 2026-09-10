@@ -274,15 +274,15 @@ mod tests {
 
     fn test_fingerprint(model: &str) -> EmbeddingFingerprint {
         EmbeddingFingerprint {
-            provider: "test".to_string(),
+            provider: "qwen3".to_string(),
             model_id: model.to_string(),
             model_revision: "rev1".to_string(),
             dimension: 768,
-            pooling_version: "cls_v1".to_string(),
+            pooling_version: "last_token_v1".to_string(),
             normalization_version: "l2_unit_v1".to_string(),
-            tokenizer_version: "tok_v1".to_string(),
+            tokenizer_version: "qwen3_tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
-            query_instruction_version: "code_v1".to_string(),
+            query_instruction_version: "code_retrieval_v1".to_string(),
         }
     }
 
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn start_and_activate_generation() {
         let mut conn = setup_test_db();
-        let fp1 = test_fingerprint("bge");
+        let fp1 = test_fingerprint("qwen3-768");
         let gen1 = GenerationManager::start_new_generation(&conn, &fp1).unwrap();
         assert_eq!(gen1.generation_id, 1);
         assert_eq!(gen1.status, GenerationStatus::Building);
@@ -322,8 +322,8 @@ mod tests {
         assert_eq!(active.generation_id, 1);
         assert_eq!(active.status, GenerationStatus::Active);
 
-        // Start Gen 2 (Qwen)
-        let fp2 = test_fingerprint("qwen3");
+        // Start Gen 2 (Qwen 1024-dim)
+        let fp2 = test_fingerprint("qwen3-1024");
         let gen2 = GenerationManager::start_new_generation(&conn, &fp2).unwrap();
         assert_eq!(gen2.generation_id, 2);
         assert_eq!(gen2.status, GenerationStatus::Building);
@@ -341,11 +341,11 @@ mod tests {
     #[test]
     fn rollback_reactivates_previous_generation() {
         let mut conn = setup_test_db();
-        let fp1 = test_fingerprint("bge");
+        let fp1 = test_fingerprint("qwen3-768");
         let _ = GenerationManager::start_new_generation(&conn, &fp1).unwrap();
         GenerationManager::activate_generation(&mut conn, 1).unwrap();
 
-        let fp2 = test_fingerprint("qwen3");
+        let fp2 = test_fingerprint("qwen3-1024");
         let _ = GenerationManager::start_new_generation(&conn, &fp2).unwrap();
         GenerationManager::activate_generation(&mut conn, 2).unwrap();
 

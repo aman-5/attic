@@ -660,7 +660,7 @@ mod ensure_profile_claimed_tests {
 
     /// Minimal provider whose only purpose is returning a fixed
     /// `EmbeddingSpaceDescriptor` — exercises `ensure_profile_claimed`
-    /// without needing a real `BgeEmbedder` (network/model weights).
+    /// without needing a real `Qwen3Embedder` (network/model weights).
     struct DescriptorProvider(EmbeddingSpaceDescriptor);
 
     impl SemanticProvider for DescriptorProvider {
@@ -693,11 +693,11 @@ mod ensure_profile_claimed_tests {
     fn descriptor(model: &str) -> EmbeddingSpaceDescriptor {
         EmbeddingSpaceDescriptor {
             schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: "bge".into(),
+            provider: "qwen3".into(),
             model: model.into(),
             model_revision: "rev1".into(),
             tokenizer_revision: "rev1".into(),
-            pooling: PoolingStrategy::Cls,
+            pooling: PoolingStrategy::LastToken,
             normalize: true,
             truncation: TruncationPolicy::Truncate,
             max_tokens: 512,
@@ -718,27 +718,27 @@ mod ensure_profile_claimed_tests {
     #[test]
     fn first_real_work_claims_the_profile() {
         let store = SemanticStore::open_in_memory().unwrap();
-        let provider = DescriptorProvider(descriptor("bge-small-en-v1.5"));
+        let provider = DescriptorProvider(descriptor("qwen3-embedding-0.6b"));
         assert!(
             ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
                 .unwrap()
         );
         let persisted = store.read_embedding_profile().unwrap().unwrap();
-        assert_eq!(persisted.config.model, "bge-small-en-v1.5");
+        assert_eq!(persisted.config.model, "qwen3-embedding-0.6b");
     }
 
     #[test]
     fn conflicting_explicit_provider_refuses_to_embed() {
         let store = SemanticStore::open_in_memory().unwrap();
-        // A different process already claimed "bge-small-en-v1.5".
+        // A different process already claimed "qwen3-embedding-0.6b".
         store
             .claim_embedding_profile_if_absent(
-                descriptor("bge-small-en-v1.5"),
+                descriptor("qwen3-embedding-0.6b"),
                 EmbeddingIntentSource::Recommendation,
             )
             .unwrap();
         // This process's provider is explicitly configured for a different model.
-        let provider = DescriptorProvider(descriptor("bge-large-en-v1.5"));
+        let provider = DescriptorProvider(descriptor("qwen3-large-custom"));
         let proceed =
             ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::TomlOverride).unwrap();
         assert!(
@@ -747,7 +747,7 @@ mod ensure_profile_claimed_tests {
         );
         // The persisted profile must remain the original — never silently overwritten.
         let persisted = store.read_embedding_profile().unwrap().unwrap();
-        assert_eq!(persisted.config.model, "bge-small-en-v1.5");
+        assert_eq!(persisted.config.model, "qwen3-embedding-0.6b");
     }
 
     #[test]
@@ -755,7 +755,7 @@ mod ensure_profile_claimed_tests {
         let store = SemanticStore::open_in_memory().unwrap();
         store
             .claim_embedding_profile_if_absent(
-                descriptor("bge-small-en-v1.5"),
+                descriptor("qwen3-embedding-0.6b"),
                 EmbeddingIntentSource::Recommendation,
             )
             .unwrap();
@@ -764,7 +764,7 @@ mod ensure_profile_claimed_tests {
         // this does NOT hot-swap the provider instance (see
         // ensure_profile_claimed's doc comment, "SECOND KNOWN LIMITATION") —
         // it only verifies the call returns true rather than refusing.
-        let provider = DescriptorProvider(descriptor("bge-large-en-v1.5"));
+        let provider = DescriptorProvider(descriptor("qwen3-large-custom"));
         let proceed =
             ensure_profile_claimed(&store, &provider, EmbeddingIntentSource::Recommendation)
                 .unwrap();

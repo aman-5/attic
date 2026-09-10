@@ -12,9 +12,8 @@
 //! while the label stays the same, the profile hash would stay identical
 //! while the actual embedding space silently changed underneath it — exactly
 //! the invisible-corpus-corruption failure mode this type exists to prevent.
-//! Resolving refs to commit SHAs is the caller's job (a future
-//! `BgeEmbedder`/model-loading concern); this module only hashes and
-//! persists whatever resolved descriptor it is handed.
+//! Resolving refs to commit SHAs is the caller's job (a model-loading concern);
+//! this module only hashes and persists whatever resolved descriptor it is handed.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,9 +46,9 @@ pub enum TruncationPolicy {
 pub struct EmbeddingSpaceDescriptor {
     /// Version of [`Self::canonical_bytes`]'s encoding.
     pub schema_version: u32,
-    /// Stable provider id (e.g. `"bge"`).
+    /// Stable provider id (e.g. `"qwen3"`).
     pub provider: String,
-    /// Model name (e.g. `"bge-small-en-v1.5"`).
+    /// Model name (e.g. `"qwen3-embedding-0.6b"`).
     pub model: String,
     /// Resolved, immutable model revision (a commit SHA, never `"main"`).
     pub model_revision: String,
@@ -207,11 +206,11 @@ mod tests {
     fn descriptor(model_revision: &str) -> EmbeddingSpaceDescriptor {
         EmbeddingSpaceDescriptor {
             schema_version: EmbeddingSpaceDescriptor::SCHEMA_VERSION,
-            provider: "bge".into(),
-            model: "bge-small-en-v1.5".into(),
+            provider: "qwen3".into(),
+            model: "qwen3-embedding-0.6b".into(),
             model_revision: model_revision.into(),
             tokenizer_revision: "tok-abc123".into(),
-            pooling: PoolingStrategy::Cls,
+            pooling: PoolingStrategy::LastToken,
             normalize: true,
             truncation: TruncationPolicy::Truncate,
             max_tokens: 512,

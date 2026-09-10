@@ -60,7 +60,7 @@ impl ModelManifest {
             model_id: "qwen3-embedding-0.6b".to_string(),
             repo_owner: "Qwen".to_string(),
             repo_name: "Qwen3-Embedding-0.6B".to_string(),
-            pinned_revision: "b1a7d6e4c3b2a1".to_string(), // Stable pinned commit hash
+            pinned_revision: "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3".to_string(), // Stable pinned commit hash
             files: vec![
                 ModelFileSpec {
                     filename: "config.json".to_string(),
@@ -342,5 +342,20 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn qwen3_pinned_manifest_integrity() {
+        let manifest = ModelManifest::qwen3_default();
+        assert_eq!(manifest.model_id, "qwen3-embedding-0.6b");
+        assert_eq!(manifest.repo_owner, "Qwen");
+        assert_eq!(manifest.repo_name, "Qwen3-Embedding-0.6B");
+        assert_eq!(manifest.pinned_revision, "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3");
+        assert_eq!(manifest.license, "Apache-2.0");
+
+        let filenames: Vec<&str> = manifest.files.iter().map(|f| f.filename.as_str()).collect();
+        assert!(filenames.contains(&"config.json"));
+        assert!(filenames.contains(&"tokenizer.json"));
+        assert!(filenames.contains(&"model.safetensors"));
     }
 }

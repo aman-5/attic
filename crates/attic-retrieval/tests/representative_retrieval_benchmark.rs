@@ -727,7 +727,7 @@ fn representative_retrieval_benchmark_test() {
     println!("  Tier C (Hybrid Semantic)        : Recall@1={:.3}, Recall@5={:.3}, Recall@10={:.3}, MRR={:.3}", c_recall1, c_recall5, c_recall10, c_mrr);
 
     println!("\nDETAILED FAILURE & REGRESSION ANALYSIS TABLE (§35):");
-    println!("{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | {}", "ID", "Category", "Tier A", "Tier C", "Failure Category", "Query");
+    println!("{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | Query", "ID", "Category", "Tier A", "Tier C", "Failure Category");
     println!("{:-<5}-|-{:-<22}-|-{:-<8}-|-{:-<8}-|-{:-<20}-|-{:-<35}", "", "", "", "", "", "");
     for (id, cat, q, _exp, a_r, c_r, f_cat) in &regression_records {
         let a_str = if *a_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", a_r + 1) };
@@ -735,12 +735,24 @@ fn representative_retrieval_benchmark_test() {
         println!("{:<5} | {:<22} | {:<8} | {:<8} | {:<20} | {}", id, cat.as_str(), a_str, c_str, f_cat.as_str(), q);
     }
 
-    // 5. Generate Markdown Report Artifact
+    // 5. Evaluate Acceptance Gates (Single source of truth for report and assertions)
+    let r5_pass = c_recall5 >= a_recall5 && c_recall5 >= 0.85;
+    let r10_pass = c_recall10 >= 0.90;
+    let mrr_pass = c_mrr >= 0.80;
+    let overall_pass = r5_pass && r10_pass && mrr_pass;
+
+    let r5_status = if r5_pass { "PASS" } else { "FAIL" };
+    let r10_status = if r10_pass { "PASS" } else { "FAIL" };
+    let mrr_status = if mrr_pass { "PASS" } else { "FAIL" };
+    let overall_status = if overall_pass { "PASS" } else { "FAIL" };
+
+    // 6. Generate Markdown Report Artifact
     let report_content = format!(
 r#"# Representative Retrieval Benchmark Report (CP19)
 
 **Date**: 2026-09-09
-**Status**: PASS
+**Status**: {overall_status}
+**Evaluation Scope**: Retrieval pipeline & hybrid ranking fusion (deterministic `HashingEmbedder` TEST DOUBLE)
 **Corpus**: 3 repositories (`auth-service`, `frontend-web`, `engine-core`)
 **Languages**: Java, TypeScript, Rust, YAML, Markdown
 **Code Sizes**: Small (<50 lines), Medium (100–300 lines), Large (>600 lines)
@@ -753,9 +765,9 @@ r#"# Representative Retrieval Benchmark Report (CP19)
 | Metric | Tier A (Canonical) | Tier C (Hybrid Semantic) | Delta | Acceptance Gate | Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Recall@1** | {a_recall1:.3} | {c_recall1:.3} | {d_r1:+.3} | — | INFO |
-| **Recall@5** | {a_recall5:.3} | {c_recall5:.3} | {d_r5:+.3} | ≥ Tier A & ≥ 0.85 | **PASS** |
-| **Recall@10** | — | {c_recall10:.3} | — | ≥ 0.90 | **PASS** |
-| **MRR** | {a_mrr:.3} | {c_mrr:.3} | {d_mrr:+.3} | ≥ Tier A | **PASS** |
+| **Recall@5** | {a_recall5:.3} | {c_recall5:.3} | {d_r5:+.3} | ≥ Tier A & ≥ 0.85 | **{r5_status}** |
+| **Recall@10** | — | {c_recall10:.3} | — | ≥ 0.90 | **{r10_status}** |
+| **MRR** | {a_mrr:.3} | {c_mrr:.3} | {d_mrr:+.3} | ≥ 0.80 | **{mrr_status}** |
 
 ---
 
@@ -772,16 +784,20 @@ r#"# Representative Retrieval Benchmark Report (CP19)
 - **Semantic Augmentation**: Natural language and architectural queries retrieve authoritative documentation and cross-repo contracts effectively.
 - **Generated Code Support**: Stubs marked `@generated` remain discoverable in hybrid search without polluting lexical ranking.
 "#,
+        overall_status = overall_status,
         a_recall1 = a_recall1,
         c_recall1 = c_recall1,
         d_r1 = c_recall1 - a_recall1,
         a_recall5 = a_recall5,
         c_recall5 = c_recall5,
         d_r5 = c_recall5 - a_recall5,
+        r5_status = r5_status,
         c_recall10 = c_recall10,
+        r10_status = r10_status,
         a_mrr = a_mrr,
         c_mrr = c_mrr,
         d_mrr = c_mrr - a_mrr,
+        mrr_status = mrr_status,
         table_rows = regression_records.iter().map(|(id, cat, q, exp, a_r, c_r, f_cat)| {
             let a_str = if *a_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", a_r + 1) };
             let c_str = if *c_r == usize::MAX { "MISS".to_string() } else { format!("Rank {}", c_r + 1) };
@@ -797,8 +813,8 @@ r#"# Representative Retrieval Benchmark Report (CP19)
     }
     std::fs::write(&report_path, report_content).expect("write benchmark report");
 
-    // 6. Hard Acceptance Gates (§34, §35)
-    assert!(c_recall5 >= a_recall5, "Tier C Recall@5 must be >= Tier A Recall@5");
-    assert!(c_recall5 >= 0.85, "Tier C Recall@5 must be >= 0.85 (got {:.3})", c_recall5);
-    assert!(c_mrr >= 0.70, "Tier C MRR must be >= 0.70 (got {:.3})", c_mrr);
+    // 7. Hard Acceptance Gates (§34, §35) — Enforced from single source of truth
+    assert!(r5_pass, "Tier C Recall@5 must be >= Tier A Recall@5 and >= 0.85 (Tier C: {:.3}, Tier A: {:.3})", c_recall5, a_recall5);
+    assert!(r10_pass, "Tier C Recall@10 must be >= 0.90 (got {:.3})", c_recall10);
+    assert!(mrr_pass, "Tier C MRR must be >= 0.80 (got {:.3})", c_mrr);
 }

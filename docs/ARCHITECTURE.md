@@ -458,13 +458,12 @@ this system needs to not accidentally break.
 ## Semantic layer (optional, default-enabled)
 
 Semantic (embedding-based) retrieval is **enabled by default**; set
-`ATTIC_SEMANTIC=0` to disable it. When enabled, `BgeEmbedder` — a
-real, Candle-backed neural embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — is the
-default provider; `HashingEmbedder`, a deterministic feature-hashing
-baseline, remains available as an explicit `attic.toml` `[embedding]`
-override and is what CI/tests use to stay offline and byte-deterministic.
+`ATTIC_SEMANTIC=0` to disable it. When enabled, `Qwen3Embedder` — a
+real, Candle-backed neural embedder (`Qwen/Qwen3-Embedding-0.6B`) — is the
+production provider; `HashingEmbedder` serves strictly as a deterministic
+test double for offline test isolation.
 See [Resource management](#resource-management) below for the
-`EmbeddingProfile` persistence and `ResourceMode`/`ResourcePolicy` design,
+`EmbeddingFingerprint` / `ResourceOrchestrator` design,
 and `crates/attic-retrieval/src/hybrid.rs` for the RRF hybrid-search fusion.
 When disabled or degraded, canonical (lexical/structural)
 retrieval is entirely unaffected; the semantic layer never gates or blocks

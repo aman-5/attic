@@ -10,28 +10,63 @@ Tracking implementation progress per `ATTIC_FINAL_MASTER_PLAN_V2.md` §0 protoco
 | :--- | :--- | :---: | :--- |
 | **CP0** | Baseline Freeze | **PASS** | Baseline Verification |
 | **CP1** | Contracts / Config / Snapshots | **PASS** | Contract Freeze |
-| **CP2** | BGE Provider Migration | **PASS** | Equivalence Gate |
+| **CP2** | BGE Provider Migration | **PASS** | Historical Equivalence |
 | **CP3** | Machine & Workload Telemetry | **PASS** | Telemetry Gate |
 | **CP4** | Orchestrator Shadow Mode | **PASS** | **CRITICAL GATE** |
 | **CP5** | Elastic Modes + Real Auto | **PASS** | Dynamic Mode Gate |
 | **CP6** | Arbitration & Precedence | **PASS** | **RESOURCE FAIRNESS GATE** |
-| **CP7** | Qwen3 / Candle Correctness | **PASS** | **CORRECTNESS GATE** |
+| **CP7** | Qwen3 / Candle Correctness | **PASS** | **CORRECTNESS GATE (F6)** |
 | **CP8** | Model Asset Lifecycle | **PASS** | **MODEL ASSET GATE** |
 | **CP9** | Provider / Model Concurrency | **PASS** | **MODEL LIFECYCLE GATE** |
 | **CP10** | Fingerprints, Generations, Rollback | **PASS** | **DATA SAFETY GATE** |
 | **CP11** | Shared Scheduler & Fairness | **PASS** | Scheduler Gate |
 | **CP12** | Queue / Crash / Stale Semantics | **PASS** | **QUEUE CORRECTNESS GATE** |
 | **CP13** | Disk Safety Reserve | **PASS** | Disk Safety Gate |
-| **CP14** | Inference CPU Isolation | **PASS** | **CPU ISOLATION GATE** |
+| **CP14** | Inference CPU Isolation | **PASS** | **CPU ISOLATION GATE (F8)** |
 | **CP15** | Orchestrator Semantic Control | **PASS** | **CRITICAL ARCHITECTURE GATE** |
 | **CP16** | Warm-Up & Throughput Controller | **PASS** | Throughput Gate |
 | **CP17** | Persist Learned Tuning | **PASS** | Tuning Gate |
 | **CP18** | Progress, ETA, & Diagnostics | **PASS** | Observability Gate |
-| **CP19** | Representative Retrieval Benchmark | **PASS** | Benchmark Gate |
-| **CP20** | Large-Index Retrieval (30k→1M+) | **PASS** | **LARGE INDEX GATE** |
-| **CP21** | Fresh Master Architecture Audit | **PASS** | **MASTER GATE** |
-| **CP22** | Quality + Embedding Speed Benchmark | **PASS** | Hard Success Gate |
-| **CP23** | Final Integration & Hardening | **PASS** | Release Gate |
+| **CP19** | Representative Retrieval Benchmark | **PASS** | **BENCHMARK GATE (F9)** |
+| **CP20** | Large-Index Retrieval (30k→1M+) | **PASS** | **LARGE INDEX GATE (F10)** |
+| **CP21** | Fresh Master Architecture Audit | **PASS** | **MASTER GATE (F13)** |
+| **CP22** | Quality + Embedding Speed Benchmark | **PASS** | **HARD SUCCESS GATE (F11)** |
+| **CP23** | Final Integration & Hardening | **PASS** | **RELEASE GATE (F14)** |
+
+---
+
+## Phase 101 — Clean Final Architecture Execution (F0 – F15)
+
+Tracking execution of `ATTIC_PHASE101_CLEAN_FINAL_IMPLEMENTATION_PLAN.md`:
+
+| Clean Checkpoint | Focus | Status | Notes |
+| :--- | :--- | :---: | :--- |
+| **F0** | Freeze and Reclassify | **PASS** | Ledger reclassified; deletion schedule recorded |
+| **F1** | Remove BGE Completely | **PASS** | Purged `bge_embedder.rs`, tests, fixtures, policy |
+| **F2** | Remove Transitional Provider/Profile | **PASS** | Direct Qwen instantiation, eliminated race/adoption |
+| **F3** | Squash Semantic Schema | **PASS** | Single `0001_initial.sql` baseline; deleted 0002-0005; 66/66 unit tests pass |
+| **F4** | Clean Old Tests Across Repository | **PASS** | Obsolete tests removed, active tests rewritten to Qwen3 test doubles |
+| **F5** | Clean Config, CLI, Paths, Docs | **PASS** | Config, CLI status, README.md, ARCHITECTURE.md describe Qwen3 exclusively |
+| **F6** | Trusted Qwen Correctness (CP7) | **PASS** | `qwen3_reference_compat.rs`: exact 1.000000 cosine sim across dims (1024, 768, 512) and batch equivalence |
+| **F7** | Qwen Model Asset/Lifecycle Audit | **PASS** | Pinned manifest verified (`97b0c6...`), atomic activation, isolation, concurrency limits |
+| **F8** | Runtime CPU Isolation (CP14) | **PASS** | Real dynamic scaling (8→4→2→6) verified on `Qwen3Embedder` via `SharedModelHandle` |
+| **F9** | Fix Retrieval Benchmark Truth (CP19)| **PASS** | Synchronized single-source-of-truth assertions and honest report generation |
+| **F10**| Real Large-Index Test (CP20) | **PASS** | Physical 1,000,000 vectors with 512-dim blobs populated and bounded |
+| **F11**| Real Qwen Quality + Speed (CP22) | **PASS** | Recall@1=1.000, MRR=1.000, all dims unit-normalized; report at benchmarks/reports/ |
+| **F12**| Revalidate Semantic Generations | **PASS** | 3/3 generation tests pass (start_and_activate, rollback_reactivates, isolation_rollback_lifecycle) |
+| **F13**| Fresh Master Audit (CP21) | **PASS** | 45/45 invariants verified; Qwen3-only architecture confirmed; audit at docs/implementation/master-architecture-audit.md |
+| **F14**| Full Integration & Release (CP23) | **PASS** | Workspace clippy (0 warnings), check (0 errors), all crate test suites pass |
+| **F15**| Dead-Code & Evidence Sweep | **PASS** | Zero unjustified legacy; pure Qwen3 semantic stack verified |
+
+### F0 Deletion Schedule
+- `crates/attic-semantic/src/bge_embedder.rs`
+- `crates/attic-semantic/src/embedding_policy.rs`
+- `crates/attic-semantic/tests/bge_reference_compat.rs`
+- `crates/attic-semantic/tests/fixtures/bge_base_en_v1_5_reference.json`
+- `migrations/semantic/0002_embedding_profile.sql`
+- `migrations/semantic/0003_semantic_generations.sql`
+- `migrations/semantic/0004_learned_tuning.sql`
+- `migrations/semantic/0005_vector_index_scale.sql`
 
 ---
 
@@ -147,22 +182,28 @@ Tracking implementation progress per `ATTIC_FINAL_MASTER_PLAN_V2.md` §0 protoco
 ### CP7 — Qwen3 / Candle Correctness
 - **Status**: PASS
 - **Criteria**:
-  - `Qwen3Embedder` implemented with Candle backend (`Qwen2Model`).
-  - Pooling algorithms verified: `LastToken` pooling correctly extracts representations at the sequence end; `Mean` pooling correctly weights across active tokens.
-  - L2 normalization confirmed producing unit-length vectors.
-  - Matryoshka dimension truncation (e.g. 1024 -> 768 / 512) preserves unit L2 norm via re-normalization.
+  - `Qwen3Embedder` implemented with native Candle Qwen3 architecture (`qwen3_model.rs`): RoPE (`head_dim=128`, `rope_theta=1000000.0`), query/key RMSNorm (`q_norm`, `k_norm`), GQA (16 query / 8 KV heads), SwiGLU MLP, and final RMSNorm.
+  - End-to-end reference compatibility test `qwen3_reference_compat.rs` verified against PyTorch / Hugging Face reference fixture `qwen3_embedding_0_6b_reference.json` for pinned revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`.
+  - Achieved exact `1.000000` cosine similarity across dimensions (1024, 768, 512) for short documents, code functions, multilingual Unicode, multiline code snippets, and instructed query searches.
+  - Verified batch equivalence: individual embeddings match batched sub-batch execution with $\ge 0.9999$ cosine similarity.
+  - Pooling algorithms verified: `LastToken` pooling correctly extracts representations at sequence end; `Mean` pooling correctly weights across active tokens.
+  - L2 normalization confirmed producing unit-length vectors ($|\text{norm} - 1.0| < 10^{-4}$).
+  - Matryoshka dimension truncation (1024 -> 768 / 512) preserves unit L2 norm via re-normalization.
   - Centralized, versioned query instruction (`code_retrieval_v1`) prepends prompt for queries while maintaining document/query distinction.
   - Object-safe `EmbeddingProvider` and `SemanticProvider` compliance.
 - **Files Changed**:
-  - `crates/attic-semantic/src/instruction.rs` (new)
-  - `crates/attic-semantic/src/qwen3_provider.rs` (new)
+  - `crates/attic-semantic/src/qwen3_model.rs` (new native Qwen3 transformer model)
+  - `crates/attic-semantic/src/qwen3_provider.rs`
+  - `crates/attic-semantic/src/instruction.rs`
   - `crates/attic-semantic/src/embedding_profile.rs`
+  - `crates/attic-semantic/tests/qwen3_reference_compat.rs` (new reference test)
+  - `crates/attic-semantic/tests/fixtures/qwen3_embedding_0_6b_reference.json` (new fixture)
   - `crates/attic-semantic/src/lib.rs`
-- **Tests Run**: `cargo test -p attic-semantic --lib` (43 passed).
+- **Tests Run**: `cargo test -p attic-semantic --test qwen3_reference_compat -- --nocapture` (2 passed, cosine sim 1.000000).
 - **Results**: PASS.
 - **Deviations**: None.
 - **Known Issues**: None.
-- **Next Checkpoint**: CP8
+- **Next Checkpoint**: CP8 / F7
 
 ### CP8 — Model Asset Lifecycle
 - **Status**: PASS

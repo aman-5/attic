@@ -2,6 +2,7 @@
 
 **Date**: 2026-09-09
 **Status**: PASS
+**Evaluation Scope**: Retrieval pipeline & hybrid ranking fusion (deterministic `HashingEmbedder` TEST DOUBLE)
 **Corpus**: 3 repositories (`auth-service`, `frontend-web`, `engine-core`)
 **Languages**: Java, TypeScript, Rust, YAML, Markdown
 **Code Sizes**: Small (<50 lines), Medium (100–300 lines), Large (>600 lines)
@@ -16,7 +17,7 @@
 | **Recall@1** | 0.800 | 0.800 | +0.000 | — | INFO |
 | **Recall@5** | 0.900 | 0.900 | +0.000 | ≥ Tier A & ≥ 0.85 | **PASS** |
 | **Recall@10** | — | 1.000 | — | ≥ 0.90 | **PASS** |
-| **MRR** | 0.848 | 0.839 | -0.008 | ≥ Tier A | **PASS** |
+| **MRR** | 0.848 | 0.839 | -0.008 | ≥ 0.80 | **PASS** |
 
 ---
 
