@@ -565,7 +565,6 @@ fn quality_and_speed_benchmark_gate() {
 
     // ── 5. Bulk Batch Size Scaling & Throughput (§24, C4) ────────────────────
     let bulk_plan = CpuIsolationPlan::compute(8, 1);
-    bulk_plan.apply_environment_hints();
 
     let batch_sizes = [1usize, 4, 8, 16];
     let mut batch_metrics = Vec::new();
@@ -600,11 +599,13 @@ fn quality_and_speed_benchmark_gate() {
 
     for &bs in &batch_sizes {
         let t0 = Instant::now();
-        for chunk in items_16.chunks(bs) {
-            let _ = embedder
-                .embed_documents(chunk, &budget)
-                .expect("batch embed");
-        }
+        bulk_plan.execute_isolated(|| {
+            for chunk in items_16.chunks(bs) {
+                let _ = embedder
+                    .embed_documents(chunk, &budget)
+                    .expect("batch embed");
+            }
+        });
         let elapsed = t0.elapsed();
         let total_ms = elapsed.as_secs_f64() * 1000.0;
         let units_per_sec = (items_16.len() as f64) / elapsed.as_secs_f64();
@@ -624,7 +625,6 @@ fn quality_and_speed_benchmark_gate() {
         let plan = CpuIsolationPlan::compute(granted_threads, 2);
         assert!(!plan.is_oversubscribed());
         assert!(plan.total_allocated_threads <= granted_threads);
-        plan.apply_environment_hints();
 
         let t0 = Instant::now();
         let _ = plan.execute_isolated(|| {
@@ -669,6 +669,8 @@ fn quality_and_speed_benchmark_gate() {
     let mut handler_samples = Vec::with_capacity(sample_queries.len());
     let mut total_mcp_samples = Vec::with_capacity(sample_queries.len());
 
+    let interactive_plan = CpuIsolationPlan::compute(8, 1);
+
     for query_text in &sample_queries {
         let t_prep0 = Instant::now();
         let instructed_query = attic_semantic::instruction::format_query_instruction(
@@ -687,9 +689,11 @@ fn quality_and_speed_benchmark_gate() {
         tok_samples.push(tokenization_ms);
 
         let t_q0 = Instant::now();
-        let q_vec = embedder
-            .embed_query(query_text, &budget)
-            .expect("mcp query");
+        let q_vec = interactive_plan.execute_isolated(|| {
+            embedder
+                .embed_query(query_text, &budget)
+                .expect("mcp query")
+        });
         let query_emb_ms = t_q0.elapsed().as_secs_f64() * 1000.0;
         query_emb_samples.push(query_emb_ms);
 

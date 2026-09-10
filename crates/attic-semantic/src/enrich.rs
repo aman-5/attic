@@ -201,9 +201,17 @@ pub fn drive(
         }
 
         let mut usage = ResourceUsage::default();
+        let plan = crate::cpu_isolation::CpuIsolationPlan::compute(
+            cfg.effective_cpu_threads(),
+            cfg.embedding_worker_count,
+        );
         // Enrichment's own wall-clock budget is the provider deadline: a
         // slow/hung backend must never hold the drive loop past it.
-        match provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline)) {
+        // Isolation plan ensures Qwen CPU execution respects orchestrator thread limits.
+        let embed_res = plan.execute_isolated(|| {
+            provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline))
+        });
+        match embed_res {
             Ok(outputs) => {
                 let mut batch_records = Vec::with_capacity(outputs.len());
                 for out in outputs {

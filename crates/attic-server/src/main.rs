@@ -5129,7 +5129,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let srv = make_server(&tmp);
         let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
-        let provider = Arc::new(attic_semantic::providers::HashingEmbedder::new());
+        let provider = Arc::new(attic_semantic::testing::HashingEmbedder::new());
         let stack = attic_retrieval::semantic::SemanticStack {
             store: store.clone(),
             provider,

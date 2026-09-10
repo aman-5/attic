@@ -11,6 +11,7 @@
 //!   items may still be returned alongside the error.
 //! * Resource accounting is observable, never hidden inside the provider.
 
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SemanticError;
@@ -207,3 +208,40 @@ pub trait EmbeddingProvider: Send + Sync {
         budget: &EmbeddingExecutionBudget,
     ) -> Result<Vec<f32>, SemanticError>;
 }
+
+/// Fallback provider that reports unavailable when models are missing or disabled.
+#[derive(Debug, Default)]
+pub struct UnavailableProvider {
+    pub reason: String,
+}
+
+impl SemanticProvider for UnavailableProvider {
+    fn id(&self) -> &'static str {
+        "unavailable"
+    }
+    fn model_id(&self) -> &str {
+        "none-v0"
+    }
+    fn dimensions(&self) -> usize {
+        8
+    }
+    fn max_input_bytes(&self) -> usize {
+        1024
+    }
+    fn available(&self) -> bool {
+        false
+    }
+    fn embed_batch(
+        &self,
+        _: &[EmbeddingInput],
+        _: &CancelFlag,
+        _: &mut ResourceUsage,
+        _: Option<Instant>,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+        Err(SemanticError::ProviderUnavailable {
+            provider: "unavailable".into(),
+            reason: self.reason.clone(),
+        })
+    }
+}
+

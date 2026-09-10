@@ -170,11 +170,12 @@ impl Qwen3Attention {
         let (q, k) = self.rotary_emb.apply(&q, &k)?;
 
         // GQA repeat_kv
-        let k = repeat_kv(k, self.num_kv_groups)?;
-        let v = repeat_kv(v, self.num_kv_groups)?;
+        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let q = (q * scale)?;
+        let mut scores = q.matmul(&k.transpose(2, 3)?)?;
         if let Some(mask) = attn_mask {
             scores = scores.broadcast_add(mask)?;
         }

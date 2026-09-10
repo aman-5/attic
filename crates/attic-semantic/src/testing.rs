@@ -199,41 +199,7 @@ impl EmbeddingProvider for HashingEmbedder {
 // Test doubles (used across §22 suites)
 // ---------------------------------------------------------------------------
 
-/// Provider that reports unavailable (models missing / endpoint down).
-#[derive(Debug, Default)]
-pub struct UnavailableProvider {
-    pub reason: String,
-}
-
-impl SemanticProvider for UnavailableProvider {
-    fn id(&self) -> &'static str {
-        "unavailable"
-    }
-    fn model_id(&self) -> &str {
-        "none-v0"
-    }
-    fn dimensions(&self) -> usize {
-        8
-    }
-    fn max_input_bytes(&self) -> usize {
-        1024
-    }
-    fn available(&self) -> bool {
-        false
-    }
-    fn embed_batch(
-        &self,
-        _: &[EmbeddingInput],
-        _: &CancelFlag,
-        _: &mut ResourceUsage,
-        _: Option<Instant>,
-    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
-        Err(SemanticError::ProviderUnavailable {
-            provider: "unavailable".into(),
-            reason: self.reason.clone(),
-        })
-    }
-}
+pub use crate::provider::UnavailableProvider;
 
 /// Provider whose generation always fails after `fail_after` items.
 pub struct FailingProvider {

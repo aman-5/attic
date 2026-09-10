@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use attic_retrieval::{AnswerRequest, semantic::enrich_to_completion};
-use attic_semantic::{EnrichmentConfig, HashingEmbedder};
+use attic_semantic::{EnrichmentConfig, testing::HashingEmbedder};
 use common::Fixture;
 use common::bench::{cases, evaluate_tier, path_order, recall_at, served_paths};
 

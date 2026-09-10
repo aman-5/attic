@@ -28,7 +28,7 @@ use attic_indexing::{IndexOptions, IndexingStore, index_repository};
 use attic_retrieval::{
     AnswerMode, AnswerRequest, RetrievalService, semantic::enrich_to_completion,
 };
-use attic_semantic::{EnrichmentConfig, HashingEmbedder};
+use attic_semantic::{EnrichmentConfig, testing::HashingEmbedder};
 use attic_storage::{DbPool, WriterQueue, WriterQueueHandle, open_db, run_migrations};
 use tempfile::TempDir;
 

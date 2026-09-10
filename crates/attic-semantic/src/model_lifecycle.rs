@@ -12,6 +12,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::cpu_isolation::CpuIsolationPlan;
 use crate::error::SemanticError;
 use crate::provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
@@ -41,6 +42,7 @@ pub struct SharedModelHandle {
     cancel_flag: Arc<CancelFlag>,
     baseline_memory_mib: u64,
     max_concurrency: AtomicUsize,
+    isolation_plan: Arc<RwLock<CpuIsolationPlan>>,
 }
 
 impl SharedModelHandle {
@@ -50,13 +52,16 @@ impl SharedModelHandle {
         baseline_memory_mib: u64,
         max_concurrency: usize,
     ) -> Self {
+        let lanes = max_concurrency.max(1);
+        let plan = CpuIsolationPlan::compute(lanes * 2, lanes);
         Self {
             provider,
             state: Arc::new(RwLock::new(ModelLifecycleState::Ready)),
             active_inferences: Arc::new(AtomicUsize::new(0)),
             cancel_flag: Arc::new(CancelFlag::new()),
             baseline_memory_mib,
-            max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
+            max_concurrency: AtomicUsize::new(lanes),
+            isolation_plan: Arc::new(RwLock::new(plan)),
         }
     }
 
@@ -96,6 +101,18 @@ impl SharedModelHandle {
         self.max_concurrency.store(new_max.max(1), Ordering::SeqCst);
     }
 
+    /// Dynamically update CPU thread grant and inference lane count (§21).
+    pub fn update_cpu_allocation(&self, granted_threads: usize, lanes: usize) {
+        let plan = CpuIsolationPlan::compute(granted_threads, lanes);
+        self.update_max_concurrency(plan.inference_lanes);
+        *self.isolation_plan.write().unwrap() = plan;
+    }
+
+    /// Current CPU isolation plan.
+    pub fn isolation_plan(&self) -> CpuIsolationPlan {
+        *self.isolation_plan.read().unwrap()
+    }
+
     /// Cooperative cancellation flag for this model instance.
     pub fn cancel_flag(&self) -> Arc<CancelFlag> {
         self.cancel_flag.clone()
@@ -123,7 +140,8 @@ impl SharedModelHandle {
         budget: &EmbeddingExecutionBudget,
     ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
         let _guard = self.acquire_inference_permit()?;
-        self.provider.embed_documents(inputs, budget)
+        let plan = *self.isolation_plan.read().unwrap();
+        plan.execute_isolated(|| self.provider.embed_documents(inputs, budget))
     }
 
     /// Embed query with in-flight tracking, concurrency gating, and drain protection.
@@ -133,7 +151,8 @@ impl SharedModelHandle {
         budget: &EmbeddingExecutionBudget,
     ) -> Result<Vec<f32>, SemanticError> {
         let _guard = self.acquire_inference_permit()?;
-        self.provider.embed_query(query, budget)
+        let plan = *self.isolation_plan.read().unwrap();
+        plan.execute_isolated(|| self.provider.embed_query(query, budget))
     }
 
     /// Request model unload: transition to Draining, signal cancellation, and drain.

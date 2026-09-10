@@ -12,8 +12,8 @@ use attic_retrieval::{
     semantic::{SemanticStack, enrich_to_completion},
 };
 use attic_semantic::{
-    CancelFlag, EnrichmentConfig, FailingProvider, HashingEmbedder, RecordingProvider,
-    SlowProvider, UnavailableProvider,
+    CancelFlag, EnrichmentConfig,
+    testing::{FailingProvider, HashingEmbedder, RecordingProvider, SlowProvider, UnavailableProvider},
 };
 use common::Fixture;
 

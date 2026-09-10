@@ -28,7 +28,7 @@ pub mod learned_tuning;
 pub mod model_assets;
 pub mod model_lifecycle;
 pub mod provider;
-pub mod providers;
+pub mod testing;
 pub mod qwen3_model;
 pub mod qwen3_provider;
 pub mod scheduler;
@@ -55,11 +55,8 @@ pub use model_assets::{
 pub use model_lifecycle::{ModelLifecycleState, SharedModelHandle};
 pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider, cosine,
-};
-/// Test doubles and conformance providers (strictly forbidden in production; test harness only).
-pub use providers::{
-    FailingProvider, HashingEmbedder, RecordingProvider, SlowProvider, UnavailableProvider,
+    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
+    UnavailableProvider, cosine,
 };
 pub use qwen3_provider::{QWEN_MODEL_ID, QWEN_PROVIDER_ID, Qwen3Embedder, QwenPooling};
 pub use scheduler::{
