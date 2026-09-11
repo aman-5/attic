@@ -697,9 +697,21 @@ impl SemanticStore {
             )?;
             let mut mark_stmt =
                 tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
+            let mut check_stmt = tx.prepare(
+                "SELECT 1 FROM sem_embeddings WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3"
+            )?;
 
+            let mut new_units = 0i64;
             let now = Self::now_ms();
             for rec in records {
+                if !check_stmt.exists(params![
+                    rec.retrieval_unit_id,
+                    rec.provider_id,
+                    rec.model_id
+                ])? {
+                    new_units += 1;
+                }
+
                 let norm: f32 = rec.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let mut blob = Vec::with_capacity(rec.vector.len() * 4);
                 for v in &rec.vector {
@@ -723,10 +735,12 @@ impl SemanticStore {
                 mark_stmt.execute(params![rec.retrieval_unit_id, Q_DONE])?;
             }
 
-            tx.execute(
-                "UPDATE sem_generations SET unit_count = unit_count + ?1 WHERE generation_id = ?2",
-                params![records.len() as i64, generation_id],
-            )?;
+            if new_units > 0 {
+                tx.execute(
+                    "UPDATE sem_generations SET unit_count = unit_count + ?1 WHERE generation_id = ?2",
+                    params![new_units, generation_id],
+                )?;
+            }
         }
 
         tx.commit()?;
