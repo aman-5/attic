@@ -207,6 +207,11 @@ fn default_semantic_enabled() -> bool {
     true
 }
 
+/// Helper returning true as default for indexing.structural.
+fn default_structural_indexing() -> bool {
+    true
+}
+
 /// Helper returning default model name for semantic.model.
 fn default_semantic_model() -> String {
     "qwen3-embedding-0.6b".to_string()
@@ -296,7 +301,7 @@ impl ResourceOverrides {
 }
 
 /// User-tunable indexing/discovery overrides (`[indexing]` in `attic.toml`).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingOverride {
     /// Additional repo-relative glob patterns to exclude from indexing,
@@ -307,6 +312,23 @@ pub struct IndexingOverride {
     /// (`attic_discovery::GlobRule::exclude`) at bootstrap time.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Operational kill-switch mirroring `attic_indexing::IndexOptions::structural`
+    /// (previously hardcoded `true` with no way to flip it in production):
+    /// when `false`, only the GenericAnalyzer runs (lexical-only indexing,
+    /// no structural/AST analysis) for both bootstrap and incremental
+    /// reindexing. Default `true` — current behavior unchanged unless
+    /// explicitly set.
+    #[serde(default = "default_structural_indexing")]
+    pub structural: bool,
+}
+
+impl Default for IndexingOverride {
+    fn default() -> Self {
+        Self {
+            exclude: Vec::new(),
+            structural: true,
+        }
+    }
 }
 
 /// Parsed `attic.toml` — resource/semantic/indexing tunables only.
@@ -372,6 +394,10 @@ model = "qwen3-embedding-0.6b"
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
 # Attic's built-in defaults (node_modules/, target/, build output, etc.).
 # exclude = ["**/pom.xml"]
+
+# Kill-switch: set to false to fall back to lexical-only indexing (no
+# structural/AST analysis) if structural analysis misbehaves on this codebase.
+# structural = true
 "#;
 
 #[cfg(test)]

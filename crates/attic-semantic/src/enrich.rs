@@ -167,12 +167,36 @@ pub fn drive(
         if items.is_empty() {
             break;
         }
+        // [FIX] Everything below this point must NEVER return `Err` out of
+        // this loop iteration without first releasing `items` back to
+        // PENDING/FAILED — `queue_take_batch` already flipped them to
+        // INFLIGHT, and a bare `?` here would abandon them there forever
+        // (the bug behind observed queue_inflight growth with queue_done
+        // stuck at 0).
         let target_gen_id = match provider.fingerprint() {
-            Some(ref fp) => Some(ensure_generation_for_fingerprint(store, fp)?),
+            Some(ref fp) => match ensure_generation_for_fingerprint(store, fp) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!("failed to resolve embedding generation: {e}");
+                    for it in &items {
+                        store.queue_reset(&it.retrieval_unit_id)?;
+                    }
+                    continue;
+                }
+            },
             None => None,
         };
         let ids: Vec<String> = items.iter().map(|i| i.retrieval_unit_id.clone()).collect();
-        let rows = attic_storage::semantic_units_by_ids(conn, &ids)?;
+        let rows = match attic_storage::semantic_units_by_ids(conn, &ids) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("failed to load semantic units for batch: {e}");
+                for it in &items {
+                    store.queue_reset(&it.retrieval_unit_id)?;
+                }
+                continue;
+            }
+        };
 
         // Build provider inputs; refuse anything that fails the security
         // gate BEFORE it can reach the provider (§18 defense-in-depth —
@@ -199,6 +223,15 @@ pub fn drive(
                 text: r.retrieval_text.clone(),
             });
         }
+        // [FIX] A unit claimed via `items`/`ids` that never came back from
+        // `semantic_units_by_ids` (e.g. its canonical row was deleted after
+        // being queued) was previously left INFLIGHT forever with no error
+        // and no resolution. Quarantine it explicitly instead.
+        for id in &ids {
+            if !meta.contains_key(id) {
+                store.queue_fail_permanently(id)?;
+            }
+        }
 
         let mut usage = ResourceUsage::default();
         let plan = crate::cpu_isolation::CpuIsolationPlan::compute(
@@ -212,6 +245,8 @@ pub fn drive(
             .execute_isolated(|| provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline)));
         match embed_res {
             Ok(outputs) => {
+                let mut handled: std::collections::HashSet<String> =
+                    std::collections::HashSet::with_capacity(outputs.len());
                 let mut batch_records = Vec::with_capacity(outputs.len());
                 for out in outputs {
                     if let Some(r) = meta.get(&out.unit_key) {
@@ -221,6 +256,7 @@ pub fn drive(
                                 expected: provider.dimensions(),
                             });
                         }
+                        handled.insert(out.unit_key.clone());
                         let identity = SemanticUnitIdentity::new(
                             r.unit_id.clone(),
                             r.source_revision_id.clone(),
@@ -242,11 +278,35 @@ pub fn drive(
                         });
                     }
                 }
-                stats.embedded += batch_records.len() as u64;
-                if let Some(gen_id) = target_gen_id {
-                    store.put_batch_for_generation(&batch_records, gen_id)?;
+                // [FIX] Any requested input the provider silently dropped
+                // (returned fewer vectors than inputs) previously stayed
+                // INFLIGHT forever with no error raised anywhere.
+                for input in &inputs {
+                    if !handled.contains(&input.unit_key) {
+                        store.queue_mark_failed(&input.unit_key, cfg.max_attempts)?;
+                        stats.failed_items += 1;
+                    }
+                }
+                // [FIX] The commit itself is fallible (canonical/semantic DB
+                // contention, disk errors). Previously a bare `?` here threw
+                // away already-computed embeddings AND left the batch
+                // permanently INFLIGHT. Reset on failure so it's retried
+                // instead of leaked.
+                let commit = if let Some(gen_id) = target_gen_id {
+                    store.put_batch_for_generation(&batch_records, gen_id)
                 } else {
-                    store.put_batch_and_mark_done(&batch_records)?;
+                    store.put_batch_and_mark_done(&batch_records)
+                };
+                match commit {
+                    Ok(()) => {
+                        stats.embedded += batch_records.len() as u64;
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to commit embedding batch: {e}");
+                        for r in &batch_records {
+                            store.queue_reset(&r.retrieval_unit_id)?;
+                        }
+                    }
                 }
             }
             Err(SemanticError::Cancelled { .. }) => {
@@ -413,7 +473,14 @@ impl BackgroundEnricher {
             let write_generation = write_generation.clone();
             let reconcile_gate = reconcile_gate.clone();
             let handle = std::thread::spawn(move || {
-                let conn = match Connection::open(&conn_path) {
+                // [FIX] Use the shared pragma-configured opener (WAL +
+                // busy_timeout=5000, etc.) instead of a raw `Connection::open`.
+                // A bare connection has no busy_timeout, so any transient lock
+                // held by the canonical writer (bootstrap/incremental commits)
+                // surfaced as an immediate SQLITE_BUSY error here — which,
+                // combined with drive()'s per-batch error handling, silently
+                // abandoned the whole already-claimed INFLIGHT batch.
+                let conn = match attic_storage::connection::open_ro(&conn_path) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("background enrichment cannot open index: {e}");

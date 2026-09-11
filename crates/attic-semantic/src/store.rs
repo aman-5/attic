@@ -173,10 +173,10 @@ impl GenerationIndex {
     }
 
     pub fn tombstone_unit(&mut self, unit_id: &str) {
-        if let Some(&ann_id) = self.unit_to_ann_id.get(unit_id) {
-            if let Some(entry) = self.metadata.get_mut(&ann_id) {
-                entry.deleted = true;
-            }
+        if let Some(&ann_id) = self.unit_to_ann_id.get(unit_id)
+            && let Some(entry) = self.metadata.get_mut(&ann_id)
+        {
+            entry.deleted = true;
         }
     }
 
@@ -808,10 +808,10 @@ impl SemanticStore {
             let ann_id = gen_idx.next_ann_id;
             gen_idx.next_ann_id += 1;
 
-            if let Some(old_ann_id) = gen_idx.unit_to_ann_id.insert(unit_id, ann_id) {
-                if let Some(entry) = gen_idx.metadata.get_mut(&old_ann_id) {
-                    entry.deleted = true;
-                }
+            if let Some(old_ann_id) = gen_idx.unit_to_ann_id.insert(unit_id, ann_id)
+                && let Some(entry) = gen_idx.metadata.get_mut(&old_ann_id)
+            {
+                entry.deleted = true;
             }
 
             gen_idx.hnsw.insert((&coarse, ann_id));

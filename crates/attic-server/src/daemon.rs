@@ -25,7 +25,6 @@
 //! fallback if an old pre-daemon binary is holding the lock.
 
 use std::{
-    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::{

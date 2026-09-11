@@ -544,7 +544,10 @@ impl AtticServer {
             .iter()
             .map(|pattern| GlobRule::exclude(pattern.clone()))
             .collect();
-        let opts = IndexOptions::default();
+        let opts = IndexOptions {
+            structural: self.attic_config.indexing.structural,
+            ..IndexOptions::default()
+        };
         let result = attic_indexing::index_repository_with_cancellation(
             &store,
             root,
@@ -754,6 +757,48 @@ impl AtticServer {
             }
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+    }
+
+    /// Debug/admin tool: claim and execute exactly one pending incremental
+    /// task synchronously, bypassing the background scheduler threads —
+    /// for on-demand catch-up without waiting on the scheduler's poll
+    /// interval. Shares the exact same atomic claim
+    /// (`attic_storage::ops_tasks::claim_next_pending_task`) as the
+    /// background scheduler, so there is no risk of double-processing a
+    /// task racing the background threads.
+    ///
+    /// This call BLOCKS until the claimed task completes (or returns
+    /// immediately with `drained: false` if the queue was empty) — it is
+    /// not fire-and-forget. Never call this from a latency-sensitive path.
+    fn handle_debug_drain_task(&self) -> Result<CallToolResult, ServerError> {
+        let root = {
+            let roots = lock_or_call_err!(self.active_roots.read(), "active_roots");
+            roots.first().cloned()
+        };
+        let Some(root) = root else {
+            return Err(ServerError::InvalidArg(
+                "no active workspace roots configured".into(),
+            ));
+        };
+        let mut policy = DiscoveryPolicy::default_git();
+        policy.attic_exclude_rules = self
+            .attic_config
+            .indexing
+            .exclude
+            .iter()
+            .map(|pattern| GlobRule::exclude(pattern.clone()))
+            .collect();
+        let drained = attic_incremental::run_next_task_synchronously(
+            &self.pool,
+            &self.writer,
+            &root,
+            &policy,
+            self.resource_monitor.as_deref(),
+        )
+        .map_err(|e| ServerError::InvalidArg(format!("task drain failed: {e}")))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({ "drained": drained }).to_string(),
+        )]))
     }
 
     /// Runtime logical-workspace membership management via the `workspace`
@@ -2091,6 +2136,15 @@ struct ResourceStatus<'a> {
     attic_config: &'a attic_core::AtticConfig,
 }
 
+// [FIX] `chunks_per_sec` in `semantic_progress` used to be a hardcoded
+// literal (50.0), so ETA never reflected reality. This tracks the previous
+// poll's (timestamp, queue_done count) so each status call can derive a
+// real rolling rate from the actual delta. Process-lifetime static: there
+// is one semantic store per server process, so no per-instance state is
+// needed beyond this.
+static LAST_SEMANTIC_PROGRESS_SAMPLE: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
 #[allow(clippy::too_many_arguments)]
 fn handle_status(
     pool: &DbPool,
@@ -2212,13 +2266,43 @@ fn handle_status(
             "loading"
         };
 
+        // [FIX] Real rolling chunks/sec derived from the queue_done delta
+        // since the last status poll, replacing the previous hardcoded
+        // 50.0/200.0 literals that never reflected actual throughput.
+        let now = std::time::Instant::now();
+        let chunks_per_sec = {
+            let mut last = LAST_SEMANTIC_PROGRESS_SAMPLE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let rate = match *last {
+                Some((last_time, last_done)) if done > last_done => {
+                    let elapsed = now.duration_since(last_time).as_secs_f64();
+                    if elapsed > 0.0 {
+                        (done - last_done) as f64 / elapsed
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            *last = Some((now, done));
+            rate
+        };
+        // batch_latency_ms is derived (not independently measured): the
+        // configured batch size divided by the real chunks/sec rate above.
+        let batch_size = phase8.effective_resources.embedding_batch_size.max(1) as f64;
+        let batch_latency_ms = if chunks_per_sec > 0.0 {
+            (batch_size / chunks_per_sec) * 1000.0
+        } else {
+            0.0
+        };
         let progress = attic_semantic::SemanticProgressSnapshot::compute(
             pending,
             inflight,
             done,
             failed,
-            50.0,
-            200.0,
+            chunks_per_sec,
+            batch_latency_ms,
             active_gen,
             building_gen,
             cache_state,
@@ -2596,6 +2680,14 @@ fn make_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
+            "debug_drain_task",
+            "Debug/admin: claim and execute exactly one pending incremental indexing task \
+             synchronously, bypassing the background scheduler's poll interval. Returns \
+             {\"drained\": false} if the queue was empty. This call BLOCKS until the task \
+             completes — it is not fire-and-forget and should not be used on a latency-sensitive path.",
+            json_schema(json!({"type":"object","properties":{}})),
+        ),
+        Tool::new(
             "context",
             "Evidence-driven context assembly for a natural-language engineering question. \
              Classifies the query, applies the Query Evidence Contract for its intent \
@@ -2777,6 +2869,7 @@ impl ServerHandler for AtticServer {
             };
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
                 "logging" => Self::handle_logging(&args),
+                "debug_drain_task" => self.handle_debug_drain_task(),
                 "workspace" => self.handle_workspace(&args).await,
                 "file" | "search" | "repo_map" | "context" if !workspace_configured => {
                     // UNCONFIGURED first run (┬º8/┬º30): query tools that depend on
@@ -3748,6 +3841,7 @@ pub(crate) fn build_server_and_enricher(
             match attic_incremental::spawn_scheduler(
                 attic_incremental::SchedulerConfig {
                     workers: startup_server.effective_resources.scheduler_workers,
+                    structural_indexing: startup_server.attic_config.indexing.structural,
                     ..attic_incremental::SchedulerConfig::default()
                 },
                 startup_server.pool.clone(),
