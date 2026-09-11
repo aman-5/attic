@@ -1105,11 +1105,6 @@ impl ResourceMonitor {
         self.guidance_pressure()
     }
 
-    #[allow(dead_code)]
-    fn compute_pressure(&self) -> ResourcePressure {
-        self.guidance_pressure()
-    }
-
     /// Return the current hysteresis-smoothed [`ResourcePressure`].
     pub fn pressure(&self) -> ResourcePressure {
         self.guidance_pressure()

@@ -110,21 +110,6 @@ pub(crate) struct DaemonHandle {
     ipc_path: PathBuf,
 }
 
-impl DaemonHandle {
-    /// Returns the IPC discovery file path (e.g. `attic.ipc`).
-    #[allow(dead_code)]
-    pub(crate) fn ipc_path(&self) -> &Path {
-        &self.ipc_path
-    }
-
-    /// Derive the database path from the IPC path (sibling file convention:
-    /// `attic.ipc` lives next to `attic.db`).
-    #[allow(dead_code)]
-    pub(crate) fn db_path(&self) -> PathBuf {
-        self.ipc_path.with_file_name("attic.db")
-    }
-}
-
 /// A connected IPC stream, ready to be spliced to this process's own
 /// stdin/stdout.
 pub(crate) struct RelayHandle {
@@ -1205,46 +1190,6 @@ pub(crate) async fn run_relay_supervised(
     run_relay_supervised_internal(relay, db_path, daemon_starter, recovery, None).await
 }
 
-/// Low-level relay that simply splices `stdin ↔ stream` byte-for-byte with
-/// no session caching. Used only for the `ATTIC_NO_DAEMON` fast-path and in
-/// tests that don't need Phase 6/7 recovery.
-#[allow(dead_code)]
-pub(crate) async fn run_relay(relay: RelayHandle) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let (mut recv_half, mut send_half) = relay.stream.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = [0u8; 4096];
-    let mut daemon_buf = [0u8; 4096];
-
-    loop {
-        tokio::select! {
-            n = stdin.read(&mut stdin_buf) => {
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if send_half.write_all(&stdin_buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            n = recv_half.read(&mut daemon_buf) => {
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdout.write_all(&daemon_buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handle one accepted IPC connection on the daemon side: run the MCP server
 /// over this socket connection (reading from the socket, writing to the
 /// socket) using `server.serve()`.
@@ -1284,16 +1229,6 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-/// Handle one accepted stdio connection on the daemon side.  Used when the
-/// daemon is invoked directly (no relay) — i.e. the first launch with
-/// `ATTIC_NO_DAEMON=0` that wins election still reads from its own stdin.
-#[allow(dead_code)]
-pub(crate) async fn handle_stdio_connection(server: AtticServer) -> anyhow::Result<()> {
-    let running = server.serve(rmcp::transport::stdio()).await?;
-    let _ = running.waiting().await;
-    Ok(())
 }
 
 /// Spawn the daemon accept loop on a background task so the caller retains
@@ -1575,26 +1510,6 @@ pub(crate) async fn run_daemon_accept_loop(
     Ok(())
 }
 
-/// Returns a human-readable summary of the relay recovery backoff schedule
-/// for use in log messages and diagnostics.
-#[allow(dead_code)]
-pub(crate) fn relay_recovery_info() -> HashMap<&'static str, String> {
-    let mut m = HashMap::new();
-    m.insert(
-        "recovery_budget_secs",
-        RELAY_RECOVERY_BUDGET.as_secs().to_string(),
-    );
-    m.insert(
-        "backoff_steps_ms",
-        RELAY_RECOVERY_BACKOFFS_MS
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    m
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1702,13 +1617,6 @@ mod tests {
         let (framed_mcp, next_mcp) = parsed_mcp.unwrap();
         assert_eq!(framed_mcp, mcp_raw.as_bytes());
         assert_eq!(next_mcp, mcp_raw.len());
-    }
-
-    #[test]
-    fn test_relay_recovery_info() {
-        let info = relay_recovery_info();
-        assert_eq!(info.get("recovery_budget_secs").unwrap(), "30");
-        assert_eq!(info.get("backoff_steps_ms").unwrap(), "100,250,500,1000");
     }
 
     #[test]

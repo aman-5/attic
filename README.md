@@ -450,6 +450,3 @@ workflow: schema migrations, adding an analyzer, and the release process
   pipeline, ownership model, storage concurrency, security, crash recovery.
 - [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) — operations manual: install,
   connect, troubleshoot, recover, update, and develop.
-- [`docs/FINAL_VALIDATION_TODO.md`](docs/FINAL_VALIDATION_TODO.md) —
-  authoritative list of what has and hasn't yet been independently
-  verified (platform CI, scale/soak/stress, real semantic provider).

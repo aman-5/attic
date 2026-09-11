@@ -48,7 +48,7 @@ pub mod resources {
     pub const MAX_INDEXING_WORKERS: usize = 8;
 
     /// Maximum concurrent semantic enrichment workers.  Only active when
-    /// ATTIC_SEMANTIC=1; baseline hashing embedder is single-threaded.
+    /// ATTIC_SEMANTIC=1.
     pub const MAX_SEMANTIC_WORKERS: usize = 4;
 
     /// Total memory budget for all in-index operations (MiB).  When approached,

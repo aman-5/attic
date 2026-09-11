@@ -587,37 +587,6 @@ impl BackgroundEnricher {
 #[cfg(test)]
 mod generation_driven_enrichment_tests {
     use super::*;
-    use crate::provider::{CancelFlag, EmbeddingFingerprint, EmbeddingOutput};
-
-    #[allow(dead_code)]
-    struct FingerprintedProvider(EmbeddingFingerprint);
-
-    impl SemanticProvider for FingerprintedProvider {
-        fn id(&self) -> &'static str {
-            "fingerprinted-test"
-        }
-        fn model_id(&self) -> &str {
-            "fingerprinted-test-v1"
-        }
-        fn dimensions(&self) -> usize {
-            4
-        }
-        fn max_input_bytes(&self) -> usize {
-            4096
-        }
-        fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
-            Some(self.0.clone())
-        }
-        fn embed_batch(
-            &self,
-            _inputs: &[EmbeddingInput],
-            _cancel: &CancelFlag,
-            _usage: &mut ResourceUsage,
-            _deadline: Option<Instant>,
-        ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
-            Ok(vec![])
-        }
-    }
 
     fn test_fp(model: &str) -> EmbeddingFingerprint {
         EmbeddingFingerprint {

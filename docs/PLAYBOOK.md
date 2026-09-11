@@ -267,7 +267,7 @@ cd attic
 rustup show                                   # installs the pinned toolchain (rust-toolchain.toml)
 cargo build --package attic-server            # debug build
 cargo test -p <crate>                         # focused test, fast inner loop
-cargo test --workspace                        # complete suite (slow — see FINAL_VALIDATION_TODO.md for CI status)
+cargo test --workspace                        # complete suite (slow)
 cargo fmt --all                               # formatting (rustfmt.toml)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --package attic-server --target x86_64-pc-windows-msvc   # release build (adjust target per platform)
@@ -356,9 +356,8 @@ safely removes it at any time; it will be regenerated on the next build.
     silently overclaimed); see the C/C++/Ruby/C#/Scala/PHP/Swift/Lua/Rust/
     Dockerfile entries already registered there for the reference shape.
 - **Retrieval changes**: modify the Query Evidence Contract or candidate
-  generation in `crates/attic-retrieval`; re-run the relevant benchmark in
-  `benchmarks/` against its baseline before merging (see
-  `benchmarks/acceptance.md`).
+  generation in `crates/attic-retrieval`; re-run the relevant regression
+  gate tests in `crates/attic-retrieval/tests/` before merging.
 - **Release process**: bump `version` in the root `Cargo.toml`, then for
   each supported target run
   `tools/package.sh --target <triple> --out dist` (builds, stages, verifies,

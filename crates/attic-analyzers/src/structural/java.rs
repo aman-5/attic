@@ -1,8 +1,8 @@
 //! Java language specification (grammar: `tree-sitter-java` 0.23.x).
 //!
-//! Extraction rules are grounded exclusively in parse trees inspected via
-//! tests/parse_probe.rs against the pinned grammar — never copied from other
-//! languages. Key observed kinds: `program`, `package_declaration`
+//! Extraction rules are grounded exclusively in parse trees produced by the
+//! pinned grammar — never copied from other languages. Key observed kinds:
+//! `program`, `package_declaration`
 //! (`scoped_identifier`), `import_declaration` (+ anonymous `static` / `*`
 //! tokens), `class_declaration` / `interface_declaration` /
 //! `enum_declaration` (`modifiers`, `superclass`, `super_interfaces` →

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 7 release packaging for Attic.
+# Release packaging for Attic.
 #
 # Builds attic-server for a target triple and assembles a clean release
 # archive with the canonical layout:
@@ -118,9 +118,7 @@ for lic in LICENSE-MIT LICENSE-APACHE; do
   [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"
 done
 # Operator docs only (markdown), preserving relative structure under docs/.
-# FINAL_VALIDATION_TODO.md is an internal pre-release validation checklist,
-# not end-user documentation — deliberately excluded from release archives.
-(cd "$REPO_ROOT" && find docs -name '*.md' -type f ! -name 'FINAL_VALIDATION_TODO.md') | while read -r doc; do
+(cd "$REPO_ROOT" && find docs -name '*.md' -type f) | while read -r doc; do
   mkdir -p "$STAGE/$(dirname "$doc")"
   cp "$REPO_ROOT/$doc" "$STAGE/$doc"
 done

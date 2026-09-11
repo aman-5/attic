@@ -231,12 +231,11 @@ pub(crate) struct AtticServer {
 
 /// Phase 9: decide which `SemanticProvider` to actually construct.
 ///
-/// Reconstructs the persisted or configured semantic provider for Attic.
 /// Reconstructs the configured semantic provider for Attic.
 ///
-/// In Phase 103 Clean Final Architecture, `Qwen3Embedder` is the sole production
-/// neural provider. If unavailable (e.g. offline with no cached weights), it degrades
-/// to `UnavailableProvider`, never corrupting the vector space and never falling back to Hashing.
+/// `Qwen3Embedder` is the sole production neural provider. If unavailable
+/// (e.g. offline with no cached weights), it degrades to `UnavailableProvider`,
+/// never corrupting the vector space and never falling back to a hashing embedder.
 fn resolve_semantic_provider(
     attic_config: &attic_core::AtticConfig,
     batch_size: usize,
