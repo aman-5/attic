@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS sem_embeddings (
     vector              BLOB    NOT NULL,
     created_at_ms       INTEGER NOT NULL,
     generation_id       INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (retrieval_unit_id, provider_id, model_id)
+    PRIMARY KEY (retrieval_unit_id, provider_id, model_id, generation_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sem_model

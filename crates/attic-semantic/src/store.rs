@@ -698,7 +698,7 @@ impl SemanticStore {
             let mut mark_stmt =
                 tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
             let mut check_stmt = tx.prepare(
-                "SELECT 1 FROM sem_embeddings WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3"
+                "SELECT 1 FROM sem_embeddings WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3 AND generation_id=?4"
             )?;
 
             let mut new_units = 0i64;
@@ -707,7 +707,8 @@ impl SemanticStore {
                 if !check_stmt.exists(params![
                     rec.retrieval_unit_id,
                     rec.provider_id,
-                    rec.model_id
+                    rec.model_id,
+                    generation_id
                 ])? {
                     new_units += 1;
                 }
