@@ -116,15 +116,16 @@ pub struct ActiveIdentityRow {
 }
 
 /// Compact coarse vector dimension for stage-1 candidate search.
-/// Qwen3 is an MRL (Matryoshka Representation Learning) model: the first 32 dimensions
+/// Qwen3 is an MRL (Matryoshka Representation Learning) model: the first 128 dimensions
 /// capture the coarse semantic topology with high recall fidelity.
-const COARSE_INDEX_DIM: usize = 32;
+const COARSE_INDEX_DIM: usize = 128;
 
 /// A lightweight candidate index entry cached in memory for high-throughput candidate search.
 #[derive(Debug, Clone)]
 struct CandidateEntry {
     rowid: i64,
     repository_id: String,
+    deleted: bool,
 }
 
 /// Generation-isolated candidate index backed by HNSW for O(log N) fast retrieval.
@@ -140,6 +141,7 @@ struct GenerationIndex {
     generation_id: i64,
     hnsw: Hnsw<'static, f32, DistCosine>,
     metadata: HashMap<usize, CandidateEntry>,
+    unit_to_ann_id: HashMap<String, usize>,
     last_synced_rowid: i64,
     next_ann_id: usize,
 }
@@ -155,17 +157,26 @@ impl std::fmt::Debug for GenerationIndex {
 }
 
 impl GenerationIndex {
-    pub fn new(generation_id: i64) -> Self {
+    pub fn new(generation_id: i64, capacity: usize) -> Self {
         Self {
             generation_id,
-            // Configure HNSW parameters for up to 1M items.
-            // max_nb_connection: 16, max_elements: 1_000_000, max_layer: 16, ef_construction: 200.
+            // Configure HNSW parameters for dynamic capacity.
+            // max_nb_connection: 16, max_elements: capacity, max_layer: 16, ef_construction: 200.
             // DistCosine is safe for signed float32 vectors; DistDot would panic on negative dot
             // products that arise naturally from L2-normalised neural embeddings.
-            hnsw: Hnsw::new(16, 1_000_000, 16, 200, DistCosine {}),
+            hnsw: Hnsw::new(16, capacity, 16, 200, DistCosine {}),
             metadata: HashMap::new(),
+            unit_to_ann_id: HashMap::new(),
             last_synced_rowid: 0,
             next_ann_id: 1,
+        }
+    }
+
+    pub fn tombstone_unit(&mut self, unit_id: &str) {
+        if let Some(&ann_id) = self.unit_to_ann_id.get(unit_id) {
+            if let Some(entry) = self.metadata.get_mut(&ann_id) {
+                entry.deleted = true;
+            }
         }
     }
 
@@ -216,11 +227,14 @@ impl GenerationIndex {
                 break;
             }
 
-            let neighbors = self.hnsw.search(&q_coarse, candidate_limit, ef_search);
+            let neighbors = self.hnsw.search(&q_coarse, ef_search, ef_search);
             top_candidates.clear();
 
             for neighbor in neighbors {
                 if let Some(entry) = self.metadata.get(&neighbor.d_id) {
+                    if entry.deleted {
+                        continue;
+                    }
                     if let Some(repo) = repository_filter
                         && entry.repository_id != repo
                     {
@@ -362,7 +376,7 @@ impl SemanticStore {
             blob.extend_from_slice(&v.to_le_bytes());
         }
         self.guard()?.execute(
-            "INSERT INTO sem_embeddings
+            "INSERT OR REPLACE INTO sem_embeddings
                  (retrieval_unit_id, repository_id, source_revision_id,
                   index_generation_id, selection_version, provider_id, model_id,
                   content_hash, dim, norm, vector, created_at_ms)
@@ -402,7 +416,7 @@ impl SemanticStore {
 
         {
             let mut insert_stmt = tx.prepare(
-                "INSERT INTO sem_embeddings
+                "INSERT OR REPLACE INTO sem_embeddings
                      (retrieval_unit_id, repository_id, source_revision_id,
                       index_generation_id, selection_version, provider_id, model_id,
                       content_hash, dim, norm, vector, created_at_ms)
@@ -440,6 +454,20 @@ impl SemanticStore {
         Ok(())
     }
 
+    fn tombstone_units_in_all_indexes<'a>(&self, unit_ids: impl Iterator<Item = &'a str>) {
+        let ids: Vec<&str> = unit_ids.collect();
+        if ids.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.candidate_index.lock() {
+            for gen_idx in guard.values_mut() {
+                for unit_id in &ids {
+                    gen_idx.tombstone_unit(unit_id);
+                }
+            }
+        }
+    }
+
     /// Delete every embedding for one unit (all models) or one exact record
     /// when `provider`/`model` are given.
     pub fn delete(
@@ -448,23 +476,21 @@ impl SemanticStore {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<usize, SemanticError> {
-        match (provider, model) {
-            (Some(p), Some(m)) => {
-                let n = self.guard()?.execute(
-                    "DELETE FROM sem_embeddings
+        let n = match (provider, model) {
+            (Some(p), Some(m)) => self.guard()?.execute(
+                "DELETE FROM sem_embeddings
                       WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3",
-                    params![unit_id, p, m],
-                )?;
-                Ok(n)
-            }
-            _ => {
-                let n = self.guard()?.execute(
-                    "DELETE FROM sem_embeddings WHERE retrieval_unit_id=?1",
-                    params![unit_id],
-                )?;
-                Ok(n)
-            }
+                params![unit_id, p, m],
+            )?,
+            _ => self.guard()?.execute(
+                "DELETE FROM sem_embeddings WHERE retrieval_unit_id=?1",
+                params![unit_id],
+            )?,
+        };
+        if n > 0 {
+            self.tombstone_units_in_all_indexes(std::iter::once(unit_id));
         }
+        Ok(n)
     }
 
     /// Lookup by exact semantic-unit identity components + model.
@@ -520,18 +546,26 @@ impl SemanticStore {
         active_provider: &str,
         active_model: &str,
     ) -> Result<usize, SemanticError> {
-        Ok(self.guard()?.execute(
+        let n = self.guard()?.execute(
             "DELETE FROM sem_embeddings WHERE provider_id!=?1 OR model_id!=?2",
             params![active_provider, active_model],
-        )?)
+        )?;
+        if n > 0 {
+            self.candidate_index.lock().unwrap().clear();
+        }
+        Ok(n)
     }
 
     /// Delete everything for one model (full semantic-layer reset).
     pub fn purge_model(&self, provider: &str, model: &str) -> Result<usize, SemanticError> {
-        Ok(self.guard()?.execute(
+        let n = self.guard()?.execute(
             "DELETE FROM sem_embeddings WHERE provider_id=?1 AND model_id=?2",
             params![provider, model],
-        )?)
+        )?;
+        if n > 0 {
+            self.candidate_index.lock().unwrap().clear();
+        }
+        Ok(n)
     }
 
     /// Count embeddings for a (provider, model), optionally per repository.
@@ -655,7 +689,7 @@ impl SemanticStore {
 
         {
             let mut insert_stmt = tx.prepare(
-                "INSERT INTO sem_embeddings
+                "INSERT OR REPLACE INTO sem_embeddings
                      (retrieval_unit_id, repository_id, source_revision_id,
                       index_generation_id, selection_version, provider_id, model_id,
                       content_hash, dim, norm, vector, created_at_ms, generation_id)
@@ -709,12 +743,23 @@ impl SemanticStore {
             SemanticError::StoreUnavailable("candidate index mutex poisoned".into())
         })?;
 
+        // Fast path check if generation exists and its count
+        let unit_count = conn
+            .query_row(
+                "SELECT unit_count FROM sem_generations WHERE generation_id = ?1",
+                params![generation_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+        let capacity = unit_count.max(10_000) + 1_000_000;
+
         let gen_idx = index_guard
             .entry(generation_id)
-            .or_insert_with(|| GenerationIndex::new(generation_id));
+            .or_insert_with(|| GenerationIndex::new(generation_id, capacity));
 
         let mut stmt = conn.prepare(
-            "SELECT rowid, repository_id, norm, substr(vector, 1, 128)
+            "SELECT rowid, retrieval_unit_id, repository_id, norm, substr(vector, 1, 512)
              FROM sem_embeddings
              WHERE generation_id = ?1 AND rowid > ?2
              ORDER BY rowid ASC",
@@ -722,9 +767,10 @@ impl SemanticStore {
         let mut rows = stmt.query(params![generation_id, gen_idx.last_synced_rowid])?;
         while let Some(r) = rows.next()? {
             let rowid: i64 = r.get(0)?;
-            let repo_id: String = r.get(1)?;
-            let _norm: f32 = r.get(2)?;
-            let blob: Vec<u8> = r.get(3)?;
+            let unit_id: String = r.get(1)?;
+            let repo_id: String = r.get(2)?;
+            let _norm: f32 = r.get(3)?;
+            let blob: Vec<u8> = r.get(4)?;
 
             let mut coarse = [0.0f32; COARSE_INDEX_DIM];
             let floats_to_read = (blob.len() / 4).min(COARSE_INDEX_DIM);
@@ -747,12 +793,19 @@ impl SemanticStore {
             let ann_id = gen_idx.next_ann_id;
             gen_idx.next_ann_id += 1;
 
+            if let Some(old_ann_id) = gen_idx.unit_to_ann_id.insert(unit_id, ann_id) {
+                if let Some(entry) = gen_idx.metadata.get_mut(&old_ann_id) {
+                    entry.deleted = true;
+                }
+            }
+
             gen_idx.hnsw.insert((&coarse, ann_id));
             gen_idx.metadata.insert(
                 ann_id,
                 CandidateEntry {
                     rowid,
                     repository_id: repo_id,
+                    deleted: false,
                 },
             );
             gen_idx.last_synced_rowid = rowid;
@@ -860,10 +913,10 @@ impl SemanticStore {
 
         // Stage 1 & 2: Candidate search with metadata filtering
         let (candidate_ids, rows_scanned, truncated) = {
-            let mut index_guard = self.candidate_index.lock().unwrap();
+            let index_guard = self.candidate_index.lock().unwrap();
             let gen_idx = index_guard
-                .entry(generation_id)
-                .or_insert_with(|| GenerationIndex::new(generation_id));
+                .get(&generation_id)
+                .expect("index synced immediately above");
             gen_idx.search_candidates(query, candidate_limit, repository_filter, budget)
         };
 
