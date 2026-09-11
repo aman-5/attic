@@ -20,7 +20,7 @@ use crate::error::SemanticError;
 use crate::instruction::{CODE_RETRIEVAL_V1_ID, format_query_instruction};
 use crate::provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ResourceUsage, SemanticProvider,
+    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
 use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -507,6 +507,13 @@ impl SemanticProvider for Qwen3Embedder {
 
     fn available(&self) -> bool {
         true
+    }
+
+    fn concurrency_contract(&self) -> ProviderConcurrencyContract {
+        // One shared model is guarded by `model: Mutex<Qwen3Model>`. More
+        // callers cannot perform additional forward passes; they only wait
+        // on the mutex after claiming queue work.
+        ProviderConcurrencyContract::Serialized
     }
 
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {

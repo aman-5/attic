@@ -63,6 +63,8 @@ pub struct EnrichmentConfig {
     /// `BackgroundEnricher::spawn` spins up (mirrors
     /// `attic_storage::ResourcePolicy::embedding_worker_count`).
     pub embedding_worker_count: usize,
+    /// Maximum CPU threads available to semantic inference across all lanes.
+    pub cpu_threads: usize,
     /// Optional dynamic resource allocation handle from ResourceOrchestrator (Master Plan §12, §15, CP15).
     pub dynamic_allocation: Option<Arc<std::sync::RwLock<attic_storage::ResourceAllocation>>>,
 }
@@ -80,6 +82,7 @@ impl EnrichmentConfig {
             max_attempts,
             budget_ms,
             embedding_worker_count,
+            cpu_threads: 2,
             dynamic_allocation: None,
         }
     }
@@ -113,7 +116,7 @@ impl EnrichmentConfig {
             let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
             return guard.semantic_cpu_threads;
         }
-        2
+        self.cpu_threads.max(1)
     }
 }
 
@@ -124,6 +127,7 @@ impl Default for EnrichmentConfig {
             max_attempts: 3,
             budget_ms: 2_000,
             embedding_worker_count: 1,
+            cpu_threads: 2,
             dynamic_allocation: None,
         }
     }
@@ -457,11 +461,21 @@ impl BackgroundEnricher {
             reconciling: false,
         }));
 
-        // [FIX] `.max(1)`: `validate()` already rejects a configured 0, but a
-        // defensive floor here means a 0 that somehow slips through produces
-        // a `BackgroundEnricher` that still does real work instead of one
-        // that silently spawns no threads at all.
-        let worker_count = cfg.embedding_worker_count.max(1);
+        // Honor the provider's real inference concurrency before spawning
+        // workers or claiming queue rows. Qwen owns one mutex-protected model,
+        // so spawning eight callers merely left seven blocked on that mutex,
+        // inflated INFLIGHT by 7 * batch_size, and (via CpuIsolationPlan)
+        // divided the usable CPU budget among lanes that never ran.
+        let worker_count = provider
+            .concurrency_contract()
+            .effective_workers(cfg.embedding_worker_count);
+        // `drive()` uses this count to divide its CPU allocation. Store the
+        // effective count, not the requested count, so a serialized provider
+        // receives the full semantic CPU grant in its sole runnable lane.
+        let cfg = EnrichmentConfig {
+            embedding_worker_count: worker_count,
+            ..cfg
+        };
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let stop2 = stop.clone();
@@ -654,6 +668,28 @@ impl BackgroundEnricher {
 #[cfg(test)]
 mod generation_driven_enrichment_tests {
     use super::*;
+
+    #[test]
+    fn worker_count_honors_provider_concurrency_contract() {
+        use crate::provider::ProviderConcurrencyContract;
+
+        assert_eq!(
+            ProviderConcurrencyContract::Serialized.effective_workers(8),
+            1
+        );
+        assert_eq!(
+            ProviderConcurrencyContract::SharedConcurrent.effective_workers(8),
+            8
+        );
+        assert_eq!(
+            ProviderConcurrencyContract::PooledLanes { max_lanes: 3 }.effective_workers(8),
+            3
+        );
+        assert_eq!(
+            ProviderConcurrencyContract::PooledLanes { max_lanes: 0 }.effective_workers(0),
+            1
+        );
+    }
 
     fn test_fp(model: &str) -> EmbeddingFingerprint {
         EmbeddingFingerprint {

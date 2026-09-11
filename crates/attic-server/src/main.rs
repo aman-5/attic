@@ -341,6 +341,17 @@ fn semantic_opt_in_from_env(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
+/// Keep background neural inference near 28% of logical CPU. Integer thread
+/// granularity makes an exact percentage impossible on small machines, so we
+/// round to the nearest thread and cap at 30% whenever at least one thread
+/// fits under that ceiling.
+fn semantic_cpu_thread_budget(logical_cpus: usize) -> usize {
+    let logical = logical_cpus.max(1);
+    let rounded_target = (logical.saturating_mul(28) + 50) / 100;
+    let thirty_percent_ceiling = logical.saturating_mul(30) / 100;
+    rounded_target.max(1).min(thirty_percent_ceiling.max(1))
+}
+
 impl AtticServer {
     fn new(db_path: &Path) -> Result<Self, ServerError> {
         // Single production env read: semantic layer is ON by default; set
@@ -396,7 +407,13 @@ impl AtticServer {
             &snapshot,
         )
         .map_err(|e| ServerError::InvalidArg(format!("invalid resource configuration: {e}")))?;
-        let effective = resolution.effective;
+        let mut effective = resolution.effective;
+        if semantic_opt_in {
+            // Batch 64 pushed the F32 Qwen process above 5 GiB and magnified
+            // padding/attention work. Sixteen keeps the observed working set
+            // near the requested 3-3.5 GiB envelope while still vectorizing.
+            effective.embedding_batch_size = effective.embedding_batch_size.min(16);
+        }
         info!(
             mode = resolution.mode.as_str(),
             mode_source = resolution.mode_source.as_str(),
@@ -465,6 +482,18 @@ impl AtticServer {
         } else {
             None
         };
+        // Resource limits and status must describe runnable inference lanes,
+        // not merely the mode's requested worker count. The production Qwen
+        // provider owns one mutex-protected model and is therefore serialized.
+        // Reporting/applying eight workers made seven waiters claim work and
+        // made the CPU isolation plan give the only runnable lane 1/8 of its
+        // intended CPU budget.
+        if let Some(stack) = semantic.as_ref() {
+            effective.embedding_worker_count = stack
+                .provider
+                .concurrency_contract()
+                .effective_workers(effective.embedding_worker_count);
+        }
         // Phase 8: the resource monitor is now driven by the SAME
         // hardware-aware `EffectiveResourceConfig` resolved above (env >
         // attic.toml > detected mode > built-in default, then hardware-
@@ -2216,6 +2245,9 @@ fn handle_status(
         "max_foreground_queries": phase8.effective_resources.max_foreground_queries,
         "embedding_batch_size": phase8.effective_resources.embedding_batch_size,
         "embedding_worker_count": phase8.effective_resources.embedding_worker_count,
+        "semantic_cpu_threads": semantic_cpu_thread_budget(
+            std::thread::available_parallelism().map_or(1, usize::from)
+        ),
         "writer_batch_size": phase8.effective_resources.writer_batch_size,
         "writer_flush_interval_ms": phase8.effective_resources.writer_flush_interval_ms,
         "writer_queue_capacity": phase8.effective_resources.writer_queue_capacity,
@@ -3620,6 +3652,9 @@ pub(crate) fn build_server_and_enricher(
         let enrichment_cfg = attic_semantic::EnrichmentConfig {
             batch_size: server.effective_resources.embedding_batch_size,
             embedding_worker_count: server.effective_resources.embedding_worker_count,
+            cpu_threads: semantic_cpu_thread_budget(
+                std::thread::available_parallelism().map_or(1, usize::from),
+            ),
             ..attic_semantic::EnrichmentConfig::default()
         };
         semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
@@ -4264,6 +4299,16 @@ mod tests {
         assert!(semantic_opt_in_from_env(Some("1")));
         assert!(semantic_opt_in_from_env(Some("")));
         assert!(semantic_opt_in_from_env(Some("false")));
+    }
+
+    #[test]
+    fn semantic_cpu_budget_scales_globally_near_twenty_eight_percent() {
+        assert_eq!(semantic_cpu_thread_budget(4), 1);
+        assert_eq!(semantic_cpu_thread_budget(8), 2);
+        assert_eq!(semantic_cpu_thread_budget(16), 4);
+        assert_eq!(semantic_cpu_thread_budget(20), 6);
+        assert_eq!(semantic_cpu_thread_budget(32), 9);
+        assert_eq!(semantic_cpu_thread_budget(64), 18);
     }
 
     /// A fresh install (no `attic.toml` yet) must end up with a real,

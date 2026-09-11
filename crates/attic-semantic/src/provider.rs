@@ -85,6 +85,17 @@ pub trait SemanticProvider: Send + Sync {
         true
     }
 
+    /// Declare how many callers may execute inference against this provider.
+    ///
+    /// Queue workers must honor this contract before claiming work. The
+    /// default preserves concurrency for lightweight/test providers; neural
+    /// providers that protect one model behind a mutex must report
+    /// `Serialized` so waiting callers do not hoard queue items or divide the
+    /// CPU budget into lanes that cannot actually run concurrently.
+    fn concurrency_contract(&self) -> ProviderConcurrencyContract {
+        ProviderConcurrencyContract::SharedConcurrent
+    }
+
     /// Return the immutable architectural fingerprint of the vector space, if known.
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
         None
@@ -176,6 +187,19 @@ pub enum ProviderConcurrencyContract {
     Serialized,
     /// Concurrent callers require a bounded pool of lane instances.
     PooledLanes { max_lanes: usize },
+}
+
+impl ProviderConcurrencyContract {
+    /// Clamp a requested queue-worker count to the provider's runnable
+    /// inference concurrency.
+    pub fn effective_workers(self, requested: usize) -> usize {
+        let requested = requested.max(1);
+        match self {
+            Self::Serialized => 1,
+            Self::SharedConcurrent => requested,
+            Self::PooledLanes { max_lanes } => requested.min(max_lanes.max(1)),
+        }
+    }
 }
 
 /// Master embedding provider contract (Final Master Plan V2 §27).
