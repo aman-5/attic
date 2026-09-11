@@ -341,15 +341,17 @@ fn semantic_opt_in_from_env(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
-/// Keep background neural inference near 28% of logical CPU. Integer thread
+/// Keep background neural inference near 33% of logical CPU. Integer thread
 /// granularity makes an exact percentage impossible on small machines, so we
-/// round to the nearest thread and cap at 30% whenever at least one thread
+/// round to the nearest thread and cap at 35% whenever at least one thread
 /// fits under that ceiling.
 fn semantic_cpu_thread_budget(logical_cpus: usize) -> usize {
     let logical = logical_cpus.max(1);
-    let rounded_target = (logical.saturating_mul(28) + 50) / 100;
-    let thirty_percent_ceiling = logical.saturating_mul(30) / 100;
-    rounded_target.max(1).min(thirty_percent_ceiling.max(1))
+    let rounded_target = (logical.saturating_mul(33) + 50) / 100;
+    let thirty_five_percent_ceiling = logical.saturating_mul(35) / 100;
+    rounded_target
+        .max(1)
+        .min(thirty_five_percent_ceiling.max(1))
 }
 
 impl AtticServer {
@@ -4302,13 +4304,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_cpu_budget_scales_globally_near_twenty_eight_percent() {
+    fn semantic_cpu_budget_scales_globally_near_thirty_three_percent() {
         assert_eq!(semantic_cpu_thread_budget(4), 1);
+        // 3/8 would exceed the hard 35% ceiling, so integer granularity
+        // requires the conservative 2-thread choice on an 8-thread host.
         assert_eq!(semantic_cpu_thread_budget(8), 2);
-        assert_eq!(semantic_cpu_thread_budget(16), 4);
-        assert_eq!(semantic_cpu_thread_budget(20), 6);
-        assert_eq!(semantic_cpu_thread_budget(32), 9);
-        assert_eq!(semantic_cpu_thread_budget(64), 18);
+        assert_eq!(semantic_cpu_thread_budget(16), 5);
+        assert_eq!(semantic_cpu_thread_budget(20), 7);
+        assert_eq!(semantic_cpu_thread_budget(32), 11);
+        assert_eq!(semantic_cpu_thread_budget(64), 21);
     }
 
     /// A fresh install (no `attic.toml` yet) must end up with a real,
