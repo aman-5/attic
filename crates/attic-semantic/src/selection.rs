@@ -19,8 +19,18 @@ use crate::store::SemanticStore;
 /// stamped with an older version (identity component, §5).
 pub const SEMANTIC_SELECTION_VERSION: &str = "sem-sel-v1";
 
+/// Default per-file size ceiling for semantic admission (256 KiB).
+///
+/// Above a few hundred KB a text file is almost always generated data — an
+/// export, a dump, a fixture, a bundle — whose thousands of chunks embed
+/// slowly on CPU and then mostly duplicate each other in the vector space
+/// (measured on a real corpus: five ~4 MiB environment JSON exports produced
+/// 98% of the embedding queue). Such files stay fully lexical-searchable;
+/// they simply never enter the embedding queue.
+pub const DEFAULT_SEMANTIC_MAX_FILE_BYTES: u64 = 256 * 1024;
+
 /// Inspectable knobs (defaults are compile-time constants; tests may vary).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectionConfig {
     /// Units below this composite score are not worth an embedding.
     pub min_score: f64,
@@ -31,6 +41,18 @@ pub struct SelectionConfig {
     /// Units whose text exceeds this are NEVER embedded (LARGE safety §19);
     /// enrichment truncates nothing silently.
     pub max_input_bytes: usize,
+    /// Units from FILES larger than this are never embedded, however good
+    /// their score (see [`DEFAULT_SEMANTIC_MAX_FILE_BYTES`]). This is the
+    /// gate that keeps multi-megabyte machine-generated dumps out of the
+    /// queue; lexical indexing is unaffected.
+    pub max_file_bytes: u64,
+    /// Additional path globs excluded from embedding (case-insensitive,
+    /// matched against the workspace-relative path; `*` stays within a
+    /// segment, `**` crosses segments, a trailing `/` matches a directory
+    /// anywhere in the path, and a pattern without `/` also matches the bare
+    /// file name). Empty by default — [`GENERATED_MARKERS`] already covers
+    /// the common generated trees.
+    pub exclude_globs: Vec<String>,
 }
 
 impl SelectionConfig {
@@ -41,10 +63,13 @@ impl SelectionConfig {
     /// silently truncate. See the `const _` chain assertion below.
     pub const MAX_INPUT_BYTES_DEFAULT: usize =
         crate::qwen3_provider::DEFAULT_MAX_TOKENS * crate::qwen3_provider::MIN_BYTES_PER_TOKEN;
-}
 
-impl Default for SelectionConfig {
-    fn default() -> Self {
+    /// The default configuration as a const expression — the single source of
+    /// truth for the defaults, so `EnrichmentConfig::standalone` can stay a
+    /// `const fn` (its callers use it in const contexts). `Default::default()`
+    /// delegates here; the `baseline_const_matches_default` test pins the two
+    /// together.
+    pub const fn baseline() -> Self {
         Self {
             min_score: 0.30,
             // Scaled by the same 5x as `max_units_total` below, so a
@@ -59,7 +84,15 @@ impl Default for SelectionConfig {
             // gate passed the check documented as "enrichment truncates
             // nothing silently" and were then truncated by the tokenizer.
             max_input_bytes: Self::MAX_INPUT_BYTES_DEFAULT,
+            max_file_bytes: DEFAULT_SEMANTIC_MAX_FILE_BYTES,
+            exclude_globs: Vec::new(),
         }
+    }
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self::baseline()
     }
 }
 
@@ -141,6 +174,8 @@ impl SelectionReport {
 pub const EX_GENERATED_PATH: &str = "generated_path";
 pub const EX_GENERATED_TYPE: &str = "generated_file_type";
 pub const EX_TOO_LARGE: &str = "exceeds_max_input_bytes";
+pub const EX_FILE_TOO_BIG: &str = "file_exceeds_max_file_bytes";
+pub const EX_EXCLUDED_GLOB: &str = "excluded_by_glob";
 pub const EX_DUPLICATE: &str = "duplicate_content";
 pub const EX_BELOW_THRESHOLD: &str = "below_score_threshold";
 pub const EX_CAP_REPO: &str = "per_repository_cap";
@@ -168,6 +203,68 @@ const GENERATED_MARKERS: &[&str] = &[
 
 fn is_generated_path(path_lower: &str) -> bool {
     GENERATED_MARKERS.iter().any(|m| path_lower.contains(m))
+}
+
+/// Deliberately small glob matcher (this crate carries no external glob
+/// dependency): `*` matches within a path segment, `**` matches across
+/// segments, `?` matches one byte. Byte-oriented by design — it only ever
+/// produces a bool, never slices the text.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[u8], t: &[u8]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(b'*') => {
+                if p.get(1) == Some(&b'*') {
+                    // `**` crosses `/`; a following `/` may match zero segments.
+                    let rest = if p.get(2) == Some(&b'/') {
+                        &p[3..]
+                    } else {
+                        &p[2..]
+                    };
+                    (0..=t.len()).any(|i| inner(rest, &t[i..]))
+                } else {
+                    // `*` matches zero or more non-`/` bytes.
+                    let mut i = 0;
+                    loop {
+                        if inner(&p[1..], &t[i..]) {
+                            return true;
+                        }
+                        if i >= t.len() || t[i] == b'/' {
+                            return false;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            Some(&c) => !t.is_empty() && (c == b'?' || c == t[0]) && inner(&p[1..], &t[1..]),
+        }
+    }
+    inner(pattern.as_bytes(), text.as_bytes())
+}
+
+/// True when `path_lower` (already lowercased) matches any configured glob.
+/// A pattern with no `/` also matches the bare file name, so `*.min.js`
+/// catches `web/js/app.min.js`; a trailing `/` matches the directory anywhere
+/// in the path.
+fn path_is_excluded(path_lower: &str, globs: &[String]) -> bool {
+    globs.iter().any(|g| {
+        let g = g.trim().to_lowercase();
+        if g.is_empty() {
+            return false;
+        }
+        if let Some(dir) = g.strip_suffix('/') {
+            let dir = dir.trim_matches('/');
+            return !dir.is_empty()
+                && (path_lower.starts_with(&format!("{dir}/"))
+                    || path_lower.contains(&format!("/{dir}/")));
+        }
+        glob_matches(&g, path_lower)
+            || (!g.contains('/')
+                && path_lower
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| glob_matches(&g, name)))
+    })
 }
 
 /// Source-class prior from the recorded file_type OR the path when the
@@ -287,6 +384,18 @@ pub fn select_units(
         }
         if r.discovery_class == "IGNORED" {
             report.exclude(EX_GENERATED_TYPE);
+            continue;
+        }
+        // Admission gates: explicit path rules first, then the per-file size
+        // ceiling. Both are about the *file*, not the unit's score — a
+        // machine-generated dump produces thousands of individually
+        // fine-looking units.
+        if path_is_excluded(&lower_path, &cfg.exclude_globs) {
+            report.exclude(EX_EXCLUDED_GLOB);
+            continue;
+        }
+        if r.size_bytes >= 0 && r.size_bytes as u64 > cfg.max_file_bytes {
+            report.exclude(EX_FILE_TOO_BIG);
             continue;
         }
         if r.retrieval_text.len() > cfg.max_input_bytes {
@@ -409,7 +518,17 @@ mod tests {
             last_indexed_at_us: None,
             unit_node_count: 2,
             file_symbol_defs: 1,
+            // Small enough to stay far under `DEFAULT_SEMANTIC_MAX_FILE_BYTES`
+            // so the admission size gate never fires in pre-existing tests.
+            size_bytes: 100,
         }
+    }
+
+    #[test]
+    fn baseline_const_matches_default() {
+        // `baseline()` exists so `EnrichmentConfig::standalone` can be const;
+        // it must never drift from `Default`.
+        assert_eq!(SelectionConfig::baseline(), SelectionConfig::default());
     }
 
     #[test]
@@ -450,6 +569,61 @@ mod tests {
         let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 0);
         assert_eq!(rep.excluded.get(EX_TOO_LARGE), Some(&1));
+    }
+
+    #[test]
+    fn files_over_the_semantic_size_cap_are_never_selected() {
+        // The Dump-corpus regression: five ~4 MiB environment JSON exports
+        // produced 98% of the embedding queue. Their units score fine
+        // individually; the gate is on the FILE.
+        let mut dump = row("u1", "DEV-Code.json", "CONFIG", "ordinary chunk text");
+        dump.size_bytes = 5 * 1024 * 1024;
+        let rows = vec![
+            dump,
+            row("u2", "docs/guide.md", "DOCUMENT", "ordinary chunk text 2"),
+        ];
+        let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].row.unit_id, "u2");
+        assert_eq!(rep.excluded.get(EX_FILE_TOO_BIG), Some(&1));
+    }
+
+    #[test]
+    fn configured_globs_exclude_paths_from_embedding() {
+        let cfg = SelectionConfig {
+            exclude_globs: vec!["*-code.json".to_owned(), "fixtures/".to_owned()],
+            ..Default::default()
+        };
+        let rows = vec![
+            row("u1", "DEV-Code.json", "CONFIG", "body one"),
+            row("u2", "fixtures/seed.rs", "SOURCE", "body two"),
+            row("u3", "src/main.rs", "SOURCE", "body three"),
+        ];
+        let (sel, rep) = select_units(&rows, &HashMap::new(), &cfg);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].row.unit_id, "u3");
+        assert_eq!(rep.excluded.get(EX_EXCLUDED_GLOB), Some(&2));
+    }
+
+    #[test]
+    fn glob_matcher_segment_semantics() {
+        assert!(glob_matches("*.min.js", "app.min.js"));
+        assert!(!glob_matches("*.min.js", "app.js"));
+        assert!(glob_matches("fixtures/**", "fixtures/a/b.json"));
+        assert!(
+            !glob_matches("*.json", "a/b.json"),
+            "`*` must not cross `/`"
+        );
+        assert!(glob_matches("**/gen/**", "a/gen/b.rs"));
+        assert!(path_is_excluded(
+            "web/js/app.min.js",
+            &["*.min.js".to_owned()]
+        ));
+        assert!(path_is_excluded(
+            "a/node_modules/b.js",
+            &["node_modules/".to_owned()]
+        ));
+        assert!(!path_is_excluded("src/main.rs", &["*.json".to_owned()]));
     }
 
     #[test]

@@ -42,6 +42,12 @@ CREATE INDEX IF NOT EXISTS idx_sem_embeddings_gen_repo
 CREATE INDEX IF NOT EXISTS idx_sem_embeddings_model_repo
     ON sem_embeddings(provider_id, model_id, repository_id);
 
+-- Content-addressed reuse: enrichment looks up already-computed vectors by
+-- (provider, model, dim, content_hash) so identical text is never embedded
+-- twice, across repositories and across generations.
+CREATE INDEX IF NOT EXISTS idx_sem_embeddings_content
+    ON sem_embeddings(provider_id, model_id, dim, content_hash);
+
 CREATE TABLE IF NOT EXISTS sem_queue (
     retrieval_unit_id TEXT PRIMARY KEY,
     priority          REAL    NOT NULL DEFAULT 0.5,

@@ -181,6 +181,20 @@ pub struct IndexOptions {
 /// activations it now has to share a machine with.
 pub const DEFAULT_ANALYSIS_CACHE_FLUSH_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Files analyzed per thread per stripe (see the striped analysis pipeline in
+/// `index_repository_with_cancellation`). Eight gives the parallel stage
+/// enough work to amortise thread dispatch without letting one stripe's
+/// unmerged output grow large.
+const ANALYSIS_STRIPE_PER_THREAD: usize = 8;
+
+/// Floor on the analysis stripe size, in files. The stripe bounds how many
+/// files' analysis output (retrieval text plus structural captures) is live
+/// and unmerged at once: 32 files × the measured ~1.8 KB average unit text is
+/// tens of kilobytes, and even pathological files (5 MB of minified JSON) keep
+/// a stripe in the tens of megabytes — versus the whole corpus at once before
+/// striping.
+const ANALYSIS_STRIPE_MIN_FILES: usize = 32;
+
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
@@ -271,6 +285,13 @@ pub struct IndexStageTimings {
     /// the run executed sequentially (single file, single core, or an explicit
     /// `analysis_threads = 1`).
     pub analysis_threads_used: usize,
+    /// High-water mark of retrieval-text bytes held in *unmerged* analysis
+    /// output. Analysis runs in stripes that are merged and dropped before the
+    /// next stripe starts, so this is bounded by one stripe
+    /// (`ANALYSIS_STRIPE_MIN_FILES` / `ANALYSIS_STRIPE_PER_THREAD`) rather than
+    /// by repository size. Counts retrieval text only; structural captures,
+    /// when enabled, are additional.
+    pub analysis_inflight_peak_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -849,7 +870,7 @@ pub fn index_repository_with_cancellation(
             .collect(),
     );
 
-    // ── Analysis, phase A: analyze every file in parallel ────────────────
+    // ── Analysis: striped analyze → merge pipeline ───────────────────────
     //
     // `analyze_single_file` is pure — it reads one path, dispatches to a
     // `Send + Sync` analyzer, and returns owned data. It performs no database
@@ -857,160 +878,198 @@ pub fn index_repository_with_cancellation(
     // contract. The shared inputs (`analysis_cache`, `registry`, `opts`,
     // `policy_hash`) are all read-only here.
     //
-    // Determinism is preserved by construction: work is partitioned by index,
-    // each worker writes only its own slots, and phase B consumes the results
-    // strictly in discovery order. Thread count therefore changes timing and
-    // nothing else.
+    // Analysis runs in stripes: one stripe is analyzed in parallel, merged
+    // below, and dropped before the next stripe is analyzed. Analyzing the
+    // whole corpus before merging anything held every file's `FilePrep`
+    // (retrieval text plus structural captures) resident simultaneously — a
+    // peak that grew with repository size, in a pipeline whose purpose is the
+    // opposite. The stripe bounds live preps to `stripe_size` files; stripes
+    // are contiguous slices of the discovery order merged in sequence, so the
+    // merge observes exactly the order a single pass would produce.
     let analysis_threads = resolve_analysis_threads(opts.analysis_threads, file_records.len());
     timings.analysis_threads_used = analysis_threads;
 
-    let prepped = analyze_files(
-        file_records,
-        &analysis_cache,
-        &registry,
-        opts,
-        &policy_hash,
-        cancellation,
-        analysis_threads,
-    )?;
-    rss.sample();
+    let stripe_size = analysis_threads
+        .saturating_mul(ANALYSIS_STRIPE_PER_THREAD)
+        .max(ANALYSIS_STRIPE_MIN_FILES);
+    let mut stripes: Vec<Vec<FileRecord>> =
+        Vec::with_capacity(file_records.len().div_ceil(stripe_size));
+    let mut rest = file_records;
+    while !rest.is_empty() {
+        let take = stripe_size.min(rest.len());
+        let tail = rest.split_off(take);
+        stripes.push(rest);
+        rest = tail;
+    }
 
-    // ── Analysis, phase B: merge results in discovery order ──────────────
-    for prepped_file in prepped {
+    for stripe in stripes {
         if cancellation.is_cancelled() {
             return Err(IndexError::Cancelled);
         }
-        let AnalyzedFile {
-            mut rec,
-            prep,
-            was_cache_hit,
-            small_file_bytes_read,
-        } = prepped_file;
+        let prepped = analyze_files(
+            stripe,
+            &analysis_cache,
+            &registry,
+            opts,
+            &policy_hash,
+            cancellation,
+            analysis_threads,
+        )?;
 
-        // PR-8 measurement: a fresh analysis of a SMALL file re-reads content
-        // discovery already read once (see
-        // `discovery_counters.small_file_bytes_read`). Cache hits never
-        // re-read anything, so they report `None` here.
-        if let Some(bytes) = small_file_bytes_read {
-            result.analysis_small_file_bytes_read += bytes;
-            result.analysis_small_file_reads += 1;
-        }
-
-        match prep {
-            Ok(FilePrep::Indexable {
-                mut units,
-                captured,
-                security_state,
-                is_partial_scan,
-            }) => {
-                if opts.refresh_existing
-                    && let Some(old) = rec.old_fo_id.clone()
-                {
-                    stale_occurrences.push(old);
-                }
-                rec.security_state = security_state;
-                rec.is_partial_scan = is_partial_scan;
-                pipeline.note_occurrence(&rec.repo_relative, &rec.fo_id.to_string_repr());
-
-                // Stash this file's result for potential cache persistence
-                // BEFORE `units`/`captured` are consumed below — serializing
-                // by reference here needs no clone of the analysis output.
-                // If this run later hits a transient failure elsewhere,
-                // whatever succeeded is written in one batch by the
-                // completeness gate below. Skipped for cache hits: the
-                // existing `index_analysis_cache` row already has this exact
-                // content_hash, so rewriting it would be a no-op.
-                if !was_cache_hit && let Ok(units_json) = serde_json::to_string(&units) {
-                    let captured_json = captured
-                        .as_ref()
-                        .and_then(|c| serde_json::to_string(c).ok());
-                    // Phase 0: this is the second in-memory copy of the same
-                    // text `pending_units` already holds, JSON-escaped. Track
-                    // it so its true cost is visible rather than inferred.
-                    cache_writes_live_bytes += (units_json.len()
-                        + captured_json.as_ref().map_or(0, |c| c.len()))
-                        as u64;
-                    timings.cache_writes_peak_bytes =
-                        timings.cache_writes_peak_bytes.max(cache_writes_live_bytes);
-                    cache_writes.push(attic_storage::CachedFileAnalysis {
-                        repo_relative: rec.repo_relative.clone(),
-                        content_hash: rec.content_hash.clone(),
-                        security_state: security_state.as_str().to_owned(),
-                        is_partial_scan,
-                        secret_pattern_version: SECRET_PATTERN_VERSION,
-                        analyzer_registry_version: attic_core::constants::ANALYZER_REGISTRY_VERSION
-                            .to_owned(),
-                        discovery_policy_hash: policy_hash.clone(),
-                        structural: opts.structural,
-                        max_units_per_file: opts.max_units_per_file as u64,
-                        units_json,
-                        captured_json,
-                    });
-
-                    // Bound the buffer. See
-                    // `IndexOptions::analysis_cache_flush_bytes` for why
-                    // flushing this particular accumulator early is safe
-                    // (pure retry cache, no bearing on which generation is
-                    // CURRENT) while batching the publication is not.
-                    if opts.analysis_cache_flush_bytes > 0
-                        && cache_writes_live_bytes >= opts.analysis_cache_flush_bytes
-                    {
-                        flush_analysis_cache(store, repo_id, &mut cache_writes)?;
-                        cache_writes_live_bytes = 0;
-                        timings.cache_writes_flushes += 1;
-                        rss.sample();
-                    }
-                }
-
-                if let Some(captured) = captured {
-                    pipeline.record(*captured);
-                }
-                // Phase 0: accumulate BEFORE `append` moves `units` away.
-                pending_units_live_bytes += units
+        // High-water mark of unmerged analysis output: bounded by one stripe,
+        // not by repository size. Retrieval text only; structural captures
+        // (when `opts.structural` is on) are additional.
+        let stripe_prep_bytes: u64 = prepped
+            .iter()
+            .map(|f| match &f.prep {
+                Ok(FilePrep::Indexable { units, .. }) => units
                     .iter()
                     .map(|u| u.retrieval_text.len() as u64)
-                    .sum::<u64>();
-                pending_units.append(&mut units);
-                if pending_units_live_bytes > timings.pending_units_peak_bytes {
-                    timings.pending_units_peak_bytes = pending_units_live_bytes;
-                    timings.pending_units_peak_count = pending_units.len();
-                }
-                indexed_records.push(rec);
-                result.files_indexed += 1;
+                    .sum::<u64>(),
+                _ => 0,
+            })
+            .sum();
+        timings.analysis_inflight_peak_bytes =
+            timings.analysis_inflight_peak_bytes.max(stripe_prep_bytes);
+        rss.sample();
+
+        // ── Merge this stripe, in discovery order ────────────────────────────
+        for prepped_file in prepped {
+            if cancellation.is_cancelled() {
+                return Err(IndexError::Cancelled);
             }
-            Ok(FilePrep::Skip) => {
-                // Permanent, deterministic skip discovered only during
-                // analysis (e.g. content changed to binary/invalid-UTF-8
-                // since discovery ran). Retire any prior occurrence — never
-                // leave it advertised as current truth (P0-3/P0-5).
-                debug!(path = %rec.repo_relative, "file permanently skipped during analysis");
-                result.files_skipped += 1;
-                if let Some(old) = rec.old_fo_id.clone() {
-                    stale_occurrences.push(old);
-                    tombstones.push(build_tombstone(
-                        repo_id,
-                        rev_id,
-                        gen_id,
-                        rec.fi_id,
-                        rec.stable_id_basis.clone(),
-                        rec.repo_relative.clone(),
-                        rec.content_hash.clone(),
-                    ));
-                }
+            let AnalyzedFile {
+                mut rec,
+                prep,
+                was_cache_hit,
+                small_file_bytes_read,
+            } = prepped_file;
+
+            // PR-8 measurement: a fresh analysis of a SMALL file re-reads content
+            // discovery already read once (see
+            // `discovery_counters.small_file_bytes_read`). Cache hits never
+            // re-read anything, so they report `None` here.
+            if let Some(bytes) = small_file_bytes_read {
+                result.analysis_small_file_bytes_read += bytes;
+                result.analysis_small_file_reads += 1;
             }
-            Err(e) => {
-                // Transient/retryable failure: this path has not reached any
-                // terminal state this run. Do not falsely delete or publish
-                // anything for it — record it for the completeness gate
-                // below, which aborts the whole run rather than publish a
-                // generation that mixes verified content with content nobody
-                // actually verified.
-                warn!(
-                    path = %rec.repo_relative,
-                    error = %e,
-                    "analysis failed (transient); this run cannot become current until resolved"
-                );
-                transient_failed_paths.push(rec.repo_relative.clone());
+
+            match prep {
+                Ok(FilePrep::Indexable {
+                    mut units,
+                    captured,
+                    security_state,
+                    is_partial_scan,
+                }) => {
+                    if opts.refresh_existing
+                        && let Some(old) = rec.old_fo_id.clone()
+                    {
+                        stale_occurrences.push(old);
+                    }
+                    rec.security_state = security_state;
+                    rec.is_partial_scan = is_partial_scan;
+                    pipeline.note_occurrence(&rec.repo_relative, &rec.fo_id.to_string_repr());
+
+                    // Stash this file's result for potential cache persistence
+                    // BEFORE `units`/`captured` are consumed below — serializing
+                    // by reference here needs no clone of the analysis output.
+                    // If this run later hits a transient failure elsewhere,
+                    // whatever succeeded is written in one batch by the
+                    // completeness gate below. Skipped for cache hits: the
+                    // existing `index_analysis_cache` row already has this exact
+                    // content_hash, so rewriting it would be a no-op.
+                    if !was_cache_hit && let Ok(units_json) = serde_json::to_string(&units) {
+                        let captured_json = captured
+                            .as_ref()
+                            .and_then(|c| serde_json::to_string(c).ok());
+                        // Phase 0: this is the second in-memory copy of the same
+                        // text `pending_units` already holds, JSON-escaped. Track
+                        // it so its true cost is visible rather than inferred.
+                        cache_writes_live_bytes += (units_json.len()
+                            + captured_json.as_ref().map_or(0, |c| c.len()))
+                            as u64;
+                        timings.cache_writes_peak_bytes =
+                            timings.cache_writes_peak_bytes.max(cache_writes_live_bytes);
+                        cache_writes.push(attic_storage::CachedFileAnalysis {
+                            repo_relative: rec.repo_relative.clone(),
+                            content_hash: rec.content_hash.clone(),
+                            security_state: security_state.as_str().to_owned(),
+                            is_partial_scan,
+                            secret_pattern_version: SECRET_PATTERN_VERSION,
+                            analyzer_registry_version:
+                                attic_core::constants::ANALYZER_REGISTRY_VERSION.to_owned(),
+                            discovery_policy_hash: policy_hash.clone(),
+                            structural: opts.structural,
+                            max_units_per_file: opts.max_units_per_file as u64,
+                            units_json,
+                            captured_json,
+                        });
+
+                        // Bound the buffer. See
+                        // `IndexOptions::analysis_cache_flush_bytes` for why
+                        // flushing this particular accumulator early is safe
+                        // (pure retry cache, no bearing on which generation is
+                        // CURRENT) while batching the publication is not.
+                        if opts.analysis_cache_flush_bytes > 0
+                            && cache_writes_live_bytes >= opts.analysis_cache_flush_bytes
+                        {
+                            flush_analysis_cache(store, repo_id, &mut cache_writes)?;
+                            cache_writes_live_bytes = 0;
+                            timings.cache_writes_flushes += 1;
+                            rss.sample();
+                        }
+                    }
+
+                    if let Some(captured) = captured {
+                        pipeline.record(*captured);
+                    }
+                    // Phase 0: accumulate BEFORE `append` moves `units` away.
+                    pending_units_live_bytes += units
+                        .iter()
+                        .map(|u| u.retrieval_text.len() as u64)
+                        .sum::<u64>();
+                    pending_units.append(&mut units);
+                    if pending_units_live_bytes > timings.pending_units_peak_bytes {
+                        timings.pending_units_peak_bytes = pending_units_live_bytes;
+                        timings.pending_units_peak_count = pending_units.len();
+                    }
+                    indexed_records.push(rec);
+                    result.files_indexed += 1;
+                }
+                Ok(FilePrep::Skip) => {
+                    // Permanent, deterministic skip discovered only during
+                    // analysis (e.g. content changed to binary/invalid-UTF-8
+                    // since discovery ran). Retire any prior occurrence — never
+                    // leave it advertised as current truth (P0-3/P0-5).
+                    debug!(path = %rec.repo_relative, "file permanently skipped during analysis");
+                    result.files_skipped += 1;
+                    if let Some(old) = rec.old_fo_id.clone() {
+                        stale_occurrences.push(old);
+                        tombstones.push(build_tombstone(
+                            repo_id,
+                            rev_id,
+                            gen_id,
+                            rec.fi_id,
+                            rec.stable_id_basis.clone(),
+                            rec.repo_relative.clone(),
+                            rec.content_hash.clone(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // Transient/retryable failure: this path has not reached any
+                    // terminal state this run. Do not falsely delete or publish
+                    // anything for it — record it for the completeness gate
+                    // below, which aborts the whole run rather than publish a
+                    // generation that mixes verified content with content nobody
+                    // actually verified.
+                    warn!(
+                        path = %rec.repo_relative,
+                        error = %e,
+                        "analysis failed (transient); this run cannot become current until resolved"
+                    );
+                    transient_failed_paths.push(rec.repo_relative.clone());
+                }
             }
         }
     }
@@ -1210,6 +1269,7 @@ pub fn index_repository_with_cancellation(
         cache_writes_peak_bytes = result.stage_timings.cache_writes_peak_bytes,
         cache_writes_flushes = result.stage_timings.cache_writes_flushes,
         analysis_threads_used = result.stage_timings.analysis_threads_used,
+        analysis_inflight_peak_bytes = result.stage_timings.analysis_inflight_peak_bytes,
         "indexing run complete"
     );
 
@@ -2566,7 +2626,8 @@ mod tests {
     }
 
     #[test]
-    fn e2e_file_identity_is_stable_across_reindex() {        let fx = make_store();
+    fn e2e_file_identity_is_stable_across_reindex() {
+        let fx = make_store();
         write_file(fx._dir.path(), "stable_id.rs", "fn stable_id_token() {}\n");
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();

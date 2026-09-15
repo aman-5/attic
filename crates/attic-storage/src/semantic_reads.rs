@@ -43,6 +43,10 @@ pub struct SemanticUnitRow {
     pub unit_node_count: i64,
     /// Definition symbols recorded anywhere in the backing FILE.
     pub file_symbol_defs: i64,
+    /// Byte size of the backing file at index time (`o.size_bytes`); semantic
+    /// admission uses it to keep multi-megabyte generated dumps out of the
+    /// embedding queue regardless of how their units score.
+    pub size_bytes: i64,
 }
 
 const SEMANTIC_UNIT_SQL: &str = r"
@@ -53,7 +57,8 @@ SELECT u.id, u.repository_id, u.file_occurrence_id, u.index_generation_id,
        (SELECT COUNT(*) FROM core_retrieval_unit_nodes run
           WHERE run.retrieval_unit_id = u.id)                       AS unit_node_count,
        (SELECT COUNT(*) FROM core_symbol_occurrences so
-          WHERE so.file_occurrence_id = o.id AND so.is_definition=1) AS file_symbol_defs
+          WHERE so.file_occurrence_id = o.id AND so.is_definition=1) AS file_symbol_defs,
+       o.size_bytes
   FROM core_retrieval_units   u
   JOIN core_file_occurrences  o ON o.id = u.file_occurrence_id
  WHERE u.lexical_state     = 'CURRENT'
@@ -91,6 +96,7 @@ pub fn semantic_unit_rows(
             last_indexed_at_us: r.get(13)?,
             unit_node_count: r.get(14)?,
             file_symbol_defs: r.get(15)?,
+            size_bytes: r.get(16)?,
         });
     }
     Ok(out)
@@ -114,7 +120,8 @@ pub fn semantic_units_by_ids(
                     (SELECT COUNT(*) FROM core_retrieval_unit_nodes run
                        WHERE run.retrieval_unit_id = u.id),
                     (SELECT COUNT(*) FROM core_symbol_occurrences so
-                       WHERE so.file_occurrence_id = o.id AND so.is_definition=1)
+                       WHERE so.file_occurrence_id = o.id AND so.is_definition=1),
+                    o.size_bytes
                FROM core_retrieval_units   u
                JOIN core_file_occurrences  o ON o.id = u.file_occurrence_id
               WHERE u.id IN ({placeholders})
@@ -147,6 +154,7 @@ pub fn semantic_units_by_ids(
                 last_indexed_at_us: r.get(13)?,
                 unit_node_count: r.get(14)?,
                 file_symbol_defs: r.get(15)?,
+                size_bytes: r.get(16)?,
             });
         }
     }

@@ -28,6 +28,11 @@ pub struct ReconcileReport {
     pub purged_other_models: usize,
     /// Units (re-)queued for enrichment.
     pub enqueued: usize,
+    /// Stale rows kept as reuse donors: their content hash is selected again
+    /// under a fresh unit id (a re-index mints new ids for unchanged text),
+    /// so enrichment clones the stored vector instead of re-running
+    /// inference. A later reconcile sweeps them once the replacement exists.
+    pub reuse_donors_kept: usize,
     /// Queue entries dropped for units no longer selected.
     pub queue_dropped: usize,
     /// The underlying selection report (inspectability §4/§21).
@@ -68,10 +73,11 @@ pub fn reconcile(
         );
     }
 
-    // 3. Delete stored rows whose lineage no longer matches.
+    // 3. Partition stored rows into still-valid and stale (deletion happens
+    //    after the missing set is known — see step 5).
     let stored = store.active_identity_rows(provider.id(), provider.model_id())?;
     let mut kept_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut missing: Vec<(String, f64)> = Vec::new();
+    let mut stale = Vec::new();
     for s in stored {
         match expected.get(s.retrieval_unit_id.as_str()) {
             Some((ch, genid, ver))
@@ -81,25 +87,43 @@ pub fn reconcile(
             {
                 kept_ids.insert(s.retrieval_unit_id);
             }
-            _ => {
-                store.delete(
-                    &s.retrieval_unit_id,
-                    Some(provider.id()),
-                    Some(provider.model_id()),
-                )?;
-                report.invalidated_stale += 1;
-            }
+            _ => stale.push(s),
         }
     }
 
     // 4. Enqueue what is selected but not yet embedded (score = priority).
+    let mut missing: Vec<(String, f64)> = Vec::new();
     for su in &selected {
         if !kept_ids.contains(&su.row.unit_id) {
             missing.push((su.row.unit_id.clone(), su.score));
         }
     }
 
-    // 5. Bounded queue hygiene: drop entries no longer selected.
+    // 5. Delete stale rows — EXCEPT reuse donors. A full re-index mints fresh
+    //    unit ids for unchanged text, which would otherwise read as
+    //    "everything stale" and force a full CPU re-embed of content that has
+    //    not changed by one byte. A stale row whose content hash is selected
+    //    again stays: enrichment clones its stored vector onto the new unit id
+    //    via `vectors_for_contents`. The donor is swept by a later reconcile
+    //    once the replacement row exists (its hash is then no longer missing).
+    let missing_hashes: std::collections::HashSet<&str> = missing
+        .iter()
+        .map(|(id, _)| expected[id.as_str()].0.as_str())
+        .collect();
+    for s in stale {
+        if missing_hashes.contains(s.content_hash.as_str()) {
+            report.reuse_donors_kept += 1;
+            continue;
+        }
+        store.delete(
+            &s.retrieval_unit_id,
+            Some(provider.id()),
+            Some(provider.model_id()),
+        )?;
+        report.invalidated_stale += 1;
+    }
+
+    // 6. Bounded queue hygiene: drop entries no longer selected.
     let all_selected: Vec<String> = selected.iter().map(|s| s.row.unit_id.clone()).collect();
     report.queue_dropped = store.queue_retain_only(&all_selected)?;
 

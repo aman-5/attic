@@ -17,7 +17,7 @@
 //! generic analyzer rather than in any per-format code.
 
 use attic_analyzers::api::{
-    AnalyzerContent, AnalyzerInput, Analyzer, ResourceBudget, diagnostic_codes,
+    Analyzer, AnalyzerContent, AnalyzerInput, ResourceBudget, diagnostic_codes,
 };
 use attic_analyzers::cancellation::CancellationToken;
 use attic_analyzers::generic::{GenericAnalyzer, MAX_UNIT_CHARS};

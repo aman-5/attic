@@ -330,6 +330,19 @@ enum BoundaryRank {
     Record,
 }
 
+/// Nesting/quote state carried across consecutive split pieces of one source
+/// text. The splitter is invoked once per piece over the *remainder* of the
+/// text, so each invocation must inherit where the previous cut left the
+/// scanner. Restarting from zeroed state made every `}` inside an array look
+/// like a top-level record end from the second piece onward, cutting
+/// mid-record while believing a record boundary had been found.
+#[derive(Clone, Copy, Debug, Default)]
+struct ScannerState {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
 /// Choose where to cut `s` so the piece before the cut ends at the most
 /// complete structural boundary available at or below `cap` bytes.
 ///
@@ -343,6 +356,10 @@ enum BoundaryRank {
 /// only counted outside double-quoted strings, so a `{` inside a string value
 /// cannot desynchronise nesting depth.
 ///
+/// `state` carries the nesting/quote state inherited from the previous piece
+/// and is updated to the state at the returned cut, so the next invocation
+/// starts from the truth rather than from zero.
+///
 /// Degradation is by design. If the text has no recognisable structure in the
 /// search window — or quoting is unbalanced enough that the scanner believes
 /// it is inside a string — no candidate is found and the result is exactly the
@@ -351,32 +368,33 @@ enum BoundaryRank {
 ///
 /// The returned index is always a UTF-8 char boundary and always `>= 1` when
 /// `s` is non-empty, so callers are guaranteed forward progress.
-fn structural_split_point(s: &str, cap: usize) -> usize {
+fn structural_split_point(s: &str, cap: usize, state: &mut ScannerState) -> usize {
     let hard = floor_char_boundary(s, cap);
     if hard >= s.len() {
         return hard;
     }
     let window_start = hard.saturating_sub(SPLIT_SEARCH_WINDOW);
 
-    let mut best: Option<(BoundaryRank, usize)> = None;
-    let mut consider = |rank: BoundaryRank, at: usize| {
+    let mut best: Option<(BoundaryRank, usize, ScannerState)> = None;
+    let mut consider = |rank: BoundaryRank, at: usize, snapshot: ScannerState| {
         if at <= window_start || at > hard || !s.is_char_boundary(at) {
             return;
         }
         // `>=` so that among equally ranked boundaries the latest one wins,
         // keeping units as close to the cap as possible.
         match best {
-            Some((best_rank, _)) if rank < best_rank => {}
-            _ => best = Some((rank, at)),
+            Some((best_rank, _, _)) if rank < best_rank => {}
+            _ => best = Some((rank, at, snapshot)),
         }
     };
 
-    let mut depth: u32 = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    // Scanning must start at 0, not at `window_start`: nesting depth and
+    let mut depth: u32 = state.depth;
+    let mut in_string = state.in_string;
+    let mut escaped = state.escaped;
+    // Scanning must start at index 0, not at `window_start`: nesting depth and
     // string state at the window are only correct if every preceding byte has
-    // been seen.
+    // been seen. It starts from the *carried* state, not from zero — a piece
+    // begins wherever the previous cut left the scanner (see `ScannerState`).
     for (i, ch) in s[..hard].char_indices() {
         let after = i + ch.len_utf8();
         if in_string {
@@ -395,7 +413,15 @@ fn structural_split_point(s: &str, cap: usize) -> usize {
             '}' | ']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    consider(BoundaryRank::Record, after);
+                    consider(
+                        BoundaryRank::Record,
+                        after,
+                        ScannerState {
+                            depth,
+                            in_string,
+                            escaped,
+                        },
+                    );
                 }
             }
             ',' | ';' => {
@@ -404,15 +430,54 @@ fn structural_split_point(s: &str, cap: usize) -> usize {
                 } else {
                     BoundaryRank::Separator
                 };
-                consider(rank, after);
+                consider(
+                    rank,
+                    after,
+                    ScannerState {
+                        depth,
+                        in_string,
+                        escaped,
+                    },
+                );
             }
-            '\n' => consider(BoundaryRank::Line, after),
-            c if c.is_whitespace() => consider(BoundaryRank::Word, after),
+            '\n' => consider(
+                BoundaryRank::Line,
+                after,
+                ScannerState {
+                    depth,
+                    in_string,
+                    escaped,
+                },
+            ),
+            c if c.is_whitespace() => consider(
+                BoundaryRank::Word,
+                after,
+                ScannerState {
+                    depth,
+                    in_string,
+                    escaped,
+                },
+            ),
             _ => {}
         }
     }
 
-    best.map_or(hard, |(_, at)| at).max(1)
+    match best {
+        Some((_, at, snapshot)) => {
+            *state = snapshot;
+            at.max(1)
+        }
+        None => {
+            // Blind cut at `hard`: the emitted piece is `s[..hard]`, so the
+            // carried state is whatever the scanner had reached at `hard`.
+            *state = ScannerState {
+                depth,
+                in_string,
+                escaped,
+            };
+            hard.max(1)
+        }
+    }
 }
 
 /// Emit one chunk as one or more retrieval units, splitting any chunk whose
@@ -456,6 +521,7 @@ fn emit_chunk_units(
     let total_len = text.len();
     let mut offset = 0usize;
     let mut emitted = 0usize;
+    let mut scanner = ScannerState::default();
     while offset < total_len {
         let remaining = &text[offset..];
         let take = if remaining.len() <= MAX_UNIT_CHARS {
@@ -464,8 +530,10 @@ fn emit_chunk_units(
             // Guarantee forward progress: `structural_split_point` clamps to
             // at least 1 byte, so even a first char wider than the cap — which
             // MAX_UNIT_CHARS (thousands of bytes) makes impossible — cannot
-            // spin forever.
-            structural_split_point(remaining, MAX_UNIT_CHARS)
+            // spin forever. `scanner` carries nesting/quote state into each
+            // piece so the split of piece N starts from where piece N-1 was
+            // cut, not from a zeroed re-read of a mid-structure slice.
+            structural_split_point(remaining, MAX_UNIT_CHARS, &mut scanner)
         };
         let piece = &remaining[..take];
         *cumulative_text_bytes += piece.len() as u64;
@@ -1178,6 +1246,37 @@ mod tests {
             rejoined, text,
             "multi-byte content must round-trip exactly across a split"
         );
+    }
+
+    #[test]
+    fn split_of_minified_json_tracks_nesting_across_pieces() {
+        // Regression: the splitter restarted its depth/quote scan from zero on
+        // every piece, so from the second piece onward a `}` inside an array
+        // looked like a top-level record end. Cuts then landed *before* the
+        // separating comma (piece ends `}`, next starts `,`) instead of after
+        // it. With carried state, every piece after the first must begin at a
+        // record boundary.
+        let record = format!("{{\"key\":\"{}\"}}", "a".repeat(180)); // ~190 bytes
+        let text = format!("[{}]", vec![record; 40].join(","));
+        assert!(
+            text.len() > MAX_UNIT_CHARS * 3,
+            "input must force several split pieces"
+        );
+
+        let out = analyzer().analyze(text_input(&text));
+        let units = &out.retrieval_units;
+        assert!(units.len() > 2, "must have split into several units");
+
+        let rejoined: String = units.iter().map(|u| u.retrieval_text.as_str()).collect();
+        assert_eq!(rejoined, text, "split must be lossless");
+
+        for (i, u) in units.iter().enumerate().skip(1) {
+            assert!(
+                u.retrieval_text.starts_with('{'),
+                "piece {i} must start at a record boundary, got: {:.30}…",
+                u.retrieval_text
+            );
+        }
     }
 
     // ── RedactedBytes ─────────────────────────────────────────────────────────

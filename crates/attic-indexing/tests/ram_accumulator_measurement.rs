@@ -34,8 +34,11 @@ fn dense_json_file(index: usize, rules: usize) -> String {
 
 fn build_repo(dir: &Path, files: usize, rules_per_file: usize) {
     for i in 0..files {
-        std::fs::write(dir.join(format!("Env_{i}-Code.json")), dense_json_file(i, rules_per_file))
-            .expect("write fixture");
+        std::fs::write(
+            dir.join(format!("Env_{i}-Code.json")),
+            dense_json_file(i, rules_per_file),
+        )
+        .expect("write fixture");
     }
 }
 
@@ -62,7 +65,8 @@ fn index_and_report(label: &str, files: usize, rules_per_file: usize) -> (u64, u
         "\n[{label}] files={} units={} \n  \
          stages: discovery={}ms collect={}ms analysis={}ms resolve={}ms publish={}ms total={}ms\n  \
          rss: start={:?}MiB peak={:?}MiB\n  \
-         accumulators: pending_units_peak={} bytes ({} units)  cache_writes_peak={} bytes\n  \
+         accumulators: pending_units_peak={} bytes ({} units)  cache_writes_peak={} bytes  \
+         analysis_inflight_peak={} bytes\n  \
          cache/pending ratio: {:.2}x",
         result.files_indexed,
         result.units_inserted,
@@ -77,6 +81,7 @@ fn index_and_report(label: &str, files: usize, rules_per_file: usize) -> (u64, u
         t.pending_units_peak_bytes,
         t.pending_units_peak_count,
         t.cache_writes_peak_bytes,
+        t.analysis_inflight_peak_bytes,
         t.cache_writes_peak_bytes as f64 / t.pending_units_peak_bytes.max(1) as f64,
     );
 
@@ -207,6 +212,51 @@ fn analysis_cache_peak_is_bounded_by_the_flush_threshold() {
     );
 }
 
+/// The striped analysis pipeline bounds *unmerged* analysis output: at most
+/// one stripe of files' results (retrieval text plus structural captures) is
+/// live at once, instead of the whole corpus. Regression guard for the
+/// whole-corpus `Vec<AnalyzedFile>` peak that parallel analysis introduced.
+#[test]
+fn analysis_inflight_peak_is_bounded_by_the_stripe() {
+    // 128 files with analysis forced sequential: stripe = max(1*8, 32) = 32
+    // files, so the run is 4 stripes and the unmerged peak should sit near a
+    // quarter of the corpus text, not at 100% of it.
+    let dir = TempDir::new().unwrap();
+    build_repo(dir.path(), 128, 8);
+
+    let db_path = dir.path().join("striped.db");
+    let (conn, pool) = open_db(&db_path).unwrap();
+    attic_storage::run_migrations(&conn).unwrap();
+    let queue = WriterQueue::new(conn).unwrap();
+    let handle = queue.handle();
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &handle,
+    };
+    let policy = DiscoveryPolicy::default_git();
+    let opts = IndexOptions {
+        analysis_threads: 1,
+        ..IndexOptions::default()
+    };
+    let result = index_repository(&store, dir.path(), &policy, &opts).expect("indexing succeeds");
+
+    let inflight = result.stage_timings.analysis_inflight_peak_bytes;
+    let total = result.stage_timings.pending_units_peak_bytes;
+    println!(
+        "\n[striped] analysis_inflight_peak={inflight} bytes vs whole-corpus pending peak={total} bytes"
+    );
+
+    assert!(
+        inflight > 0,
+        "analysis produced units, so a stripe held them"
+    );
+    assert!(
+        inflight.saturating_mul(2) <= total,
+        "with 4 stripes the unmerged peak must stay well under the whole-corpus \
+         total (inflight={inflight}, total={total})"
+    );
+}
+
 /// A warm reindex hits `index_analysis_cache` for every file, so the second
 /// copy is not rebuilt. Confirms the duplicate footprint is a cold-run cost.
 #[test]
@@ -231,8 +281,7 @@ fn warm_reindex_does_not_rebuild_the_cache_copy() {
 
     println!(
         "\n[warm] cold cache_writes_peak={} -> warm cache_writes_peak={}",
-        first.stage_timings.cache_writes_peak_bytes,
-        second.stage_timings.cache_writes_peak_bytes,
+        first.stage_timings.cache_writes_peak_bytes, second.stage_timings.cache_writes_peak_bytes,
     );
 
     assert!(

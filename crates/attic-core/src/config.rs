@@ -230,6 +230,18 @@ pub struct SemanticConfig {
     /// Optional output dimension override (e.g. 512, 768, 1024).
     #[serde(default)]
     pub dimension: Option<usize>,
+    /// Path globs whose units are never selected for embedding
+    /// (case-insensitive; `*` stays within a path segment, `**` crosses
+    /// segments, trailing `/` matches a directory anywhere). Excluded content
+    /// stays fully lexical-searchable — this only keeps it out of the
+    /// embedding queue.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Files larger than this many bytes are never selected for embedding
+    /// (generated exports/dumps). `None` uses the built-in default of
+    /// 256 KiB.
+    #[serde(default)]
+    pub max_file_bytes: Option<u64>,
 }
 
 impl Default for SemanticConfig {
@@ -238,6 +250,8 @@ impl Default for SemanticConfig {
             enabled: true,
             model: default_semantic_model(),
             dimension: None,
+            exclude_globs: Vec::new(),
+            max_file_bytes: None,
         }
     }
 }
@@ -390,6 +404,14 @@ mode = "auto"
 enabled = true
 model = "qwen3-embedding-0.6b"
 
+# Admission policy for the embedding queue. Excluded content stays fully
+# lexical-searchable; it is simply never embedded.
+# Files larger than this are never embedded (default: 262144 = 256 KiB) —
+# multi-megabyte exports/dumps are generated data, not prose.
+# max_file_bytes = 262144
+# Additional paths to keep out of the embedding queue.
+# exclude_globs = ["*-Code.json", "fixtures/"]
+
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
 # Attic's built-in defaults (node_modules/, target/, build output, etc.).
@@ -441,6 +463,19 @@ mod tests {
     fn semantic_disabled_config_parses() {
         let cfg = AtticConfig::parse_str("[semantic]\nenabled = false\n").unwrap();
         assert!(!cfg.semantic.enabled);
+    }
+
+    #[test]
+    fn semantic_admission_keys_parse() {
+        let cfg = AtticConfig::parse_str(
+            "[semantic]\nexclude_globs = [\"*-Code.json\", \"fixtures/\"]\nmax_file_bytes = 131072\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.semantic.exclude_globs,
+            vec!["*-Code.json".to_string(), "fixtures/".to_string()]
+        );
+        assert_eq!(cfg.semantic.max_file_bytes, Some(131_072));
     }
 
     #[test]

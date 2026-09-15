@@ -587,8 +587,7 @@ fn oversized_units_are_excluded_not_truncated_silently() {
         .copied()
         .unwrap_or(0);
     assert_eq!(
-        too_big,
-        0,
+        too_big, 0,
         "the analyzer now bounds every unit, so none should be rejected for \
          size; got {:?}",
         rep.selection.excluded
@@ -604,13 +603,8 @@ fn oversized_units_are_excluded_not_truncated_silently() {
         max_input_bytes: 16,
         ..Default::default()
     };
-    let strict_rep = attic_semantic::reconcile(
-        &conn,
-        &stack.store,
-        stack.provider.as_ref(),
-        &strict,
-    )
-    .unwrap();
+    let strict_rep =
+        attic_semantic::reconcile(&conn, &stack.store, stack.provider.as_ref(), &strict).unwrap();
     let strict_too_big = strict_rep
         .selection
         .excluded

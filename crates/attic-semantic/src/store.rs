@@ -468,6 +468,60 @@ impl SemanticStore {
         }
     }
 
+    /// Content-addressed vector lookup: for each given content hash, the
+    /// stored vector (if any) under this exact provider/model/dim. Enrichment
+    /// uses it to reuse an already-computed embedding for identical text —
+    /// across repositories (shared boilerplate, copied components) and across
+    /// generations — instead of paying CPU inference again. First row found
+    /// per hash wins; vectors for identical (provider, model, dim, content)
+    /// are interchangeable by construction.
+    pub fn vectors_for_contents(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        dim: usize,
+        content_hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, SemanticError> {
+        let mut out = HashMap::new();
+        if content_hashes.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.guard()?;
+        for chunk in content_hashes.chunks(64) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT content_hash, vector FROM sem_embeddings
+                  WHERE provider_id = ?1 AND model_id = ?2 AND dim = ?3
+                    AND content_hash IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut param_values: Vec<Box<dyn rusqlite::ToSql>> =
+                Vec::with_capacity(chunk.len() + 3);
+            param_values.push(Box::new(provider_id.to_owned()));
+            param_values.push(Box::new(model_id.to_owned()));
+            param_values.push(Box::new(dim as i64));
+            for h in chunk {
+                param_values.push(Box::new(h.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+            let mut rows = stmt.query(param_refs.as_slice())?;
+            while let Some(r) = rows.next()? {
+                let hash: String = r.get(0)?;
+                if out.contains_key(&hash) {
+                    continue;
+                }
+                let blob: Vec<u8> = r.get(1)?;
+                let mut vec = Vec::with_capacity(blob.len() / 4);
+                for b in blob.as_chunks::<4>().0 {
+                    vec.push(f32::from_le_bytes(*b));
+                }
+                out.insert(hash, vec);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every embedding for one unit (all models) or one exact record
     /// when `provider`/`model` are given.
     pub fn delete(
@@ -1260,6 +1314,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn vectors_for_contents_returns_stored_vectors_by_hash() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let r1 = rec("u1", vec![1.0, 0.0]);
+        let r2 = rec("u2", vec![0.0, 1.0]);
+        let h1 = r1.content_hash.clone();
+        let h2 = r2.content_hash.clone();
+        let dim = r1.dim;
+        s.put(&r1).unwrap();
+        s.put(&r2).unwrap();
+
+        let got = s
+            .vectors_for_contents(
+                "hashing",
+                "hashed-ngram-v1",
+                dim,
+                &[h1.clone(), h2.clone(), "absent".to_string()],
+            )
+            .unwrap();
+        assert_eq!(got.get(&h1).map(Vec::as_slice), Some(&[1.0, 0.0][..]));
+        assert_eq!(got.get(&h2).map(Vec::as_slice), Some(&[0.0, 1.0][..]));
+        assert!(!got.contains_key("absent"));
+
+        // A different dim must NOT match: a stale 256-dim row can never
+        // satisfy a 1024-dim request after a dimension override change.
+        let wrong_dim = s
+            .vectors_for_contents("hashing", "hashed-ngram-v1", dim + 1, &[h1.clone()])
+            .unwrap();
+        assert!(wrong_dim.is_empty());
+        // Nor a different model.
+        let wrong_model = s
+            .vectors_for_contents("hashing", "other-model", dim, &[h1.clone()])
+            .unwrap();
+        assert!(wrong_model.is_empty());
     }
 
     #[test]

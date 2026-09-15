@@ -3657,6 +3657,14 @@ pub(crate) fn build_server_and_enricher(
             cpu_threads: semantic_cpu_thread_budget(
                 std::thread::available_parallelism().map_or(1, usize::from),
             ),
+            selection: {
+                let mut sel = attic_semantic::SelectionConfig::default();
+                sel.exclude_globs = server.attic_config.semantic.exclude_globs.clone();
+                if let Some(max_bytes) = server.attic_config.semantic.max_file_bytes {
+                    sel.max_file_bytes = max_bytes;
+                }
+                sel
+            },
             ..attic_semantic::EnrichmentConfig::default()
         };
         semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(

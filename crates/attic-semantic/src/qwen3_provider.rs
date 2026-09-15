@@ -659,49 +659,15 @@ impl SemanticProvider for Qwen3Embedder {
         let mut indexed: Vec<(usize, &EmbeddingInput)> = inputs.iter().enumerate().collect();
         indexed.sort_by_key(|(_, item)| item.text.len());
 
-        let mut sorted_outputs: Vec<(usize, EmbeddingOutput)> = Vec::with_capacity(inputs.len());
-
-        // Token-budget batching, not fixed-count batching: `plan_sub_batch_end`
-        // narrows the batch when the (length-sorted) items are long, so peak
-        // attention memory stays roughly flat instead of scaling with the
-        // square of whatever sequence length this chunk happens to contain.
-        let mut cursor = 0usize;
-        while cursor < indexed.len() {
-            let chunk_end = self.plan_sub_batch_end(&indexed, cursor);
-            let chunk = &indexed[cursor..chunk_end];
-            cursor = chunk_end;
-
-            if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
-                return Err(SemanticError::Cancelled {
-                    completed: sorted_outputs.len(),
-                    total: inputs.len(),
-                });
-            }
-
-            let texts: Vec<&str> = chunk.iter().map(|(_, item)| item.text.as_str()).collect();
-            let vectors = self.embed_sub_batch(&texts)?;
-
-            for ((orig_idx, item), vector) in chunk.iter().zip(vectors) {
-                if vector.len() != self.target_dims || vector.iter().any(|v| !v.is_finite()) {
-                    return Err(SemanticError::EmbeddingFailed(format!(
-                        "provider produced an invalid vector for unit '{}' (len={}, expected={})",
-                        item.unit_key,
-                        vector.len(),
-                        self.target_dims
-                    )));
-                }
-                sorted_outputs.push((
-                    *orig_idx,
-                    EmbeddingOutput {
-                        unit_key: item.unit_key.clone(),
-                        vector,
-                    },
-                ));
-            }
-        }
-
-        sorted_outputs.sort_by_key(|(orig_idx, _)| *orig_idx);
-        let outputs: Vec<EmbeddingOutput> = sorted_outputs.into_iter().map(|(_, o)| o).collect();
+        let outputs = run_sub_batches(
+            &indexed,
+            inputs.len(),
+            self.target_dims,
+            |start| self.plan_sub_batch_end(&indexed, start),
+            &|texts| self.embed_sub_batch(texts),
+            cancel,
+            deadline,
+        )?;
 
         let total_bytes: usize = inputs.iter().map(|i| i.text.len()).sum();
         let elapsed = t0.elapsed();
@@ -713,6 +679,83 @@ impl SemanticProvider for Qwen3Embedder {
 
         Ok(outputs)
     }
+}
+
+/// Embed `indexed` (sorted ascending by text length) in token-budgeted
+/// sub-batches and return outputs restored to input order.
+///
+/// # Deadline vs. cancellation semantics
+///
+/// The caller's deadline gates **entry to this call only**. Sub-batching is an
+/// internal memory-management detail of the provider; it must not change the
+/// observable contract of one `embed_batch` call. Checking the deadline between
+/// sub-batches livelocked semantic enrichment: CPU inference of one sub-batch
+/// (~149 s measured on the reference machine) always exceeds the caller's ~2 s
+/// enrichment budget, so the second sub-batch always observed an expired
+/// deadline, returned `Cancelled`, and the caller discarded the completed work
+/// and re-queued the whole batch — forever (`queue_inflight` pinned,
+/// `queue_done` permanently 0). A batch that has started therefore runs to
+/// completion, exactly as it did when a call was a single chunk. `cancel`
+/// (user/shutdown) stays responsive between sub-batches. Both exit paths commit
+/// nothing, per the §11 contract.
+fn run_sub_batches(
+    indexed: &[(usize, &EmbeddingInput)],
+    total: usize,
+    target_dims: usize,
+    mut plan_end: impl FnMut(usize) -> usize,
+    embed: &dyn Fn(&[&str]) -> Result<Vec<Vec<f32>>, SemanticError>,
+    cancel: &CancelFlag,
+    deadline: Option<Instant>,
+) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+    if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(SemanticError::Cancelled {
+            completed: 0,
+            total,
+        });
+    }
+
+    let mut sorted_outputs: Vec<(usize, EmbeddingOutput)> = Vec::with_capacity(total);
+    let mut cursor = 0usize;
+    while cursor < indexed.len() {
+        // Token-budget batching, not fixed-count batching: the planner narrows
+        // the sub-batch when the (length-sorted) items are long, so peak
+        // attention memory stays roughly flat instead of scaling with the
+        // square of whatever sequence length this chunk happens to contain.
+        let chunk_end = plan_end(cursor);
+        let chunk = &indexed[cursor..chunk_end];
+        cursor = chunk_end;
+
+        if cancel.is_cancelled() {
+            return Err(SemanticError::Cancelled {
+                completed: sorted_outputs.len(),
+                total,
+            });
+        }
+
+        let texts: Vec<&str> = chunk.iter().map(|(_, item)| item.text.as_str()).collect();
+        let vectors = embed(&texts)?;
+
+        for ((orig_idx, item), vector) in chunk.iter().zip(vectors) {
+            if vector.len() != target_dims || vector.iter().any(|v| !v.is_finite()) {
+                return Err(SemanticError::EmbeddingFailed(format!(
+                    "provider produced an invalid vector for unit '{}' (len={}, expected={})",
+                    item.unit_key,
+                    vector.len(),
+                    target_dims
+                )));
+            }
+            sorted_outputs.push((
+                *orig_idx,
+                EmbeddingOutput {
+                    unit_key: item.unit_key.clone(),
+                    vector,
+                },
+            ));
+        }
+    }
+
+    sorted_outputs.sort_by_key(|(orig_idx, _)| *orig_idx);
+    Ok(sorted_outputs.into_iter().map(|(_, o)| o).collect())
 }
 
 impl EmbeddingProvider for Qwen3Embedder {
@@ -762,6 +805,116 @@ impl EmbeddingProvider for Qwen3Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_deadline_at_entry_cancels_without_invoking_embed() {
+        let inputs = [EmbeddingInput {
+            unit_key: "a".into(),
+            text: "x".repeat(100),
+        }];
+        let indexed: Vec<(usize, &EmbeddingInput)> = inputs.iter().enumerate().collect();
+        let calls = std::cell::Cell::new(0usize);
+        let embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>, SemanticError> {
+            calls.set(calls.get() + texts.len());
+            Ok(texts.iter().map(|_| vec![0.0f32; 4]).collect())
+        };
+        let err = run_sub_batches(
+            &indexed,
+            1,
+            4,
+            |start| (start + 1).min(indexed.len()),
+            &embed,
+            &CancelFlag::new(),
+            Some(Instant::now() - std::time::Duration::from_secs(1)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SemanticError::Cancelled {
+                    completed: 0,
+                    total: 1
+                }
+            ),
+            "expired deadline at entry must cancel with nothing completed"
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "no inference may run past an expired entry deadline"
+        );
+    }
+
+    #[test]
+    fn deadline_expiring_mid_batch_does_not_discard_completed_work() {
+        // Regression for the enrichment livelock: CPU inference of one
+        // sub-batch (~149 s measured) always exceeds the caller's 2 s budget,
+        // so a per-sub-batch deadline check cancelled every batch at sub-batch
+        // 2 and the caller discarded the completed work, forever. The deadline
+        // must gate entry only; a started batch runs to completion.
+        let inputs: Vec<EmbeddingInput> = (0..4)
+            .map(|i| EmbeddingInput {
+                unit_key: format!("u{i}"),
+                text: "y".repeat(900),
+            })
+            .collect();
+        let indexed: Vec<(usize, &EmbeddingInput)> = inputs.iter().enumerate().collect();
+        let embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>, SemanticError> {
+            // Every sub-batch outlives the 10 ms entry deadline.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            Ok(texts.iter().map(|_| vec![0.0f32; 4]).collect())
+        };
+        let outputs = run_sub_batches(
+            &indexed,
+            indexed.len(),
+            4,
+            // One item per sub-batch: forces 4 sub-batches, so sub-batch 2
+            // starts long after the deadline has expired.
+            |start| (start + 1).min(indexed.len()),
+            &embed,
+            &CancelFlag::new(),
+            Some(Instant::now() + std::time::Duration::from_millis(10)),
+        )
+        .expect("a started batch must run to completion; the deadline gates entry only");
+        assert_eq!(outputs.len(), 4);
+        let keys: Vec<&str> = outputs.iter().map(|o| o.unit_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["u0", "u1", "u2", "u3"],
+            "outputs restored to input order"
+        );
+    }
+
+    #[test]
+    fn cancel_between_sub_batches_still_stops_promptly() {
+        let flag = CancelFlag::new();
+        let inputs: Vec<EmbeddingInput> = (0..4)
+            .map(|i| EmbeddingInput {
+                unit_key: format!("u{i}"),
+                text: "z".repeat(10),
+            })
+            .collect();
+        let indexed: Vec<(usize, &EmbeddingInput)> = inputs.iter().enumerate().collect();
+        let embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>, SemanticError> {
+            // Simulate a shutdown requested while the first sub-batch runs.
+            flag.cancel();
+            Ok(texts.iter().map(|_| vec![0.0f32; 4]).collect())
+        };
+        let err = run_sub_batches(
+            &indexed,
+            indexed.len(),
+            4,
+            |start| (start + 1).min(indexed.len()),
+            &embed,
+            &flag,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SemanticError::Cancelled { total: 4, .. }),
+            "user/shutdown cancellation must remain responsive between sub-batches"
+        );
+    }
 
     #[test]
     fn last_token_pool_extracts_correct_positions() {

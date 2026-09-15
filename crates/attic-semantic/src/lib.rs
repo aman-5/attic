@@ -63,9 +63,9 @@ pub use scheduler::{
     HierarchicalFairnessScheduler, QueueBackpressure, ScheduledUnit, SchedulerConfig,
 };
 pub use selection::{
-    EX_BELOW_THRESHOLD, EX_CAP_REPO, EX_CAP_TOTAL, EX_DUPLICATE, EX_GENERATED_PATH,
-    EX_GENERATED_TYPE, EX_TOO_LARGE, SEMANTIC_SELECTION_VERSION, SelectedUnit, SelectionConfig,
-    SelectionReport, SelectionSignals, select_units,
+    EX_BELOW_THRESHOLD, EX_CAP_REPO, EX_CAP_TOTAL, EX_DUPLICATE, EX_EXCLUDED_GLOB, EX_FILE_TOO_BIG,
+    EX_GENERATED_PATH, EX_GENERATED_TYPE, EX_TOO_LARGE, SEMANTIC_SELECTION_VERSION, SelectedUnit,
+    SelectionConfig, SelectionReport, SelectionSignals, select_units,
 };
 pub use store::{EmbeddingRecord, KnnResult, NearestHit, QueueItem, ScanBudget, SemanticStore};
 pub use throughput_controller::{

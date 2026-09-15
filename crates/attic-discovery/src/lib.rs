@@ -370,12 +370,8 @@ fn scan_entry(
         _ => None,
     };
 
-    let manifest = manifest::manifest_for_entry(
-        entry,
-        canonical_root,
-        prefetched.as_deref(),
-        cancellation,
-    )?;
+    let manifest =
+        manifest::manifest_for_entry(entry, canonical_root, prefetched.as_deref(), cancellation)?;
 
     let mut diagnostics = Vec::new();
     let (classification, small_file_bytes) = classify_file_for_downstream(

@@ -67,6 +67,11 @@ pub struct EnrichmentConfig {
     pub cpu_threads: usize,
     /// Optional dynamic resource allocation handle from ResourceOrchestrator (Master Plan §12, §15, CP15).
     pub dynamic_allocation: Option<Arc<std::sync::RwLock<attic_storage::ResourceAllocation>>>,
+    /// Admission policy used by the reconcile pass this enricher runs: which
+    /// units ever enter the queue (per-file size ceiling, path globs, caps).
+    /// Carried here so the server's `[semantic]` config reaches the one place
+    /// reconcile is driven from.
+    pub selection: SelectionConfig,
 }
 
 impl EnrichmentConfig {
@@ -84,6 +89,7 @@ impl EnrichmentConfig {
             embedding_worker_count,
             cpu_threads: 2,
             dynamic_allocation: None,
+            selection: SelectionConfig::baseline(),
         }
     }
 
@@ -129,6 +135,7 @@ impl Default for EnrichmentConfig {
             embedding_worker_count: 1,
             cpu_threads: 2,
             dynamic_allocation: None,
+            selection: SelectionConfig::default(),
         }
     }
 }
@@ -242,16 +249,96 @@ pub fn drive(
             cfg.effective_cpu_threads(),
             cfg.embedding_worker_count,
         );
+
+        // Content-addressed reuse: identical text already embedded under this
+        // exact provider/model/dim gets its stored vector copied instead of
+        // re-running CPU inference. Across a fleet of similar repositories
+        // (shared boilerplate, copied components) this is the difference
+        // between embedding each unique byte sequence once and embedding it
+        // once per repository. The lookup is fallible — on error the claimed
+        // items go back to PENDING exactly like the other pre-embed failures
+        // above, rather than leaking INFLIGHT.
+        let hashes: Vec<String> = inputs
+            .iter()
+            .map(|i| crate::identity::content_hash(&i.text))
+            .collect();
+        let existing = match store.vectors_for_contents(
+            provider.id(),
+            provider.model_id(),
+            provider.dimensions(),
+            &hashes,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("embedding reuse lookup failed: {e}");
+                for it in &items {
+                    store.queue_reset(&it.retrieval_unit_id)?;
+                }
+                continue;
+            }
+        };
+
+        let record_for = |r: &attic_storage::SemanticUnitRow, vector: Vec<f32>| {
+            let identity = SemanticUnitIdentity::new(
+                r.unit_id.clone(),
+                r.source_revision_id.clone(),
+                r.index_generation_id.clone(),
+                SEMANTIC_SELECTION_VERSION,
+                &r.retrieval_text,
+            );
+            EmbeddingRecord {
+                retrieval_unit_id: identity.retrieval_unit_id,
+                repository_id: r.repository_id.clone(),
+                source_revision_id: identity.source_revision_id,
+                index_generation_id: identity.index_generation_id,
+                selection_version: identity.selection_version,
+                provider_id: provider.id().to_owned(),
+                model_id: provider.model_id().to_owned(),
+                content_hash: identity.content_hash,
+                dim: vector.len(),
+                vector,
+            }
+        };
+
+        let mut handled: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(inputs.len());
+        let mut batch_records: Vec<EmbeddingRecord> = Vec::with_capacity(inputs.len());
+        let mut to_embed: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len());
+        for (input, ch) in inputs.into_iter().zip(hashes) {
+            match existing.get(&ch) {
+                Some(vector) => {
+                    // Same text, same provider/model/dim ⇒ same vector; the
+                    // record is re-stamped with THIS unit's own identity.
+                    if let Some(r) = meta.get(&input.unit_key) {
+                        handled.insert(input.unit_key.clone());
+                        batch_records.push(record_for(r, vector.clone()));
+                    } else {
+                        // Unreachable by construction (inputs are built from
+                        // meta rows); route through the provider path so the
+                        // dropped-input check below resolves it explicitly.
+                        to_embed.push(input);
+                    }
+                }
+                None => to_embed.push(input),
+            }
+        }
+
         // Enrichment's own wall-clock budget is the provider deadline: a
         // slow/hung backend must never hold the drive loop past it.
         // Isolation plan ensures Qwen CPU execution respects orchestrator thread limits.
-        let embed_res = plan
-            .execute_isolated(|| provider.embed_batch(&inputs, cancel, &mut usage, Some(deadline)));
+        let embed_res = if to_embed.is_empty() {
+            // Every claimed unit was satisfied by content reuse — no
+            // inference to run. Per §11 nothing about cancellation semantics
+            // changes: the commit below still either happens whole or not at
+            // all.
+            Ok(Vec::new())
+        } else {
+            plan.execute_isolated(|| {
+                provider.embed_batch(&to_embed, cancel, &mut usage, Some(deadline))
+            })
+        };
         match embed_res {
             Ok(outputs) => {
-                let mut handled: std::collections::HashSet<String> =
-                    std::collections::HashSet::with_capacity(outputs.len());
-                let mut batch_records = Vec::with_capacity(outputs.len());
                 for out in outputs {
                     if let Some(r) = meta.get(&out.unit_key) {
                         if out.vector.len() != provider.dimensions() {
@@ -261,31 +348,13 @@ pub fn drive(
                             });
                         }
                         handled.insert(out.unit_key.clone());
-                        let identity = SemanticUnitIdentity::new(
-                            r.unit_id.clone(),
-                            r.source_revision_id.clone(),
-                            r.index_generation_id.clone(),
-                            SEMANTIC_SELECTION_VERSION,
-                            &r.retrieval_text,
-                        );
-                        batch_records.push(EmbeddingRecord {
-                            retrieval_unit_id: identity.retrieval_unit_id,
-                            repository_id: r.repository_id.clone(),
-                            source_revision_id: identity.source_revision_id,
-                            index_generation_id: identity.index_generation_id,
-                            selection_version: identity.selection_version,
-                            provider_id: provider.id().to_owned(),
-                            model_id: provider.model_id().to_owned(),
-                            content_hash: identity.content_hash,
-                            dim: out.vector.len(),
-                            vector: out.vector,
-                        });
+                        batch_records.push(record_for(r, out.vector));
                     }
                 }
                 // [FIX] Any requested input the provider silently dropped
                 // (returned fewer vectors than inputs) previously stayed
                 // INFLIGHT forever with no error raised anywhere.
-                for input in &inputs {
+                for input in &to_embed {
                     if !handled.contains(&input.unit_key) {
                         store.queue_mark_failed(&input.unit_key, cfg.max_attempts)?;
                         stats.failed_items += 1;
@@ -536,12 +605,7 @@ impl BackgroundEnricher {
                     };
                     if should_reconcile {
                         let _release_gate = ReconcileGuard(&reconcile_gate);
-                        match reconcile(
-                            &conn,
-                            &store,
-                            provider.as_ref(),
-                            &SelectionConfig::default(),
-                        ) {
+                        match reconcile(&conn, &store, provider.as_ref(), &cfg.selection) {
                             Ok(report) if report.enqueued > 0 => {
                                 tracing::info!(
                                     enqueued = report.enqueued,

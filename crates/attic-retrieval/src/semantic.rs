@@ -368,8 +368,8 @@ pub fn enrich_to_completion(
     stack: &SemanticStack,
     cfg: &attic_semantic::EnrichmentConfig,
 ) -> Result<attic_semantic::EnrichStats, String> {
-    let sel_cfg = attic_semantic::SelectionConfig::default();
-    let _report = attic_semantic::reconcile(conn, &stack.store, stack.provider.as_ref(), &sel_cfg)
+    let sel_cfg = &cfg.selection;
+    let _report = attic_semantic::reconcile(conn, &stack.store, stack.provider.as_ref(), sel_cfg)
         .map_err(|e| e.to_string())?;
     let cancel = attic_semantic::CancelFlag::new();
     // Test/bootstrap convenience — no explicit override provenance is
