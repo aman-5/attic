@@ -31,7 +31,36 @@ pub const HF_QWEN_OWNER: &str = "Qwen";
 pub const HF_QWEN_REPO: &str = "Qwen3-Embedding-0.6B";
 pub const QWEN_PROVIDER_ID: &str = "qwen3";
 pub const QWEN_MODEL_ID: &str = "qwen3-embedding-0.6b";
-pub const DEFAULT_MAX_TOKENS: usize = 512;
+/// Maximum tokens per embedded unit.
+///
+/// Raised from the original 512 because 512 tokens is roughly 1–2 KB of dense,
+/// punctuation-heavy text (JSON, minified JS, SQL). The generic analyzer's
+/// chunk target alone is 2 KB, so *ordinary* chunks — not just pathological
+/// ones — were being tokenizer-truncated, losing their tail silently.
+///
+/// Deliberately doubled rather than raised further: the attention mask is
+/// materialised at `batch × seq_len × seq_len` floats
+/// (`Qwen3Model::build_attention_mask`), so this ceiling is quadratic in peak
+/// embedding memory. 1024 covers the analyzer's per-unit cap with margin;
+/// 2048+ risks multi-GB activations on a full batch, which is precisely the
+/// memory pressure the indexing work is trying to remove.
+///
+/// Cost note: this is a ceiling, not a fixed cost. Sequences are padded to the
+/// longest item in a batch, not to this value, so short units stay cheap.
+pub const DEFAULT_MAX_TOKENS: usize = 1_024;
+/// Conservative lower bound on bytes-per-token used to convert the token
+/// ceiling into a byte ceiling.
+///
+/// This replaces a `* 64` factor that was wrong by more than an order of
+/// magnitude: it made the provider advertise ~32 KB of capacity while the
+/// tokenizer truncated at 512 tokens (~1–2 KB of dense content), so callers
+/// admitted units far larger than the model would actually read.
+///
+/// 2 bytes/token is a floor, not an average: English prose runs ~4, code ~3,
+/// and dense JSON/minified output approaches ~2. Using the floor means
+/// `max_input_bytes` under-promises, which is the safe direction — a unit that
+/// passes the gate always fits.
+pub const MIN_BYTES_PER_TOKEN: usize = 2;
 pub const NATIVE_QWEN_DIMENSION: usize = 1024;
 const DTYPE: DType = DType::F32;
 
@@ -502,7 +531,10 @@ impl SemanticProvider for Qwen3Embedder {
     }
 
     fn max_input_bytes(&self) -> usize {
-        self.max_tokens * 64
+        // Derived from the token ceiling via a conservative floor ratio, so
+        // "accepted by the gate" implies "read in full by the model". See
+        // MIN_BYTES_PER_TOKEN for why the old `* 64` factor was unsafe.
+        self.max_tokens * MIN_BYTES_PER_TOKEN
     }
 
     fn available(&self) -> bool {

@@ -497,6 +497,17 @@ pub mod diagnostic_codes {
     pub const CANCELLED: &str = "CANCELLED";
     pub const MALFORMED_INPUT: &str = "MALFORMED_INPUT";
     pub const UNSTABLE_CAPTURE: &str = "UNSTABLE_CAPTURE";
+    /// A single source line exceeded the per-unit size cap and was split
+    /// across several retrieval units at UTF-8 char boundaries.
+    ///
+    /// Distinct from `RESOURCE_EXHAUSTED` (analysis stopped early, output is
+    /// incomplete) and `PARTIAL_SCAN` (only part of the file was read):
+    /// here every byte IS indexed, just distributed across more units than
+    /// the line structure implies. Emitted so an oversized line is never
+    /// *silently* reshaped — downstream consumers (notably the semantic
+    /// layer's per-unit size gate) can see that a unit boundary is
+    /// synthetic rather than a real line break.
+    pub const UNIT_TRUNCATED: &str = "UNIT_TRUNCATED";
 }
 
 /// The complete output of a single analyzer invocation.

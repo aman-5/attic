@@ -33,6 +33,16 @@ pub struct SelectionConfig {
     pub max_input_bytes: usize,
 }
 
+impl SelectionConfig {
+    /// Default byte ceiling for an embeddable unit.
+    ///
+    /// Derived from the embedding provider's real read capacity rather than
+    /// chosen independently: the gate must never admit a unit the model would
+    /// silently truncate. See the `const _` chain assertion below.
+    pub const MAX_INPUT_BYTES_DEFAULT: usize =
+        crate::qwen3_provider::DEFAULT_MAX_TOKENS * crate::qwen3_provider::MIN_BYTES_PER_TOKEN;
+}
+
 impl Default for SelectionConfig {
     fn default() -> Self {
         Self {
@@ -44,10 +54,44 @@ impl Default for SelectionConfig {
             // long before the (now much higher) global cap is ever reached.
             max_units_per_repo: 2_560,
             max_units_total: 100_000,
-            max_input_bytes: 16_384,
+            // Was a standalone 16_384, which sat far ABOVE what the provider
+            // actually reads — so units between the provider ceiling and this
+            // gate passed the check documented as "enrichment truncates
+            // nothing silently" and were then truncated by the tokenizer.
+            max_input_bytes: Self::MAX_INPUT_BYTES_DEFAULT,
         }
     }
 }
+
+/// The size limits in the pipeline must form a chain, or content is silently
+/// lost between them:
+///
+/// ```text
+/// selection gate  <=  provider read capacity
+/// ```
+///
+/// This link is guaranteed *by construction* above:
+/// [`SelectionConfig::MAX_INPUT_BYTES_DEFAULT`] is derived from the provider's
+/// token ceiling rather than chosen independently, which is what went wrong
+/// before — a standalone 16_384 against a real ~1 KB tokenizer limit, so units
+/// passed the gate documented as "enrichment truncates nothing silently" and
+/// were then truncated anyway.
+///
+/// Units produced *larger* than this gate are fine: they are excluded and
+/// counted as [`EX_TOO_LARGE`], which is explicit and inspectable. The
+/// invariant that matters is only that nothing admitted here is later cut.
+const _: () = {
+    assert!(
+        SelectionConfig::MAX_INPUT_BYTES_DEFAULT
+            <= crate::qwen3_provider::DEFAULT_MAX_TOKENS
+                * crate::qwen3_provider::MIN_BYTES_PER_TOKEN,
+        "selection gate must never admit a unit larger than the provider reads"
+    );
+    assert!(
+        SelectionConfig::MAX_INPUT_BYTES_DEFAULT > 0,
+        "selection gate must admit something"
+    );
+};
 
 /// One unit's observable signal vector.
 #[derive(Debug, Clone, Copy, PartialEq)]

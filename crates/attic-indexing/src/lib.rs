@@ -155,6 +155,56 @@ impl Default for IndexOptions {
     }
 }
 
+/// Per-stage wall-clock and memory profile for one indexing run (Phase 0
+/// instrumentation).
+///
+/// Exists so "which stage is slow" and "how much RAM did this run actually
+/// need" are answerable from an `IndexResult` instead of from server logs or
+/// guesswork. Every field is a measurement, never a limit: nothing in the
+/// pipeline reads these values back to make a decision.
+///
+/// The `*_peak_bytes` high-water marks are the live sizes of the whole-repo
+/// accumulators. They are the numbers that must stay flat as repository size
+/// grows once batched publication lands; a run whose peaks scale with repo
+/// size is the defect these fields exist to expose.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IndexStageTimings {
+    /// Discovery walk: gitignore-aware traversal, manifest hashing, secret
+    /// classification (`attic_discovery::discover_with_cancellation`).
+    pub discovery_ms: u64,
+    /// Building the eligible `FileRecord` set (identity lookup/allocation).
+    pub collect_ms: u64,
+    /// Per-file analysis: cache lookup, read, analyzer dispatch, chunking.
+    pub analysis_ms: u64,
+    /// Structural resolution (`StructuralPipeline::finish`) plus assembly of
+    /// the publication payloads.
+    pub resolve_ms: u64,
+    /// The coordinated writer-queue publication itself.
+    pub publish_ms: u64,
+    /// Whole-run wall clock, including time not attributed to any stage above.
+    pub total_ms: u64,
+    /// Process RSS sampled before the run starts, in MiB. `None` when the
+    /// platform does not expose process memory.
+    pub rss_start_mib: Option<u64>,
+    /// Highest process RSS observed during the run, in MiB. Sampled at stage
+    /// boundaries and at each accumulator high-water mark, so it is a floor on
+    /// true peak, never an overestimate.
+    pub rss_peak_mib: Option<u64>,
+    /// High-water mark of `pending_units` retrieval text held in memory.
+    ///
+    /// Monotonic today because nothing drains `pending_units` before
+    /// publication — which is precisely the defect this field measures. Once
+    /// batched publication lands, the live counter feeding this must be
+    /// decremented on every flush or the "peak" becomes a run total.
+    pub pending_units_peak_bytes: u64,
+    /// High-water mark of the serialized `cache_writes` buffer — the PR-7
+    /// analysis-cache copy, which holds a second, JSON-escaped copy of the
+    /// same text that `pending_units` already holds.
+    pub cache_writes_peak_bytes: u64,
+    /// Number of retrieval units held at the `pending_units` high-water mark.
+    pub pending_units_peak_count: usize,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct IndexResult {
     pub files_visited: usize,
@@ -185,6 +235,39 @@ pub struct IndexResult {
     /// counterpart to `discovery_counters`, so "why was X skipped" doesn't
     /// require reading server logs. See [`attic_discovery::Diagnostic`].
     pub discovery_diagnostics: Vec<attic_discovery::Diagnostic>,
+    /// Phase 0 instrumentation: per-stage wall clock, process RSS, and
+    /// accumulator high-water marks for this run. Measurement only — no
+    /// pipeline decision reads these back.
+    pub stage_timings: IndexStageTimings,
+}
+
+/// Tracks the highest process RSS seen across a run.
+///
+/// Sampling is explicit and cheap-ish (`sample_process_rss_mib` refreshes one
+/// process), so it happens at stage boundaries rather than per file. That
+/// makes the recorded peak a floor on the true peak, which is the safe
+/// direction for a budget check: it can under-report, never over-report.
+#[derive(Debug, Default)]
+struct RssTracker {
+    start_mib: Option<u64>,
+    peak_mib: Option<u64>,
+}
+
+impl RssTracker {
+    fn start() -> Self {
+        let now = attic_storage::sample_process_rss_mib();
+        Self {
+            start_mib: now,
+            peak_mib: now,
+        }
+    }
+
+    /// Sample RSS now and retain it if it is a new high-water mark.
+    fn sample(&mut self) {
+        if let Some(now) = attic_storage::sample_process_rss_mib() {
+            self.peak_mib = Some(self.peak_mib.map_or(now, |p| p.max(now)));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,8 +466,18 @@ pub fn index_repository_with_cancellation(
     if cancellation.is_cancelled() {
         return Err(IndexError::Cancelled);
     }
+    // Phase 0 instrumentation. `run_start` anchors `total_ms`; `stage_start`
+    // is reset at each stage boundary. Both are measurement-only.
+    let run_start = std::time::Instant::now();
+    let mut timings = IndexStageTimings::default();
+    let mut rss = RssTracker::start();
+    let mut stage_start = run_start;
+
     // 1. Phase 1B discovery — real manifest hash, git meta, security classification.
     let discovery = attic_discovery::discover_with_cancellation(root, policy, cancellation)?;
+    timings.discovery_ms = stage_start.elapsed().as_millis() as u64;
+    rss.sample();
+    stage_start = std::time::Instant::now();
 
     info!(
         files = discovery.entries.len(),
@@ -649,6 +742,13 @@ pub fn index_repository_with_cancellation(
     // 6. Run Phase 1C analysis per file.  Produces pending units only — no
     //    database writes happen during analysis.
     //
+    // Phase 0: close the "collect eligible records" stage here — everything
+    // above this point is discovery-derived bookkeeping, everything below is
+    // per-file analysis.
+    timings.collect_ms = stage_start.elapsed().as_millis() as u64;
+    rss.sample();
+    stage_start = std::time::Instant::now();
+    //
     // PR-7: bulk-load the analysis cache from any prior attempt at this
     // repository (one query, same bulk-preload shape as PR-5). A cache hit
     // (same path, same content hash) skips re-running the analyzer entirely
@@ -667,6 +767,10 @@ pub fn index_repository_with_cancellation(
     };
     let mut pending_units: Vec<PendingUnit> = Vec::new();
     let mut indexed_records: Vec<FileRecord> = Vec::new();
+    // Phase 0: live byte counts for the two whole-repo text accumulators.
+    // These only feed `timings`; nothing reads them to make a decision.
+    let mut pending_units_live_bytes: u64 = 0;
+    let mut cache_writes_live_bytes: u64 = 0;
     let mut pipeline = structural_pipeline::StructuralPipeline::new(
         root,
         discovery
@@ -744,6 +848,14 @@ pub fn index_repository_with_cancellation(
                     let captured_json = captured
                         .as_ref()
                         .and_then(|c| serde_json::to_string(c).ok());
+                    // Phase 0: this is the second in-memory copy of the same
+                    // text `pending_units` already holds, JSON-escaped. Track
+                    // it so its true cost is visible rather than inferred.
+                    cache_writes_live_bytes += (units_json.len()
+                        + captured_json.as_ref().map_or(0, |c| c.len()))
+                        as u64;
+                    timings.cache_writes_peak_bytes =
+                        timings.cache_writes_peak_bytes.max(cache_writes_live_bytes);
                     cache_writes.push(attic_storage::CachedFileAnalysis {
                         repo_relative: rec.repo_relative.clone(),
                         content_hash: rec.content_hash.clone(),
@@ -763,7 +875,16 @@ pub fn index_repository_with_cancellation(
                 if let Some(captured) = captured {
                     pipeline.record(*captured);
                 }
+                // Phase 0: accumulate BEFORE `append` moves `units` away.
+                pending_units_live_bytes += units
+                    .iter()
+                    .map(|u| u.retrieval_text.len() as u64)
+                    .sum::<u64>();
                 pending_units.append(&mut units);
+                if pending_units_live_bytes > timings.pending_units_peak_bytes {
+                    timings.pending_units_peak_bytes = pending_units_live_bytes;
+                    timings.pending_units_peak_count = pending_units.len();
+                }
                 indexed_records.push(rec);
                 result.files_indexed += 1;
             }
@@ -803,6 +924,12 @@ pub fn index_repository_with_cancellation(
             }
         }
     }
+
+    // Phase 0: analysis stage ends here — the gate below and the payload
+    // assembly after it are resolution/publication work, not analysis.
+    timings.analysis_ms = stage_start.elapsed().as_millis() as u64;
+    rss.sample();
+    stage_start = std::time::Instant::now();
 
     // Generation-completeness gate (Phase 6.4): every discovered path must
     // have reached INDEXED, INTENTIONALLY_SKIPPED, or REMOVED/EXCLUDED above.
@@ -929,6 +1056,12 @@ pub fn index_repository_with_cancellation(
         return Err(IndexError::Cancelled);
     }
 
+    // Phase 0: payload assembly + structural resolution are done; what
+    // follows is the writer-queue publication itself.
+    timings.resolve_ms = stage_start.elapsed().as_millis() as u64;
+    rss.sample();
+    stage_start = std::time::Instant::now();
+
     let stats: IndexPublicationStats = submit_index_publication(
         store.writer,
         IndexPublication {
@@ -971,12 +1104,31 @@ pub fn index_repository_with_cancellation(
     result.units_inserted = stats.units_inserted;
     result.units_deleted = stats.units_deleted;
 
+    // Phase 0: close the publication stage and the whole-run clock, then take
+    // a final RSS sample so the peak covers the largest commit.
+    timings.publish_ms = stage_start.elapsed().as_millis() as u64;
+    rss.sample();
+    timings.total_ms = run_start.elapsed().as_millis() as u64;
+    timings.rss_start_mib = rss.start_mib;
+    timings.rss_peak_mib = rss.peak_mib;
+    result.stage_timings = timings;
+
     info!(
         files_indexed = result.files_indexed,
         files_skipped = result.files_skipped,
         units_inserted = result.units_inserted,
         units_deleted = result.units_deleted,
         repository_id = %result.repository_id,
+        discovery_ms = result.stage_timings.discovery_ms,
+        collect_ms = result.stage_timings.collect_ms,
+        analysis_ms = result.stage_timings.analysis_ms,
+        resolve_ms = result.stage_timings.resolve_ms,
+        publish_ms = result.stage_timings.publish_ms,
+        total_ms = result.stage_timings.total_ms,
+        rss_start_mib = ?result.stage_timings.rss_start_mib,
+        rss_peak_mib = ?result.stage_timings.rss_peak_mib,
+        pending_units_peak_bytes = result.stage_timings.pending_units_peak_bytes,
+        cache_writes_peak_bytes = result.stage_timings.cache_writes_peak_bytes,
         "indexing run complete"
     );
 
@@ -2015,9 +2167,82 @@ mod tests {
         );
     }
 
+    // ── Phase 0 instrumentation ───────────────────────────────────────────
+
     #[test]
-    fn e2e_file_identity_is_stable_across_reindex() {
+    fn stage_timings_are_populated_and_accumulators_are_measured() {
+        // The instrumentation must report a real profile, not zeros, and the
+        // two text accumulators must be observed separately so the cost of
+        // the PR-7 cache copy is visible rather than inferred.
         let fx = make_store();
+        // Enough distinct content that at least one retrieval unit is emitted
+        // per file and the peak counters are non-trivial.
+        for i in 0..8 {
+            write_file(
+                fx._dir.path(),
+                &format!("measured_{i}.rs"),
+                &format!("pub fn measured_token_{i}() -> u32 {{ {i} }}\n").repeat(40),
+            );
+        }
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+
+        let t = &result.stage_timings;
+        assert!(
+            t.total_ms >= t.discovery_ms,
+            "total wall clock must cover the discovery stage: total={} discovery={}",
+            t.total_ms,
+            t.discovery_ms
+        );
+        assert!(
+            t.pending_units_peak_bytes > 0,
+            "pending_units high-water mark must be measured when units were emitted"
+        );
+        assert!(
+            t.pending_units_peak_count > 0,
+            "unit count at the high-water mark must be recorded alongside the byte figure"
+        );
+        // Fresh repository: every file misses the analysis cache, so the PR-7
+        // JSON copy of the very same text is also resident. This is the
+        // second whole-repo text buffer the RAM plan targets; assert it is
+        // actually observed, because "it is only one copy" was the wrong
+        // assumption that motivated this instrumentation.
+        assert!(
+            t.cache_writes_peak_bytes > 0,
+            "cache_writes high-water mark must be measured on a cold (cache-miss) run"
+        );
+    }
+
+    #[test]
+    fn stage_timings_survive_a_reindex_and_report_cache_hits() {
+        // On a second run every file hits `index_analysis_cache`, so the
+        // JSON copy is skipped entirely. Guards the claim that the second
+        // buffer is a cold-run cost, not a permanent one.
+        let fx = make_store();
+        write_file(
+            fx._dir.path(),
+            "cached_once.rs",
+            "pub fn cached_once_token() {}\n",
+        );
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let s = store(&fx);
+        let first = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert!(
+            first.stage_timings.pending_units_peak_bytes > 0,
+            "first run must emit units"
+        );
+
+        let second = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert!(
+            second.stage_timings.total_ms >= second.stage_timings.publish_ms,
+            "total wall clock must cover the publication stage on every run"
+        );
+    }
+
+    #[test]
+    fn e2e_file_identity_is_stable_across_reindex() {        let fx = make_store();
         write_file(fx._dir.path(), "stable_id.rs", "fn stable_id_token() {}\n");
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();

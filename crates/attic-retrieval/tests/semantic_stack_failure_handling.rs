@@ -536,17 +536,43 @@ fn generated_output_is_never_embedded() {
 
 #[test]
 fn oversized_units_are_excluded_not_truncated_silently() {
+    // Two-part contract.
+    //
+    // Part 1 (the improvement): content that is oversized *in the source* —
+    // a single 24 KB line — no longer disappears from the semantic layer.
+    // The generic analyzer now bounds every unit it emits, so this content
+    // arrives as several embeddable units instead of one oversized unit that
+    // the gate had to drop. Previously the whole line was excluded, which is
+    // why long-line formats (JSON rule expressions, minified bundles, log
+    // dumps) were effectively absent from semantic search.
+    //
+    // Part 2 (the invariant this test was written for): the gate itself must
+    // still refuse anything above its limit rather than pass it through to be
+    // silently tokenizer-truncated. Since the analyzer no longer produces such
+    // units, that is exercised with a deliberately tiny limit.
     let fx = Fixture::seed_pub(&[
         ("src/main/java/com/sable/Router.java", common::ROUTER_JAVA),
         ("config/app.yml", common::APP_YML),
         (
             "src/big_generated_table.rs",
-            Box::leak(format!("// {}\nfn big() {{}}\n", "x".repeat(24_000)).into_boxed_str()),
+            Box::leak(
+                // Varied content: a single long line whose pieces are distinct,
+                // so splitting is observable without duplicate-collapsing.
+                format!(
+                    "// {}\nfn big() {{}}\n",
+                    (0..1_200)
+                        .map(|i| format!("token_{i} "))
+                        .collect::<String>()
+                )
+                .into_boxed_str(),
+            ),
         ),
     ]);
     let svc = fx.service_with_semantic(hashing()).unwrap();
     let stack = svc.semantic.as_ref().unwrap().clone();
     let conn = fx.read_conn();
+
+    // Part 1 — with the real config nothing is rejected for size.
     let rep = attic_semantic::reconcile(
         &conn,
         &stack.store,
@@ -560,10 +586,42 @@ fn oversized_units_are_excluded_not_truncated_silently() {
         .get(attic_semantic::EX_TOO_LARGE)
         .copied()
         .unwrap_or(0);
-    assert!(
-        too_big >= 1,
-        "oversized unit must be counted: {:?}",
+    assert_eq!(
+        too_big,
+        0,
+        "the analyzer now bounds every unit, so none should be rejected for \
+         size; got {:?}",
         rep.selection.excluded
+    );
+    assert!(
+        rep.selection.selected > 0,
+        "bounded units from a long line must be embeddable, not dropped"
+    );
+
+    // Part 2 — the gate still excludes (never silently truncates) anything
+    // above its limit.
+    let strict = attic_semantic::SelectionConfig {
+        max_input_bytes: 16,
+        ..Default::default()
+    };
+    let strict_rep = attic_semantic::reconcile(
+        &conn,
+        &stack.store,
+        stack.provider.as_ref(),
+        &strict,
+    )
+    .unwrap();
+    let strict_too_big = strict_rep
+        .selection
+        .excluded
+        .get(attic_semantic::EX_TOO_LARGE)
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        strict_too_big >= 1,
+        "a unit above the gate must be counted as excluded, never truncated \
+         silently: {:?}",
+        strict_rep.selection.excluded
     );
 }
 

@@ -72,6 +72,7 @@ pub use ops_tasks::{
 pub use resource_manager::{
     EmbeddingHeavyPermit, IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig,
     ResourceMonitor, adaptive_embedding_batch, adaptive_embedding_limit, adaptive_indexing_limit,
+    sample_process_rss_mib,
 };
 pub use resource_policy::{
     EffectiveResourceConfig, HardwareSnapshot, ResourceDetectionError, ResourceMode,
