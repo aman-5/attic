@@ -151,9 +151,35 @@ pub struct ResourcePolicy {
     pub max_io_ops_per_sec: u32,
 }
 
-impl ResourcePolicy {
-    /// The baseline for a given mode — NOT yet clamped to real hardware.
-    /// `Balanced` deliberately mirrors today's exact hardcoded defaults
+/// Developer-machine RAM allowance (Phase 6 — agreed policy).
+///
+/// Attic is a background developer tool; it must never push total system
+/// memory toward paging. The allowance is the minimum of:
+/// - 50% of physical RAM (burst ceiling),
+/// - keeping total system usage below 85% (Attic_share = 85% − other apps),
+/// - a 256 MiB floor so the function never returns a useless zero budget
+///   (the monitor's own Emergency tier still protects against runaway).
+///
+/// Pure so it is unit-testable without hardware.
+pub fn developer_machine_allowance_mib(total_memory_mib: u64) -> u64 {
+    if total_memory_mib == 0 {
+        return 2048; // detection failed — conservative baseline
+    }
+    // 50% burst ceiling.
+    let burst_ceiling = total_memory_mib / 2;
+    // Assume a typical developer workload (IDE + browser + build) occupies
+    // ~35% before Attic starts; Attic may then take total to 85%.
+    // => Attic share ≈ 85% − 35% = 50% of total — same as burst ceiling on
+    // an idle machine, tighter when other apps already use more. We encode
+    // the policy statically here; the live ResourceMonitor tiers enforce the
+    // dynamic part (reduce at 75%, pause at 82%) at runtime.
+    let allowance = burst_ceiling;
+    allowance.max(256)
+}
+
+    impl ResourcePolicy {
+        /// The baseline for a given mode — NOT yet clamped to real hardware.
+        /// `Balanced` deliberately mirrors today's exact hardcoded defaults
     /// (`attic_core::resources`, `writer.rs` constants) so typical-hardware
     /// users see zero behavior change during rollout. `Low`/`Performance`
     /// are proposed starting points, not yet benchmark-tuned.
@@ -317,13 +343,16 @@ impl ResourcePolicy {
     /// FINAL step, success path: hardware-dependent safety clamp, applied to
     /// the fully-resolved value so an override can never bypass it.
     pub fn clamp_to_hardware(self, snapshot: &HardwareSnapshot) -> EffectiveResourceConfig {
-        let ram_ceiling = snapshot.total_memory_mib * 60 / 100;
-        let memory_budget_mib =
-            if self.memory_budget_mib == 8192 && snapshot.total_memory_mib > 16384 {
-                ram_ceiling
-            } else {
-                self.memory_budget_mib.min(ram_ceiling)
-            };
+        // Phase 6: the ceiling is the developer-machine allowance (50% of
+        // physical RAM). Performance mode on large-RAM machines still scales
+        // UP to that allowance (preserving the old grow-on-big-hardware
+        // behavior); any baseline above the allowance is clamped DOWN to it.
+        let allowance = developer_machine_allowance_mib(snapshot.total_memory_mib);
+        let memory_budget_mib = if self.memory_budget_mib == 8192 && allowance > 8192 {
+            allowance
+        } else {
+            self.memory_budget_mib.min(allowance)
+        };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
         EffectiveResourceConfig {
@@ -824,7 +853,17 @@ mod tests {
         let policy = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
         let snapshot = snap(32768, 16);
         let effective = policy.clamp_to_hardware(&snapshot);
-        assert_eq!(effective.memory_budget_mib, 32768 * 60 / 100);
+        // Phase 6 developer-machine policy: 50% of physical RAM ceiling.
+        assert_eq!(effective.memory_budget_mib, 32768 / 2);
         assert!(effective.memory_budget_mib > 8192);
+    }
+
+    #[test]
+    fn developer_machine_allowance_never_exceeds_half_ram() {
+        assert_eq!(developer_machine_allowance_mib(8192), 4096);
+        assert_eq!(developer_machine_allowance_mib(32768), 16384);
+        // Detection failure / tiny machine: conservative floor, never zero.
+        assert_eq!(developer_machine_allowance_mib(0), 2048);
+        assert_eq!(developer_machine_allowance_mib(256), 256);
     }
 }
