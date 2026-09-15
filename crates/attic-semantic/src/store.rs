@@ -18,7 +18,8 @@ use std::sync::Mutex;
 
 use crate::error::SemanticError;
 use crate::generation::{GenerationManager, GenerationRecord};
-use crate::provider::{CancelFlag, EmbeddingFingerprint};
+#[allow(unused_imports)] // ExecutionBackend used by tests via super::*
+use crate::provider::{CancelFlag, EmbeddingFingerprint, ExecutionBackend};
 use hnsw_rs::prelude::*;
 use rusqlite::{Connection, params};
 
@@ -1506,6 +1507,7 @@ mod tests {
             tokenizer_version: "tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         };
         let gen1 = store.start_new_generation(&fp1).unwrap();
         assert_eq!(gen1.generation_id, 1);
@@ -1544,6 +1546,7 @@ mod tests {
             tokenizer_version: "qwen_tok".to_string(),
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         };
         let gen2 = store.start_new_generation(&fp2).unwrap();
         assert_eq!(gen2.generation_id, 2);

@@ -306,6 +306,7 @@ dependencies = [
 name = "attic-semantic"
 version = "0.1.0"
 dependencies = [
+ "attic-core",
  "attic-discovery",
  "attic-storage",
  "blake3",

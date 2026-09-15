@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+attic-core = { path = "../attic-core" }
 attic-storage = { path = "../attic-storage" }
 attic-discovery = { workspace = true }
 rusqlite = { workspace = true }

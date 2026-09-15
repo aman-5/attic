@@ -10,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SemanticError;
-use crate::provider::EmbeddingFingerprint;
+#[allow(unused_imports)] // ExecutionBackend used by tests via super::*
+use crate::provider::{EmbeddingFingerprint, ExecutionBackend};
 
 /// Operational status of a semantic generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +308,7 @@ mod tests {
             tokenizer_version: "qwen3_tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         }
     }
 

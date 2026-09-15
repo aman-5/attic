@@ -228,7 +228,7 @@ impl Drop for InferencePermit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::EmbeddingFingerprint;
+    use crate::provider::{EmbeddingFingerprint, ExecutionBackend};
 
     struct MockProvider {
         fp: EmbeddingFingerprint,
@@ -277,6 +277,7 @@ mod tests {
             tokenizer_version: "tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_v1".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         };
         SharedModelHandle::new(Arc::new(MockProvider { fp }), 500, max_concurrency)
     }

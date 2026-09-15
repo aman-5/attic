@@ -20,7 +20,7 @@ use crate::error::SemanticError;
 use crate::instruction::{CODE_RETRIEVAL_V1_ID, format_query_instruction};
 use crate::provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
+    EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
 use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -392,8 +392,9 @@ impl Qwen3Embedder {
             pooling_version: pooling.as_version_str().to_string(),
             normalization_version: "l2_unit_v1".to_string(),
             tokenizer_version: "qwen_bpe_v1".to_string(),
-            chunking_version: "ast_v1".to_string(),
+            chunking_version: attic_core::constants::CHUNKING_VERSION.to_string(),
             query_instruction_version: CODE_RETRIEVAL_V1_ID.to_string(),
+            execution_backend: ExecutionBackend::CandleCpu,
         };
 
         Ok(Self {

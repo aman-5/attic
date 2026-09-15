@@ -134,6 +134,41 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
         .clamp(-1.0, 1.0)
 }
 
+/// Execution backend that produced a vector — TELEMETRY ONLY (Final Master
+/// Plan identity split). Two backends may write to the same vector space only
+/// after measured parity; the backend itself never participates in identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionBackend {
+    CandleCpu,
+    CandleCuda,
+    CandleMetal,
+    OrtDirectMl,
+    OrtCoreMl,
+    Hashing,
+    Unknown,
+}
+
+impl Default for ExecutionBackend {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl ExecutionBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CandleCpu => "candle-cpu",
+            Self::CandleCuda => "candle-cuda",
+            Self::CandleMetal => "candle-metal",
+            Self::OrtDirectMl => "ort-directml",
+            Self::OrtCoreMl => "ort-coreml",
+            Self::Hashing => "hashing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Comprehensive architectural fingerprint of an active embedding vector space (Final Master Plan V2 §51).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingFingerprint {
@@ -151,10 +186,50 @@ pub struct EmbeddingFingerprint {
     pub normalization_version: String,
     /// Tokenizer vocabulary/code version.
     pub tokenizer_version: String,
-    /// Chunking/windowing strategy version.
+    /// Chunking/windowing strategy version. NOT part of the vector-space
+    /// identity — chunking changes which texts exist, not the space they
+    /// live in. Carried here for lineage; see [`Self::vector_space_id`].
     pub chunking_version: String,
     /// Query instruction template version (e.g. "code_retrieval_v1").
     pub query_instruction_version: String,
+    /// Execution backend that produced vectors (telemetry only — excluded
+    /// from both identity hashes below; serde default keeps pre-split
+    /// rows readable).
+    #[serde(default)]
+    pub execution_backend: ExecutionBackend,
+}
+
+impl EmbeddingFingerprint {
+    /// Vector-space identity: model artifact, tokenizer, pooling,
+    /// normalization, dimension, instruction — the things that determine
+    /// whether two vectors may be compared at all. Chunking and backend are
+    /// deliberately excluded (chunking selects texts; backend is telemetry).
+    pub fn vector_space_id(&self) -> String {
+        let canonical = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.provider,
+            self.model_id,
+            self.model_revision,
+            self.dimension,
+            self.pooling_version,
+            self.normalization_version,
+            self.tokenizer_version,
+            self.query_instruction_version,
+        );
+        blake3::hash(canonical.as_bytes()).to_hex().to_string()
+    }
+
+    /// Content-generation identity: which texts were selected and how they
+    /// were produced. Changing this invalidates the content, not the space.
+    pub fn content_generation_id(&self, selection_version: &str) -> String {
+        let canonical = format!(
+            "{}|{}|{}",
+            self.chunking_version,
+            selection_version,
+            attic_core::constants::ANALYZER_REGISTRY_VERSION,
+        );
+        blake3::hash(canonical.as_bytes()).to_hex().to_string()
+    }
 }
 
 /// Resource limits allocated to an embedding inference call (Final Master Plan V2 §27).
@@ -266,5 +341,70 @@ impl SemanticProvider for UnavailableProvider {
             provider: "unavailable".into(),
             reason: self.reason.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod identity_split_tests {
+    use super::*;
+
+    fn fp(model_rev: &str) -> EmbeddingFingerprint {
+        EmbeddingFingerprint {
+            provider: "qwen3".into(),
+            model_id: "qwen3-embedding-0.6b".into(),
+            model_revision: model_rev.into(),
+            dimension: 1024,
+            pooling_version: "last_token_v1".into(),
+            normalization_version: "l2_unit_v1".into(),
+            tokenizer_version: "qwen_bpe_v1".into(),
+            chunking_version: attic_core::constants::CHUNKING_VERSION.into(),
+            query_instruction_version: "code_retrieval_v1".into(),
+            execution_backend: ExecutionBackend::CandleCpu,
+        }
+    }
+
+    #[test]
+    fn vector_space_ignores_chunking_and_backend() {
+        let a = fp("rev1");
+        let mut b = fp("rev1");
+        b.chunking_version = "json_router_v2".into();
+        b.execution_backend = ExecutionBackend::OrtDirectMl;
+        assert_eq!(
+            a.vector_space_id(),
+            b.vector_space_id(),
+            "chunking/backend must not alter vector-space identity"
+        );
+    }
+
+    #[test]
+    fn vector_space_changes_with_model_revision() {
+        assert_ne!(fp("rev1").vector_space_id(), fp("rev2").vector_space_id());
+    }
+
+    #[test]
+    fn content_generation_changes_with_chunking() {
+        let a = fp("rev1");
+        let mut b = fp("rev1");
+        b.chunking_version = "json_router_v2".into();
+        assert_ne!(
+            a.content_generation_id("sel_v1"),
+            b.content_generation_id("sel_v1"),
+            "chunking change must produce a new content generation"
+        );
+    }
+
+    #[test]
+    fn content_generation_ignores_backend() {
+        let a = fp("rev1");
+        let mut b = fp("rev1");
+        b.execution_backend = ExecutionBackend::OrtDirectMl;
+        assert_eq!(a.content_generation_id("sel_v1"), b.content_generation_id("sel_v1"));
+    }
+
+    #[test]
+    fn pre_split_rows_deserialize_with_unknown_backend() {
+        let legacy = r#"{"provider":"qwen3","model_id":"m","model_revision":"r","dimension":1024,"pooling_version":"p","normalization_version":"n","tokenizer_version":"t","chunking_version":"ast_v1","query_instruction_version":"q"}"#;
+        let parsed: EmbeddingFingerprint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.execution_backend, ExecutionBackend::Unknown);
     }
 }

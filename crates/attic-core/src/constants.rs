@@ -13,6 +13,13 @@ pub const ANALYZER_REGISTRY_VERSION: &str = "0.2.0";
 /// Increment this whenever the ruleset changes to trigger re-scanning.
 pub const SECRET_PATTERN_VERSION: i64 = 1;
 
+/// Chunking/segmentation strategy version — a REAL, live value (Phase: identity
+/// split). MUST be bumped whenever chunk boundary logic changes (e.g. the
+/// generic analyzer's TARGET_CHUNK_CHARS or a content-class router), so stale
+/// generations are detectable instead of silently mixing chunk shapes.
+/// 1.x = legacy line-count cap; 2.0.0 = character-target (TARGET_CHUNK_CHARS).
+pub const CHUNKING_VERSION: &str = "2.0.0";
+
 /// Well-known keys used in the `subsystem_versions_json` map stored in
 /// `core_index_generations`. Keep in sync with the migration SQL.
 pub mod subsystem_keys {

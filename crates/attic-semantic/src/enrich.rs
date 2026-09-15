@@ -22,7 +22,8 @@ use crate::error::SemanticError;
 use crate::identity::SemanticUnitIdentity;
 use crate::invalidate::reconcile;
 use crate::provider::{
-    CancelFlag, EmbeddingFingerprint, EmbeddingInput, ResourceUsage, SemanticProvider,
+    CancelFlag, EmbeddingFingerprint, EmbeddingInput, ExecutionBackend, ResourceUsage,
+    SemanticProvider,
 };
 use crate::selection::{SEMANTIC_SELECTION_VERSION, SelectionConfig};
 use crate::store::{EmbeddingRecord, SemanticStore};
@@ -735,7 +736,7 @@ mod generation_driven_enrichment_tests {
 
     #[test]
     fn worker_count_honors_provider_concurrency_contract() {
-        use crate::provider::ProviderConcurrencyContract;
+        use crate::provider::{ExecutionBackend, ProviderConcurrencyContract};
 
         assert_eq!(
             ProviderConcurrencyContract::Serialized.effective_workers(8),
@@ -766,6 +767,7 @@ mod generation_driven_enrichment_tests {
             tokenizer_version: "tok_v1".to_string(),
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         }
     }
 

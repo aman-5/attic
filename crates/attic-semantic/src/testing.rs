@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::error::SemanticError;
 use crate::provider::{
-    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, ExecutionBackend, EmbeddingInput, EmbeddingOutput,
     EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
 
@@ -126,6 +126,7 @@ impl SemanticProvider for HashingEmbedder {
             tokenizer_version: "test".to_owned(),
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
+            execution_backend: ExecutionBackend::Unknown,
         })
     }
 
@@ -175,6 +176,7 @@ impl EmbeddingProvider for HashingEmbedder {
             tokenizer_version: "word_char_ngram_v1".to_string(),
             chunking_version: "retrieval_unit_v1".to_string(),
             query_instruction_version: "none".to_string(),
+            execution_backend: ExecutionBackend::Unknown,
         }
     }
 
@@ -247,6 +249,7 @@ impl SemanticProvider for FailingProvider {
             tokenizer_version: "test".to_owned(),
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
+            execution_backend: ExecutionBackend::Unknown,
         })
     }
     fn embed_batch(
@@ -307,6 +310,7 @@ impl SemanticProvider for SlowProvider {
             tokenizer_version: "test".to_owned(),
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
+            execution_backend: ExecutionBackend::Unknown,
         })
     }
     fn embed_batch(
