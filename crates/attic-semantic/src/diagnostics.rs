@@ -83,6 +83,51 @@ impl SemanticProgressSnapshot {
     }
 }
 
+/// Stall detection (Phase 5): flags the exact failure mode observed in
+/// production — a batch claimed INFLIGHT but producing zero completions for
+/// longer than the threshold. Pure function over observable counters so it
+/// is testable without a live queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StallAssessment {
+    pub stalled: bool,
+    /// Human-readable verdict for status output.
+    pub verdict: String,
+}
+
+/// Assess whether the enrichment pipeline is stalled.
+///
+/// `inflight` items with `chunks_per_sec` at ~0 for longer than
+/// `STALL_THRESHOLD_SECS` since the last completed batch means the worker is
+/// hung (e.g. a blocked GPU kernel call), not merely slow — a healthy slow
+/// pipeline still completes batches. The 2026-09 incident: 16 chunks
+/// in-flight 20+ min, 0 completed — this detector flags exactly that.
+pub const STALL_THRESHOLD_SECS: u64 = 120;
+
+pub fn assess_stall(
+    inflight: u64,
+    done: u64,
+    chunks_per_sec: f64,
+    secs_since_last_completed_batch: u64,
+) -> StallAssessment {
+    let stalled = inflight > 0
+        && chunks_per_sec < 0.01
+        && secs_since_last_completed_batch > STALL_THRESHOLD_SECS;
+    let verdict = if stalled {
+        format!(
+            "STALLED: {inflight} items in-flight, 0 completed batches for {secs_since_last_completed_batch}s (threshold {STALL_THRESHOLD_SECS}s) — inference worker is hung; restart the embedding worker"
+        )
+    } else if inflight > 0 && chunks_per_sec < 0.01 {
+        format!(
+            "SLOW: {inflight} items in-flight, no batch completed yet ({secs_since_last_completed_batch}s) — within tolerance, first batch may still be running"
+        )
+    } else if inflight == 0 && done > 0 {
+        "IDLE: queue drained".to_string()
+    } else {
+        "HEALTHY".to_string()
+    };
+    StallAssessment { stalled, verdict }
+}
+
 /// Best-effort explanation of why Attic operations may be currently throttled or degraded (§62).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhySlowDiagnostic {
@@ -287,5 +332,39 @@ mod tests {
             user_caps_active: false,
         };
         assert_eq!(diagnose_why_slow(&nominal_ctx).code, "nominal");
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[test]
+    fn inflight_with_zero_throughput_past_threshold_is_stalled() {
+        // The exact 2026-09 incident signature: 16 in-flight, 0 done, 20 min.
+        let a = assess_stall(16, 0, 0.0, 1209);
+        assert!(a.stalled);
+        assert!(a.verdict.contains("STALLED"));
+    }
+
+    #[test]
+    fn first_batch_within_threshold_is_slow_not_stalled() {
+        let a = assess_stall(16, 0, 0.0, 45);
+        assert!(!a.stalled);
+        assert!(a.verdict.contains("SLOW"));
+    }
+
+    #[test]
+    fn completing_batches_is_healthy() {
+        let a = assess_stall(16, 500, 12.5, 3);
+        assert!(!a.stalled);
+        assert_eq!(a.verdict, "HEALTHY");
+    }
+
+    #[test]
+    fn drained_queue_is_idle() {
+        let a = assess_stall(0, 200, 0.0, 9999);
+        assert!(!a.stalled);
+        assert!(a.verdict.contains("IDLE"));
     }
 }

@@ -2440,6 +2440,37 @@ fn handle_status(
         );
         payload["semantic_progress"] = json!(progress);
 
+        // Phase 5 stall detection: flag a hung inference worker (the
+        // 2026-09 incident: 16 in-flight, 0 done for 20+ min reported as
+        // merely "slow"). Track the last time `done` advanced.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_DONE_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+            static LAST_ADVANCE_SECS: AtomicU64 = AtomicU64::new(0);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let prev_done = LAST_DONE_COUNT.swap(done, Ordering::SeqCst);
+            if prev_done == u64::MAX || done > prev_done {
+                // First sample or progress — reset the clock.
+                LAST_ADVANCE_SECS.store(now_secs, Ordering::SeqCst);
+            }
+            let last_advance = LAST_ADVANCE_SECS.load(Ordering::SeqCst);
+            let secs_since_advance = now_secs.saturating_sub(last_advance);
+            let stall = attic_semantic::diagnostics::assess_stall(
+                inflight,
+                done,
+                chunks_per_sec,
+                secs_since_advance,
+            );
+            payload["semantic_stall"] = json!({
+                "stalled": stall.stalled,
+                "verdict": stall.verdict,
+                "secs_since_last_completed_batch": secs_since_advance,
+            });
+        }
+
         let diag_ctx = attic_semantic::DiagnosticContext {
             disk_emergency: false,
             disk_warning: false,
