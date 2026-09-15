@@ -24,6 +24,17 @@ lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
 
+# Phase 7 build-footprint: full debuginfo on Windows produces multi-GB .pdb
+# files per binary/test — the dominant contributor to a ~30 GB target dir.
+# Line tables keep stack traces/debugging usable while cutting artifact size
+# dramatically. Split-debuginfo keeps it out of the final binaries.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+
 # Compile compute-heavy tensor dependencies and semantic models with optimization in dev/test
 [profile.dev.package.candle-core]
 opt-level = 3
