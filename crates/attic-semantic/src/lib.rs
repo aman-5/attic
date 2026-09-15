@@ -28,6 +28,8 @@ pub mod invalidate;
 pub mod learned_tuning;
 pub mod model_assets;
 pub mod model_lifecycle;
+#[cfg(feature = "ort-directml")]
+pub mod ort_directml;
 pub mod provider;
 pub mod qwen3_model;
 pub mod qwen3_provider;
@@ -55,6 +57,8 @@ pub use model_assets::{
     ModelAssetError, ModelAssetManager, ModelAssetStatus, ModelFileSpec, ModelManifest,
 };
 pub use model_lifecycle::{ModelLifecycleState, SharedModelHandle};
+#[cfg(feature = "ort-directml")]
+pub use ort_directml::{ORT_PROVIDER_ID, OrtDirectMlProvider};
 pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
     EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage,

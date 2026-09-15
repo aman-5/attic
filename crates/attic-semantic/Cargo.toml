@@ -25,6 +25,17 @@ hf-hub = { workspace = true }
 rayon = "1.10"
 hnsw_rs = "0.3.4"
 
+# Phase 4: ORT/DirectML GPU provider (Windows-first; no CUDA toolkit needed).
+# Optional so default builds stay lean and platform-specific backends compile
+# only where they ship.
+ort = { version = "2.0.0-rc.10", features = ["directml", "ndarray", "half"], optional = true }
+half = { version = "2.1", features = ["num-traits"], optional = true }
+ndarray = { version = "0.17", optional = true }
+
+[features]
+default = []
+ort-directml = ["dep:ort", "dep:half", "dep:ndarray"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

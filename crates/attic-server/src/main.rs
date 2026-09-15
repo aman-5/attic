@@ -278,6 +278,31 @@ fn resolve_semantic_provider(
         );
     }
 
+    // Phase 4: prefer the ORT/DirectML GPU provider when a local ONNX model
+    // directory is configured/present — measured ~195× faster than the candle
+    // CPU path on an RTX A500 (3,130 vs 16 tok/s). Set ATTIC_ONNX_MODEL_DIR
+    // to a directory containing model_fp16.onnx + tokenizer.json to enable.
+    #[cfg(feature = "ort-directml")]
+    if let Ok(onnx_dir) = std::env::var("ATTIC_ONNX_MODEL_DIR") {
+        let dir = PathBuf::from(onnx_dir);
+        if dir.join("model_fp16.onnx").is_file() {
+            match attic_semantic::OrtDirectMlProvider::from_model_dir(
+                &dir,
+                batch_size,
+                512, // measured optimum: padding waste dominates at 1024
+                attic_config.semantic.dimension,
+            ) {
+                Ok(p) => {
+                    tracing::info!("using ORT/DirectML GPU provider for Qwen3");
+                    return Arc::new(p);
+                }
+                Err(e) => {
+                    tracing::warn!("DirectML provider init failed ({e}); falling back to candle CPU");
+                }
+            }
+        }
+    }
+
     for dir in candidate_dirs {
         if let Ok(embedder) = attic_semantic::Qwen3Embedder::from_local_cache(
             &dir,

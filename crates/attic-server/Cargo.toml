@@ -37,3 +37,9 @@ interprocess = { workspace = true }
 tempfile.workspace = true
 regex = "1"
 
+
+[features]
+# GPU semantic backend via ONNX Runtime DirectML (Windows; no CUDA toolkit).
+# Build with: cargo build -p attic-server --features ort-directml
+default = []
+ort-directml = ["attic-semantic/ort-directml"]
