@@ -977,6 +977,10 @@ pub fn default_registry() -> AnalyzerRegistry {
     reg.register_specialized(go::analyzer());
     reg.register_specialized(javascript::analyzer());
     reg.register_specialized(typescript::analyzer());
+    // Phase 3 content routing: JSON documents get canonical subtree chunks
+    // with JSON-pointer addressing instead of 2,000-char line chunks — this
+    // is what makes cross-environment dedup actually fire.
+    reg.register_specialized(std::sync::Arc::new(crate::json::JsonAnalyzer::new()));
     // `.tsx` bug fix: register the JSX-aware grammar under an explicit
     // language tag rather than `FileType::TypeScript` — both `TypeScriptSpec`
     // and `TsxSpec` declare identical capability levels, so registering both

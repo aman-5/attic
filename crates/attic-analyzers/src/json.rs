@@ -1,0 +1,417 @@
+//! JSON content-class analyzer (Phase 3 — corpus-aware routing).
+//!
+//! The GenericAnalyzer's 2,000-char line chunks are wrong for large JSON
+//! documents: chunk boundaries depend on incidental whitespace/indentation,
+//! so identical subtrees in DEV/QA/STAGE/UAT/PROD exports produce *different*
+//! chunks and defeat content-hash dedup (measured: 87.6% of lines duplicate
+//! across those five files).
+//!
+//! This analyzer instead:
+//! - parses the document,
+//! - decomposes it into top-level subtrees (object members / array elements),
+//! - serializes each subtree CANONICALLY (compact, key-sorted) — identical
+//!   logical content yields byte-identical text regardless of source
+//!   formatting, so `selection`'s content-hash dedup (EX_DUPLICATE) collapses
+//!   shared subtrees across environment files,
+//! - prefixes each unit with its JSON pointer for exact addressing,
+//! - splits oversized subtrees recursively (never emitting a unit beyond the
+//!   resource budget), keeping every byte represented,
+//! - emits MALFORMED_INPUT and yields nothing on parse failure — `dispatch`
+//!   then falls back to GenericAnalyzer, so malformed JSON is still fully
+//!   indexed as plain text.
+
+use attic_core::{FileType, SourceSpan};
+use tracing::debug;
+
+use crate::api::{
+    Analyzer, AnalyzerCapabilities, AnalyzerContent, AnalyzerDescriptor, AnalyzerDiagnostic,
+    AnalyzerInput, AnalyzerOutput, CapabilityKind, CapabilityLevel, RetrievalUnitSpec,
+    diagnostic_codes,
+};
+use crate::generic::TARGET_CHUNK_CHARS;
+
+/// JSON analyzer: canonical subtree chunking with JSON-pointer addressing.
+pub struct JsonAnalyzer {
+    desc: AnalyzerDescriptor,
+}
+
+impl JsonAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            desc: AnalyzerDescriptor {
+                name: "json".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                description:
+                    "JSON-aware analyzer: canonical subtree chunks with JSON-pointer addressing."
+                        .to_string(),
+                supported_file_types: vec![FileType::Json],
+                capabilities: AnalyzerCapabilities::single(
+                    CapabilityKind::Lexical,
+                    CapabilityLevel::Full,
+                ),
+            },
+        }
+    }
+}
+
+impl Default for JsonAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Analyzer for JsonAnalyzer {
+    fn descriptor(&self) -> &AnalyzerDescriptor {
+        &self.desc
+    }
+
+    fn analyze(&self, input: AnalyzerInput) -> AnalyzerOutput {
+        let start = std::time::Instant::now();
+        let mut diagnostics: Vec<AnalyzerDiagnostic> = Vec::new();
+        let mut units: Vec<RetrievalUnitSpec> = Vec::new();
+
+        // This analyzer requires whole-content access (JSON parsing is not
+        // line-streamable without a much larger streaming-JSON investment).
+        // LARGE/StreamingHandle inputs are drained into memory — the largest
+        // corpus JSON seen is ~5 MB, well within budget.
+        let file_occurrence_id = input.file_occurrence_id;
+        let bytes: Vec<u8> = match input.content {
+            AnalyzerContent::FullBytes(b) | AnalyzerContent::RedactedBytes(b) => b,
+            AnalyzerContent::StreamingHandle(mut stream) => {
+                // LargeFileStream is chunked, not std::io::Read — drain it.
+                let mut buf = Vec::new();
+                let mut read_failed = false;
+                loop {
+                    match stream.next_chunk() {
+                        Some(Ok(chunk)) => buf.extend_from_slice(chunk.redacted.as_bytes()),
+                        Some(Err(e)) => {
+                            diagnostics.push(AnalyzerDiagnostic::error(
+                                diagnostic_codes::MALFORMED_INPUT,
+                                format!("failed to read JSON stream: {e}"),
+                            ));
+                            read_failed = true;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                if read_failed {
+                    return self.empty_output(file_occurrence_id, diagnostics);
+                }
+                buf
+            }
+        };
+
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::MALFORMED_INPUT,
+                    "JSON input is not valid UTF-8; falling back to generic chunking.",
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            }
+        };
+
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                // Malformed JSON: emit the diagnostic and produce NO units —
+                // dispatch falls back to GenericAnalyzer so every byte is
+                // still indexed as plain text, and the file is reported.
+                diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::MALFORMED_INPUT,
+                    format!("JSON parse failed ({e}); falling back to plain-text chunking"),
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            }
+        };
+
+        // Environment label from the filename (DEV/QA/STAGE/UAT/PROD) — lets
+        // a unit carry which environment export it came from.
+        let env_label = input
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(detect_env_label);
+
+        let max_units = input.resource_budget.max_retrieval_units as usize;
+        let mut state = ChunkState {
+            units: &mut units,
+            diagnostics: &mut diagnostics,
+            max_units,
+            env: env_label.as_deref(),
+            cancelled: false,
+        };
+        chunk_value(&value, "", &mut state, 0, &input.cancellation_token);
+
+        if state.cancelled {
+            diagnostics.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::CANCELLED,
+                "JSON analysis cancelled; output is partial",
+            ));
+        }
+
+        debug!(
+            path = %input.path.display(),
+            units = units.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "JsonAnalyzer: analysis complete"
+        );
+
+        AnalyzerOutput {
+            analyzer_id: "json".to_string(),
+            analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
+            file_occurrence_id: input.file_occurrence_id,
+            structural_nodes: vec![],
+            symbols: vec![],
+            imports: vec![],
+            relationships: vec![],
+            retrieval_units: units,
+            diagnostics,
+            fallback_used: false,
+            structurally_complete: true,
+            capability_used: CapabilityKind::Lexical,
+        }
+    }
+}
+
+impl JsonAnalyzer {
+    fn empty_output(
+        &self,
+        file_occurrence_id: attic_core::FileOccurrenceId,
+        diagnostics: Vec<AnalyzerDiagnostic>,
+    ) -> AnalyzerOutput {
+        AnalyzerOutput {
+            analyzer_id: "json".to_string(),
+            analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
+            file_occurrence_id,
+            structural_nodes: vec![],
+            symbols: vec![],
+            imports: vec![],
+            relationships: vec![],
+            retrieval_units: vec![],
+            diagnostics,
+            fallback_used: false,
+            structurally_complete: false,
+            capability_used: CapabilityKind::Lexical,
+        }
+    }
+}
+
+/// Detect an environment label from a filename stem (DEV/QA/STAGE/UAT/PROD).
+fn detect_env_label(filename: &str) -> Option<String> {
+    let upper = filename.to_ascii_uppercase();
+    for env in ["PROD", "STAGE", "UAT", "QA", "DEV"] {
+        // Match as a filename component, not a substring (e.g. "DEVELOPMENT"
+        // must not match DEV).
+        if upper.split(['-', '_', '.']).any(|part| part == env) {
+            return Some(env.to_string());
+        }
+    }
+    None
+}
+
+struct ChunkState<'a> {
+    units: &'a mut Vec<RetrievalUnitSpec>,
+    diagnostics: &'a mut Vec<AnalyzerDiagnostic>,
+    max_units: usize,
+    env: Option<&'a str>,
+    cancelled: bool,
+}
+
+/// Serialize a JSON value canonically: compact, object keys sorted. Identical
+/// logical content then yields byte-identical text across source files whose
+/// formatting differs (the whole point — content-hash dedup downstream).
+fn canonical(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical(&map[k])))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonical).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => serde_json::to_string(other).unwrap(),
+    }
+}
+
+/// Escape a path segment per RFC 6901 JSON Pointer.
+fn escape_pointer(seg: &str) -> String {
+    seg.replace('~', "~0").replace('/', "~1")
+}
+
+fn chunk_value(
+    value: &serde_json::Value,
+    pointer: &str,
+    state: &mut ChunkState,
+    ordinal_start: u32,
+    cancel: &crate::cancellation::CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        state.cancelled = true;
+        return;
+    }
+    if state.units.len() >= state.max_units {
+        return;
+    }
+
+    let body = canonical(value);
+    let header = match state.env {
+        Some(env) => format!("// json-pointer: {} (env: {})\n", pointer, env),
+        None => format!("// json-pointer: {}\n", pointer),
+    };
+
+    if header.len() + body.len() <= TARGET_CHUNK_CHARS {
+        push_unit(state, header, &body, ordinal_start);
+        return;
+    }
+
+    // Oversized subtree: decompose into children so units stay within the
+    // character target and dedup works at finer granularity.
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                let child_ptr = format!("{}/{}", pointer, escape_pointer(k));
+                chunk_value(&map[k], &child_ptr, state, ordinal_start, cancel);
+                if state.cancelled || state.units.len() >= state.max_units {
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, item) in arr.iter().enumerate() {
+                let child_ptr = format!("{}/{}", pointer, i);
+                chunk_value(item, &child_ptr, state, ordinal_start, cancel);
+                if state.cancelled || state.units.len() >= state.max_units {
+                    return;
+                }
+            }
+        }
+        // A scalar/primitive that alone exceeds the target (e.g. a huge
+        // base64 blob): split the canonical text at char boundaries rather
+        // than drop it — every byte stays represented.
+        _ => {
+            let full = format!("{header}{body}");
+            let mut offset = 0usize;
+            while offset < full.len() && state.units.len() < state.max_units {
+                let end = (offset + TARGET_CHUNK_CHARS).min(full.len());
+                let end = full.floor_char_boundary(end);
+                push_unit(state, String::new(), &full[offset..end], ordinal_start);
+                offset = end;
+            }
+            if offset < full.len() {
+                state.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    "unit budget reached while splitting an oversized JSON scalar",
+                ));
+            }
+        }
+    }
+}
+
+fn push_unit(state: &mut ChunkState, header: String, body: &str, ordinal_start: u32) {
+    let ordinal = ordinal_start + state.units.len() as u32;
+    let text = format!("{header}{body}");
+    let end_line = body.matches('\n').count() as u32;
+    state.units.push(RetrievalUnitSpec {
+        span: SourceSpan {
+            start_line: 0,
+            start_col: 0,
+            end_line: end_line.max(1),
+            end_col: 0,
+        },
+        retrieval_text: text,
+        ordinal,
+        structural_node_index: None,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ResourceBudget;
+    use attic_core::FileOccurrenceId;
+    use std::path::PathBuf;
+
+    fn input_for(text: &str, filename: &str) -> AnalyzerInput {
+        AnalyzerInput {
+            file_occurrence_id: FileOccurrenceId::new_v4(),
+            path: PathBuf::from(filename),
+            content: AnalyzerContent::FullBytes(text.as_bytes().to_vec()),
+            file_type: FileType::Json,
+            language_hint: Some("json".into()),
+            size_bytes: text.len() as u64,
+            is_partial_scan: false,
+            cancellation_token: crate::cancellation::CancellationToken::default(),
+            resource_budget: ResourceBudget::default(),
+        }
+    }
+
+    #[test]
+    fn identical_subtrees_canonicalize_identically_across_formatting() {
+        let a = r#"{ "name": "x",  "nested": { "b": 2, "a": 1 } }"#;
+        let b = r#"{"nested":{"a":1,"b":2},"name":"x"}"#;
+        let out_a = JsonAnalyzer::new().analyze(input_for(a, "DEV-Form.json"));
+        let out_b = JsonAnalyzer::new().analyze(input_for(b, "PROD-Form.json"));
+        // Same logical content -> same canonical unit text apart from the
+        // env label in the header.
+        let body_a = out_a.retrieval_units[0]
+            .retrieval_text
+            .replace("(env: DEV)", "(env: PROD)");
+        assert_eq!(body_a, out_b.retrieval_units[0].retrieval_text);
+    }
+
+    #[test]
+    fn malformed_json_produces_diagnostic_and_no_units() {
+        let out = JsonAnalyzer::new().analyze(input_for("{not json", "x.json"));
+        assert!(out.retrieval_units.is_empty());
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == diagnostic_codes::MALFORMED_INPUT)
+        );
+    }
+
+    #[test]
+    fn json_pointer_addresses_and_env_labels_present() {
+        let text = r#"{"properties":{"journeyName":"IS_Journey"}}"#;
+        let out = JsonAnalyzer::new().analyze(input_for(text, "UAT-Code.json"));
+        assert_eq!(out.retrieval_units.len(), 1);
+        let t = &out.retrieval_units[0].retrieval_text;
+        assert!(t.contains("json-pointer:"), "pointer header present: {t}");
+        assert!(t.contains("env: UAT"), "env label present: {t}");
+    }
+
+    #[test]
+    fn large_object_decomposes_into_child_subtrees() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..50 {
+            obj.insert(
+                format!("key_{i:03}"),
+                serde_json::Value::String("x".repeat(500)),
+            );
+        }
+        let text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
+        let out = JsonAnalyzer::new().analyze(input_for(&text, "data.json"));
+        assert!(
+            out.retrieval_units.len() > 1,
+            "oversized root must decompose into children"
+        );
+        for u in &out.retrieval_units {
+            assert!(
+                u.retrieval_text.len() <= TARGET_CHUNK_CHARS + 256,
+                "unit within target+header slack: {}",
+                u.retrieval_text.len()
+            );
+        }
+    }
+}

@@ -37,6 +37,7 @@ pub mod api;
 pub mod cancellation;
 pub mod dispatch;
 pub mod generic;
+pub mod json;
 pub mod registry;
 pub mod structural;
 
@@ -51,5 +52,6 @@ pub use api::{
 pub use cancellation::CancellationToken;
 pub use dispatch::dispatch;
 pub use generic::GenericAnalyzer;
+pub use json::JsonAnalyzer;
 pub use registry::AnalyzerRegistry;
 pub use structural::default_registry;
