@@ -61,6 +61,30 @@ pub const DEFAULT_MAX_TOKENS: usize = 1_024;
 /// `max_input_bytes` under-promises, which is the safe direction — a unit that
 /// passes the gate always fits.
 pub const MIN_BYTES_PER_TOKEN: usize = 2;
+/// Upper bound on `batch_items × padded_sequence_length` for one forward pass.
+///
+/// A fixed *item count* is the wrong unit for batching a transformer. Peak
+/// activation memory is driven by `batch × heads × seq_len²`
+/// (`Qwen3Model::build_attention_mask` materialises `batch × 1 × seq × seq`
+/// floats before a single layer even runs), so a batch of 16 costs ~16× more
+/// when the items happen to be 1024 tokens than when they are 256 — the same
+/// "batch size" spanning a ~64× memory range.
+///
+/// Because [`Qwen3Embedder::embed_batch`] sorts inputs by length before
+/// chunking, every sub-batch is padded to roughly its own longest item, so the
+/// product below is a good proxy for that batch's real cost. Capping the
+/// product keeps peak memory roughly flat across content shapes: many short
+/// units still batch wide, while a run of long units automatically narrows.
+///
+/// This budget may only ever *shrink* a batch relative to the configured item
+/// count (see [`Qwen3Embedder::plan_sub_batch_end`]). The count cap is owned by
+/// the resource monitor / throughput controller, and a memory guard must never
+/// silently raise a limit those components lowered.
+///
+/// 4096 leaves the common case untouched (16 items × ~256 tokens = 4096) while
+/// cutting a worst-case 1024-token batch from 16 items to 4 — a 4× reduction in
+/// the largest transient allocation the indexing pipeline makes.
+pub const DEFAULT_BATCH_TOKEN_BUDGET: usize = 4_096;
 pub const NATIVE_QWEN_DIMENSION: usize = 1024;
 const DTYPE: DType = DType::F32;
 
@@ -89,6 +113,10 @@ pub struct Qwen3Embedder {
     tokenizer: Tokenizer,
     device: Device,
     batch_size: usize,
+    /// Memory guard on `batch_items × padded_seq_len` — see
+    /// [`DEFAULT_BATCH_TOKEN_BUDGET`]. Only ever shrinks a batch below
+    /// `batch_size`; never grows one.
+    batch_token_budget: usize,
     native_dims: usize,
     target_dims: usize,
     max_tokens: usize,
@@ -373,6 +401,7 @@ impl Qwen3Embedder {
             tokenizer,
             device,
             batch_size: batch_size.max(1),
+            batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
             native_dims,
             target_dims,
             max_tokens,
@@ -384,6 +413,60 @@ impl Qwen3Embedder {
     /// Access the underlying tokenizer.
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
+    }
+
+    /// Current `batch_items × padded_seq_len` memory budget.
+    pub fn batch_token_budget(&self) -> usize {
+        self.batch_token_budget
+    }
+
+    /// Override the memory budget (operators tuning for a constrained host).
+    ///
+    /// Clamped to at least `max_tokens` so a single maximum-length unit can
+    /// always still be embedded: a budget that cannot fit one item would
+    /// deadlock the queue rather than protect memory.
+    pub fn set_batch_token_budget(&mut self, budget: usize) {
+        self.batch_token_budget = budget.max(self.max_tokens);
+    }
+
+    /// Conservative token estimate for `text`, used only for batch planning.
+    ///
+    /// Deliberately an over-estimate (`MIN_BYTES_PER_TOKEN` is a floor on
+    /// bytes-per-token, so dividing by it is a ceiling on tokens): planning
+    /// errs toward smaller batches, which costs a little throughput and can
+    /// never cost memory. Clamped to `max_tokens` because the tokenizer
+    /// truncates there regardless of how long the input is.
+    fn estimated_tokens(&self, text: &str) -> usize {
+        text.len()
+            .div_ceil(MIN_BYTES_PER_TOKEN)
+            .clamp(1, self.max_tokens)
+    }
+
+    /// Choose the exclusive end index of the sub-batch starting at `start`.
+    ///
+    /// `indexed` must be sorted ascending by text length (as `embed_batch`
+    /// does), so the last item admitted is the one every other item is padded
+    /// up to — making `admitted_count × widest_estimate` a direct proxy for
+    /// this batch's padded cost.
+    ///
+    /// Always admits at least one item, so a single unit larger than the whole
+    /// budget still makes progress instead of stalling the queue forever.
+    fn plan_sub_batch_end(&self, indexed: &[(usize, &EmbeddingInput)], start: usize) -> usize {
+        let count_cap = start.saturating_add(self.batch_size).min(indexed.len());
+        let mut widest = 0usize;
+        let mut end = start;
+        while end < count_cap {
+            let candidate_widest = widest.max(self.estimated_tokens(&indexed[end].1.text));
+            let candidate_cost = (end + 1 - start).saturating_mul(candidate_widest);
+            // `end > start` keeps the always-make-progress guarantee: the first
+            // item is admitted unconditionally, however large it is.
+            if end > start && candidate_cost > self.batch_token_budget {
+                break;
+            }
+            widest = candidate_widest;
+            end += 1;
+        }
+        end
     }
 
     /// Extract last non-padding token representation for each item in the batch.
@@ -578,7 +661,16 @@ impl SemanticProvider for Qwen3Embedder {
 
         let mut sorted_outputs: Vec<(usize, EmbeddingOutput)> = Vec::with_capacity(inputs.len());
 
-        for chunk in indexed.chunks(self.batch_size) {
+        // Token-budget batching, not fixed-count batching: `plan_sub_batch_end`
+        // narrows the batch when the (length-sorted) items are long, so peak
+        // attention memory stays roughly flat instead of scaling with the
+        // square of whatever sequence length this chunk happens to contain.
+        let mut cursor = 0usize;
+        while cursor < indexed.len() {
+            let chunk_end = self.plan_sub_batch_end(&indexed, cursor);
+            let chunk = &indexed[cursor..chunk_end];
+            cursor = chunk_end;
+
             if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(SemanticError::Cancelled {
                     completed: sorted_outputs.len(),

@@ -114,7 +114,9 @@ fn accumulators_scale_linearly_with_repository_size() {
     );
 
     // The PR-7 analysis cache holds a second, JSON-escaped copy of the very
-    // same text, so a cold run carries roughly double the text footprint.
+    // same text. On a corpus this small the cache never reaches
+    // `analysis_cache_flush_bytes`, so it is still a single un-flushed batch
+    // and remains at least as large as the raw text it duplicates.
     assert!(
         large_cache > 0,
         "cache_writes must be populated on a cold (cache-miss) run"
@@ -123,6 +125,85 @@ fn accumulators_scale_linearly_with_repository_size() {
         large_cache >= large_pending,
         "the JSON-escaped cache copy should be at least as large as the raw \
          text it duplicates (cache={large_cache}, pending={large_pending})"
+    );
+}
+
+/// The analysis cache is now *bounded*: once the buffered rows reach
+/// `analysis_cache_flush_bytes` they are handed to the writer queue and the
+/// buffer is emptied, so its high-water mark no longer tracks repository size.
+///
+/// This is the regression guard for that bound. It drives the threshold down
+/// to a value the fixture is certain to exceed, then asserts the peak stays
+/// near it instead of growing to the whole-corpus total measured by
+/// `accumulators_scale_linearly_with_repository_size`.
+#[test]
+fn analysis_cache_peak_is_bounded_by_the_flush_threshold() {
+    let dir = TempDir::new().unwrap();
+    build_repo(dir.path(), 8, 8);
+
+    let db_path = dir.path().join("bounded.db");
+    let (conn, pool) = open_db(&db_path).unwrap();
+    attic_storage::run_migrations(&conn).unwrap();
+    let queue = WriterQueue::new(conn).unwrap();
+    let handle = queue.handle();
+    let store = IndexingStore {
+        readers: &pool,
+        writer: &handle,
+    };
+    let policy = DiscoveryPolicy::default_git();
+
+    let unbounded = index_repository(&store, dir.path(), &policy, &IndexOptions::default())
+        .expect("unbounded run succeeds");
+    let unbounded_peak = unbounded.stage_timings.cache_writes_peak_bytes;
+
+    // One file's cache row is far larger than this, so every single file
+    // crosses the threshold and flushes.
+    let flush_bytes = 64 * 1024;
+    let bounded_opts = IndexOptions {
+        analysis_cache_flush_bytes: flush_bytes,
+        ..IndexOptions::default()
+    };
+    let dir2 = TempDir::new().unwrap();
+    build_repo(dir2.path(), 8, 8);
+    let db2 = dir2.path().join("bounded2.db");
+    let (conn2, pool2) = open_db(&db2).unwrap();
+    attic_storage::run_migrations(&conn2).unwrap();
+    let queue2 = WriterQueue::new(conn2).unwrap();
+    let handle2 = queue2.handle();
+    let store2 = IndexingStore {
+        readers: &pool2,
+        writer: &handle2,
+    };
+    let bounded = index_repository(&store2, dir2.path(), &policy, &bounded_opts)
+        .expect("bounded run succeeds");
+    let bounded_peak = bounded.stage_timings.cache_writes_peak_bytes;
+
+    println!(
+        "\n[bounded] unbounded cache peak={unbounded_peak} bytes -> bounded peak={bounded_peak} \
+         bytes across {} flushes",
+        bounded.stage_timings.cache_writes_flushes,
+    );
+
+    assert!(
+        bounded.stage_timings.cache_writes_flushes > 0,
+        "a threshold below one file's cache row must trigger mid-run flushes"
+    );
+    assert_eq!(
+        unbounded.units_inserted, bounded.units_inserted,
+        "flushing the cache earlier must not change what gets indexed"
+    );
+    assert!(
+        bounded_peak < unbounded_peak,
+        "bounding the cache must lower its high-water mark \
+         (bounded={bounded_peak}, unbounded={unbounded_peak})"
+    );
+    // The buffer is checked after each file is merged, so the peak can exceed
+    // the threshold by at most one file's worth of rows — never by the corpus.
+    let one_file_slack = unbounded_peak / 8 + flush_bytes;
+    assert!(
+        bounded_peak <= flush_bytes + one_file_slack,
+        "the peak must stay within one file of the threshold \
+         (peak={bounded_peak}, threshold={flush_bytes}, slack={one_file_slack})"
     );
 }
 

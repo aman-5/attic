@@ -262,34 +262,47 @@ pub fn discover_with_cancellation(
 
     let mut all_diagnostics = walk_result.diagnostics;
 
-    // 5. Build the BLAKE3 manifest using raw (unredacted) bytes.
-    let manifest = manifest::build_manifest_with_cancellation(
-        &walk_result.entries,
-        &canonical_root,
-        cancellation,
-    )?;
+    // 5-6. Manifest hashing and content classification, fused into ONE pass.
+    //
+    // These used to be two sequential loops over every eligible file, each
+    // reading the whole file: BLAKE3 for the manifest, then `read_to_string`
+    // for the secrets scan. For SMALL files — the overwhelming majority of a
+    // source tree — that is the same bytes off disk twice. `scan_entry` reads
+    // once and feeds both consumers, and the pass runs on a worker pool
+    // because every file's work is independent and touches no shared state.
+    //
+    // The manifest hash is defined over raw, unredacted bytes, so the bytes
+    // handed to the hasher are the untouched read — decoding to text happens
+    // afterwards, for the scan only.
+    let threads = resolve_scan_threads(walk_result.entries.len());
+    let scanned = parallel_map_slice(&walk_result.entries, threads, |entry| {
+        scan_entry(entry, &canonical_root, cancellation)
+    });
 
-    // Collect manifest read errors and unstable capture diagnostics.
-    all_diagnostics.extend(manifest.read_errors.clone());
-    all_diagnostics.extend(manifest.unstable_captures.clone());
-
-    // 6. Classify each file's content for downstream use.
-    //    SMALL: full scan via secrets::preprocess.
-    //    LARGE: bounded streaming scan via secrets::stream_scan_large_file_classify.
-    //    VERY_LARGE: head+tail sample → PartialScan classification.
-    //    Content is NOT retained — only the classification is stored.
+    let mut manifest_entries: Vec<manifest::ManifestEntry> =
+        Vec::with_capacity(walk_result.entries.len());
+    let mut manifest_read_errors: Vec<Diagnostic> = Vec::new();
+    let mut manifest_unstable: Vec<Diagnostic> = Vec::new();
     let mut downstream_classifications: Vec<(String, DownstreamClassification)> =
         Vec::with_capacity(walk_result.entries.len());
 
-    for entry in &walk_result.entries {
-        if cancellation.is_cancelled() {
-            return Err(DiscoveryError::Cancelled);
-        }
-        let (classification, small_file_bytes) = classify_file_for_downstream(
-            &entry.abs_path,
-            &entry.repo_relative,
-            &mut all_diagnostics,
-        );
+    // Merged strictly in walk order, so the manifest text — and therefore the
+    // source-revision identifier — is identical to what the sequential
+    // implementation produced.
+    for scanned_entry in scanned {
+        let ScannedEntry {
+            repo_relative,
+            manifest,
+            classification,
+            small_file_bytes,
+            diagnostics,
+        } = scanned_entry?;
+
+        manifest_entries.extend(manifest.entry);
+        manifest_read_errors.extend(manifest.read_error);
+        manifest_unstable.extend(manifest.unstable);
+        all_diagnostics.extend(diagnostics);
+
         if let Some(bytes_read) = small_file_bytes {
             // `Some(0)` (a genuinely empty SMALL file) must still count as
             // a completed read — only `None` (not a SMALL-tier read, or one
@@ -297,8 +310,18 @@ pub fn discover_with_cancellation(
             counters.small_file_bytes_read += bytes_read;
             counters.small_file_reads += 1;
         }
-        downstream_classifications.push((entry.repo_relative.clone(), classification));
+        downstream_classifications.push((repo_relative, classification));
     }
+
+    let manifest = manifest::finalize_manifest(
+        manifest_entries,
+        manifest_read_errors.clone(),
+        manifest_unstable.clone(),
+    );
+
+    // Collect manifest read errors and unstable capture diagnostics.
+    all_diagnostics.extend(manifest_read_errors);
+    all_diagnostics.extend(manifest_unstable);
 
     Ok(DiscoveryOutput {
         entries: walk_result.entries,
@@ -308,6 +331,117 @@ pub fn discover_with_cancellation(
         downstream_classifications,
         counters,
     })
+}
+
+/// One file's fused manifest + classification result.
+struct ScannedEntry {
+    repo_relative: String,
+    manifest: manifest::EntryManifest,
+    classification: DownstreamClassification,
+    /// Bytes read for a SMALL-tier file (PR-8 measurement); `None` for other
+    /// tiers or reads that never completed.
+    small_file_bytes: Option<u64>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Hash and classify one entry, reading SMALL files exactly once.
+///
+/// LARGE and VERY_LARGE files keep their existing contracts untouched: the
+/// manifest streams them in bounded chunks and the classifier uses its own
+/// bounded streaming/sampling scanners, so neither tier ever materialises a
+/// whole file. Only the SMALL tier — which by definition already fits in
+/// memory and was already being read twice — is fused.
+fn scan_entry(
+    entry: &walk::EligibleEntry,
+    canonical_root: &Path,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<ScannedEntry, DiscoveryError> {
+    if cancellation.is_cancelled() {
+        return Err(DiscoveryError::Cancelled);
+    }
+
+    // One stat decides whether this file is worth reading whole. A failure is
+    // never a content verdict (the path was eligible moments ago), so the
+    // classifier is still consulted and reports it as transient.
+    let prefetched = match std::fs::metadata(&entry.abs_path) {
+        Ok(meta) if secrets::classify_file_size(meta.len()) == FileSizeTier::Small => {
+            std::fs::read(&entry.abs_path).ok()
+        }
+        _ => None,
+    };
+
+    let manifest = manifest::manifest_for_entry(
+        entry,
+        canonical_root,
+        prefetched.as_deref(),
+        cancellation,
+    )?;
+
+    let mut diagnostics = Vec::new();
+    let (classification, small_file_bytes) = classify_file_for_downstream(
+        &entry.abs_path,
+        &entry.repo_relative,
+        &mut diagnostics,
+        prefetched,
+    );
+
+    Ok(ScannedEntry {
+        repo_relative: entry.repo_relative.clone(),
+        manifest,
+        classification,
+        small_file_bytes,
+        diagnostics,
+    })
+}
+
+/// Worker count for the fused discovery scan, clamped to the work available.
+fn resolve_scan_threads(file_count: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, file_count.max(1))
+}
+
+/// Map `f` over `items` on `threads` workers, preserving input order.
+///
+/// Uses scoped threads so `f` can borrow freely from the caller; no allocation
+/// beyond one result vector per worker. Falls back to a plain sequential map
+/// when there is no parallelism to gain, so small repositories pay nothing.
+///
+/// Order is preserved by construction: workers take disjoint contiguous
+/// chunks and their outputs are concatenated in chunk order, so the result is
+/// byte-identical to `items.iter().map(f).collect()` regardless of `threads`.
+fn parallel_map_slice<T, R>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    if threads <= 1 || items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let chunk_len = items.len().div_ceil(threads);
+    let f = &f;
+    let mut chunked: Vec<Vec<R>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk_len)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            // A worker panic is a bug, not a recoverable condition; re-raising
+            // it preserves the sequential implementation's behaviour of
+            // unwinding out of discovery rather than returning partial results.
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+            .collect()
+    });
+
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in &mut chunked {
+        out.append(chunk);
+    }
+    out
 }
 
 /// Classify one file's content for downstream use by determining its size
@@ -332,6 +466,7 @@ fn classify_file_for_downstream(
     abs_path: &Path,
     repo_relative: &str,
     diagnostics: &mut Vec<Diagnostic>,
+    prefetched_small: Option<Vec<u8>>,
 ) -> (DownstreamClassification, Option<u64>) {
     // Stat to determine size tier (no content read yet). A stat failure here
     // is never a content verdict — the file may simply be racing a
@@ -354,29 +489,49 @@ fn classify_file_for_downstream(
     match size_tier {
         FileSizeTier::Small => {
             // Full content — bounded by MAX_FULL_LOAD_BYTES (4 MiB).
-            let content = match std::fs::read_to_string(abs_path) {
-                Ok(s) => s,
-                // Only "content is not valid UTF-8" is a genuine, permanent
-                // content verdict (binary file). Any other I/O failure
-                // (sharing violation, permission race, vanished mid-walk) is
-                // transient and must be retried, never silently skipped
-                // forever alongside real binary files.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    return (
-                        DownstreamClassification::ScanSkipped {
-                            reason: "file content is not valid UTF-8 (binary)".to_string(),
-                        },
-                        None,
-                    );
-                }
-                Err(e) => {
-                    return (
-                        DownstreamClassification::ScanTransientError {
-                            reason: format!("file read failed: {e}"),
-                        },
-                        None,
-                    );
-                }
+            //
+            // `prefetched_small` lets the caller hand over bytes it has
+            // already read (the manifest hash needs the very same raw bytes),
+            // turning two full reads of every small file into one. Decoding
+            // those bytes here is exactly what `read_to_string` does
+            // internally, so both paths classify identically — including
+            // treating invalid UTF-8 as the permanent "binary" verdict.
+            let content = match prefetched_small {
+                Some(raw) => match String::from_utf8(raw) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return (
+                            DownstreamClassification::ScanSkipped {
+                                reason: "file content is not valid UTF-8 (binary)".to_string(),
+                            },
+                            None,
+                        );
+                    }
+                },
+                None => match std::fs::read_to_string(abs_path) {
+                    Ok(s) => s,
+                    // Only "content is not valid UTF-8" is a genuine, permanent
+                    // content verdict (binary file). Any other I/O failure
+                    // (sharing violation, permission race, vanished mid-walk) is
+                    // transient and must be retried, never silently skipped
+                    // forever alongside real binary files.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        return (
+                            DownstreamClassification::ScanSkipped {
+                                reason: "file content is not valid UTF-8 (binary)".to_string(),
+                            },
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        return (
+                            DownstreamClassification::ScanTransientError {
+                                reason: format!("file read failed: {e}"),
+                            },
+                            None,
+                        );
+                    }
+                },
             };
             // The whole file was successfully read at this point, whatever
             // the classification turns out to be below — this is the real

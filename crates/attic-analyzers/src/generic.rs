@@ -305,6 +305,116 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// How far back from the hard byte cap a structural boundary is worth looking
+/// for.
+///
+/// A quarter of the cap: wide enough to reach the end of a typical JSON record
+/// or a long prose line, narrow enough that a boundary-aligned unit is never
+/// dramatically smaller than a blind one. Units stay within
+/// `[MAX_UNIT_CHARS - SPLIT_SEARCH_WINDOW, MAX_UNIT_CHARS]`, so retrieval-unit
+/// counts and embedding costs are unchanged in the aggregate.
+const SPLIT_SEARCH_WINDOW: usize = MAX_UNIT_CHARS / 4;
+
+/// Boundary quality, worst to best. Ordering is the whole point of the type:
+/// a later variant always wins over an earlier one at the same position.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BoundaryRank {
+    /// After a run of whitespace — splits between words rather than inside one.
+    Word,
+    /// After a value separator (`,` or `;`) — splits between sibling values.
+    Separator,
+    /// After a newline — splits between lines.
+    Line,
+    /// After a container closed back to the outermost level — splits between
+    /// whole top-level records.
+    Record,
+}
+
+/// Choose where to cut `s` so the piece before the cut ends at the most
+/// complete structural boundary available at or below `cap` bytes.
+///
+/// This is deliberately **format-agnostic**: it infers structure from the text
+/// itself rather than from a file extension or a content sniff, so it improves
+/// JSON, JSONL, YAML, CSV, JS/TS object literals, logs, and plain prose with
+/// one code path and gains nothing to maintain when a new format shows up.
+///
+/// The ladder is: end of a top-level record > end of a line > after a value
+/// separator > after whitespace > blind byte cut. Brackets and separators are
+/// only counted outside double-quoted strings, so a `{` inside a string value
+/// cannot desynchronise nesting depth.
+///
+/// Degradation is by design. If the text has no recognisable structure in the
+/// search window — or quoting is unbalanced enough that the scanner believes
+/// it is inside a string — no candidate is found and the result is exactly the
+/// blind `floor_char_boundary` cut this function replaced. The worst case is
+/// therefore the previous behaviour, never worse.
+///
+/// The returned index is always a UTF-8 char boundary and always `>= 1` when
+/// `s` is non-empty, so callers are guaranteed forward progress.
+fn structural_split_point(s: &str, cap: usize) -> usize {
+    let hard = floor_char_boundary(s, cap);
+    if hard >= s.len() {
+        return hard;
+    }
+    let window_start = hard.saturating_sub(SPLIT_SEARCH_WINDOW);
+
+    let mut best: Option<(BoundaryRank, usize)> = None;
+    let mut consider = |rank: BoundaryRank, at: usize| {
+        if at <= window_start || at > hard || !s.is_char_boundary(at) {
+            return;
+        }
+        // `>=` so that among equally ranked boundaries the latest one wins,
+        // keeping units as close to the cap as possible.
+        match best {
+            Some((best_rank, _)) if rank < best_rank => {}
+            _ => best = Some((rank, at)),
+        }
+    };
+
+    let mut depth: u32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    // Scanning must start at 0, not at `window_start`: nesting depth and
+    // string state at the window are only correct if every preceding byte has
+    // been seen.
+    for (i, ch) in s[..hard].char_indices() {
+        let after = i + ch.len_utf8();
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    consider(BoundaryRank::Record, after);
+                }
+            }
+            ',' | ';' => {
+                let rank = if depth == 0 {
+                    BoundaryRank::Record
+                } else {
+                    BoundaryRank::Separator
+                };
+                consider(rank, after);
+            }
+            '\n' => consider(BoundaryRank::Line, after),
+            c if c.is_whitespace() => consider(BoundaryRank::Word, after),
+            _ => {}
+        }
+    }
+
+    best.map_or(hard, |(_, at)| at).max(1)
+}
+
 /// Emit one chunk as one or more retrieval units, splitting any chunk whose
 /// joined text exceeds [`MAX_UNIT_CHARS`].
 ///
@@ -314,11 +424,14 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 /// accumulating as soon as the target is passed — so a chunk can only exceed
 /// the cap if it is a *single* line that does.
 ///
-/// Splitting is byte-oriented but always lands on a UTF-8 char boundary via
-/// [`floor_char_boundary`], so multi-byte characters are never cut in half.
-/// Every emitted piece keeps the original line's span: the pieces genuinely
-/// come from that one source line, and reporting a fabricated line range would
-/// corrupt the span→source mapping that evidence verification depends on.
+/// Splitting prefers the most complete structural boundary available within a
+/// bounded look-back window (see [`structural_split_point`]) and always lands
+/// on a UTF-8 char boundary, so multi-byte characters are never cut in half
+/// and a minified structured file is cut between records rather than through
+/// the middle of one. Every emitted piece keeps the original line's span: the
+/// pieces genuinely come from that one source line, and reporting a fabricated
+/// line range would corrupt the span→source mapping that evidence verification
+/// depends on.
 ///
 /// Returns the number of units emitted, and pushes exactly one
 /// [`diagnostic_codes::UNIT_TRUNCATED`] warning per split chunk.
@@ -348,11 +461,11 @@ fn emit_chunk_units(
         let take = if remaining.len() <= MAX_UNIT_CHARS {
             remaining.len()
         } else {
-            // Guarantee forward progress: `floor_char_boundary` can only
-            // return 0 if the very first char is wider than the cap, which
-            // MAX_UNIT_CHARS (thousands of bytes) makes impossible — but
-            // clamp anyway so a future smaller cap cannot spin forever.
-            floor_char_boundary(remaining, MAX_UNIT_CHARS).max(1)
+            // Guarantee forward progress: `structural_split_point` clamps to
+            // at least 1 byte, so even a first char wider than the cap — which
+            // MAX_UNIT_CHARS (thousands of bytes) makes impossible — cannot
+            // spin forever.
+            structural_split_point(remaining, MAX_UNIT_CHARS)
         };
         let piece = &remaining[..take];
         *cumulative_text_bytes += piece.len() as u64;

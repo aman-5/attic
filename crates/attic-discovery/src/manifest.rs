@@ -115,6 +115,128 @@ pub fn build_manifest(entries: &[EligibleEntry], root: &Path) -> SourceManifest 
         .expect("default cancellation token cannot be cancelled")
 }
 
+/// Manifest outcome for one entry — the per-file half of
+/// [`build_manifest_with_cancellation`], factored out so the discovery pass can
+/// run it in parallel and, for SMALL files, hand it bytes it has already read
+/// instead of forcing a second read of the same file.
+pub(crate) struct EntryManifest {
+    /// `None` when the content could not be read (see `read_error`).
+    pub entry: Option<ManifestEntry>,
+    pub read_error: Option<Diagnostic>,
+    pub unstable: Option<Diagnostic>,
+}
+
+/// Hash one entry's content and detect whether it changed underneath us.
+///
+/// When `prefetched` is `Some`, those bytes are hashed directly rather than
+/// re-opening the file. The caller must pass the *raw* bytes exactly as read
+/// from disk: the manifest hash is defined over raw content, so passing
+/// transformed (decoded, redacted, normalised) bytes would silently change the
+/// source revision identifier.
+///
+/// Returns `Err(Cancelled)` only on cancellation; every I/O failure is reported
+/// as a `read_error` diagnostic, matching the "partial manifest, never a hard
+/// failure" contract.
+pub(crate) fn manifest_for_entry(
+    entry: &EligibleEntry,
+    root: &Path,
+    prefetched: Option<&[u8]>,
+    cancellation: &attic_core::CancellationToken,
+) -> Result<EntryManifest, crate::DiscoveryError> {
+    if cancellation.is_cancelled() {
+        return Err(crate::DiscoveryError::Cancelled);
+    }
+    // ── Stat before hashing ──────────────────────────────────────────────
+    let stat_before = FileStat::read(&entry.abs_path).ok();
+
+    // ── Hash raw content ─────────────────────────────────────────────────
+    let hashed = match prefetched {
+        Some(bytes) => Ok(blake3::hash(bytes).to_hex().to_string()),
+        None => hash_file_content_cancellable(&entry.abs_path, cancellation),
+    };
+
+    match hashed {
+        Err(e) => {
+            if cancellation.is_cancelled() {
+                return Err(crate::DiscoveryError::Cancelled);
+            }
+            Ok(EntryManifest {
+                entry: None,
+                read_error: Some(Diagnostic {
+                    kind: DiagnosticKind::IoError,
+                    path: entry.abs_path.clone(),
+                    message: format!(
+                        "failed to read {} for manifest: {e}",
+                        root.join(&entry.repo_relative).display()
+                    ),
+                }),
+                unstable: None,
+            })
+        }
+        Ok(hash) => {
+            // ── Stat after hashing ───────────────────────────────────────
+            let stat_after = FileStat::read(&entry.abs_path).ok();
+
+            // Detect a change: size or mtime differs between reads.
+            // If either stat failed the capture state is uncertain —
+            // we cannot confirm the file was stable, so treat it as
+            // unstable (fail-closed).
+            let file_changed = match (&stat_before, &stat_after) {
+                (Some(before), Some(after)) => before != after,
+                // One or both stats unavailable → cannot establish stability.
+                _ => true,
+            };
+
+            let unstable = file_changed.then(|| Diagnostic {
+                kind: DiagnosticKind::UnstableCapture,
+                path: entry.abs_path.clone(),
+                message: format!(
+                    "file '{}' changed during hashing (size or mtime differed); \
+                     manifest entry may not reflect a consistent snapshot",
+                    entry.repo_relative
+                ),
+            });
+
+            Ok(EntryManifest {
+                entry: Some(ManifestEntry {
+                    repo_relative: entry.repo_relative.clone(),
+                    content_hash: hash,
+                    unstable: file_changed,
+                }),
+                read_error: None,
+                unstable,
+            })
+        }
+    }
+}
+
+/// Sort, serialise, and hash collected per-entry results into a
+/// [`SourceManifest`].
+///
+/// Split out so a parallel producer and the sequential
+/// [`build_manifest_with_cancellation`] share one definition of the canonical
+/// manifest text — the input to the stable `SourceRevision` identifier — and
+/// cannot drift apart.
+pub(crate) fn finalize_manifest(
+    mut manifest_entries: Vec<ManifestEntry>,
+    read_errors: Vec<Diagnostic>,
+    unstable_captures: Vec<Diagnostic>,
+) -> SourceManifest {
+    // Entries are already sorted by the walk; re-sort defensively in case the
+    // caller passed an unsorted slice.
+    manifest_entries.sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
+
+    let manifest_text = serialize_manifest(&manifest_entries);
+    let manifest_hash = hash_manifest_text(&manifest_text);
+
+    SourceManifest {
+        entries: manifest_entries,
+        manifest_hash,
+        read_errors,
+        unstable_captures,
+    }
+}
+
 /// Build a manifest while cooperatively observing cancellation.
 pub fn build_manifest_with_cancellation(
     entries: &[EligibleEntry],
@@ -126,75 +248,17 @@ pub fn build_manifest_with_cancellation(
     let mut unstable_captures: Vec<Diagnostic> = Vec::new();
 
     for entry in entries {
-        if cancellation.is_cancelled() {
-            return Err(crate::DiscoveryError::Cancelled);
-        }
-        // ── Stat before hashing ──────────────────────────────────────────
-        let stat_before = FileStat::read(&entry.abs_path).ok();
-
-        // ── Hash raw content ─────────────────────────────────────────────
-        match hash_file_content_cancellable(&entry.abs_path, cancellation) {
-            Err(e) => {
-                if cancellation.is_cancelled() {
-                    return Err(crate::DiscoveryError::Cancelled);
-                }
-                read_errors.push(Diagnostic {
-                    kind: DiagnosticKind::IoError,
-                    path: entry.abs_path.clone(),
-                    message: format!(
-                        "failed to read {} for manifest: {e}",
-                        root.join(&entry.repo_relative).display()
-                    ),
-                });
-            }
-            Ok(hash) => {
-                // ── Stat after hashing ───────────────────────────────────
-                let stat_after = FileStat::read(&entry.abs_path).ok();
-
-                // Detect a change: size or mtime differs between reads.
-                // If either stat failed the capture state is uncertain —
-                // we cannot confirm the file was stable, so treat it as
-                // unstable (fail-closed).
-                let file_changed = match (&stat_before, &stat_after) {
-                    (Some(before), Some(after)) => before != after,
-                    // One or both stats unavailable → cannot establish stability.
-                    _ => true,
-                };
-
-                if file_changed {
-                    unstable_captures.push(Diagnostic {
-                        kind: DiagnosticKind::UnstableCapture,
-                        path: entry.abs_path.clone(),
-                        message: format!(
-                            "file '{}' changed during hashing (size or mtime differed); \
-                             manifest entry may not reflect a consistent snapshot",
-                            entry.repo_relative
-                        ),
-                    });
-                }
-
-                manifest_entries.push(ManifestEntry {
-                    repo_relative: entry.repo_relative.clone(),
-                    content_hash: hash,
-                    unstable: file_changed,
-                });
-            }
-        }
+        let per_file = manifest_for_entry(entry, root, None, cancellation)?;
+        manifest_entries.extend(per_file.entry);
+        read_errors.extend(per_file.read_error);
+        unstable_captures.extend(per_file.unstable);
     }
 
-    // Entries are already sorted by the walk; re-sort defensively in case the
-    // caller passed an unsorted slice.
-    manifest_entries.sort_by(|a, b| a.repo_relative.cmp(&b.repo_relative));
-
-    let manifest_text = serialize_manifest(&manifest_entries);
-    let manifest_hash = hash_manifest_text(&manifest_text);
-
-    Ok(SourceManifest {
-        entries: manifest_entries,
-        manifest_hash,
+    Ok(finalize_manifest(
+        manifest_entries,
         read_errors,
         unstable_captures,
-    })
+    ))
 }
 
 /// Compute the working-tree manifest hash from already-known

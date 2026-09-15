@@ -142,7 +142,44 @@ pub struct IndexOptions {
     /// behaviour; used for honest baselines in benchmarks and as an
     /// operational kill-switch). Default `true`.
     pub structural: bool,
+    /// Flush the in-memory PR-7 analysis-cache buffer to the database once it
+    /// holds this many bytes of serialized analysis output.
+    ///
+    /// Without a bound, `cache_writes` accumulates a second, JSON-escaped copy
+    /// of every analyzed file's units for the whole repository — measured at
+    /// ~1.13× the size of the retrieval text the pipeline is already holding —
+    /// so peak memory grew linearly with repository size with no ceiling.
+    ///
+    /// Flushing early is safe in a way that batching the *publication* is not:
+    /// `index_analysis_cache` is purely a retry accelerator. It touches
+    /// neither `core_file_occurrences` nor `core_index_generations`, never
+    /// affects which generation is CURRENT, and is cleared wholesale after a
+    /// successful publication. Flushing sooner also strictly *improves*
+    /// recovery — analysis that completed before a crash or cancellation is
+    /// already durable instead of being discarded with the process.
+    ///
+    /// `0` disables flushing (single end-of-run write, the pre-bound
+    /// behaviour).
+    pub analysis_cache_flush_bytes: u64,
+    /// Maximum worker threads used for per-file analysis.
+    ///
+    /// `0` means "derive from [`std::thread::available_parallelism`]".
+    /// Analysis is the dominant stage on a cold index and
+    /// [`analyze_single_file`] is pure — it reads one file, dispatches to a
+    /// `Send + Sync` analyzer, and returns owned data — so it parallelises
+    /// without touching the coordinated-writer contract. Results are always
+    /// merged back in discovery order, so output is independent of thread
+    /// count.
+    pub analysis_threads: usize,
 }
+
+/// Default ceiling for the in-memory analysis-cache buffer (32 MiB).
+///
+/// Sized from the measured ~1.7 KB average serialized unit: 32 MiB is roughly
+/// 19,000 units of buffered retry-cache, which amortises the writer-queue
+/// round trip well while keeping the buffer a rounding error next to the model
+/// activations it now has to share a machine with.
+pub const DEFAULT_ANALYSIS_CACHE_FLUSH_BYTES: u64 = 32 * 1024 * 1024;
 
 impl Default for IndexOptions {
     fn default() -> Self {
@@ -151,8 +188,24 @@ impl Default for IndexOptions {
             max_units_per_file: 512,
             refresh_existing: true,
             structural: true,
+            analysis_cache_flush_bytes: DEFAULT_ANALYSIS_CACHE_FLUSH_BYTES,
+            analysis_threads: 0,
         }
     }
+}
+
+/// Resolve the effective analysis worker count.
+///
+/// Clamped to the number of files so a two-file repository does not spawn
+/// sixteen threads, and to at least 1 so the pipeline always makes progress on
+/// a platform that cannot report parallelism.
+fn resolve_analysis_threads(requested: usize, file_count: usize) -> usize {
+    let available = if requested > 0 {
+        requested
+    } else {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    };
+    available.clamp(1, file_count.max(1))
 }
 
 /// Per-stage wall-clock and memory profile for one indexing run (Phase 0
@@ -192,17 +245,32 @@ pub struct IndexStageTimings {
     pub rss_peak_mib: Option<u64>,
     /// High-water mark of `pending_units` retrieval text held in memory.
     ///
-    /// Monotonic today because nothing drains `pending_units` before
-    /// publication — which is precisely the defect this field measures. Once
-    /// batched publication lands, the live counter feeding this must be
-    /// decremented on every flush or the "peak" becomes a run total.
+    /// Monotonic within a run, and deliberately so: the whole generation's
+    /// retrieval text must be resident when the single atomic publication
+    /// transaction runs, so nothing drains `pending_units` before then.
+    /// Measured against real repositories this stays in the single-digit
+    /// megabytes; see [`PENDING_UNITS_ADVISORY_BYTES`] for the size at which
+    /// splitting that transaction would start to pay for its risk.
     pub pending_units_peak_bytes: u64,
     /// High-water mark of the serialized `cache_writes` buffer — the PR-7
     /// analysis-cache copy, which holds a second, JSON-escaped copy of the
     /// same text that `pending_units` already holds.
+    ///
+    /// A true high-water mark, not a run total: the live counter behind it is
+    /// reset on every flush (see `IndexOptions::analysis_cache_flush_bytes`),
+    /// so this value is bounded by that threshold plus one file's output
+    /// rather than by repository size.
     pub cache_writes_peak_bytes: u64,
     /// Number of retrieval units held at the `pending_units` high-water mark.
     pub pending_units_peak_count: usize,
+    /// How many times the analysis-cache buffer was flushed mid-run because it
+    /// reached `IndexOptions::analysis_cache_flush_bytes`. `0` means the whole
+    /// run fit in one buffer — the bound never engaged.
+    pub cache_writes_flushes: u64,
+    /// Worker threads actually used for the per-file analysis stage. `1` means
+    /// the run executed sequentially (single file, single core, or an explicit
+    /// `analysis_threads = 1`).
+    pub analysis_threads_used: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -781,44 +849,52 @@ pub fn index_repository_with_cancellation(
             .collect(),
     );
 
-    for mut rec in file_records {
+    // ── Analysis, phase A: analyze every file in parallel ────────────────
+    //
+    // `analyze_single_file` is pure — it reads one path, dispatches to a
+    // `Send + Sync` analyzer, and returns owned data. It performs no database
+    // access, so parallelising it cannot interact with the coordinated-writer
+    // contract. The shared inputs (`analysis_cache`, `registry`, `opts`,
+    // `policy_hash`) are all read-only here.
+    //
+    // Determinism is preserved by construction: work is partitioned by index,
+    // each worker writes only its own slots, and phase B consumes the results
+    // strictly in discovery order. Thread count therefore changes timing and
+    // nothing else.
+    let analysis_threads = resolve_analysis_threads(opts.analysis_threads, file_records.len());
+    timings.analysis_threads_used = analysis_threads;
+
+    let prepped = analyze_files(
+        file_records,
+        &analysis_cache,
+        &registry,
+        opts,
+        &policy_hash,
+        cancellation,
+        analysis_threads,
+    )?;
+    rss.sample();
+
+    // ── Analysis, phase B: merge results in discovery order ──────────────
+    for prepped_file in prepped {
         if cancellation.is_cancelled() {
             return Err(IndexError::Cancelled);
         }
-        // A cache hit requires the content hash AND the secret-detector /
-        // analyzer-registry versions to match what's current: a retry that
-        // spans a ruleset upgrade must never replay a verdict computed
-        // under the old rules for unchanged content (e.g. a secret the
-        // upgraded detector would now catch).
-        let cache_hit = analysis_cache
-            .get(&rec.repo_relative)
-            .filter(|cached| {
-                cached.content_hash == rec.content_hash
-                    && cached.secret_pattern_version == SECRET_PATTERN_VERSION
-                    && cached.analyzer_registry_version
-                        == attic_core::constants::ANALYZER_REGISTRY_VERSION
-                    && cached.discovery_policy_hash == policy_hash
-                    && cached.structural == opts.structural
-                    && cached.max_units_per_file == opts.max_units_per_file as u64
-            })
-            .and_then(|cached| reconstruct_file_prep_from_cache(cached, &rec));
-        let was_cache_hit = cache_hit.is_some();
-        let prep = match cache_hit {
-            Some(p) => Ok(p),
-            None => {
-                // PR-8 measurement: a fresh analysis of a SMALL file re-reads
-                // content discovery already read once (see
-                // `discovery_counters.small_file_bytes_read`). Cache hits
-                // above never re-read anything.
-                if rec.size_bytes >= 0
-                    && (rec.size_bytes as u64) <= attic_discovery::MAX_FULL_LOAD_BYTES
-                {
-                    result.analysis_small_file_bytes_read += rec.size_bytes as u64;
-                    result.analysis_small_file_reads += 1;
-                }
-                analyze_single_file(&rec, &registry, opts, cancellation)
-            }
-        };
+        let AnalyzedFile {
+            mut rec,
+            prep,
+            was_cache_hit,
+            small_file_bytes_read,
+        } = prepped_file;
+
+        // PR-8 measurement: a fresh analysis of a SMALL file re-reads content
+        // discovery already read once (see
+        // `discovery_counters.small_file_bytes_read`). Cache hits never
+        // re-read anything, so they report `None` here.
+        if let Some(bytes) = small_file_bytes_read {
+            result.analysis_small_file_bytes_read += bytes;
+            result.analysis_small_file_reads += 1;
+        }
 
         match prep {
             Ok(FilePrep::Indexable {
@@ -870,6 +946,20 @@ pub fn index_repository_with_cancellation(
                         units_json,
                         captured_json,
                     });
+
+                    // Bound the buffer. See
+                    // `IndexOptions::analysis_cache_flush_bytes` for why
+                    // flushing this particular accumulator early is safe
+                    // (pure retry cache, no bearing on which generation is
+                    // CURRENT) while batching the publication is not.
+                    if opts.analysis_cache_flush_bytes > 0
+                        && cache_writes_live_bytes >= opts.analysis_cache_flush_bytes
+                    {
+                        flush_analysis_cache(store, repo_id, &mut cache_writes)?;
+                        cache_writes_live_bytes = 0;
+                        timings.cache_writes_flushes += 1;
+                        rss.sample();
+                    }
                 }
 
                 if let Some(captured) = captured {
@@ -942,23 +1032,12 @@ pub fn index_repository_with_cancellation(
         // aborting, in ONE writer-queue submission (many statements, one
         // transaction — same shape as `submit_index_publication`), so a
         // retry does not have to re-analyze the files that already
-        // succeeded. This is purely a cache write: it does not touch
+        // succeeded. Anything already flushed mid-run by the
+        // `analysis_cache_flush_bytes` bound is durable; this writes only the
+        // tail that is still buffered. Purely a cache write: it does not touch
         // `core_file_occurrences`/`core_index_generations` and has no
         // effect on which generation is CURRENT.
-        if !cache_writes.is_empty() {
-            let now_us = incremental::now_micros();
-            store
-                .writer
-                .send(move |conn| {
-                    attic_storage::upsert_analysis_cache_entries(
-                        conn,
-                        &repo_id,
-                        &cache_writes,
-                        now_us,
-                    )
-                })
-                .map_err(IndexError::Storage)?;
-        }
+        flush_analysis_cache(store, repo_id, &mut cache_writes)?;
         return Err(IndexError::TransientFailures {
             paths: transient_failed_paths,
         });
@@ -1129,10 +1208,239 @@ pub fn index_repository_with_cancellation(
         rss_peak_mib = ?result.stage_timings.rss_peak_mib,
         pending_units_peak_bytes = result.stage_timings.pending_units_peak_bytes,
         cache_writes_peak_bytes = result.stage_timings.cache_writes_peak_bytes,
+        cache_writes_flushes = result.stage_timings.cache_writes_flushes,
+        analysis_threads_used = result.stage_timings.analysis_threads_used,
         "indexing run complete"
     );
 
+    // `pending_units` is the one accumulator still proportional to repository
+    // size: the whole generation's retrieval text must be resident when the
+    // single atomic publication transaction runs. Bounding it would mean
+    // splitting that transaction, which trades a real corruption risk for a
+    // saving that is negligible at normal repository sizes.
+    //
+    // Rather than guess where "normal" ends, say so out loud. Crossing this
+    // threshold is the signal that staged publication has become worth its
+    // risk — and until it fires, the current design is the right one.
+    if result.stage_timings.pending_units_peak_bytes > PENDING_UNITS_ADVISORY_BYTES {
+        warn!(
+            repository_id = %result.repository_id,
+            pending_units_peak_bytes = result.stage_timings.pending_units_peak_bytes,
+            pending_units_peak_count = result.stage_timings.pending_units_peak_count,
+            advisory_bytes = PENDING_UNITS_ADVISORY_BYTES,
+            "retrieval text held for atomic publication exceeded the advisory bound; \
+             this repository is large enough that staged publication would now pay for itself"
+        );
+    }
+
     Ok(result)
+}
+
+/// Point at which the whole-generation retrieval-text buffer stops being
+/// negligible and starts being worth a design change (512 MiB).
+///
+/// Chosen from measurement, not intuition: the peak tracks the repository's
+/// total indexable text, which for ordinary source trees is single-digit
+/// megabytes. Reaching half a gigabyte means the repository is two orders of
+/// magnitude larger than that, and the atomic-publication trade-off should be
+/// revisited.
+pub const PENDING_UNITS_ADVISORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Drain the buffered PR-7 analysis-cache entries into the database.
+///
+/// One writer-queue submission per call (many statements, one transaction —
+/// the same shape as `submit_index_publication`). `entries` is left empty so
+/// the caller's live-byte counter can be reset to zero alongside it.
+///
+/// A no-op when there is nothing buffered, so callers can invoke it
+/// unconditionally at a flush point or on the abort path.
+fn flush_analysis_cache(
+    store: &IndexingStore<'_>,
+    repo_id: RepositoryId,
+    entries: &mut Vec<attic_storage::CachedFileAnalysis>,
+) -> Result<(), IndexError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(entries);
+    let now_us = incremental::now_micros();
+    store
+        .writer
+        .send(move |conn| {
+            attic_storage::upsert_analysis_cache_entries(conn, &repo_id, &batch, now_us)
+        })
+        .map_err(IndexError::Storage)?;
+    Ok(())
+}
+
+/// One file's analysis outcome, carried from the parallel analyze stage to
+/// the sequential merge stage in discovery order.
+struct AnalyzedFile {
+    rec: FileRecord,
+    prep: Result<FilePrep, IndexError>,
+    /// `true` when the PR-7 analysis cache satisfied this file and the
+    /// analyzer never ran — the merge stage uses it to skip rewriting an
+    /// identical cache row.
+    was_cache_hit: bool,
+    /// `Some(bytes)` when this file was a freshly-analyzed SMALL file, whose
+    /// content analysis re-read after discovery had already read it (the PR-8
+    /// duplicate-read measurement). `None` for cache hits and larger tiers.
+    small_file_bytes_read: Option<u64>,
+}
+
+/// Analyze every file record, using `threads` workers, and return the results
+/// in the original (discovery) order.
+///
+/// # Why this is safe to parallelise
+///
+/// [`analyze_single_file`] performs no database access whatsoever: it reads
+/// one path from disk, dispatches to an analyzer (`Analyzer: Send + Sync`,
+/// documented read-only during `analyze`), and returns owned data. Nothing
+/// here goes near the coordinated writer, so the single-writer contract is
+/// untouched.
+///
+/// # Why output is deterministic
+///
+/// Work is partitioned by index into contiguous stripes; each worker owns a
+/// disjoint slice and fills only its own slots. The results vector is then
+/// reassembled in stripe order, so the sequence the caller observes is exactly
+/// the sequence a single-threaded run would produce. Thread count affects
+/// timing only — never ordering, never content.
+///
+/// Cancellation is checked per file inside each worker, so a cancelled run
+/// stops promptly rather than after the whole stripe.
+fn analyze_files(
+    file_records: Vec<FileRecord>,
+    analysis_cache: &HashMap<String, attic_storage::CachedFileAnalysis>,
+    registry: &AnalyzerRegistry,
+    opts: &IndexOptions,
+    policy_hash: &str,
+    cancellation: &CancellationToken,
+    threads: usize,
+) -> Result<Vec<AnalyzedFile>, IndexError> {
+    if file_records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let analyze_one = |rec: FileRecord| -> AnalyzedFile {
+        // A cache hit requires the content hash AND the secret-detector /
+        // analyzer-registry versions to match what's current: a retry that
+        // spans a ruleset upgrade must never replay a verdict computed under
+        // the old rules for unchanged content (e.g. a secret the upgraded
+        // detector would now catch).
+        let cache_hit = analysis_cache
+            .get(&rec.repo_relative)
+            .filter(|cached| {
+                cached.content_hash == rec.content_hash
+                    && cached.secret_pattern_version == SECRET_PATTERN_VERSION
+                    && cached.analyzer_registry_version
+                        == attic_core::constants::ANALYZER_REGISTRY_VERSION
+                    && cached.discovery_policy_hash == policy_hash
+                    && cached.structural == opts.structural
+                    && cached.max_units_per_file == opts.max_units_per_file as u64
+            })
+            .and_then(|cached| reconstruct_file_prep_from_cache(cached, &rec));
+
+        match cache_hit {
+            Some(prep) => AnalyzedFile {
+                rec,
+                prep: Ok(prep),
+                was_cache_hit: true,
+                small_file_bytes_read: None,
+            },
+            None => {
+                let small_file_bytes_read = (rec.size_bytes >= 0
+                    && (rec.size_bytes as u64) <= attic_discovery::MAX_FULL_LOAD_BYTES)
+                    .then_some(rec.size_bytes as u64);
+                let prep = analyze_single_file(&rec, registry, opts, cancellation);
+                AnalyzedFile {
+                    rec,
+                    prep,
+                    was_cache_hit: false,
+                    small_file_bytes_read,
+                }
+            }
+        }
+    };
+
+    if threads <= 1 {
+        let mut out = Vec::with_capacity(file_records.len());
+        for rec in file_records {
+            if cancellation.is_cancelled() {
+                return Err(IndexError::Cancelled);
+            }
+            out.push(analyze_one(rec));
+        }
+        return Ok(out);
+    }
+
+    // Contiguous stripes: `chunk_len` is a ceiling divide, so `threads` chunks
+    // cover every record and only the final chunk is short.
+    let chunk_len = file_records.len().div_ceil(threads);
+    let mut inputs: Vec<Vec<FileRecord>> = Vec::with_capacity(threads);
+    let mut remaining = file_records;
+    while !remaining.is_empty() {
+        let take = chunk_len.min(remaining.len());
+        let rest = remaining.split_off(take);
+        inputs.push(remaining);
+        remaining = rest;
+    }
+
+    let analyze_one = &analyze_one;
+    let mut outputs: Vec<Vec<AnalyzedFile>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = inputs
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for rec in chunk {
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
+                        local.push(analyze_one(rec));
+                    }
+                    // Hand the worker's analysis tally back with its results so
+                    // the spawning thread can attribute it (test-only; see
+                    // ANALYZE_SINGLE_FILE_CALLS).
+                    #[cfg(test)]
+                    let local = (local, take_analyze_single_file_calls());
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                // A worker panic is a bug, not a transient condition: analysis
+                // is pure and every expected failure is already modelled as
+                // `FilePrep::Skip` or `IndexError`. Propagating restores the
+                // single-threaded behaviour of unwinding out of the run.
+                let joined = h
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+                #[cfg(test)]
+                let joined = {
+                    let (results, calls) = joined;
+                    add_analyze_single_file_calls(calls);
+                    results
+                };
+                joined
+            })
+            .collect()
+    });
+
+    // A worker that observed cancellation returns a short vector, so the
+    // reassembled result would silently omit files. Surface it as the
+    // cancellation it is rather than publishing an incomplete generation.
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
+
+    let mut out = Vec::with_capacity(outputs.iter().map(Vec::len).sum());
+    for chunk in &mut outputs {
+        out.append(chunk);
+    }
+    Ok(out)
 }
 
 /// Reconstruct a cached analysis result for reuse (PR-7 cache hit).
@@ -1182,12 +1490,15 @@ fn reconstruct_file_prep_from_cache(
 // Test-only counter of `analyze_single_file` invocations (PR-7): proves a
 // cache hit genuinely skips the analyzer rather than merely producing the
 // same output by coincidence. Compiled out entirely in non-test builds.
-// clippy's `missing_const_for_thread_local` keeps firing on this exact
-// `const { .. }` initializer when combined with `#[cfg(test)]`; suppressed
-// rather than fought further since this is test-only, not shipped code.
+//
+// Thread-local, because libtest runs tests concurrently in one process and a
+// process-global counter would let any other running test's analyses inflate
+// this one's count. Analysis now runs on a worker pool, so workers report
+// their own tallies back to the thread that spawned them (see
+// `take_analyze_single_file_calls` and its use in `analyze_files`), keeping
+// every count attributed to the test that caused it.
 #[cfg(test)]
 thread_local! {
-    #[allow(clippy::missing_const_for_thread_local)]
     static ANALYZE_SINGLE_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1198,7 +1509,20 @@ fn reset_analyze_single_file_calls() {
 
 #[cfg(test)]
 fn analyze_single_file_calls() -> usize {
-    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.get())
+    ANALYZE_SINGLE_FILE_CALLS.with(std::cell::Cell::get)
+}
+
+/// Read and clear the calling thread's tally. Used by an analysis worker to
+/// hand its count back to the thread that spawned it.
+#[cfg(test)]
+fn take_analyze_single_file_calls() -> usize {
+    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.replace(0))
+}
+
+/// Add a worker's tally to the calling thread's.
+#[cfg(test)]
+fn add_analyze_single_file_calls(n: usize) {
+    ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(c.get() + n));
 }
 
 /// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return
