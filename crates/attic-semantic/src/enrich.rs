@@ -22,8 +22,7 @@ use crate::error::SemanticError;
 use crate::identity::SemanticUnitIdentity;
 use crate::invalidate::reconcile;
 use crate::provider::{
-    CancelFlag, EmbeddingFingerprint, EmbeddingInput, ExecutionBackend, ResourceUsage,
-    SemanticProvider,
+    CancelFlag, EmbeddingFingerprint, EmbeddingInput, ResourceUsage, SemanticProvider,
 };
 use crate::selection::{SEMANTIC_SELECTION_VERSION, SelectionConfig};
 use crate::store::{EmbeddingRecord, SemanticStore};
@@ -733,6 +732,7 @@ impl BackgroundEnricher {
 #[cfg(test)]
 mod generation_driven_enrichment_tests {
     use super::*;
+    use crate::provider::ExecutionBackend;
 
     #[test]
     fn worker_count_honors_provider_concurrency_contract() {

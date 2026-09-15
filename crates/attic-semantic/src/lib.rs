@@ -16,6 +16,7 @@
 //! verification continue to work untouched.
 
 pub mod cpu_isolation;
+pub mod deferred_provider;
 pub mod diagnostics;
 pub mod disk_safety;
 pub mod enrich;
@@ -37,6 +38,7 @@ pub mod testing;
 pub mod throughput_controller;
 
 pub use cpu_isolation::CpuIsolationPlan;
+pub use deferred_provider::{DeferredProvider, ModelLifecycle};
 pub use diagnostics::{
     DiagnosticContext, SemanticLatencyBreakdown, SemanticProgressSnapshot, WhySlowDiagnostic,
     diagnose_why_slow,
@@ -55,8 +57,8 @@ pub use model_assets::{
 pub use model_lifecycle::{ModelLifecycleState, SharedModelHandle};
 pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
-    UnavailableProvider, cosine,
+    EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage,
+    SemanticProvider, UnavailableProvider, cosine,
 };
 pub use qwen3_provider::{QWEN_MODEL_ID, QWEN_PROVIDER_ID, Qwen3Embedder, QwenPooling};
 pub use scheduler::{

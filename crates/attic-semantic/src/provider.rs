@@ -85,6 +85,13 @@ pub trait SemanticProvider: Send + Sync {
         true
     }
 
+    /// Model lifecycle state for status reporting, when the provider has one
+    /// (e.g. `DeferredProvider` during background download). `None` for
+    /// providers that are statically ready or unavailable.
+    fn model_lifecycle(&self) -> Option<String> {
+        None
+    }
+
     /// Declare how many callers may execute inference against this provider.
     ///
     /// Queue workers must honor this contract before claiming work. The

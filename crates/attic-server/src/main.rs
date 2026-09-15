@@ -290,11 +290,78 @@ fn resolve_semantic_provider(
     }
 
     tracing::warn!(
-        "Qwen3Embedder weights not present in local cache; degrading to unavailable provider"
+        "Qwen3Embedder weights not present in local cache; starting DEFERRED provider — background download begins after startup, semantic retrieval comes online when it completes"
     );
-    Arc::new(attic_semantic::UnavailableProvider {
-        reason: "Qwen3 model weights not found in local cache; auto-download disabled to preserve startup latency".into(),
-    })
+    let deferred = Arc::new(attic_semantic::DeferredProvider::new(
+        "Qwen3 model weights not yet downloaded; background download in progress",
+    ));
+    spawn_model_download_task(
+        deferred.clone(),
+        model_cache_dir.to_path_buf(),
+        batch_size,
+        attic_config.semantic.dimension,
+    );
+    deferred
+}
+
+/// Phase 2: background model acquisition. Downloads weights OFF the startup
+/// path (canonical/lexical indexing never waits), with the agreed failure
+/// policy: 3 attempts, 5s apart, then report failed. On success the deferred
+/// provider is hot-swapped to the real Qwen3Embedder — no restart needed.
+fn spawn_model_download_task(
+    deferred: Arc<attic_semantic::DeferredProvider>,
+    cache_dir: PathBuf,
+    batch_size: usize,
+    dimension: Option<usize>,
+) {
+    use attic_semantic::ModelLifecycle;
+    let task_deferred = deferred.clone();
+    std::thread::Builder::new()
+        .name("attic-model-download".into())
+        .spawn(move || {
+            let deferred = task_deferred;
+            const MAX_ATTEMPTS: u32 = 3;
+            const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+            for attempt in 1..=MAX_ATTEMPTS {
+                deferred.set_lifecycle(ModelLifecycle::Downloading { attempt });
+                // Qwen3Embedder::new downloads via hf-hub when the local cache
+                // is absent, then builds — one call covers the whole acquire.
+                match attic_semantic::Qwen3Embedder::new(
+                    &cache_dir,
+                    batch_size,
+                    dimension,
+                    attic_semantic::QwenPooling::LastToken,
+                ) {
+                    Ok(embedder) => {
+                        deferred.set_lifecycle(ModelLifecycle::Verifying);
+                        deferred.swap_in(Arc::new(embedder));
+                        tracing::info!(
+                            "Qwen3 model downloaded and provider swapped in — semantic retrieval is now live"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        tracing::warn!(attempt, "model download/build failed: {reason}");
+                        if attempt < MAX_ATTEMPTS {
+                            deferred.set_lifecycle(ModelLifecycle::Backoff {
+                                attempt,
+                                reason: reason.clone(),
+                            });
+                            std::thread::sleep(RETRY_DELAY);
+                        } else {
+                            deferred.set_lifecycle(ModelLifecycle::Failed { reason });
+                        }
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            deferred.set_lifecycle(ModelLifecycle::Failed {
+                reason: format!("failed to spawn download task: {e}"),
+            });
+        });
 }
 
 #[cfg(test)]
@@ -2274,6 +2341,11 @@ fn handle_status(
         }
     };
     payload["semantic_health"] = json!(semantic_health);
+    if let Some(stack) = phase8.semantic {
+        if let Some(lifecycle) = stack.provider.model_lifecycle() {
+            payload["model_lifecycle"] = json!(lifecycle);
+        }
+    }
 
     // Phase V2 CP18: Semantic progress, ETA, and "why slow" diagnostics (§61, §62).
     if let Some(stack) = phase8.semantic {
