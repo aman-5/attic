@@ -28,7 +28,7 @@ use ndarray::{Array2, Array4};
 use ort::ep::DirectML;
 use ort::session::Session;
 use ort::value::Tensor;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
 use crate::error::SemanticError;
 use crate::instruction::CODE_RETRIEVAL_V1_ID;
@@ -97,16 +97,10 @@ impl OrtDirectMlProvider {
             strategy: PaddingStrategy::Fixed(seq_len),
             ..Default::default()
         }));
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: seq_len,
-                strategy: TruncationStrategy::LongestFirst,
-                ..Default::default()
-            }))
-            .map_err(|e| SemanticError::ProviderUnavailable {
-                provider: ORT_PROVIDER_ID.into(),
-                reason: format!("failed to configure tokenizer truncation: {e}"),
-            })?;
+        // NO truncation is configured here on purpose (r04): silently
+        // clipping an over-budget input would embed only its head and store
+        // a vector claiming to represent the whole unit. run_forward rejects
+        // over-token inputs with InputTooManyTokens instead.
 
         let session = Session::builder()
             .map_err(|e| SemanticError::ProviderUnavailable {
@@ -152,6 +146,9 @@ impl OrtDirectMlProvider {
             chunking_version: attic_core::constants::CHUNKING_VERSION.into(),
             query_instruction_version: CODE_RETRIEVAL_V1_ID.into(),
             execution_backend: ExecutionBackend::OrtDirectMl,
+            // onnx-community fp16 export — NOT Q8. Part of vector-space
+            // identity (r04): fp16 vectors must never mix with Q8/fp32.
+            quantization: "fp16-onnx".into(),
         };
 
         Ok(Self {
@@ -167,12 +164,16 @@ impl OrtDirectMlProvider {
 
     /// Embed one batch of ≤ batch_size texts, each padded to seq_len.
     /// Caller holds the session mutex.
+    ///
+    /// Returns (pooled vectors at NATIVE width, per-item real token counts,
+    /// native hidden width) — batch row slicing MUST use the native width,
+    /// never the configured target dimension (r04 stride fix).
     fn run_forward(
         session: &mut Session,
         tokenizer: &Tokenizer,
         seq_len: usize,
         texts: &[&str],
-    ) -> Result<(Vec<f32>, Vec<usize>), SemanticError> {
+    ) -> Result<(Vec<f32>, Vec<usize>, usize), SemanticError> {
         let batch = texts.len();
         let mut ids_flat: Vec<i64> = Vec::with_capacity(batch * seq_len);
         let mut mask_flat: Vec<i64> = Vec::with_capacity(batch * seq_len);
@@ -181,7 +182,14 @@ impl OrtDirectMlProvider {
             let enc = tokenizer
                 .encode(*text, true)
                 .map_err(|e| SemanticError::EmbeddingFailed(format!("tokenize: {e}")))?;
-            ids_flat.extend(enc.get_ids().iter().map(|&i| i as i64));
+            let ids = enc.get_ids();
+            if ids.len() > seq_len {
+                return Err(SemanticError::InputTooManyTokens {
+                    tokens: ids.len(),
+                    max: seq_len,
+                });
+            }
+            ids_flat.extend(ids.iter().map(|&i| i as i64));
             mask_flat.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
             real_tokens.push(enc.get_attention_mask().iter().filter(|&&m| m == 1).count());
         }
@@ -249,7 +257,7 @@ impl OrtDirectMlProvider {
             }
             pooled.extend_from_slice(&v);
         }
-        Ok((pooled, real_tokens))
+        Ok((pooled, real_tokens, hidden))
     }
 }
 
@@ -333,7 +341,7 @@ impl SemanticProvider for OrtDirectMlProvider {
                 .iter()
                 .map(|(_, i)| i.text.as_str())
                 .collect();
-            let (pooled, real_tokens) = {
+            let (pooled, real_tokens, native_hidden) = {
                 let mut guard = self
                     .session
                     .lock()
@@ -341,9 +349,11 @@ impl SemanticProvider for OrtDirectMlProvider {
                 Self::run_forward(&mut guard, &self.tokenizer, self.seq_len, &texts)?
             };
 
-            let hidden = self.fingerprint.dimension;
+            // r04: rows in `pooled` are NATIVE width (e.g. 1024), regardless
+            // of the configured target dimension. Slicing with the target
+            // dimension here previously read wrong offsets for batch > 1.
             for (k, (orig_idx, input)) in indexed[start..end].iter().enumerate() {
-                let mut vec = pooled[k * hidden..(k + 1) * hidden].to_vec();
+                let mut vec = pooled[k * native_hidden..(k + 1) * native_hidden].to_vec();
                 if vec.len() > self.target_dims {
                     vec.truncate(self.target_dims);
                     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -369,5 +379,105 @@ impl SemanticProvider for OrtDirectMlProvider {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| SemanticError::EmbeddingFailed("internal: unproduced output".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{CancelFlag, EmbeddingInput, ResourceUsage, SemanticProvider};
+
+    /// Spike-validated model directory (fp16 ONNX + tokenizer). Tests skip
+    /// cleanly when the assets are not provisioned.
+    fn model_dir() -> Option<std::path::PathBuf> {
+        std::env::var("ATTIC_ONNX_MODEL_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.join("model_fp16.onnx").is_file() && p.join("tokenizer.json").is_file())
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// r04 gate (real RTX A500): batched extraction must match single-item
+    /// extraction at every Matryoshka dimension — regression coverage for the
+    /// native-width row-stride bug that corrupted batches with dim < 1024.
+    #[test]
+    fn batch_matches_single_at_reduced_dimensions() {
+        let Some(dir) = model_dir() else {
+            eprintln!("ATTIC_ONNX_MODEL_DIR not provisioned; skipping hardware test");
+            return;
+        };
+        let texts = [
+            "fn alpha() { let x = 1; }",
+            "a somewhat longer piece of source code with several tokens so padding differs",
+            "tiny",
+            "SELECT embedding FROM sem_embeddings WHERE vector_space_id = ?1",
+        ];
+        for dims in [256usize, 512, 1024] {
+            let p = OrtDirectMlProvider::from_model_dir(&dir, 4, 512, Some(dims)).unwrap();
+            let mut usage = ResourceUsage::default();
+            let inputs: Vec<EmbeddingInput> = texts
+                .iter()
+                .map(|t| EmbeddingInput {
+                    unit_key: (*t).to_string(),
+                    text: (*t).to_string(),
+                })
+                .collect();
+            let batched = p
+                .embed_batch(&inputs, &CancelFlag::new(), &mut usage, None)
+                .unwrap();
+            for (i, t) in texts.iter().enumerate() {
+                assert_eq!(batched[i].vector.len(), dims);
+                let single = p
+                    .embed_batch(
+                        &[EmbeddingInput {
+                            unit_key: (*t).to_string(),
+                            text: (*t).to_string(),
+                        }],
+                        &CancelFlag::new(),
+                        &mut usage,
+                        None,
+                    )
+                    .unwrap();
+                let sim = cosine(&batched[i].vector, &single[0].vector);
+                assert!(
+                    sim > 0.999,
+                    "dims={dims} item {i}: batch vs single cosine {sim} — stride regression?"
+                );
+            }
+        }
+    }
+
+    /// r04: input beyond the fixed token budget must fail with a typed
+    /// error — the provider must never silently embed a truncated head.
+    #[test]
+    fn over_token_input_is_rejected_not_truncated() {
+        let Some(dir) = model_dir() else {
+            eprintln!("ATTIC_ONNX_MODEL_DIR not provisioned; skipping hardware test");
+            return;
+        };
+        let p = OrtDirectMlProvider::from_model_dir(&dir, 4, 512, None).unwrap();
+        let long = "embedding ".repeat(5_000);
+        let mut usage = ResourceUsage::default();
+        let err = p
+            .embed_batch(
+                &[EmbeddingInput {
+                    unit_key: "long".into(),
+                    text: long,
+                }],
+                &CancelFlag::new(),
+                &mut usage,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, SemanticError::InputTooManyTokens { tokens, max: 512 } if tokens > 512),
+            "over-token input must be rejected with token counts, got {err:?}"
+        );
     }
 }

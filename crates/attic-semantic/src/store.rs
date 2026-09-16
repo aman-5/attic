@@ -1619,6 +1619,7 @@ mod tests {
             chunking_version: "2.0.0".into(),
             query_instruction_version: "code_retrieval_v1".into(),
             execution_backend: ExecutionBackend::OrtDirectMl,
+            quantization: "test-none".to_string(),
         };
         let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
         let cgid = s.ensure_content_generation(&fp, "sel_v1").unwrap();
@@ -1673,6 +1674,7 @@ mod tests {
             chunking_version: "c".into(),
             query_instruction_version: "q".into(),
             execution_backend: ExecutionBackend::CandleCpu,
+            quantization: "test-none".to_string(),
         };
         let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
         let cgid = s.ensure_content_generation(&fp, "sel").unwrap();
@@ -1944,6 +1946,7 @@ mod tests {
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         };
         let gen1 = store.start_new_generation(&fp1).unwrap();
         assert_eq!(gen1.generation_id, 1);
@@ -1983,6 +1986,7 @@ mod tests {
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         };
         let gen2 = store.start_new_generation(&fp2).unwrap();
         assert_eq!(gen2.generation_id, 2);

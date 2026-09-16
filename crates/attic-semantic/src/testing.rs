@@ -128,6 +128,7 @@ impl SemanticProvider for HashingEmbedder {
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         })
     }
 
@@ -178,6 +179,7 @@ impl EmbeddingProvider for HashingEmbedder {
             chunking_version: "retrieval_unit_v1".to_string(),
             query_instruction_version: "none".to_string(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         }
     }
 
@@ -251,6 +253,7 @@ impl SemanticProvider for FailingProvider {
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         })
     }
     fn embed_batch(
@@ -312,6 +315,7 @@ impl SemanticProvider for SlowProvider {
             chunking_version: "test".to_owned(),
             query_instruction_version: "test".to_owned(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         })
     }
     fn embed_batch(

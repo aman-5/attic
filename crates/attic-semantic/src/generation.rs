@@ -309,6 +309,7 @@ mod tests {
             chunking_version: "ast_v1".to_string(),
             query_instruction_version: "code_retrieval_v1".to_string(),
             execution_backend: ExecutionBackend::Unknown,
+            quantization: "test-none".to_string(),
         }
     }
 

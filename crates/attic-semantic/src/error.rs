@@ -22,6 +22,12 @@ pub enum SemanticError {
     #[error("input exceeds provider maximum ({len} > {max} bytes)")]
     InputTooLarge { len: usize, max: usize },
 
+    /// Input needs more tokens than the provider's fixed sequence budget.
+    /// Permanent for this content under this provider: retrying unchanged
+    /// will fail identically — the caller must split upstream or quarantine.
+    #[error("input exceeds provider token budget ({tokens} > {max} tokens)")]
+    InputTooManyTokens { tokens: usize, max: usize },
+
     #[error("dimension mismatch: record has {record}, provider produces {expected}")]
     DimensionMismatch { record: usize, expected: usize },
 

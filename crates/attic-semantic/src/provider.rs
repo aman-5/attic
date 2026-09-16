@@ -204,19 +204,32 @@ pub struct EmbeddingFingerprint {
     /// rows readable).
     #[serde(default)]
     pub execution_backend: ExecutionBackend,
+    /// Weight quantization of the model artifact (e.g. "q8_0", "fp16",
+    /// "fp32"). PART of vector-space identity: quantized and full-precision
+    /// weights produce measurably different vectors, so mixing them in one
+    /// space would corrupt similarity. Serde default keeps pre-r04 rows
+    /// readable ("unknown" never matches a real configured value).
+    #[serde(default = "default_quantization_unknown")]
+    pub quantization: String,
+}
+
+fn default_quantization_unknown() -> String {
+    "unknown".to_string()
 }
 
 impl EmbeddingFingerprint {
-    /// Vector-space identity: model artifact, tokenizer, pooling,
-    /// normalization, dimension, instruction — the things that determine
-    /// whether two vectors may be compared at all. Chunking and backend are
-    /// deliberately excluded (chunking selects texts; backend is telemetry).
+    /// Vector-space identity: model artifact, quantization, tokenizer,
+    /// pooling, normalization, dimension, instruction — the things that
+    /// determine whether two vectors may be compared at all. Chunking and
+    /// backend are deliberately excluded (chunking selects texts; backend is
+    /// telemetry).
     pub fn vector_space_id(&self) -> String {
         let canonical = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.provider,
             self.model_id,
             self.model_revision,
+            self.quantization,
             self.dimension,
             self.pooling_version,
             self.normalization_version,
@@ -367,6 +380,7 @@ mod identity_split_tests {
             chunking_version: attic_core::constants::CHUNKING_VERSION.into(),
             query_instruction_version: "code_retrieval_v1".into(),
             execution_backend: ExecutionBackend::CandleCpu,
+            quantization: "test-none".to_string(),
         }
     }
 

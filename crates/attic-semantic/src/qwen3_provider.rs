@@ -26,7 +26,7 @@ use crate::provider::{
 use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
 pub const HF_QWEN_OWNER: &str = "Qwen";
 pub const HF_QWEN_REPO: &str = "Qwen3-Embedding-0.6B";
@@ -375,15 +375,9 @@ impl Qwen3Embedder {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: max_tokens,
-                ..Default::default()
-            }))
-            .map_err(|e| SemanticError::ProviderUnavailable {
-                provider: QWEN_PROVIDER_ID.into(),
-                reason: format!("failed to configure tokenizer truncation: {e}"),
-            })?;
+        // No tokenizer truncation (r04): silently clipping an over-budget
+        // input would store a vector for only its head. embed_sub_batch
+        // rejects over-token inputs with InputTooManyTokens instead.
 
         let fingerprint = EmbeddingFingerprint {
             provider: QWEN_PROVIDER_ID.into(),
@@ -396,6 +390,10 @@ impl Qwen3Embedder {
             chunking_version: attic_core::constants::CHUNKING_VERSION.to_string(),
             query_instruction_version: CODE_RETRIEVAL_V1_ID.to_string(),
             execution_backend: ExecutionBackend::CandleCpu,
+            // Weights are the official safetensors upcast to F32 (DTYPE
+            // above) — NOT a quantized artifact. Part of vector-space
+            // identity (r04): these vectors must never mix with Q8/fp16.
+            quantization: "fp32-safetensors".to_string(),
         };
 
         Ok(Self {
@@ -547,6 +545,18 @@ impl Qwen3Embedder {
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| SemanticError::EmbeddingFailed(format!("tokenization failed: {e}")))?;
+
+        // r04: no silent truncation — reject any input that exceeds the
+        // provider's token budget BEFORE building tensors.
+        for e in &encodings {
+            let len = e.get_ids().len();
+            if len > self.max_tokens {
+                return Err(SemanticError::InputTooManyTokens {
+                    tokens: len,
+                    max: self.max_tokens,
+                });
+            }
+        }
 
         let token_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
         let attention_mask_rows: Vec<Vec<u32>> = encodings
