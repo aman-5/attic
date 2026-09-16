@@ -49,6 +49,14 @@ const NATIVE_DIMS: usize = 1024;
 /// Floor bytes-per-token for conservative pre-tokenization estimates.
 const MIN_BYTES_PER_TOKEN: usize = 2;
 
+/// Empty-KV element type, detected from the model's own input signature
+/// (fp16 export uses f16; the Q8/int8 exports use f32). Never assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvDType {
+    F16,
+    F32,
+}
+
 /// ONNX Runtime DirectML provider for Qwen3-Embedding-0.6B (fp16).
 pub struct OrtDirectMlProvider {
     /// DirectML sessions forbid concurrent Run() — this mutex is the
@@ -63,6 +71,7 @@ pub struct OrtDirectMlProvider {
     batch_token_budget: usize,
     target_dims: usize,
     fingerprint: EmbeddingFingerprint,
+    kv_dtype: KvDType,
 }
 
 impl OrtDirectMlProvider {
@@ -135,6 +144,23 @@ impl OrtDirectMlProvider {
             });
         }
 
+        // Detect the KV-cache element type from the model's own input
+        // signature — the fp16 export feeds f16 KV tensors, the Q8/int8
+        // exports expect f32. Hardcoding either breaks the other.
+        let kv_dtype = session
+            .inputs()
+            .iter()
+            .find(|i| i.name() == "past_key_values.0.key")
+            .map(|i| match i.dtype() {
+                ort::value::ValueType::Tensor {
+                    ty: ort::value::TensorElementType::Float32,
+                    ..
+                } => KvDType::F32,
+                _ => KvDType::F16,
+            })
+            .unwrap_or(KvDType::F16);
+        tracing::info!(?kv_dtype, "DirectML model KV-cache dtype detected");
+
         let fingerprint = EmbeddingFingerprint {
             provider: ORT_PROVIDER_ID.into(),
             model_id: crate::qwen3_provider::QWEN_MODEL_ID.into(),
@@ -159,6 +185,7 @@ impl OrtDirectMlProvider {
             batch_token_budget: batch_size.max(1) * seq_len,
             target_dims,
             fingerprint,
+            kv_dtype,
         })
     }
 
@@ -172,6 +199,7 @@ impl OrtDirectMlProvider {
         session: &mut Session,
         tokenizer: &Tokenizer,
         seq_len: usize,
+        kv_dtype: KvDType,
         texts: &[&str],
     ) -> Result<(Vec<f32>, Vec<usize>, usize), SemanticError> {
         let batch = texts.len();
@@ -202,7 +230,6 @@ impl OrtDirectMlProvider {
                 .map_err(|e| SemanticError::EmbeddingFailed(format!("tensor: {e}")))
         };
 
-        let empty_kv = Array4::<f16>::zeros((batch, NUM_KV_HEADS, 0, HEAD_DIM));
         let mut inputs: Vec<(String, ort::value::DynValue)> = vec![
             ("input_ids".into(), to_tensor(ids_flat)?.into_dyn()),
             (
@@ -213,9 +240,22 @@ impl OrtDirectMlProvider {
         ];
         for layer in 0..NUM_LAYERS {
             for kv in ["key", "value"] {
-                let t = Tensor::from_array(empty_kv.clone())
-                    .map_err(|e| SemanticError::EmbeddingFailed(format!("kv tensor: {e}")))?;
-                inputs.push((format!("past_key_values.{layer}.{kv}"), t.into_dyn()));
+                // Build the empty KV tensor in the dtype the MODEL declares
+                // (fp16 export: f16; Q8/int8 exports: f32). Both arms yield
+                // DynValue directly so the match types unify.
+                let t: ort::value::DynValue = match kv_dtype {
+                    KvDType::F16 => {
+                        Tensor::from_array(Array4::<f16>::zeros((batch, NUM_KV_HEADS, 0, HEAD_DIM)))
+                            .map_err(|e| SemanticError::EmbeddingFailed(format!("kv tensor: {e}")))?
+                            .into_dyn()
+                    }
+                    KvDType::F32 => {
+                        Tensor::from_array(Array4::<f32>::zeros((batch, NUM_KV_HEADS, 0, HEAD_DIM)))
+                            .map_err(|e| SemanticError::EmbeddingFailed(format!("kv tensor: {e}")))?
+                            .into_dyn()
+                    }
+                };
+                inputs.push((format!("past_key_values.{layer}.{kv}"), t));
             }
         }
 
@@ -346,7 +386,13 @@ impl SemanticProvider for OrtDirectMlProvider {
                     .session
                     .lock()
                     .map_err(|_| SemanticError::EmbeddingFailed("session mutex poisoned".into()))?;
-                Self::run_forward(&mut guard, &self.tokenizer, self.seq_len, &texts)?
+                Self::run_forward(
+                    &mut guard,
+                    &self.tokenizer,
+                    self.seq_len,
+                    self.kv_dtype,
+                    &texts,
+                )?
             };
 
             // r04: rows in `pooled` are NATIVE width (e.g. 1024), regardless
