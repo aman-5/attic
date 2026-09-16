@@ -24,6 +24,8 @@ use hnsw_rs::prelude::*;
 use rusqlite::{Connection, params};
 
 const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
+const SEMANTIC_MIGRATION_0002: &str =
+    include_str!("../../../migrations/semantic/0002_identity_leases.sql");
 
 /// One stored embedding with full lineage.
 #[derive(Debug, Clone)]
@@ -327,7 +329,14 @@ impl SemanticStore {
     }
 
     fn migrate(conn: &Connection) -> Result<(), SemanticError> {
+        // Ordered, idempotent chain: each script is self-recording into
+        // sem_schema_migrations (INSERT OR IGNORE), so re-running is a no-op
+        // and an existing 0001-only database upgrades in place.
         conn.execute_batch(SEMANTIC_MIGRATION_0001)?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO sem_schema_migrations (id) VALUES ('0001_initial');",
+        )?;
+        conn.execute_batch(SEMANTIC_MIGRATION_0002)?;
         Ok(())
     }
 
@@ -453,6 +462,297 @@ impl SemanticStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    // ── v2: vector spaces, canonical embeddings, occurrences, leases (r02) ─
+
+    /// Register (idempotently) the vector space described by a provider
+    /// fingerprint; returns its stable `vector_space_id`.
+    pub fn ensure_vector_space(
+        &self,
+        fp: &EmbeddingFingerprint,
+        quantization: &str,
+    ) -> Result<String, SemanticError> {
+        let id = fp.vector_space_id();
+        self.guard()?.execute(
+            "INSERT OR IGNORE INTO sem_vector_spaces
+                 (vector_space_id, provider_id, model_id, model_revision,
+                  quantization, dim, pooling_version, normalization_version,
+                  tokenizer_version, query_instruction_version,
+                  execution_backend, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                id,
+                fp.provider,
+                fp.model_id,
+                fp.model_revision,
+                quantization,
+                fp.dimension as i64,
+                fp.pooling_version,
+                fp.normalization_version,
+                fp.tokenizer_version,
+                fp.query_instruction_version,
+                fp.execution_backend.as_str(),
+                Self::now_ms()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Register (idempotently) the content-generation identity (chunking +
+    /// canonicalization + analyzer registry + selection versions).
+    pub fn ensure_content_generation(
+        &self,
+        fp: &EmbeddingFingerprint,
+        selection_version: &str,
+    ) -> Result<String, SemanticError> {
+        let id = fp.content_generation_id(selection_version);
+        self.guard()?.execute(
+            "INSERT OR IGNORE INTO sem_content_generations
+                 (content_generation_id, chunking_version,
+                  canonicalization_version, analyzer_registry_version,
+                  selection_version, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                fp.chunking_version,
+                "canonical_v1",
+                attic_core::constants::ANALYZER_REGISTRY_VERSION,
+                selection_version,
+                Self::now_ms()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Store one canonical embedding; returns true when newly inserted
+    /// (INSERT OR IGNORE — an identical canonical body in the same vector
+    /// space is embedded exactly once, ever).
+    pub fn put_embedding_v2(
+        &self,
+        vector_space_id: &str,
+        canonical_hash: &str,
+        vector: &[f32],
+    ) -> Result<bool, SemanticError> {
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut blob = Vec::with_capacity(vector.len() * 4);
+        for v in vector {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let changed = self.guard()?.execute(
+            "INSERT OR IGNORE INTO sem_embeddings_v2
+                 (vector_space_id, canonical_hash, dim, norm, vector, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                vector_space_id,
+                canonical_hash,
+                vector.len() as i64,
+                norm,
+                blob,
+                Self::now_ms()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Fetch the canonical embedding for reuse across occurrences.
+    pub fn embedding_for_canonical(
+        &self,
+        vector_space_id: &str,
+        canonical_hash: &str,
+    ) -> Result<Option<Vec<f32>>, SemanticError> {
+        let conn = self.guard()?;
+        let mut stmt = conn.prepare(
+            "SELECT dim, vector FROM sem_embeddings_v2
+              WHERE vector_space_id = ?1 AND canonical_hash = ?2",
+        )?;
+        let mut rows = stmt.query(params![vector_space_id, canonical_hash])?;
+        if let Some(row) = rows.next()? {
+            let dim = row.get::<_, i64>(0)? as usize;
+            let blob: Vec<u8> = row.get(1)?;
+            if blob.len() != dim * 4 {
+                return Err(SemanticError::StoreUnavailable(format!(
+                    "corrupt sem_embeddings_v2 row: dim {dim} but {} blob bytes",
+                    blob.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(dim);
+            for chunk in blob.chunks_exact(4) {
+                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
+
+    /// Record one occurrence of canonical content (all fields are lineage /
+    /// provenance; the vector itself lives once in sem_embeddings_v2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_occurrence(
+        &self,
+        occurrence_id: &str,
+        retrieval_unit_id: &str,
+        vector_space_id: &str,
+        canonical_hash: &str,
+        repository_id: &str,
+        source_revision_id: &str,
+        index_generation_id: &str,
+        content_generation_id: &str,
+        metadata_json: &str,
+    ) -> Result<(), SemanticError> {
+        self.guard()?.execute(
+            "INSERT OR REPLACE INTO sem_embedding_occurrences
+                 (occurrence_id, retrieval_unit_id, vector_space_id,
+                  canonical_hash, repository_id, source_revision_id,
+                  index_generation_id, content_generation_id, metadata_json,
+                  created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                occurrence_id,
+                retrieval_unit_id,
+                vector_space_id,
+                canonical_hash,
+                repository_id,
+                source_revision_id,
+                index_generation_id,
+                content_generation_id,
+                metadata_json,
+                Self::now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Count occurrences sharing one canonical embedding — the dedup proof.
+    pub fn occurrence_count_for_canonical(
+        &self,
+        vector_space_id: &str,
+        canonical_hash: &str,
+    ) -> Result<u64, SemanticError> {
+        let n: i64 = self.guard()?.query_row(
+            "SELECT COUNT(*) FROM sem_embedding_occurrences
+              WHERE vector_space_id = ?1 AND canonical_hash = ?2",
+            params![vector_space_id, canonical_hash],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Enqueue an occurrence for embedding (idempotent; preserves state of an
+    /// already-queued row).
+    pub fn queue_v2_enqueue(
+        &self,
+        occurrence_id: &str,
+        priority: f64,
+    ) -> Result<(), SemanticError> {
+        self.guard()?.execute(
+            "INSERT OR IGNORE INTO sem_queue_v2
+                 (occurrence_id, priority, state, attempts, enqueued_at_ms)
+             VALUES (?1,?2,'PENDING',0,?3)",
+            params![occurrence_id, priority, Self::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Claim one pending (or lease-expired) occurrence for `owner`. Bumps the
+    /// fencing token so any previous owner's later writes are stale.
+    /// Returns the fencing token the caller MUST present on completion.
+    pub fn queue_v2_claim(
+        &self,
+        occurrence_id: &str,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<i64>, SemanticError> {
+        let now = Self::now_ms();
+        let changed = self.guard()?.execute(
+            "UPDATE sem_queue_v2
+                SET state = 'INFLIGHT', lease_owner = ?2,
+                    lease_expires_at_ms = ?3, heartbeat_at_ms = ?4,
+                    fencing_token = fencing_token + 1
+              WHERE occurrence_id = ?1
+                AND (state = 'PENDING'
+                     OR (state = 'INFLIGHT' AND lease_expires_at_ms < ?4))",
+            params![occurrence_id, owner, now + lease_ms, now],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let token: i64 = self.guard()?.query_row(
+            "SELECT fencing_token FROM sem_queue_v2 WHERE occurrence_id = ?1",
+            params![occurrence_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some(token))
+    }
+
+    /// Extend a lease; rejected (Ok(false)) when the presented fencing token
+    /// is stale — i.e. the row was reclaimed by another worker.
+    pub fn queue_v2_heartbeat(
+        &self,
+        occurrence_id: &str,
+        owner: &str,
+        fencing_token: i64,
+        lease_ms: i64,
+    ) -> Result<bool, SemanticError> {
+        let now = Self::now_ms();
+        let changed = self.guard()?.execute(
+            "UPDATE sem_queue_v2
+                SET lease_expires_at_ms = ?4, heartbeat_at_ms = ?5
+              WHERE occurrence_id = ?1 AND lease_owner = ?2
+                AND fencing_token = ?3 AND state = 'INFLIGHT'",
+            params![occurrence_id, owner, fencing_token, now + lease_ms, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Mark an occurrence done; rejected (Ok(false)) on a stale fencing
+    /// token, so a killed worker can never commit after reclaim.
+    pub fn queue_v2_complete(
+        &self,
+        occurrence_id: &str,
+        owner: &str,
+        fencing_token: i64,
+    ) -> Result<bool, SemanticError> {
+        let changed = self.guard()?.execute(
+            "UPDATE sem_queue_v2
+                SET state = 'DONE', lease_owner = NULL, lease_expires_at_ms = NULL
+              WHERE occurrence_id = ?1 AND lease_owner = ?2
+                AND fencing_token = ?3 AND state = 'INFLIGHT'",
+            params![occurrence_id, owner, fencing_token],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Crash/restart reclaim: expired INFLIGHT leases become PENDING again
+    /// with an incremented attempt counter. Returns rows reclaimed.
+    pub fn queue_v2_reclaim_expired(&self) -> Result<u64, SemanticError> {
+        let now = Self::now_ms();
+        let changed = self.guard()?.execute(
+            "UPDATE sem_queue_v2
+                SET state = 'PENDING', attempts = attempts + 1,
+                    lease_owner = NULL, lease_expires_at_ms = NULL
+              WHERE state = 'INFLIGHT' AND lease_expires_at_ms < ?1",
+            params![now],
+        )?;
+        Ok(changed as u64)
+    }
+
+    /// Queue depth snapshot for status reporting.
+    pub fn queue_v2_counts(&self) -> Result<(u64, u64, u64, u64), SemanticError> {
+        let conn = self.guard()?;
+        let count = |state: &str| -> Result<i64, SemanticError> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sem_queue_v2 WHERE state = ?1",
+                params![state],
+                |r| r.get(0),
+            )?)
+        };
+        Ok((
+            count("PENDING")? as u64,
+            count("INFLIGHT")? as u64,
+            count("DONE")? as u64,
+            count("FAILED")? as u64,
+        ))
     }
 
     fn tombstone_units_in_all_indexes<'a>(&self, unit_ids: impl Iterator<Item = &'a str>) {
@@ -1273,7 +1573,25 @@ mod tests {
             .unwrap();
         assert_eq!(applied, 1);
 
-        for table in &["sem_embeddings", "sem_queue", "sem_query_demand"] {
+        let applied_0002: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sem_schema_migrations WHERE id='0002_identity_leases'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied_0002, 1, "0002 must be recorded and idempotent");
+
+        for table in &[
+            "sem_embeddings",
+            "sem_queue",
+            "sem_query_demand",
+            "sem_vector_spaces",
+            "sem_content_generations",
+            "sem_embeddings_v2",
+            "sem_embedding_occurrences",
+            "sem_queue_v2",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -1283,6 +1601,124 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "semantic table {table} must exist");
         }
+    }
+
+    /// r02: one canonical embedding serves many occurrences; the same body
+    /// re-put is a no-op, and every occurrence stays individually addressable.
+    #[test]
+    fn v2_canonical_embedding_shared_across_occurrences() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let fp = EmbeddingFingerprint {
+            provider: "qwen3".into(),
+            model_id: "qwen3-embedding-0.6b".into(),
+            model_revision: "rev-q8".into(),
+            dimension: 4,
+            pooling_version: "last_token_v1".into(),
+            normalization_version: "l2_unit_v1".into(),
+            tokenizer_version: "tok_v1".into(),
+            chunking_version: "2.0.0".into(),
+            query_instruction_version: "code_retrieval_v1".into(),
+            execution_backend: ExecutionBackend::OrtDirectMl,
+        };
+        let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
+        let cgid = s.ensure_content_generation(&fp, "sel_v1").unwrap();
+        // Idempotent registration.
+        assert_eq!(s.ensure_vector_space(&fp, "q8_0").unwrap(), vsid);
+        assert_eq!(s.ensure_content_generation(&fp, "sel_v1").unwrap(), cgid);
+
+        let body = "{\"a\":1}";
+        let hash = crate::identity::content_hash(body);
+        assert!(
+            s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap()
+        );
+        // Identical canonical body: second put must NOT insert again.
+        assert!(
+            !s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap()
+        );
+
+        for (i, env) in ["DEV", "PROD"].iter().enumerate() {
+            s.add_occurrence(
+                &format!("occ-{i}"),
+                &format!("unit-{i}"),
+                &vsid,
+                &hash,
+                "repo-a",
+                "rev-1",
+                "gen-1",
+                &cgid,
+                &format!("{{\"environment\": \"{env}\"}}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.occurrence_count_for_canonical(&vsid, &hash).unwrap(), 2);
+        let vec = s.embedding_for_canonical(&vsid, &hash).unwrap().unwrap();
+        assert_eq!(vec, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// r02: lease + fencing — a reclaimed row's old owner must be unable to
+    /// heartbeat or complete; the new owner's token is accepted.
+    #[test]
+    fn v2_queue_lease_fencing_rejects_stale_worker() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let fp = EmbeddingFingerprint {
+            provider: "qwen3".into(),
+            model_id: "m".into(),
+            model_revision: "r".into(),
+            dimension: 2,
+            pooling_version: "p".into(),
+            normalization_version: "n".into(),
+            tokenizer_version: "t".into(),
+            chunking_version: "c".into(),
+            query_instruction_version: "q".into(),
+            execution_backend: ExecutionBackend::CandleCpu,
+        };
+        let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
+        let cgid = s.ensure_content_generation(&fp, "sel").unwrap();
+        let hash = crate::identity::content_hash("body");
+        s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0]).unwrap();
+        s.add_occurrence(
+            "occ-1", "unit-1", &vsid, &hash, "repo", "rev", "gen", &cgid, "{}",
+        )
+        .unwrap();
+        s.queue_v2_enqueue("occ-1", 0.5).unwrap();
+
+        // Worker A claims with a 1 ms lease.
+        let token_a = s.queue_v2_claim("occ-1", "worker-a", 1).unwrap().unwrap();
+        // While A's lease is valid, worker B cannot claim.
+        assert!(
+            s.queue_v2_claim("occ-1", "worker-b", 60_000)
+                .unwrap()
+                .is_none()
+        );
+        // A can heartbeat with its token.
+        assert!(
+            s.queue_v2_heartbeat("occ-1", "worker-a", token_a, 1)
+                .unwrap()
+        );
+
+        // Lease expires (1 ms) → B reclaims with a NEW fencing token.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reclaimed = s.queue_v2_reclaim_expired().unwrap();
+        assert_eq!(reclaimed, 1);
+        let token_b = s
+            .queue_v2_claim("occ-1", "worker-b", 60_000)
+            .unwrap()
+            .unwrap();
+        assert!(token_b > token_a, "reclaim must bump the fencing token");
+
+        // Stale worker A: heartbeat and completion must both be rejected.
+        assert!(
+            !s.queue_v2_heartbeat("occ-1", "worker-a", token_a, 1)
+                .unwrap()
+        );
+        assert!(!s.queue_v2_complete("occ-1", "worker-a", token_a).unwrap());
+
+        // Current worker B completes with its token.
+        assert!(s.queue_v2_complete("occ-1", "worker-b", token_b).unwrap());
+        let (_, _, done, _) = s.queue_v2_counts().unwrap();
+        assert_eq!(done, 1);
     }
 
     fn rec(unit: &str, vec: Vec<f32>) -> EmbeddingRecord {
@@ -1641,6 +2077,11 @@ mod tests {
             "sem_query_demand",
             "sem_generations",
             "sem_learned_tuning",
+            "sem_vector_spaces",
+            "sem_content_generations",
+            "sem_embeddings_v2",
+            "sem_embedding_occurrences",
+            "sem_queue_v2",
         ];
         for tbl in expected_tables {
             let exists: bool = conn
@@ -1677,6 +2118,11 @@ mod tests {
             "idx_sem_embeddings_model_repo",
             "idx_sem_queue_state",
             "idx_sem_gen_status",
+            "idx_sem_occ_unit",
+            "idx_sem_occ_canonical",
+            "idx_sem_occ_generation",
+            "idx_sem_queue_v2_state",
+            "idx_sem_queue_v2_lease",
         ];
         for idx in expected_indexes {
             let exists: bool = conn
@@ -1692,20 +2138,23 @@ mod tests {
             );
         }
 
-        // 3. Verify exactly one baseline migration is recorded
+        // 3. Verify exactly the known baseline migrations are recorded
         let migration_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sem_schema_migrations", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 1);
+        assert_eq!(migration_count, 2, "0001 + 0002 must both be recorded");
 
-        let migration_id: String = conn
-            .query_row("SELECT id FROM sem_schema_migrations LIMIT 1", [], |r| {
-                r.get(0)
-            })
+        let mut stmt = conn
+            .prepare("SELECT id FROM sem_schema_migrations ORDER BY id")
             .unwrap();
-        assert_eq!(migration_id, "0001_initial");
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(ids, vec!["0001_initial", "0002_identity_leases"]);
     }
 
     #[test]
@@ -1722,7 +2171,7 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(count, 1);
+            assert_eq!(count, 2);
         }
 
         // Second open on existing database
@@ -1735,7 +2184,7 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(count, 1);
+            assert_eq!(count, 2);
         }
     }
 }

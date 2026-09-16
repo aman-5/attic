@@ -15,7 +15,9 @@ use crate::error::StorageError;
 
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
 const VERSION_0001: &str = "0001_initial";
-const KNOWN_VERSIONS: &[&str] = &[VERSION_0001];
+const MIGRATION_0002: &str = include_str!("../../../migrations/0002_retrieval_occurrence.sql");
+const VERSION_0002: &str = "0002_retrieval_occurrence";
+const KNOWN_VERSIONS: &[&str] = &[VERSION_0001, VERSION_0002];
 
 /// Apply the pre-release QA baseline schema to `conn`.
 ///
@@ -46,6 +48,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     }
 
     apply_migration(conn, VERSION_0001, MIGRATION_0001)?;
+    apply_migration(conn, VERSION_0002, MIGRATION_0002)?;
     Ok(())
 }
 
@@ -176,6 +179,55 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_from_0001_only_applies_0002() {
+        // Simulate an existing database created before 0002 existed: apply
+        // the baseline directly (it self-records 0001), then run the full
+        // migration chain — 0002 must apply and the new columns must exist.
+        let conn = in_memory_conn();
+        conn.execute_batch(MIGRATION_0001).unwrap();
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM core_schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, 1, "baseline self-records only 0001");
+
+        run_migrations(&conn).expect("upgrade path must succeed");
+
+        let has_0002: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM core_schema_migrations WHERE id = '0002_retrieval_occurrence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_0002, 1, "0002 must be recorded after upgrade");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(core_retrieval_units)")
+            .unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for col in [
+            "canonical_text",
+            "canonical_hash",
+            "occurrence_metadata",
+            "coverage_state",
+        ] {
+            assert!(
+                columns.contains(&col.to_string()),
+                "upgraded DB must have column '{col}'"
+            );
+        }
+
+        // Idempotent: re-running the chain on the upgraded DB is a no-op.
+        run_migrations(&conn).expect("re-run on upgraded DB must succeed");
+    }
+
+    #[test]
     fn core_tables_exist_after_migration() {
         let conn = in_memory_conn();
         run_migrations(&conn).unwrap();
@@ -231,6 +283,10 @@ mod tests {
             "start_line",
             "end_line",
             "is_redacted",
+            "canonical_text",
+            "canonical_hash",
+            "occurrence_metadata",
+            "coverage_state",
         ] {
             assert!(
                 columns.contains(&col.to_string()),
