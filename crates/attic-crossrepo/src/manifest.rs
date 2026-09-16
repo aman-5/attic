@@ -53,6 +53,12 @@ pub fn parse_manifest(rel_path: &str, bytes: &[u8]) -> ManifestParse {
             parse_requirements_txt(&text)
         }
         ".gitmodules" => parse_gitmodules(&text),
+        // OSGi bundle manifest (bnd/Maven-bundle-plugin output). Only files
+        // that actually declare Bundle-SymbolicName produce identities — a
+        // plain JAR MANIFEST.MF yields nothing.
+        "MANIFEST.MF" => parse_osgi_manifest(rel_path, &text),
+        // AEM component definitions (jcr content packages).
+        ".content.xml" => parse_aem_content_xml(rel_path, &text),
         _ => ManifestParse::default(),
     }
 }
@@ -78,6 +84,9 @@ pub fn is_manifest_path(rel_path: &str) -> bool {
         || rel_path.ends_with("/pom.xml")
         || rel_path.ends_with("/go.mod")
         || rel_path.ends_with("/pyproject.toml")
+        || rel_path.ends_with("/MANIFEST.MF")
+        || rel_path == "MANIFEST.MF"
+        || rel_path.ends_with("/.content.xml")
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +961,181 @@ pub fn parse_proto_imports(rel_path: &str, bytes: &[u8]) -> ManifestParse {
     out
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// AEM — .content.xml component definitions (r12)
+// ---------------------------------------------------------------------------
+
+/// Parse an AEM content XML document (jcr). Provides the component's own
+/// resource-type path (the repo-relative directory under `apps/`), and
+/// declares `sling:resourceSuperType` when present (component inheritance
+/// across repositories is how AEM codebases link).
+fn parse_aem_content_xml(rel_path: &str, text: &str) -> ManifestParse {
+    let mut out = ManifestParse::default();
+    // Only component definitions under an apps/ tree participate.
+    let Some(apps_pos) = rel_path.find("/apps/") else {
+        return out;
+    };
+    let rt = rel_path[apps_pos + 1..]
+        .trim_end_matches("/.content.xml")
+        .to_string();
+    if rt.is_empty() || !rt.contains("/components/") {
+        return out;
+    }
+    out.provides.push(ProvidedIdentity {
+        ecosystem: Ecosystem::AemComponent,
+        name: rt,
+    });
+
+    // Attribute scan is enough: sling:resourceSuperType="..." is a single
+    // attribute on the root jcr:content element in well-formed components.
+    for needle in ["sling:resourceSuperType=\"", "sling:resourceSuperType='"] {
+        if let Some(start) = text.find(needle) {
+            let rest = &text[start + needle.len()..];
+            let quote = needle.chars().last().unwrap();
+            if let Some(end) = rest.find(quote) {
+                let target = rest[..end].trim();
+                if !target.is_empty() {
+                    out.declarations.push(DependencyDeclaration {
+                        path: rel_path.to_string(),
+                        ecosystem: Ecosystem::AemComponent,
+                        name: target.to_string(),
+                        version_req: None,
+                        kind: DeclarationKind::External,
+                        local_hint: None,
+                    });
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+// OSGi — MANIFEST.MF (r12)
+// ---------------------------------------------------------------------------
+
+/// Unfold RFC-style manifest continuation lines (a line starting with a
+/// space continues the previous header) into `name -> value` pairs.
+fn unfold_manifest_headers(text: &str) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in text.lines().take(10_000) {
+        if line.is_empty() {
+            break; // end of main attributes
+        }
+        if let Some(stripped) = line.strip_prefix(' ') {
+            if let Some(last) = headers.last_mut() {
+                last.1.push_str(stripped.trim_start());
+            }
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    headers
+}
+
+/// Split a package list on TOP-LEVEL commas only (attribute values may be
+/// quoted strings containing commas/semicolons, e.g. `version="[1.0,2.0)"`).
+fn split_osgi_packages(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(ch);
+            }
+            ',' if !in_quotes => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// Package name of one entry: text before the first `;` directive.
+fn osgi_package_name(entry: &str) -> &str {
+    entry.split(';').next().unwrap_or(entry).trim()
+}
+
+/// Version requirement of one entry: `version="..."` attribute if present.
+fn osgi_version_req(entry: &str) -> Option<String> {
+    for part in entry.split(';').skip(1) {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("version") {
+            let v = v.trim_start().strip_prefix('=')?.trim().trim_matches('"');
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Parse an OSGi bundle manifest. Provides: bundle symbolic name + every
+/// exported package. Declares: every imported package (with version range).
+fn parse_osgi_manifest(rel_path: &str, text: &str) -> ManifestParse {
+    let mut out = ManifestParse::default();
+    let headers = unfold_manifest_headers(text);
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+
+    let Some(bsn_raw) = get("Bundle-SymbolicName") else {
+        return out; // not an OSGi bundle — plain JAR manifest
+    };
+    let bsn = bsn_raw.split(';').next().unwrap_or(bsn_raw).trim();
+    if bsn.is_empty() {
+        out.diagnostics.push(format!("osgi_empty_bsn:{rel_path}"));
+        return out;
+    }
+    out.provides.push(ProvidedIdentity {
+        ecosystem: Ecosystem::Osgi,
+        name: bsn.to_string(),
+    });
+
+    if let Some(exports) = get("Export-Package") {
+        for entry in split_osgi_packages(exports) {
+            let pkg = osgi_package_name(&entry);
+            if !pkg.is_empty() {
+                out.provides.push(ProvidedIdentity {
+                    ecosystem: Ecosystem::Osgi,
+                    name: pkg.to_string(),
+                });
+            }
+        }
+    }
+    if let Some(imports) = get("Import-Package") {
+        for entry in split_osgi_packages(imports) {
+            let pkg = osgi_package_name(&entry);
+            if pkg.is_empty() {
+                continue;
+            }
+            out.declarations.push(DependencyDeclaration {
+                path: rel_path.to_string(),
+                ecosystem: Ecosystem::Osgi,
+                name: pkg.to_string(),
+                version_req: osgi_version_req(&entry),
+                kind: DeclarationKind::External,
+                local_hint: None,
+            });
+        }
+    }
+    out
+}
+
 /// Deduplicate declarations preserving deterministic order.
 pub fn dedupe_declarations(decls: &mut Vec<DependencyDeclaration>) {
     let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -1133,5 +1317,107 @@ mod tests {
         assert!(is_manifest_path("modules/core/pom.xml"));
         assert!(!is_manifest_path("src/main.rs"));
         assert!(!is_manifest_path("docs/package-lock.json"));
+    }
+}
+
+#[cfg(test)]
+mod osgi_tests {
+    use super::*;
+
+    const BUNDLE: &str = "Manifest-Version: 1.0\r\nBundle-ManifestVersion: 2\r\nBundle-SymbolicName: com.hdfc.payment.core\r\nBundle-Version: 1.2.3\r\nExport-Package: com.hdfc.payment.api;version=\"1.0.0\",\r\n com.hdfc.payment.spi;version=\"[1.1,2.0)\"\r\nImport-Package: com.hdfc.audit;version=\"[2.0,3.0)\",com.hdfc.logging\r\n";
+
+    #[test]
+    fn osgi_manifest_provides_bundle_and_exports() {
+        let out = parse_manifest("core/META-INF/MANIFEST.MF", BUNDLE.as_bytes());
+        let names: Vec<&str> = out.provides.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"com.hdfc.payment.core"), "{names:?}");
+        assert!(names.contains(&"com.hdfc.payment.api"), "{names:?}");
+        assert!(names.contains(&"com.hdfc.payment.spi"), "{names:?}");
+        assert!(
+            out.provides.iter().all(|p| p.ecosystem == Ecosystem::Osgi),
+            "all provided identities are OSGI"
+        );
+    }
+
+    #[test]
+    fn osgi_manifest_declares_imports_with_version_ranges() {
+        let out = parse_manifest("core/META-INF/MANIFEST.MF", BUNDLE.as_bytes());
+        let decls: Vec<(&str, Option<&str>)> = out
+            .declarations
+            .iter()
+            .map(|d| (d.name.as_str(), d.version_req.as_deref()))
+            .collect();
+        assert!(
+            decls.contains(&("com.hdfc.audit", Some("[2.0,3.0)"))),
+            "continuation line unfolded, quoted version parsed: {decls:?}"
+        );
+        assert!(decls.contains(&("com.hdfc.logging", None)), "{decls:?}");
+    }
+
+    #[test]
+    fn plain_jar_manifest_without_bsn_produces_nothing() {
+        let plain = "Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\n";
+        let out = parse_manifest("app/META-INF/MANIFEST.MF", plain.as_bytes());
+        assert!(out.provides.is_empty());
+        assert!(out.declarations.is_empty());
+    }
+
+    #[test]
+    fn manifest_mf_is_a_manifest_path() {
+        assert!(is_manifest_path("META-INF/MANIFEST.MF"));
+        assert!(is_manifest_path("bundles/core/META-INF/MANIFEST.MF"));
+        assert!(!is_manifest_path("META-INF/MANIFEST.txt"));
+    }
+}
+#[cfg(test)]
+mod aem_tests {
+    use super::*;
+
+    const COMPONENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" xmlns:sling="http://sling.apache.org/jcr/sling/1.0"
+    jcr:primaryType="cq:Component"
+    jcr:title="Payment Summary"
+    sling:resourceSuperType="hdfc/components/core/basecomponent"/>"#;
+
+    #[test]
+    fn aem_component_provides_resource_type_and_declares_supertype() {
+        let out = parse_manifest(
+            "ui.apps/src/main/content/jcr_root/apps/hdfc/components/paymentsummary/.content.xml",
+            COMPONENT.as_bytes(),
+        );
+        let names: Vec<&str> = out.provides.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["apps/hdfc/components/paymentsummary"],
+            "{names:?}"
+        );
+        assert_eq!(out.provides[0].ecosystem, Ecosystem::AemComponent);
+        assert_eq!(out.declarations.len(), 1);
+        assert_eq!(
+            out.declarations[0].name,
+            "hdfc/components/core/basecomponent"
+        );
+        assert_eq!(out.declarations[0].ecosystem, Ecosystem::AemComponent);
+    }
+
+    #[test]
+    fn content_xml_outside_apps_components_yields_nothing() {
+        let out = parse_manifest(
+            "ui.content/jcr_root/conf/x/.content.xml",
+            COMPONENT.as_bytes(),
+        );
+        assert!(out.provides.is_empty());
+        assert!(out.declarations.is_empty());
+    }
+
+    #[test]
+    fn content_xml_without_supertype_only_provides() {
+        let plain = r#"<jcr:root jcr:primaryType="cq:Component" jcr:title="Standalone"/>"#;
+        let out = parse_manifest(
+            "ui.apps/src/main/content/jcr_root/apps/hdfc/components/standalone/.content.xml",
+            plain.as_bytes(),
+        );
+        assert_eq!(out.provides.len(), 1);
+        assert!(out.declarations.is_empty());
     }
 }
