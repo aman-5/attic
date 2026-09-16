@@ -2,10 +2,10 @@
 //! (CARGO_BIN_EXE_attic-inference-worker). These prove the core r06 safety
 //! properties with real processes, no GPU required.
 
+use attic_inference_protocol::EmbedItem;
 use attic_inference_protocol::supervisor::{
     LoadParams, SupervisorError, WorkerLaunch, WorkerSupervisor,
 };
-use attic_inference_protocol::EmbedItem;
 use std::time::Duration;
 
 fn launch(mode: &str) -> WorkerLaunch {
