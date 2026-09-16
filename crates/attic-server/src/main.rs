@@ -6,6 +6,7 @@
 // arguments, and genuine bounded streaming for LARGE files.
 
 mod daemon;
+mod inference_worker;
 
 use attic_discovery::{
     DiscoveryPolicy, GlobRule, SecretScanDecision, canonicalize_within_root,
@@ -3560,6 +3561,13 @@ enum Ownership {
 /// immediately, running no destructors at all, so the runtime's blocking drop
 /// (and whatever it might be stuck waiting on) never gets a chance to run.
 fn main() {
+    // r06: `attic inference-worker` runs the supervised embedding worker
+    // loop on stdin/stdout — BEFORE any tokio runtime or logging setup, so
+    // stdout stays a clean protocol channel.
+    if std::env::args().any(|a| a == "inference-worker") {
+        std::process::exit(inference_worker::run_inference_worker());
+    }
+
     // Configure global thread ceilings once at process startup before runtime initialization (§21)
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get())

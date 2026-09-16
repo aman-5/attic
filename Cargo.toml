@@ -11,6 +11,7 @@ members = [
     "crates/attic-indexing",
     "crates/attic-incremental",
     "crates/attic-retrieval",
+    "crates/attic-inference-worker",
     "crates/attic-server",
 ]
 

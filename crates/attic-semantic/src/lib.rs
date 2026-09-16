@@ -38,6 +38,7 @@ pub mod selection;
 pub mod store;
 pub mod testing;
 pub mod throughput_controller;
+pub mod worker_supervisor;
 
 pub use cpu_isolation::CpuIsolationPlan;
 pub use deferred_provider::{DeferredProvider, ModelLifecycle};
@@ -78,6 +79,7 @@ pub use throughput_controller::{
     CandidateAllocation, ControllerAction, ControllerPhase, ThroughputController,
     ThroughputControllerConfig,
 };
+pub use worker_supervisor::SupervisedWorkerProvider;
 
 /// Re-exported canonical read types the layer consumes.
 pub use attic_storage::{SemanticUnitRow, UnitAnchor};

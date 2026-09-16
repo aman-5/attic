@@ -281,6 +281,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "attic-inference-worker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "attic-retrieval"
 version = "0.1.0"
 dependencies = [
@@ -308,6 +318,7 @@ version = "0.1.0"
 dependencies = [
  "attic-core",
  "attic-discovery",
+ "attic-inference-worker",
  "attic-storage",
  "blake3",
  "candle-core",
@@ -341,6 +352,7 @@ dependencies = [
  "attic-evidence",
  "attic-incremental",
  "attic-indexing",
+ "attic-inference-worker",
  "attic-retrieval",
  "attic-semantic",
  "attic-storage",

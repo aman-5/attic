@@ -1,0 +1,25 @@
+[package]
+name = "attic-inference-worker"
+description = "Isolated inference worker process + wire protocol (r06)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "attic_inference_protocol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "attic-inference-worker"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
