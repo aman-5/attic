@@ -20,7 +20,8 @@ use crate::error::SemanticError;
 use crate::instruction::{CODE_RETRIEVAL_V1_ID, format_query_instruction};
 use crate::provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
+    EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage,
+    SemanticProvider,
 };
 use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};

@@ -177,9 +177,9 @@ pub fn developer_machine_allowance_mib(total_memory_mib: u64) -> u64 {
     allowance.max(256)
 }
 
-    impl ResourcePolicy {
-        /// The baseline for a given mode — NOT yet clamped to real hardware.
-        /// `Balanced` deliberately mirrors today's exact hardcoded defaults
+impl ResourcePolicy {
+    /// The baseline for a given mode — NOT yet clamped to real hardware.
+    /// `Balanced` deliberately mirrors today's exact hardcoded defaults
     /// (`attic_core::resources`, `writer.rs` constants) so typical-hardware
     /// users see zero behavior change during rollout. `Low`/`Performance`
     /// are proposed starting points, not yet benchmark-tuned.

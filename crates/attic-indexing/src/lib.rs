@@ -25,6 +25,11 @@
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
+// clippy 1.98 `missing_const_for_thread_local` misfires on the test-only
+// ANALYZE_SINGLE_FILE_CALLS counter: its initializer already IS a const
+// block (the form the lint asks for), and an allow attribute cannot attach
+// to the thread_local! macro invocation — so it is scoped to test builds.
+#![cfg_attr(test, allow(clippy::missing_const_for_thread_local))]
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -32,7 +37,9 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use attic_analyzers::{AnalyzerContent, AnalyzerInput, AnalyzerRegistry, ResourceBudget};
+use attic_analyzers::{
+    AnalyzerContent, AnalyzerInput, AnalyzerRegistry, ResourceBudget, diagnostic_codes,
+};
 use attic_core::{
     CancellationToken, DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
     IndexGenerationId, RepositoryId, RetrievalUnitId, SecurityState, SourceRevisionId,
@@ -82,6 +89,18 @@ pub enum IndexError {
         paths.len()
     )]
     TransientFailures { paths: Vec<String> },
+    /// Fail-closed completeness contract: the analyzer reported that it could
+    /// not represent the whole file within its resource budget
+    /// (`RESOURCE_EXHAUSTED` — e.g. retrieval-unit cap reached mid-document).
+    /// Publishing those units would silently truncate indexed content, so the
+    /// file is treated as a transient failure: the completeness gate aborts
+    /// the run, nothing is published, and the previous generation remains
+    /// current. Raising the budget or fixing the chunker is required before
+    /// this content can index successfully — never publish partial units.
+    #[error(
+        "analysis incomplete for {path}: {reason}; nothing from this file will be published (fail-closed)"
+    )]
+    IncompleteAnalysis { path: String, reason: String },
     /// `discovery.downstream_classifications` is supposed to be positionally
     /// aligned with `discovery.entries` (one classification per entry, same
     /// order — see `attic_discovery::discover`). A length mismatch means
@@ -199,7 +218,12 @@ impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             repository_name: "default".to_owned(),
-            max_units_per_file: 512,
+            // Fail-closed per-file unit ceiling (r01). Sized from the measured
+            // worst case in the target corpora (~9,700 units for a 4.5 MiB
+            // JSON export) with ~10x headroom. Exceeding it aborts the run
+            // via IndexError::IncompleteAnalysis — never silently truncates.
+            // r03 replaces this ceiling with bounded staging/spilling.
+            max_units_per_file: 100_000,
             refresh_existing: true,
             structural: true,
             analysis_cache_flush_bytes: DEFAULT_ANALYSIS_CACHE_FLUSH_BYTES,
@@ -1732,6 +1756,27 @@ fn analyze_single_file(
     };
 
     let output = attic_analyzers::dispatch(registry, input);
+
+    // Fail-closed completeness gate (per-file): if the analyzer reported that
+    // a resource budget stopped it before the whole file was represented
+    // (RESOURCE_EXHAUSTED — e.g. the retrieval-unit cap was reached mid-way
+    // through a large JSON document), publishing these units would silently
+    // truncate indexed content. Treat the file as a transient failure so the
+    // generation-completeness gate aborts the run and the previous generation
+    // stays current. This deliberately also covers GenericAnalyzer fallback
+    // output: fallback preserves *text* coverage, but if the fallback itself
+    // hit the unit budget the file is still incomplete.
+    if let Some(diag) = output
+        .diagnostics
+        .iter()
+        .find(|d| d.code == diagnostic_codes::RESOURCE_EXHAUSTED)
+    {
+        return Err(IndexError::IncompleteAnalysis {
+            path: rec.repo_relative.clone(),
+            reason: diag.message.clone(),
+        });
+    }
+
     let analyzer_id = output.analyzer_id.as_str().to_owned();
     let analyzer_version = output.analyzer_version.as_str().to_owned();
 
@@ -3139,7 +3184,14 @@ mod tests {
         std::fs::write(fx._dir.path().join("large_safe.rs"), &content).unwrap();
 
         let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions::default();
+        // This test verifies the LARGE-file streaming protocol, not budget
+        // behavior. Since r01, RESOURCE_EXHAUSTED fails closed, so a
+        // 200k-line file under the default 512-unit budget would correctly
+        // abort the generation; give it a budget that fits the content.
+        let opts = IndexOptions {
+            max_units_per_file: 1_000_000,
+            ..IndexOptions::default()
+        };
         let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
         assert_eq!(result.files_indexed, 1);
         assert!(!search_hits(&fx, "large_safe_token").is_empty());
@@ -3170,7 +3222,12 @@ mod tests {
         std::fs::write(fx._dir.path().join("large_redacted.rs"), &content).unwrap();
 
         let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions::default();
+        // Streaming/redaction protocol test — needs a unit budget that fits
+        // the content now that RESOURCE_EXHAUSTED fails closed (r01).
+        let opts = IndexOptions {
+            max_units_per_file: 1_000_000,
+            ..IndexOptions::default()
+        };
         let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
             .expect("LARGE+Redacted must stream, not error with content=None (P0-2)");
         assert_eq!(result.files_indexed, 1);
@@ -3342,6 +3399,74 @@ mod tests {
             "new content must never be published while the generation is incomplete"
         );
         assert_eq!(search_hits(&fx, "locked_token").len(), 1);
+    }
+
+    /// Fail-closed completeness: when an analyzer reports RESOURCE_EXHAUSTED
+    /// (its unit budget stopped it before the whole file was represented),
+    /// indexing must NOT publish the truncated units. The file is recorded
+    /// as a transient failure, the whole generation aborts, and the previous
+    /// generation (if any) remains current. A retry with an adequate budget
+    /// must then index the same content fully.
+    #[test]
+    fn resource_exhausted_analysis_aborts_generation_previous_state_preserved() {
+        let fx = make_store();
+        // 8 top-level keys, each with a ~600-char value: the JsonAnalyzer
+        // decomposes the oversized root into one unit per child, so the file
+        // needs 8 units — far above the tight budget below.
+        let mut obj = serde_json::Map::new();
+        for i in 0..8 {
+            obj.insert(
+                format!("k{i}"),
+                serde_json::Value::String(format!("json_budget_token_{i} {}", "x".repeat(600))),
+            );
+        }
+        let json_text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
+        write_file(fx._dir.path(), "big.json", &json_text);
+        write_file(fx._dir.path(), "ok.rs", "fn budget_ok_token() {}\n");
+
+        let policy = DiscoveryPolicy::default_git();
+        let s = store(&fx);
+
+        let tight = IndexOptions {
+            max_units_per_file: 2,
+            ..IndexOptions::default()
+        };
+        let result = index_repository(&s, fx._dir.path(), &policy, &tight);
+        match result {
+            Err(IndexError::TransientFailures { paths }) => {
+                assert!(
+                    paths.iter().any(|p| p == "big.json"),
+                    "big.json must be recorded as a failed path: {paths:?}"
+                );
+            }
+            other => panic!(
+                "resource exhaustion must abort the whole generation with \
+                 TransientFailures, never publish truncated units; got {other:?}"
+            ),
+        }
+        assert!(
+            search_hits(&fx, "budget_ok_token").is_empty(),
+            "nothing may be published from an incomplete generation"
+        );
+        assert!(
+            search_hits(&fx, "json_budget_token_0").is_empty(),
+            "truncated JSON units must never become searchable"
+        );
+
+        // Retry with an adequate budget: the same content now indexes fully.
+        let wide = IndexOptions {
+            max_units_per_file: 10_000,
+            ..IndexOptions::default()
+        };
+        let result = index_repository(&s, fx._dir.path(), &policy, &wide).unwrap();
+        assert!(result.files_indexed >= 2);
+        for i in 0..8 {
+            assert!(
+                !search_hits(&fx, &format!("json_budget_token_{i}")).is_empty(),
+                "json_budget_token_{i} must be searchable after a complete run"
+            );
+        }
+        assert!(!search_hits(&fx, "budget_ok_token").is_empty());
     }
 
     /// PR-7 acceptance test: N files, one transiently fails. The first

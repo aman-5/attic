@@ -736,7 +736,7 @@ mod generation_driven_enrichment_tests {
 
     #[test]
     fn worker_count_honors_provider_concurrency_contract() {
-        use crate::provider::{ExecutionBackend, ProviderConcurrencyContract};
+        use crate::provider::ProviderConcurrencyContract;
 
         assert_eq!(
             ProviderConcurrencyContract::Serialized.effective_workers(8),

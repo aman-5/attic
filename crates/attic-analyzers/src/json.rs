@@ -105,7 +105,9 @@ impl Analyzer for JsonAnalyzer {
         let text = match String::from_utf8(bytes) {
             Ok(t) => t,
             Err(_) => {
-                diagnostics.push(AnalyzerDiagnostic::warning(
+                // Error severity: dispatch must fall back to GenericAnalyzer
+                // so the bytes are still fully indexed as plain text.
+                diagnostics.push(AnalyzerDiagnostic::error(
                     diagnostic_codes::MALFORMED_INPUT,
                     "JSON input is not valid UTF-8; falling back to generic chunking.",
                 ));
@@ -116,10 +118,11 @@ impl Analyzer for JsonAnalyzer {
         let value: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                // Malformed JSON: emit the diagnostic and produce NO units —
-                // dispatch falls back to GenericAnalyzer so every byte is
-                // still indexed as plain text, and the file is reported.
-                diagnostics.push(AnalyzerDiagnostic::warning(
+                // Malformed JSON: emit an ERROR diagnostic and produce NO
+                // units — dispatch falls back to GenericAnalyzer (fallback is
+                // keyed on error severity) so every byte is still indexed as
+                // plain text, and the file is reported.
+                diagnostics.push(AnalyzerDiagnostic::error(
                     diagnostic_codes::MALFORMED_INPUT,
                     format!("JSON parse failed ({e}); falling back to plain-text chunking"),
                 ));
@@ -142,6 +145,7 @@ impl Analyzer for JsonAnalyzer {
             max_units,
             env: env_label.as_deref(),
             cancelled: false,
+            budget_reported: false,
         };
         chunk_value(&value, "", &mut state, 0, &input.cancellation_token);
 
@@ -218,6 +222,31 @@ struct ChunkState<'a> {
     max_units: usize,
     env: Option<&'a str>,
     cancelled: bool,
+    /// True once a RESOURCE_EXHAUSTED diagnostic has been emitted for the
+    /// unit budget — the budget can be hit at many recursion levels; the
+    /// diagnostic must appear exactly once, not once per aborted node.
+    budget_reported: bool,
+}
+
+impl ChunkState<'_> {
+    /// Record that the retrieval-unit budget stopped analysis before every
+    /// subtree was represented. The output is INCOMPLETE by definition; the
+    /// indexing layer treats this code as a hard completeness failure that
+    /// must block generation publication (fail-closed), never as a silent
+    /// truncation.
+    fn report_budget_exhausted(&mut self) {
+        if self.budget_reported {
+            return;
+        }
+        self.budget_reported = true;
+        self.diagnostics.push(AnalyzerDiagnostic::warning(
+            diagnostic_codes::RESOURCE_EXHAUSTED,
+            format!(
+                "retrieval-unit budget ({} units) exhausted before the whole JSON document was chunked; output is incomplete",
+                self.max_units
+            ),
+        ));
+    }
 }
 
 /// Serialize a JSON value canonically: compact, object keys sorted. Identical
@@ -230,7 +259,13 @@ fn canonical(v: &serde_json::Value) -> String {
             keys.sort();
             let inner: Vec<String> = keys
                 .into_iter()
-                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical(&map[k])))
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical(&map[k])
+                    )
+                })
                 .collect();
             format!("{{{}}}", inner.join(","))
         }
@@ -259,6 +294,7 @@ fn chunk_value(
         return;
     }
     if state.units.len() >= state.max_units {
+        state.report_budget_exhausted();
         return;
     }
 
@@ -282,7 +318,11 @@ fn chunk_value(
             for k in keys {
                 let child_ptr = format!("{}/{}", pointer, escape_pointer(k));
                 chunk_value(&map[k], &child_ptr, state, ordinal_start, cancel);
-                if state.cancelled || state.units.len() >= state.max_units {
+                if state.cancelled {
+                    return;
+                }
+                if state.units.len() >= state.max_units {
+                    state.report_budget_exhausted();
                     return;
                 }
             }
@@ -291,7 +331,11 @@ fn chunk_value(
             for (i, item) in arr.iter().enumerate() {
                 let child_ptr = format!("{}/{}", pointer, i);
                 chunk_value(item, &child_ptr, state, ordinal_start, cancel);
-                if state.cancelled || state.units.len() >= state.max_units {
+                if state.cancelled {
+                    return;
+                }
+                if state.units.len() >= state.max_units {
+                    state.report_budget_exhausted();
                     return;
                 }
             }
@@ -303,16 +347,17 @@ fn chunk_value(
             let full = format!("{header}{body}");
             let mut offset = 0usize;
             while offset < full.len() && state.units.len() < state.max_units {
-                let end = (offset + TARGET_CHUNK_CHARS).min(full.len());
-                let end = full.floor_char_boundary(end);
+                let mut end = (offset + TARGET_CHUNK_CHARS).min(full.len());
+                // MSRV 1.89 has no str::floor_char_boundary — walk back to
+                // the nearest UTF-8 char boundary manually.
+                while !full.is_char_boundary(end) {
+                    end -= 1;
+                }
                 push_unit(state, String::new(), &full[offset..end], ordinal_start);
                 offset = end;
             }
             if offset < full.len() {
-                state.diagnostics.push(AnalyzerDiagnostic::warning(
-                    diagnostic_codes::RESOURCE_EXHAUSTED,
-                    "unit budget reached while splitting an oversized JSON scalar",
-                ));
+                state.report_budget_exhausted();
             }
         }
     }
@@ -371,14 +416,40 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_produces_diagnostic_and_no_units() {
+    fn malformed_json_produces_error_diagnostic_and_no_units() {
         let out = JsonAnalyzer::new().analyze(input_for("{not json", "x.json"));
         assert!(out.retrieval_units.is_empty());
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|d| d.code == diagnostic_codes::MALFORMED_INPUT)
-        );
+        let diag = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == diagnostic_codes::MALFORMED_INPUT)
+            .expect("malformed input must carry MALFORMED_INPUT diagnostic");
+        // Error severity is what makes dispatch fall back to GenericAnalyzer;
+        // a warning here previously meant the file vanished from the index.
+        assert_eq!(diag.severity, crate::api::DiagnosticSeverity::Error);
+        assert!(out.has_errors());
+    }
+
+    #[test]
+    fn unit_budget_exhaustion_is_reported_exactly_once() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..20 {
+            obj.insert(
+                format!("key_{i:03}"),
+                serde_json::Value::String("x".repeat(100)),
+            );
+        }
+        let text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
+        let mut input = input_for(&text, "data.json");
+        input.resource_budget.max_retrieval_units = 3;
+        let out = JsonAnalyzer::new().analyze(input);
+        let hits = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == diagnostic_codes::RESOURCE_EXHAUSTED)
+            .count();
+        assert_eq!(hits, 1, "budget exhaustion reported exactly once");
+        assert!(out.retrieval_units.len() <= 3);
     }
 
     #[test]

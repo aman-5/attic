@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use crate::error::SemanticError;
 use crate::provider::{
-    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, ExecutionBackend, EmbeddingInput, EmbeddingOutput,
-    EmbeddingProvider, ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
+    CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
+    EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage,
+    SemanticProvider,
 };
 
 /// Deterministic feature-hashing embedder ("hashing", model "hashed-ngram-v1").

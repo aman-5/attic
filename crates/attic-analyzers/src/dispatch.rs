@@ -952,6 +952,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_malformed_json_falls_back_to_generic_and_indexes_as_text() {
+        // Regression: JsonAnalyzer previously reported parse failure as a
+        // WARNING, so dispatch kept its empty output and the file silently
+        // vanished from the index. With error severity, fallback must fire.
+        let registry = crate::structural::default_registry();
+        let input = make_text_input("{not valid json at all\nsecond line\n", FileType::Json);
+
+        let output = dispatch(&registry, input);
+
+        assert_eq!(output.analyzer_id, "generic");
+        assert!(output.fallback_used);
+        assert!(
+            !output.retrieval_units.is_empty(),
+            "malformed JSON must still be indexed as plain text"
+        );
+        let codes: Vec<&str> = output.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&diagnostic_codes::MALFORMED_INPUT));
+        assert!(codes.contains(&diagnostic_codes::FALLBACK_USED));
+    }
+
+    #[test]
     fn dispatch_specialized_panic_caught_adds_panic_caught_and_fallback_used() {
         let stub = Arc::new(PanicStub::new(FileType::Rust));
         let registry = registry_with_specialized(stub as Arc<dyn Analyzer>);

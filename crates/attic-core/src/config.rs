@@ -334,6 +334,16 @@ pub struct IndexingOverride {
     /// explicitly set.
     #[serde(default = "default_structural_indexing")]
     pub structural: bool,
+    /// Hard ceiling on retrieval units produced per file (maps to
+    /// `attic_indexing::IndexOptions::max_units_per_file`). Since r01 this is
+    /// FAIL-CLOSED: a file that exceeds the budget aborts the whole indexing
+    /// generation rather than publishing silently truncated units. The
+    /// default (100,000) is sized from the measured worst case in the target
+    /// corpora (~9,700 units for a 4.5 MiB JSON export) with ~10x headroom;
+    /// `None` = use the built-in default. Lower it only to make exhaustion
+    /// failures surface earlier, never as a coverage fix.
+    #[serde(default)]
+    pub max_units_per_file: Option<usize>,
 }
 
 impl Default for IndexingOverride {
@@ -341,6 +351,7 @@ impl Default for IndexingOverride {
         Self {
             exclude: Vec::new(),
             structural: true,
+            max_units_per_file: None,
         }
     }
 }
@@ -420,6 +431,10 @@ model = "qwen3-embedding-0.6b"
 # Kill-switch: set to false to fall back to lexical-only indexing (no
 # structural/AST analysis) if structural analysis misbehaves on this codebase.
 # structural = true
+
+# Hard per-file retrieval-unit ceiling. FAIL-CLOSED: exceeding it aborts the
+# indexing run instead of silently dropping content. Default 100000.
+# max_units_per_file = 100000
 "#;
 
 #[cfg(test)]
@@ -446,6 +461,17 @@ mod tests {
             result2.is_err(),
             "production config must reject legacy [embedding] table entirely"
         );
+    }
+
+    #[test]
+    fn indexing_config_accepts_max_units_per_file() {
+        let cfg = AtticConfig::parse_str("[indexing]\nmax_units_per_file = 2048\n").unwrap();
+        assert_eq!(cfg.indexing.max_units_per_file, Some(2048));
+        let default = AtticConfig::parse_str("").unwrap();
+        assert_eq!(default.indexing.max_units_per_file, None);
+        // The shipped template must parse and leave the override absent.
+        let template = AtticConfig::parse_str(ATTIC_TOML_TEMPLATE).unwrap();
+        assert_eq!(template.indexing.max_units_per_file, None);
     }
 
     #[test]

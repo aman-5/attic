@@ -405,7 +405,10 @@ mod identity_split_tests {
         let a = fp("rev1");
         let mut b = fp("rev1");
         b.execution_backend = ExecutionBackend::OrtDirectMl;
-        assert_eq!(a.content_generation_id("sel_v1"), b.content_generation_id("sel_v1"));
+        assert_eq!(
+            a.content_generation_id("sel_v1"),
+            b.content_generation_id("sel_v1")
+        );
     }
 
     #[test]

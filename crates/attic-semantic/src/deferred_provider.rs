@@ -91,14 +91,11 @@ impl DeferredProvider {
     }
 
     fn current(&self) -> Arc<dyn SemanticProvider> {
-        self.inner
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| {
-                Arc::new(UnavailableProvider {
-                    reason: "provider lock poisoned".into(),
-                })
+        self.inner.read().map(|g| g.clone()).unwrap_or_else(|_| {
+            Arc::new(UnavailableProvider {
+                reason: "provider lock poisoned".into(),
             })
+        })
     }
 }
 
@@ -166,9 +163,18 @@ mod tests {
     #[test]
     fn lifecycle_states_report_distinctly() {
         assert_eq!(ModelLifecycle::Missing.as_str(), "missing");
-        assert!(ModelLifecycle::Downloading { attempt: 2 }.as_str().contains("attempt=2"));
-        assert!(ModelLifecycle::Backoff { attempt: 1, reason: "x".into() }
+        assert!(
+            ModelLifecycle::Downloading { attempt: 2 }
+                .as_str()
+                .contains("attempt=2")
+        );
+        assert!(
+            ModelLifecycle::Backoff {
+                attempt: 1,
+                reason: "x".into()
+            }
             .as_str()
-            .contains("backoff"));
+            .contains("backoff")
+        );
     }
 }

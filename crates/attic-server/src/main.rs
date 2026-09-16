@@ -297,7 +297,9 @@ fn resolve_semantic_provider(
                     return Arc::new(p);
                 }
                 Err(e) => {
-                    tracing::warn!("DirectML provider init failed ({e}); falling back to candle CPU");
+                    tracing::warn!(
+                        "DirectML provider init failed ({e}); falling back to candle CPU"
+                    );
                 }
             }
         }
@@ -669,6 +671,13 @@ impl AtticServer {
             .collect();
         let opts = IndexOptions {
             structural: self.attic_config.indexing.structural,
+            // Configurable fail-closed unit ceiling ([indexing]
+            // max_units_per_file in attic.toml); absent → library default.
+            max_units_per_file: self
+                .attic_config
+                .indexing
+                .max_units_per_file
+                .unwrap_or_else(|| IndexOptions::default().max_units_per_file),
             ..IndexOptions::default()
         };
         let result = attic_indexing::index_repository_with_cancellation(
@@ -4609,6 +4618,7 @@ mod tests {
                 IndexError::PolicyHash(_) => {}
                 IndexError::RepositoryNotBootstrapped(_) => {}
                 IndexError::TransientFailures { .. } => {}
+                IndexError::IncompleteAnalysis { .. } => {}
                 IndexError::ClassificationCountMismatch { .. } => {}
                 IndexError::ClassificationPathMismatch { .. } => {}
                 IndexError::Cancelled => {}

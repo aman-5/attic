@@ -137,9 +137,7 @@ impl OrtDirectMlProvider {
         if target_dims > NATIVE_DIMS {
             return Err(SemanticError::ProviderUnavailable {
                 provider: ORT_PROVIDER_ID.into(),
-                reason: format!(
-                    "dimension override {target_dims} exceeds native {NATIVE_DIMS}"
-                ),
+                reason: format!("dimension override {target_dims} exceeds native {NATIVE_DIMS}"),
             });
         }
 
@@ -187,9 +185,7 @@ impl OrtDirectMlProvider {
             mask_flat.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
             real_tokens.push(enc.get_attention_mask().iter().filter(|&&m| m == 1).count());
         }
-        let pos_flat: Vec<i64> = (0..batch as i64)
-            .flat_map(|_| 0..seq_len as i64)
-            .collect();
+        let pos_flat: Vec<i64> = (0..batch as i64).flat_map(|_| 0..seq_len as i64).collect();
 
         let to_tensor = |v: Vec<i64>| -> Result<Tensor<i64>, SemanticError> {
             let arr = Array2::from_shape_vec((batch, seq_len), v)
@@ -201,7 +197,10 @@ impl OrtDirectMlProvider {
         let empty_kv = Array4::<f16>::zeros((batch, NUM_KV_HEADS, 0, HEAD_DIM));
         let mut inputs: Vec<(String, ort::value::DynValue)> = vec![
             ("input_ids".into(), to_tensor(ids_flat)?.into_dyn()),
-            ("attention_mask".into(), to_tensor(mask_flat.clone())?.into_dyn()),
+            (
+                "attention_mask".into(),
+                to_tensor(mask_flat.clone())?.into_dyn(),
+            ),
             ("position_ids".into(), to_tensor(pos_flat)?.into_dyn()),
         ];
         for layer in 0..NUM_LAYERS {
@@ -213,7 +212,12 @@ impl OrtDirectMlProvider {
         }
 
         let outputs = session
-            .run(inputs.iter().map(|(n, t)| (n.as_str(), t)).collect::<Vec<_>>())
+            .run(
+                inputs
+                    .iter()
+                    .map(|(n, t)| (n.as_str(), t))
+                    .collect::<Vec<_>>(),
+            )
             .map_err(|e| SemanticError::EmbeddingFailed(format!("DirectML run: {e}")))?;
 
         let out = outputs
@@ -325,7 +329,10 @@ impl SemanticProvider for OrtDirectMlProvider {
                 end += 1;
             }
 
-            let texts: Vec<&str> = indexed[start..end].iter().map(|(_, i)| i.text.as_str()).collect();
+            let texts: Vec<&str> = indexed[start..end]
+                .iter()
+                .map(|(_, i)| i.text.as_str())
+                .collect();
             let (pooled, real_tokens) = {
                 let mut guard = self
                     .session
