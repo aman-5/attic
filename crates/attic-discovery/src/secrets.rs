@@ -526,6 +526,14 @@ impl LargeFileStream {
             }
         }
         let redacted_emit_end = compute_redacted_offset(&scan.findings, &window_str, safe_emit_len);
+        // The offset arithmetic above operates on byte counts across
+        // redaction substitutions; a finding boundary can land mid-UTF-8
+        // sequence (observed panicking on a real multi-MB corpus file).
+        // Floor to the nearest char boundary — slicing must never panic.
+        let mut redacted_emit_end = redacted_emit_end.min(scan.redacted.len());
+        while !scan.redacted.is_char_boundary(redacted_emit_end) {
+            redacted_emit_end -= 1;
+        }
         let emitted_redacted = scan.redacted[..redacted_emit_end].to_string();
         self.withheld = window[safe_emit_len..].to_vec();
         self.withheld_file_offset = window_file_base + safe_emit_len;
