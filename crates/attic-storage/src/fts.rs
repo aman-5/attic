@@ -197,14 +197,41 @@ pub fn insert_retrieval_unit_with_fts(
     conn: &Connection,
     unit: &NewRetrievalUnit<'_>,
 ) -> Result<i64, StorageError> {
+    insert_retrieval_unit_inner(conn, unit, None, None)
+}
+
+/// r03 publication variant: persists the canonical body and per-occurrence
+/// provenance alongside the retrieval text. `canonical_hash` is computed
+/// from the canonical body when present, else from `retrieval_text` —
+/// identical for undecorated units, and matching what the semantic layer
+/// hashes for legacy rows.
+pub fn insert_retrieval_unit_canonical(
+    conn: &Connection,
+    unit: &NewRetrievalUnit<'_>,
+    canonical_text: Option<&str>,
+    occurrence_metadata: Option<&str>,
+) -> Result<i64, StorageError> {
+    insert_retrieval_unit_inner(conn, unit, canonical_text, occurrence_metadata)
+}
+
+fn insert_retrieval_unit_inner(
+    conn: &Connection,
+    unit: &NewRetrievalUnit<'_>,
+    canonical_text: Option<&str>,
+    occurrence_metadata: Option<&str>,
+) -> Result<i64, StorageError> {
+    let canonical_hash = blake3::hash(canonical_text.unwrap_or(unit.retrieval_text).as_bytes())
+        .to_hex()
+        .to_string();
     conn.execute(
         "INSERT INTO core_retrieval_units
              (id, repository_id, file_occurrence_id, index_generation_id,
               retrieval_text, analyzer_id, analyzer_version,
               start_line, end_line, is_redacted,
-              lexical_state, semantic_state, freshness_state)
+              lexical_state, semantic_state, freshness_state,
+              canonical_text, canonical_hash, occurrence_metadata)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 'CURRENT', 'NONE', 'CURRENT')",
+                 'CURRENT', 'NONE', 'CURRENT', ?11, ?12, ?13)",
         rusqlite::params![
             unit.id,
             unit.repository_id,
@@ -216,6 +243,9 @@ pub fn insert_retrieval_unit_with_fts(
             unit.start_line,
             unit.end_line,
             unit.is_redacted as i32,
+            canonical_text,
+            canonical_hash,
+            occurrence_metadata,
         ],
     )?;
     let rowid = conn.last_insert_rowid();

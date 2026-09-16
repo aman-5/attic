@@ -217,21 +217,24 @@ pub fn drive(
             std::collections::HashMap::new();
         for r in rows {
             meta.insert(r.unit_id.clone(), r.clone());
-            let scan = secrets::scan_and_redact(&r.retrieval_text);
+            // Scan the CANONICAL text — that is what reaches the provider
+            // (r03). retrieval_text may carry pointer/env headers; canonical
+            // text is the exact embedded body.
+            let scan = secrets::scan_and_redact(&r.canonical_text);
             if !scan.findings.is_empty() {
                 tracing::warn!("semantic enrichment refused secret-bearing unit");
                 store.queue_fail_permanently(&r.unit_id)?;
                 stats.skipped_secret += 1;
                 continue;
             }
-            if r.retrieval_text.len() > provider.max_input_bytes() {
+            if r.canonical_text.len() > provider.max_input_bytes() {
                 store.queue_fail_permanently(&r.unit_id)?;
                 stats.failed_items += 1;
                 continue;
             }
             inputs.push(EmbeddingInput {
                 unit_key: r.unit_id.clone(),
-                text: r.retrieval_text.clone(),
+                text: r.canonical_text.clone(),
             });
         }
         // [FIX] A unit claimed via `items`/`ids` that never came back from
@@ -284,7 +287,7 @@ pub fn drive(
                 r.source_revision_id.clone(),
                 r.index_generation_id.clone(),
                 SEMANTIC_SELECTION_VERSION,
-                &r.retrieval_text,
+                &r.canonical_text,
             );
             EmbeddingRecord {
                 retrieval_unit_id: identity.retrieval_unit_id,

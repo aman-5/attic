@@ -255,6 +255,8 @@ impl Analyzer for ThirdPartyLang {
             retrieval_units: vec![attic_analyzers::RetrievalUnitSpec {
                 span: SourceSpan::new(0, 0, 1, 8),
                 retrieval_text: "third-party token".into(),
+                canonical_text: None,
+                occurrence_metadata: None,
                 ordinal: 0,
                 structural_node_index: None,
             }],

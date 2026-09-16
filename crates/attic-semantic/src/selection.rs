@@ -398,11 +398,20 @@ pub fn select_units(
             report.exclude(EX_FILE_TOO_BIG);
             continue;
         }
-        if r.retrieval_text.len() > cfg.max_input_bytes {
+        if r.canonical_text.len() > cfg.max_input_bytes {
             report.exclude(EX_TOO_LARGE);
             continue;
         }
-        let ch = crate::identity::content_hash(&r.retrieval_text);
+        // Dedup on the CANONICAL body (r03): occurrence decoration (JSON
+        // pointer / environment headers) lives outside the hash, so identical
+        // logical content across files and environments collapses to one
+        // embedding. Prefer the pipeline-recorded hash; legacy rows (pre-0002)
+        // hash the canonical text here — identical result for undecorated
+        // units, where canonical_text == retrieval_text.
+        let ch = r
+            .canonical_hash
+            .clone()
+            .unwrap_or_else(|| crate::identity::content_hash(&r.canonical_text));
         if seen_content.insert(ch, ()).is_some() {
             report.exclude(EX_DUPLICATE);
             continue;
@@ -413,7 +422,7 @@ pub fn select_units(
         let structural = (n * 0.25).min(1.0);
         let sdef = r.file_symbol_defs.max(0) as f64;
         let symbol_importance = (sdef * 0.2).min(1.0);
-        let size = size_fit(r.retrieval_text.len());
+        let size = size_fit(r.canonical_text.len());
         let repo_n = repo_sizes
             .get(r.repository_id.as_str())
             .copied()
@@ -521,7 +530,34 @@ mod tests {
             // Small enough to stay far under `DEFAULT_SEMANTIC_MAX_FILE_BYTES`
             // so the admission size gate never fires in pre-existing tests.
             size_bytes: 100,
+            canonical_hash: None,
+            canonical_text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn canonical_hash_dedups_across_decorated_occurrences() {
+        // r03: two units with DIFFERENT retrieval_text (different JSON
+        // pointer/env headers) but the SAME canonical body must dedup.
+        let body = "{\"service\":\"payment\"}";
+        let hash = crate::identity::content_hash(body);
+        let mut a = row(
+            "u-dev",
+            "DEV-Form.json",
+            "CONFIG",
+            "// json-pointer: /s (env: DEV)\n",
+        );
+        let mut b = row(
+            "u-prod",
+            "PROD-Form.json",
+            "CONFIG",
+            "// json-pointer: /s (env: PROD)\n",
+        );
+        a.canonical_hash = Some(hash.clone());
+        b.canonical_hash = Some(hash);
+        let (sel, rep) = select_units(&vec![a, b], &HashMap::new(), &SelectionConfig::default());
+        assert_eq!(sel.len(), 1, "identical canonical bodies dedup to one");
+        assert_eq!(rep.excluded.get(EX_DUPLICATE), Some(&1));
     }
 
     #[test]

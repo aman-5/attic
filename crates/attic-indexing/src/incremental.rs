@@ -409,6 +409,8 @@ pub fn index_changes(
             index_generation_id: gen_id_str.clone(),
             repository_id: repo_id_str.clone(),
             retrieval_text: u.retrieval_text,
+            canonical_text: u.canonical_text,
+            occurrence_metadata: u.occurrence_metadata,
             analyzer_id: u.analyzer_id,
             analyzer_version: u.analyzer_version,
             start_line: u.start_line,

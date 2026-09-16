@@ -458,6 +458,33 @@ where
 ///   are scanned; a `PARTIAL_SECRET_SCAN` diagnostic is recorded; the
 ///   classification is always [`DownstreamClassification::PartialScan`], never
 ///   `Safe`, because the mid-body was not inspected.
+/// r03: explicit terminal verdict for document formats Attic does not parse.
+/// Extension selects the candidate; when the file's bytes are already in hand
+/// (SMALL-tier prefetch), the magic signature must confirm — a `.pdf`-named
+/// text file is still indexable text, and a `.txt`-named PDF is caught by the
+/// generic binary path instead.
+fn unsupported_document_reason(repo_relative: &str, bytes: Option<&[u8]>) -> Option<String> {
+    let lower = repo_relative.to_ascii_lowercase();
+    let (name, magic): (&str, &[u8]) = if lower.ends_with(".pdf") {
+        ("PDF", b"%PDF-")
+    } else if lower.ends_with(".docx") {
+        // DOCX is a ZIP container.
+        ("DOCX", b"PK\x03\x04")
+    } else {
+        return None;
+    };
+    if let Some(b) = bytes
+        && !b.starts_with(magic)
+    {
+        // Extension claims a document format but the bytes disagree — treat
+        // as ordinary content and let the normal text path decide.
+        return None;
+    }
+    Some(format!(
+        "unsupported document format ({name}) — not indexed; convert to text/markdown to make it searchable"
+    ))
+}
+
 fn classify_file_for_downstream(
     abs_path: &Path,
     repo_relative: &str,
@@ -481,6 +508,15 @@ fn classify_file_for_downstream(
     };
 
     let size_tier = secrets::classify_file_size(size_bytes);
+
+    // r03: known unsupported document formats get an explicit terminal
+    // verdict with a precise reason — distinct from the generic
+    // "not valid UTF-8 (binary)" message, so corpus reports can tell
+    // "unsupported type" apart from arbitrary binary content. Magic bytes
+    // confirm the format when the (already read) small-file bytes exist.
+    if let Some(reason) = unsupported_document_reason(repo_relative, prefetched_small.as_deref()) {
+        return (DownstreamClassification::ScanSkipped { reason }, None);
+    }
 
     match size_tier {
         FileSizeTier::Small => {
@@ -759,6 +795,57 @@ mod tests {
             .collect();
         assert!(paths.contains(&"src/main.rs"));
         assert!(paths.contains(&"src/lib.rs"));
+    }
+
+    #[test]
+    fn pdf_and_docx_get_explicit_unsupported_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        fs::write(root.join("report.pdf"), b"%PDF-1.7\nbinary-stuff\xFF\xFE").unwrap();
+        fs::write(root.join("bundle.docx"), b"PK\x03\x04zip-bytes\x00\xFF").unwrap();
+
+        let policy = DiscoveryPolicy::default_git();
+        let output = discover(root, &policy).unwrap();
+
+        for (path, fmt) in [("report.pdf", "PDF"), ("bundle.docx", "DOCX")] {
+            let (_, class) = output
+                .downstream_classifications
+                .iter()
+                .find(|(p, _)| p == path)
+                .unwrap_or_else(|| panic!("{path} must be classified"));
+            match class {
+                DownstreamClassification::ScanSkipped { reason } => {
+                    assert!(
+                        reason.contains(fmt),
+                        "{path} must report unsupported {fmt}: {reason}"
+                    );
+                }
+                other => panic!("{path} must be ScanSkipped with explicit reason, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_named_like_a_document_is_still_indexed() {
+        // Magic-byte confirmation: a .pdf file whose bytes are plain text is
+        // NOT an unsupported document — the normal text path decides.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        write_file(root, "notes.pdf", "plain text despite the extension\n");
+
+        let policy = DiscoveryPolicy::default_git();
+        let output = discover(root, &policy).unwrap();
+        let (_, class) = output
+            .downstream_classifications
+            .iter()
+            .find(|(p, _)| p == "notes.pdf")
+            .expect("notes.pdf must be classified");
+        assert!(
+            matches!(class, DownstreamClassification::Safe { .. }),
+            "text content must not get the unsupported-document verdict: {class:?}"
+        );
     }
 
     /// Code-review finding: a genuinely empty (0-byte) SMALL file was fully

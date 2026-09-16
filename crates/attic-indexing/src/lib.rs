@@ -415,6 +415,15 @@ struct FileRecord {
 struct PendingUnit {
     file_occurrence_id: String,
     retrieval_text: String,
+    /// Canonical body for semantic hashing/embedding (r03); `None` means
+    /// canonical == retrieval_text. `serde(default)` keeps cache rows written
+    /// before this field existed deserializable.
+    #[serde(default)]
+    canonical_text: Option<String>,
+    /// Per-occurrence provenance JSON (JSON pointer, environment); never
+    /// hashed or embedded.
+    #[serde(default)]
+    occurrence_metadata: Option<String>,
     analyzer_id: String,
     analyzer_version: String,
     start_line: Option<u32>,
@@ -1171,6 +1180,8 @@ pub fn index_repository_with_cancellation(
             index_generation_id: gen_id_str.clone(),
             repository_id: repo_id_str.clone(),
             retrieval_text: u.retrieval_text,
+            canonical_text: u.canonical_text,
+            occurrence_metadata: u.occurrence_metadata,
             analyzer_id: u.analyzer_id,
             analyzer_version: u.analyzer_version,
             start_line: u.start_line,
@@ -1788,6 +1799,8 @@ fn analyze_single_file(
             // unit_spec.retrieval_text directly — the analyzer has already
             // handled RedactedBytes semantics (safe surroundings preserved).
             retrieval_text: unit_spec.retrieval_text.clone(),
+            canonical_text: unit_spec.canonical_text.clone(),
+            occurrence_metadata: unit_spec.occurrence_metadata.clone(),
             analyzer_id: analyzer_id.clone(),
             analyzer_version: analyzer_version.clone(),
             start_line: Some(unit_spec.span.start_line),
@@ -3467,6 +3480,80 @@ mod tests {
             );
         }
         assert!(!search_hits(&fx, "budget_ok_token").is_empty());
+    }
+
+    /// r03 gate: identical JSON logical content in DEV/PROD exports must
+    /// produce the SAME canonical_hash (one embedding candidate downstream),
+    /// while each occurrence keeps its own environment/pointer provenance.
+    #[test]
+    fn json_cross_environment_units_share_canonical_hash() {
+        let fx = make_store();
+        let dev = r#"{ "service": "payment", "retry": 3 }"#;
+        let prod = r#"{"retry":3,"service":"payment"}"#; // reordered keys
+        write_file(fx._dir.path(), "DEV-Env.json", dev);
+        write_file(fx._dir.path(), "PROD-Env.json", prod);
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(result.files_indexed, 2);
+
+        let verify = verify_conn(&fx);
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = verify
+                .prepare(
+                    "SELECT o.path, u.canonical_hash, u.occurrence_metadata
+                       FROM core_retrieval_units u
+                       JOIN core_file_occurrences o ON o.id = u.file_occurrence_id
+                      ORDER BY o.path",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(rows.len(), 2, "one canonical unit per file");
+        assert_eq!(
+            rows[0].1, rows[1].1,
+            "DEV and PROD units must share one canonical hash: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(p, _, m)| p == "DEV-Env.json" && m.contains("\"DEV\"")),
+            "DEV occurrence metadata: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(p, _, m)| p == "PROD-Env.json" && m.contains("\"PROD\"")),
+            "PROD occurrence metadata: {rows:?}"
+        );
+        // Both occurrences remain searchable via their decorated text.
+        assert!(!search_hits(&fx, "payment").is_empty());
+    }
+
+    /// r03 gate: a file producing far more than the old 512-unit cap must
+    /// index completely under the fail-closed default budget.
+    #[test]
+    fn json_file_with_over_10k_units_indexes_completely() {
+        let fx = make_store();
+        let mut obj = serde_json::Map::new();
+        for i in 0..11_000 {
+            obj.insert(
+                format!("key_{i:05}"),
+                serde_json::Value::String(format!("value_{i}")),
+            );
+        }
+        let text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
+        write_file(fx._dir.path(), "huge.json", &text);
+
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
+            .expect("11k-unit file must index completely under the 100k default budget");
+        assert_eq!(result.units_inserted, 11_000);
+        assert!(!search_hits(&fx, "value_0").is_empty());
+        assert!(!search_hits(&fx, "value_10999").is_empty());
     }
 
     /// PR-7 acceptance test: N files, one transiently fails. The first

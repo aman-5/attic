@@ -831,6 +831,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: span_for_bytes(start, end, src),
                     retrieval_text: text,
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal: *ordinal,
                     structural_node_index: None,
                 });
@@ -846,6 +848,8 @@ pub(crate) mod engine {
             units.push(RetrievalUnitSpec {
                 span: nodes[node_idx].span,
                 retrieval_text: text,
+                canonical_text: None,
+                occurrence_metadata: None,
                 ordinal,
                 structural_node_index: Some(node_idx),
             });
@@ -866,6 +870,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: span_for_bytes(pos, end, src),
                     retrieval_text: src.text(pos, end),
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal,
                     structural_node_index: None,
                 });
@@ -879,6 +885,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: SourceSpan::new(0, 0, 0, 0),
                     retrieval_text: chunk_text.clone(),
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal,
                     structural_node_index: None,
                 });

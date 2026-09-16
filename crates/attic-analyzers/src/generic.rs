@@ -540,6 +540,8 @@ fn emit_chunk_units(
         units.push(RetrievalUnitSpec {
             span,
             retrieval_text: piece.to_string(),
+            canonical_text: None,
+            occurrence_metadata: None,
             ordinal: units.len() as u32,
             structural_node_index: None,
         });
@@ -605,6 +607,8 @@ fn build_retrieval_unit_from_lines(
     RetrievalUnitSpec {
         span: SourceSpan::new(start_line_0, 0, end_line_0, end_col_0),
         retrieval_text,
+        canonical_text: None,
+        occurrence_metadata: None,
         ordinal,
         structural_node_index: None,
     }

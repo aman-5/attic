@@ -32,7 +32,7 @@ use attic_core::{
 };
 
 use crate::error::StorageError;
-use crate::fts::{delete_retrieval_units_for_file, insert_retrieval_unit_with_fts};
+use crate::fts::delete_retrieval_units_for_file;
 use crate::repository::file_occurrence::{
     insert_file_occurrence_with_freshness, upsert_file_identity,
 };
@@ -99,6 +99,12 @@ pub struct PublicationRetrievalUnit {
     pub repository_id: String,
     /// Safe retrieval text (must not contain secrets).
     pub retrieval_text: String,
+    /// Canonical body for semantic hashing/embedding (r03); `None` means
+    /// canonical == retrieval_text.
+    pub canonical_text: Option<String>,
+    /// Per-occurrence provenance JSON (JSON pointer, environment); never
+    /// part of the content hash.
+    pub occurrence_metadata: Option<String>,
     /// Analyzer identifier that produced this unit.
     pub analyzer_id: String,
     /// Analyzer version that produced this unit.
@@ -373,7 +379,7 @@ fn execute_index_publication(
     }
 
     for u in &p.retrieval_units {
-        insert_retrieval_unit_with_fts(
+        crate::fts::insert_retrieval_unit_canonical(
             conn,
             &crate::fts::NewRetrievalUnit {
                 id: &u.id,
@@ -387,6 +393,8 @@ fn execute_index_publication(
                 end_line: u.end_line,
                 is_redacted: u.is_redacted,
             },
+            u.canonical_text.as_deref(),
+            u.occurrence_metadata.as_deref(),
         )?;
         stats.units_inserted += 1;
     }
@@ -508,6 +516,8 @@ mod tests {
             index_generation_id: gen_id.to_string_repr(),
             repository_id: repo_id.to_string_repr(),
             retrieval_text: "pub fn coordinated_writer_token() {}".into(),
+            canonical_text: None,
+            occurrence_metadata: None,
             analyzer_id: "generic".into(),
             analyzer_version: "0.1.0".into(),
             start_line: Some(0),

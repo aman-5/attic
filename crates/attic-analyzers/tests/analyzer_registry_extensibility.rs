@@ -80,6 +80,8 @@ impl Analyzer for MockLanguageAnalyzer {
             retrieval_units: vec![attic_analyzers::RetrievalUnitSpec {
                 span: attic_core::SourceSpan::new(0, 0, 1, 10),
                 retrieval_text: "mock entry token".to_string(),
+                canonical_text: None,
+                occurrence_metadata: None,
                 ordinal: 0,
                 structural_node_index: None,
             }],

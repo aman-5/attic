@@ -305,7 +305,7 @@ fn chunk_value(
     };
 
     if header.len() + body.len() <= TARGET_CHUNK_CHARS {
-        push_unit(state, header, &body, ordinal_start);
+        push_unit(state, header, &body, ordinal_start, pointer);
         return;
     }
 
@@ -341,32 +341,55 @@ fn chunk_value(
             }
         }
         // A scalar/primitive that alone exceeds the target (e.g. a huge
-        // base64 blob): split the canonical text at char boundaries rather
-        // than drop it — every byte stays represented.
+        // base64 blob): split the canonical BODY at char boundaries rather
+        // than drop it — every byte stays represented, and the header only
+        // decorates the first piece's retrieval_text.
         _ => {
-            let full = format!("{header}{body}");
             let mut offset = 0usize;
-            while offset < full.len() && state.units.len() < state.max_units {
-                let mut end = (offset + TARGET_CHUNK_CHARS).min(full.len());
+            let mut first = true;
+            while offset < body.len() && state.units.len() < state.max_units {
+                let mut end = (offset + TARGET_CHUNK_CHARS).min(body.len());
                 // MSRV 1.89 has no str::floor_char_boundary — walk back to
                 // the nearest UTF-8 char boundary manually.
-                while !full.is_char_boundary(end) {
+                while !body.is_char_boundary(end) {
                     end -= 1;
                 }
-                push_unit(state, String::new(), &full[offset..end], ordinal_start);
+                let piece_header = if first { header.clone() } else { String::new() };
+                push_unit(
+                    state,
+                    piece_header,
+                    &body[offset..end],
+                    ordinal_start,
+                    pointer,
+                );
+                first = false;
                 offset = end;
             }
-            if offset < full.len() {
+            if offset < body.len() {
                 state.report_budget_exhausted();
             }
         }
     }
 }
 
-fn push_unit(state: &mut ChunkState, header: String, body: &str, ordinal_start: u32) {
+fn push_unit(
+    state: &mut ChunkState,
+    header: String,
+    body: &str,
+    ordinal_start: u32,
+    pointer: &str,
+) {
     let ordinal = ordinal_start + state.units.len() as u32;
     let text = format!("{header}{body}");
     let end_line = body.matches('\n').count() as u32;
+    // Canonical body excludes the pointer/env header so identical logical
+    // content hashes identically across files and environments (r03). The
+    // header lives only in retrieval_text (lexical display) and the
+    // occurrence metadata JSON (provenance for filtering/display).
+    let occurrence_metadata = match state.env {
+        Some(env) => serde_json::json!({"json_pointer": pointer, "environment": env}).to_string(),
+        None => serde_json::json!({"json_pointer": pointer}).to_string(),
+    };
     state.units.push(RetrievalUnitSpec {
         span: SourceSpan {
             start_line: 0,
@@ -375,6 +398,8 @@ fn push_unit(state: &mut ChunkState, header: String, body: &str, ordinal_start: 
             end_col: 0,
         },
         retrieval_text: text,
+        canonical_text: Some(body.to_string()),
+        occurrence_metadata: Some(occurrence_metadata),
         ordinal,
         structural_node_index: None,
     });
@@ -407,12 +432,22 @@ mod tests {
         let b = r#"{"nested":{"a":1,"b":2},"name":"x"}"#;
         let out_a = JsonAnalyzer::new().analyze(input_for(a, "DEV-Form.json"));
         let out_b = JsonAnalyzer::new().analyze(input_for(b, "PROD-Form.json"));
-        // Same logical content -> same canonical unit text apart from the
-        // env label in the header.
-        let body_a = out_a.retrieval_units[0]
-            .retrieval_text
-            .replace("(env: DEV)", "(env: PROD)");
-        assert_eq!(body_a, out_b.retrieval_units[0].retrieval_text);
+        // Canonical bodies are byte-identical across environments/formatting;
+        // the env label lives only in retrieval_text + occurrence metadata.
+        assert_eq!(
+            out_a.retrieval_units[0].canonical_text, out_b.retrieval_units[0].canonical_text,
+            "canonical bodies must match for content-hash dedup"
+        );
+        assert_ne!(
+            out_a.retrieval_units[0].retrieval_text, out_b.retrieval_units[0].retrieval_text,
+            "retrieval text keeps per-occurrence env header"
+        );
+        let meta_a = out_a.retrieval_units[0]
+            .occurrence_metadata
+            .as_deref()
+            .unwrap();
+        assert!(meta_a.contains("\"environment\":\"DEV\""), "{meta_a}");
+        assert!(meta_a.contains("\"json_pointer\":\"\""), "{meta_a}");
     }
 
     #[test]
