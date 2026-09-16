@@ -17,6 +17,19 @@
 # Usage:
 #   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
 #
+#   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
+#                   [--features "ort-directml"] [--stage-only]
+#
+# Backend variants (r14):
+#   default build                 CPU-safe; semantic runs via the supervised
+#                                 worker with the Candle Qwen3 provider.
+#   --features ort-directml       Windows GPU build (NVIDIA validated on RTX
+#                                 A500; AMD/Intel untested). Requires the MSVC
+#                                 toolchain — never the GNU target — because
+#                                 ONNX Runtime ships MSVC-only binaries. The
+#                                 `inference-worker` subcommand is part of the
+#                                 same binary; no extra artifact is packaged.
+#
 # Cross-compilation targets:
 #   x86_64-pc-windows-msvc      Windows x86_64
 #   x86_64-unknown-linux-gnu    Linux x86_64
@@ -29,6 +42,9 @@ usage() { echo "usage: $0 --target <triple> [--out <dir>] [--stage-only] | --ver
 MODE=build
 STAGE_ONLY=false
 TARGET=
+# r14: optional Cargo feature set for backend variants (e.g. "ort-directml"
+# for the Windows GPU build). Empty = default CPU-safe build.
+FEATURES=
 OUT=dist
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --out) OUT="$2"; shift 2 ;;
     --verify) MODE=verify; VERIFY_DIR="$2"; shift 2 ;;
     --stage-only) STAGE_ONLY=true; shift ;;
+    --features) FEATURES="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -93,8 +110,12 @@ case " $SUPPORTED_TARGETS " in
 esac
 
 cd "$REPO_ROOT"
-echo "== building attic-server for $TARGET"
-cargo build --release --package attic-server --target "$TARGET"
+echo "== building attic-server for $TARGET${FEATURES:+ (features: $FEATURES)}"
+if [[ -n "$FEATURES" ]]; then
+  cargo build --release --package attic-server --target "$TARGET" --features "$FEATURES"
+else
+  cargo build --release --package attic-server --target "$TARGET"
+fi
 
 # The Cargo package is named `attic-server` but its `[[bin]]` target is
 # named `attic` (see crates/attic-server/Cargo.toml) — cargo therefore

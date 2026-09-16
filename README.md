@@ -426,12 +426,36 @@ Requires:
   MSRV `1.89`); `rustup show` in the repo root installs it automatically.
 - **A linker for your platform**:
   - **Windows (recommended)**: Microsoft "Build Tools for Visual Studio"
-    with the C++ build tools workload.
+    with the C++ build tools workload. The GPU build
+    (`--features ort-directml`) **requires MSVC** — ONNX Runtime ships
+    MSVC-only prebuilt binaries, so build with
+    `cargo build --release --package attic-server --target x86_64-pc-windows-msvc --features ort-directml`.
   - **Windows (no MSVC)**: GNU/MinGW via [Scoop](https://scoop.sh)
-    (`scoop install mingw`) — see `docs/PLAYBOOK.md` (Development).
+    (`scoop install mingw`) — CPU-only build; see `docs/PLAYBOOK.md`
+    (Development).
   - **Linux**: system `cc`/`clang` (e.g. `build-essential` on
     Debian/Ubuntu) — tree-sitter grammars build bundled C sources via `cc`.
   - **macOS**: `xcode-select --install` (Command Line Tools).
+
+### Semantic engine notes
+
+- **Isolated inference worker** — neural embedding runs in a supervised
+  child process (`attic inference-worker`, spawned automatically; not a
+  user-facing command). A hung or crashed model runtime is killed and
+  restarted without touching the MCP server.
+- **GPU (Windows)**: with the `ort-directml` build, set
+  `ATTIC_ONNX_MODEL_DIR` to a directory containing `model_fp16.onnx` +
+  `tokenizer.json` (onnx-community Qwen3-Embedding-0.6B fp16 export).
+  Without it, the verified CPU provider is used. `status` reports which
+  backend/quantization is actually serving under `semantic_identity`.
+- **CPU model cache**: the Qwen3 safetensors download in the background on
+  first run (canonical indexing never waits), are verified against pinned
+  SHA-256, and a corrupt cache is quarantined, never silently loaded.
+- **Unsupported documents**: PDF and DOCX are reported as
+  `unsupported document format` in diagnostics rather than parsed.
+- `[indexing] max_units_per_file` in `attic.toml` is a fail-closed ceiling
+  (default 100000) — a file exceeding it aborts the indexing run rather
+  than publishing silently truncated content.
 
 ```sh
 cargo test -p <crate>                                 # focused test
