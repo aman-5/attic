@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+sha2 = "0.11"
+hex = "0.4"
 tracing = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }

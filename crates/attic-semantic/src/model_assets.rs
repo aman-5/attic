@@ -61,20 +61,32 @@ impl ModelManifest {
             repo_owner: "Qwen".to_string(),
             repo_name: "Qwen3-Embedding-0.6B".to_string(),
             pinned_revision: "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3".to_string(), // Stable pinned commit hash
+            // SHA-256 pinned from the official HF revision above (integrity
+            // against corruption; first download trusts HF+TLS like any
+            // lockfile bootstrap). Verification is now real SHA-256 (r05).
             files: vec![
                 ModelFileSpec {
                     filename: "config.json".to_string(),
-                    expected_sha256: None,
+                    expected_sha256: Some(
+                        "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"
+                            .to_string(),
+                    ),
                     expected_size_bytes: None,
                 },
                 ModelFileSpec {
                     filename: "tokenizer.json".to_string(),
-                    expected_sha256: None,
+                    expected_sha256: Some(
+                        "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+                            .to_string(),
+                    ),
                     expected_size_bytes: None,
                 },
                 ModelFileSpec {
                     filename: "model.safetensors".to_string(),
-                    expected_sha256: None,
+                    expected_sha256: Some(
+                        "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"
+                            .to_string(),
+                    ),
                     expected_size_bytes: None,
                 },
             ],
@@ -162,14 +174,14 @@ impl ModelAssetManager {
         Ok(staging)
     }
 
-    /// Compute SHA256 hex string for a file.
+    /// Compute the real SHA-256 hex digest of a file (streamed; multi-GB
+    /// weights must never load whole). r05 fix: this previously computed
+    /// BLAKE3 despite the name, so no pinned SHA-256 could ever match.
     pub fn compute_file_sha256(path: &Path) -> Result<String, ModelAssetError> {
-        use blake3::Hasher;
-        // In Attic, blake3 is universally available, but if SHA256 is expected:
-        // blake3 is 10x faster and secure; let's support standard sha256 or blake3
+        use sha2::Digest;
         let mut file = File::open(path)?;
-        let mut hasher = Hasher::new();
-        let mut buffer = [0u8; 65536];
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
         loop {
             let n = file.read(&mut buffer)?;
             if n == 0 {
@@ -177,7 +189,7 @@ impl ModelAssetManager {
             }
             hasher.update(&buffer[..n]);
         }
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(hex::encode(hasher.finalize()))
     }
 
     /// Validate all files in the staging directory against the manifest.
@@ -260,6 +272,38 @@ impl ModelAssetManager {
             let _ = fs::remove_dir_all(staging);
         }
     }
+
+    /// Verify the ACTIVE snapshot against the pinned manifest (r05).
+    /// `MissingFile`/`Offline` are transient (partial or absent download);
+    /// `ChecksumMismatch`/`ValidationFailed` are permanent for this content —
+    /// the caller must quarantine and re-download, never load or retry the
+    /// same bytes.
+    pub fn verify_active_snapshot(&self) -> Result<PathBuf, ModelAssetError> {
+        let snapshot = self.snapshot_dir();
+        if !snapshot.is_dir() {
+            return Err(ModelAssetError::Offline);
+        }
+        self.validate_staging(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Move a corrupt snapshot aside so the next download starts clean.
+    /// Never deletes — the evidence stays for operators. Returns the
+    /// quarantine path when a snapshot existed.
+    pub fn quarantine_snapshot(&self) -> Result<Option<PathBuf>, ModelAssetError> {
+        let snapshot = self.snapshot_dir();
+        if !snapshot.exists() {
+            return Ok(None);
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dest =
+            snapshot.with_file_name(format!("{}.corrupt-{stamp}", self.manifest.pinned_revision));
+        fs::rename(&snapshot, &dest)?;
+        Ok(Some(dest))
+    }
 }
 
 #[cfg(test)]
@@ -277,13 +321,20 @@ mod tests {
     #[test]
     fn atomic_activation_promotes_staging_and_updates_refs() {
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = ModelManifest::qwen3_default();
+        let mut manifest = ModelManifest::qwen3_default();
         let mgr = ModelAssetManager::new(tmp.path(), manifest.clone());
 
         let staging = mgr.prepare_staging().unwrap();
         fs::write(staging.join("config.json"), "{\"vocab_size\": 1000}").unwrap();
         fs::write(staging.join("tokenizer.json"), "{}").unwrap();
         fs::write(staging.join("model.safetensors"), "binary-weights").unwrap();
+        // Pin from the staged content (production pins come from the official
+        // revision; tests pin what they staged).
+        for f in manifest.files.iter_mut() {
+            f.expected_sha256 =
+                Some(ModelAssetManager::compute_file_sha256(&staging.join(&f.filename)).unwrap());
+        }
+        let mgr = ModelAssetManager::new(tmp.path(), manifest.clone());
 
         let active_path = mgr
             .activate_staging(&staging)
@@ -317,7 +368,12 @@ mod tests {
     #[test]
     fn validation_fails_on_missing_required_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = ModelManifest::qwen3_default();
+        let mut manifest = ModelManifest::qwen3_default();
+        // Unpinned: this test exercises the MISSING-file check, which runs
+        // before any checksum comparison.
+        for f in manifest.files.iter_mut() {
+            f.expected_sha256 = None;
+        }
         let mgr = ModelAssetManager::new(tmp.path(), manifest);
 
         let staging = mgr.prepare_staging().unwrap();
@@ -338,7 +394,12 @@ mod tests {
     #[test]
     fn validation_fails_on_invalid_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = ModelManifest::qwen3_default();
+        let mut manifest = ModelManifest::qwen3_default();
+        // Unpinned: this test exercises the config.json JSON-validity check,
+        // which runs after checksum comparison.
+        for f in manifest.files.iter_mut() {
+            f.expected_sha256 = None;
+        }
         let mgr = ModelAssetManager::new(tmp.path(), manifest);
 
         let staging = mgr.prepare_staging().unwrap();
@@ -371,5 +432,77 @@ mod tests {
         assert!(filenames.contains(&"config.json"));
         assert!(filenames.contains(&"tokenizer.json"));
         assert!(filenames.contains(&"model.safetensors"));
+    }
+
+    /// r05: the default manifest pins REAL sha256 values, and the verifier
+    /// is real SHA-256 (a BLAKE3 mislabel previously made pinning
+    /// impossible).
+    #[test]
+    fn qwen3_manifest_has_real_sha256_pins() {
+        let manifest = ModelManifest::qwen3_default();
+        for f in &manifest.files {
+            let pin = f
+                .expected_sha256
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must be sha256-pinned", f.filename));
+            assert_eq!(pin.len(), 64, "{} pin must be sha256 hex", f.filename);
+            assert!(pin.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    /// r05: a corrupt active snapshot fails verification permanently and is
+    /// quarantined (evidence preserved), so the next run re-downloads clean.
+    #[test]
+    fn corrupt_active_snapshot_fails_and_quarantines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest::qwen3_default();
+        let mgr = ModelAssetManager::new(tmp.path(), manifest);
+
+        // Stage files with WRONG content, then force-activate by creating the
+        // snapshot layout directly (bypassing validation).
+        let snapshot = mgr.snapshot_dir();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("config.json"), "{}").unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "not-the-real-weights").unwrap();
+
+        let err = mgr.verify_active_snapshot().unwrap_err();
+        assert!(
+            matches!(err, ModelAssetError::ChecksumMismatch { .. }),
+            "corrupt snapshot must fail with checksum mismatch, got {err:?}"
+        );
+
+        let q = mgr
+            .quarantine_snapshot()
+            .unwrap()
+            .expect("snapshot existed, must quarantine");
+        assert!(!snapshot.exists(), "corrupt snapshot moved aside");
+        assert!(q.exists(), "quarantine preserves the evidence");
+        assert_eq!(
+            mgr.check_status(),
+            ModelAssetStatus::NotPresent,
+            "after quarantine the model is cleanly absent for re-download"
+        );
+    }
+
+    /// r05: a correctly pinned snapshot verifies. Uses a manifest whose pins
+    /// are computed from the staged content (same code path as production).
+    #[test]
+    fn active_snapshot_with_matching_pins_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manifest = ModelManifest::qwen3_default();
+        let mgr_probe = ModelAssetManager::new(tmp.path(), manifest.clone());
+        let snapshot = mgr_probe.snapshot_dir();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("config.json"), "{\"a\":1}").unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+        for f in manifest.files.iter_mut() {
+            f.expected_sha256 =
+                Some(ModelAssetManager::compute_file_sha256(&snapshot.join(&f.filename)).unwrap());
+        }
+        let mgr = ModelAssetManager::new(tmp.path(), manifest);
+        let verified = mgr.verify_active_snapshot().unwrap();
+        assert_eq!(verified, snapshot);
     }
 }

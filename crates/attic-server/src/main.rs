@@ -361,11 +361,55 @@ fn spawn_model_download_task(
                 ) {
                     Ok(embedder) => {
                         deferred.set_lifecycle(ModelLifecycle::Verifying);
-                        deferred.swap_in(Arc::new(embedder));
-                        tracing::info!(
-                            "Qwen3 model downloaded and provider swapped in — semantic retrieval is now live"
+                        // r05: verify the active snapshot against the pinned
+                        // SHA-256 manifest BEFORE swap-in. Checksum/validation
+                        // failure is PERMANENT for this content — quarantine
+                        // the corrupt snapshot and stop; it is never retried
+                        // as a transient network failure. Missing/absent
+                        // files remain transient (resume + retry).
+                        let mgr = attic_semantic::ModelAssetManager::new(
+                            &cache_dir,
+                            attic_semantic::ModelManifest::qwen3_default(),
                         );
-                        return;
+                        match mgr.verify_active_snapshot() {
+                            Ok(_) => {
+                                deferred.swap_in(Arc::new(embedder));
+                                tracing::info!(
+                                    "Qwen3 model verified against pinned manifest and provider swapped in — semantic retrieval is now live"
+                                );
+                                return;
+                            }
+                            Err(
+                                e @ (attic_semantic::ModelAssetError::ChecksumMismatch {
+                                    ..
+                                }
+                                | attic_semantic::ModelAssetError::ValidationFailed(_)),
+                            ) => {
+                                let quarantined = mgr.quarantine_snapshot().ok().flatten();
+                                deferred.set_lifecycle(ModelLifecycle::Failed {
+                                    reason: format!(
+                                        "model artifact verification failed (permanent): {e}; snapshot quarantined to {quarantined:?}"
+                                    ),
+                                });
+                                return;
+                            }
+                            Err(e) => {
+                                // Offline/missing — transient: count it as a
+                                // failed attempt and follow the same
+                                // 3-attempt/5s policy as download failures.
+                                let reason = e.to_string();
+                                tracing::warn!(attempt, "artifact verification incomplete: {reason}");
+                                if attempt < MAX_ATTEMPTS {
+                                    deferred.set_lifecycle(ModelLifecycle::Backoff {
+                                        attempt,
+                                        reason,
+                                    });
+                                    std::thread::sleep(RETRY_DELAY);
+                                } else {
+                                    deferred.set_lifecycle(ModelLifecycle::Failed { reason });
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let reason = e.to_string();
