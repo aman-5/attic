@@ -181,3 +181,50 @@ impl SemanticProvider for SupervisedWorkerProvider {
             .collect())
     }
 }
+
+/// The fingerprint the worker's provider WILL have once loaded — needed
+/// before the child exists so enrichment can key generations. Must match
+/// the in-worker providers exactly (qwen3_provider / ort_directml); the
+/// real provider reports its fingerprint after load and a mismatch would
+/// produce a new vector space rather than silent mixing.
+pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> EmbeddingFingerprint {
+    use crate::provider::ExecutionBackend;
+    let base = EmbeddingFingerprint {
+        provider: "qwen3".into(),
+        model_id: crate::qwen3_provider::QWEN_MODEL_ID.into(),
+        model_revision: String::new(),
+        dimension: dimension.unwrap_or(1024),
+        pooling_version: "last_token_v1".into(),
+        normalization_version: "l2_unit_v1".into(),
+        tokenizer_version: "qwen_bpe_v1".into(),
+        chunking_version: attic_core::constants::CHUNKING_VERSION.into(),
+        query_instruction_version: crate::instruction::CODE_RETRIEVAL_V1_ID.into(),
+        execution_backend: ExecutionBackend::Unknown,
+        quantization: String::new(),
+    };
+    match backend {
+        "ort-directml" => EmbeddingFingerprint {
+            model_revision: "onnx-community-fp16".into(),
+            execution_backend: ExecutionBackend::OrtDirectMl,
+            quantization: "fp16-onnx".into(),
+            ..base
+        },
+        _ => EmbeddingFingerprint {
+            model_revision: crate::model_assets::ModelManifest::qwen3_default().pinned_revision,
+            execution_backend: ExecutionBackend::CandleCpu,
+            quantization: "fp32-safetensors".into(),
+            ..base
+        },
+    }
+}
+
+/// The max_input_bytes the worker's provider will enforce, without loading
+/// the model (mirrors each provider's contract).
+pub fn expected_max_input_bytes(backend: &str, seq_len: usize) -> usize {
+    match backend {
+        // DirectML: fixed sequence length x conservative bytes-per-token.
+        "ort-directml" => seq_len * 2,
+        // Candle: DEFAULT_MAX_TOKENS (1024) x MIN_BYTES_PER_TOKEN (2).
+        _ => 1024 * 2,
+    }
+}

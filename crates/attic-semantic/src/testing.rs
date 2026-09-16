@@ -403,3 +403,53 @@ impl SemanticProvider for RecordingProvider {
         Ok(out)
     }
 }
+
+/// Provider that reports OOM (`BudgetExhausted`) whenever a batch exceeds
+/// `max_items`, and succeeds otherwise — drives r07 adaptive-batch tests.
+pub struct OomProvider {
+    pub max_items: usize,
+}
+
+impl SemanticProvider for OomProvider {
+    fn id(&self) -> &'static str {
+        "oom"
+    }
+    fn model_id(&self) -> &str {
+        "oom-v1"
+    }
+    fn dimensions(&self) -> usize {
+        4
+    }
+    fn max_input_bytes(&self) -> usize {
+        4096
+    }
+    fn available(&self) -> bool {
+        true
+    }
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        None
+    }
+    fn embed_batch(
+        &self,
+        inputs: &[EmbeddingInput],
+        _cancel: &CancelFlag,
+        usage: &mut ResourceUsage,
+        _deadline: Option<Instant>,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+        if inputs.len() > self.max_items {
+            return Err(SemanticError::BudgetExhausted(format!(
+                "mock OOM: {} items exceeds device limit {}",
+                inputs.len(),
+                self.max_items
+            )));
+        }
+        usage.items_embedded += inputs.len() as u64;
+        Ok(inputs
+            .iter()
+            .map(|i| EmbeddingOutput {
+                unit_key: i.unit_key.clone(),
+                vector: vec![0.5; 4],
+            })
+            .collect())
+    }
+}

@@ -149,6 +149,9 @@ pub struct EnrichStats {
     pub cancelled: bool,
     pub elapsed_ms: u64,
     pub queue_remaining: u64,
+    /// How many times an OOM (BudgetExhausted) forced a batch-cap halving
+    /// this drive — the adaptive-batching signal (r07).
+    pub oom_reductions: u64,
 }
 
 /// Drive the enrichment queue until empty or budget/cancellation bounds hit.
@@ -165,12 +168,19 @@ pub fn drive(
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_millis(cfg.budget_ms.max(1));
     let mut stats = EnrichStats::default();
+    // r07 OOM-adaptive cap: after a provider BudgetExhausted (GPU/native
+    // OOM), batches are retried at half size (floor 1) instead of failing
+    // items. Clears only when the process restarts — conservative by design.
+    let mut oom_batch_cap: Option<usize> = None;
 
     loop {
         if cancel.is_cancelled() || Instant::now() >= deadline {
             break;
         }
-        let batch_size = cfg.effective_batch_size();
+        let mut batch_size = cfg.effective_batch_size();
+        if let Some(cap) = oom_batch_cap {
+            batch_size = batch_size.min(cap);
+        }
         if batch_size == 0 {
             break;
         }
@@ -395,6 +405,32 @@ pub fn drive(
                     store.queue_reset(&it.retrieval_unit_id)?;
                 }
                 break;
+            }
+            Err(SemanticError::BudgetExhausted(reason)) => {
+                // r07: OOM is NOT an item failure. Halve the batch cap
+                // (floor 1), return items to PENDING, retry smaller. A
+                // single-item OOM is permanent for this content on this
+                // device — quarantine it instead of looping forever.
+                let current = oom_batch_cap.unwrap_or(batch_size).max(1);
+                let next = (current / 2).max(1);
+                stats.oom_reductions += 1;
+                if items.len() <= 1 && next == 1 {
+                    tracing::warn!(
+                        "embedding OOM at single-item batch ({reason}); quarantining item"
+                    );
+                    for it in &items {
+                        store.queue_mark_failed(&it.retrieval_unit_id, cfg.max_attempts)?;
+                        stats.failed_items += 1;
+                    }
+                } else {
+                    tracing::warn!(
+                        "embedding OOM ({reason}); batch cap {current} -> {next}, retrying"
+                    );
+                    oom_batch_cap = Some(next);
+                    for it in &items {
+                        store.queue_reset(&it.retrieval_unit_id)?;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("embedding batch failed: {e}");
@@ -844,5 +880,106 @@ mod generation_driven_enrichment_tests {
         // If dynamic allocation sets semantic_batch_size to 0 (emergency halt), effective is 0.
         alloc.write().unwrap().semantic_batch_size = 0;
         assert_eq!(cfg.effective_batch_size(), 0);
+    }
+
+    /// r07: an OOM (BudgetExhausted) batch must NOT fail items — the drive
+    /// halves the batch cap, returns items to PENDING, and completes them at
+    /// the reduced size.
+    #[test]
+    fn oom_batch_halves_and_eventually_embeds_everything() {
+        use attic_core::{
+            DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
+            IndexGenerationId, RepositoryId, SecurityState, SourceRevisionId, SourceType,
+            SubsystemVersions,
+        };
+
+        // Canonical in-memory DB with four indexable units.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        attic_storage::run_migrations(&conn).unwrap();
+        let repo_id = RepositoryId::new_v4();
+        attic_storage::upsert_repository(&conn, &repo_id, "/repo/oom", "oom-repo").unwrap();
+        let rev_id = SourceRevisionId::new_v4();
+        attic_storage::insert_source_revision(
+            &conn,
+            &rev_id,
+            &repo_id,
+            "abc123",
+            "2026-01-01T00:00:00Z",
+            SourceType::Git,
+        )
+        .unwrap();
+        let gen_id = IndexGenerationId::new_v4();
+        attic_storage::insert_index_generation(
+            &conn,
+            &gen_id,
+            &repo_id,
+            &rev_id,
+            1,
+            &SubsystemVersions::new(),
+        )
+        .unwrap();
+        let fid = FileIdentityId::new_v4();
+        attic_storage::upsert_file_identity(&conn, &fid, &repo_id, "basis").unwrap();
+        let occ_id = FileOccurrenceId::new_v4();
+        attic_storage::insert_file_occurrence(
+            &conn,
+            &attic_storage::NewFileOccurrence {
+                id: &occ_id,
+                file_identity_id: &fid,
+                source_revision_id: &rev_id,
+                index_generation_id: Some(&gen_id),
+                path: "src/lib.rs",
+                content_hash: "blake3:aa",
+                size_bytes: 128,
+                language: Some("rust"),
+                file_type: FileType::Rust,
+                discovery_class: DiscoveryClass::Vcs,
+                security_state: SecurityState::Clean,
+                existence_state: ExistenceState::Present,
+            },
+        )
+        .unwrap();
+
+        let store = SemanticStore::open_in_memory().unwrap();
+        let mut unit_ids = Vec::new();
+        for i in 0..4 {
+            let unit_id = attic_core::RetrievalUnitId::new_v4().to_string_repr();
+            attic_storage::insert_retrieval_unit_with_fts(
+                &conn,
+                &attic_storage::NewRetrievalUnit {
+                    id: &unit_id,
+                    file_occurrence_id: &occ_id.to_string_repr(),
+                    index_generation_id: &gen_id.to_string_repr(),
+                    repository_id: &repo_id.to_string_repr(),
+                    retrieval_text: match i {
+                        0 => "fn oom_token_alpha() {}",
+                        1 => "fn oom_token_beta() {}",
+                        2 => "fn oom_token_gamma() {}",
+                        _ => "fn oom_token_delta() {}",
+                    },
+                    analyzer_id: "generic",
+                    analyzer_version: "test",
+                    start_line: Some(i as u32),
+                    end_line: Some(i as u32),
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+            unit_ids.push(unit_id);
+        }
+        store.queue_enqueue(&unit_ids, 0.5).unwrap();
+
+        // Batch 4 requested; provider OOMs above 2.
+        let provider = crate::testing::OomProvider { max_items: 2 };
+        let cfg = EnrichmentConfig {
+            batch_size: 4,
+            budget_ms: 30_000,
+            ..EnrichmentConfig::default()
+        };
+        let stats = drive(&conn, &store, &provider, &cfg, &CancelFlag::new()).unwrap();
+        assert_eq!(stats.embedded, 4, "all four units embed after halving");
+        assert_eq!(stats.oom_reductions, 1, "exactly one halving event");
+        assert_eq!(stats.failed_items, 0);
+        assert_eq!(stats.queue_remaining, 0);
     }
 }

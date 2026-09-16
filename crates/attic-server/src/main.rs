@@ -279,6 +279,11 @@ fn resolve_semantic_provider(
         );
     }
 
+    // r06/r07: neural inference runs in the supervised worker process. The
+    // parent never loads model tensors at startup — it probes asset presence
+    // (cheap) and hands the worker the load spec; the child loads lazily on
+    // the first batch and can be killed/restarted if the native stack hangs.
+
     // Phase 4: prefer the ORT/DirectML GPU provider when a local ONNX model
     // directory is configured/present — measured ~195× faster than the candle
     // CPU path on an RTX A500 (3,130 vs 16 tok/s). Set ATTIC_ONNX_MODEL_DIR
@@ -286,34 +291,36 @@ fn resolve_semantic_provider(
     #[cfg(feature = "ort-directml")]
     if let Ok(onnx_dir) = std::env::var("ATTIC_ONNX_MODEL_DIR") {
         let dir = PathBuf::from(onnx_dir);
-        if dir.join("model_fp16.onnx").is_file() {
-            match attic_semantic::OrtDirectMlProvider::from_model_dir(
-                &dir,
+        if dir.join("model_fp16.onnx").is_file() && dir.join("tokenizer.json").is_file() {
+            tracing::info!("using supervised ORT/DirectML GPU worker for Qwen3");
+            return supervised_provider(
+                "ort-directml",
+                model_cache_dir,
                 batch_size,
-                512, // measured optimum: padding waste dominates at 1024
                 attic_config.semantic.dimension,
-            ) {
-                Ok(p) => {
-                    tracing::info!("using ORT/DirectML GPU provider for Qwen3");
-                    return Arc::new(p);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "DirectML provider init failed ({e}); falling back to candle CPU"
-                    );
-                }
-            }
+                Some(dir),
+            );
         }
     }
 
-    for dir in candidate_dirs {
-        if let Ok(embedder) = attic_semantic::Qwen3Embedder::from_local_cache(
-            &dir,
-            batch_size,
-            attic_config.semantic.dimension,
-            attic_semantic::QwenPooling::LastToken,
+    for dir in &candidate_dirs {
+        // Cheap presence probe only — never construct the model in-process.
+        let mgr = attic_semantic::ModelAssetManager::new(
+            dir,
+            attic_semantic::ModelManifest::qwen3_default(),
+        );
+        if matches!(
+            mgr.check_status(),
+            attic_semantic::ModelAssetStatus::Active { .. }
         ) {
-            return Arc::new(embedder);
+            tracing::info!("Qwen3 assets present; using supervised candle-cpu worker");
+            return supervised_provider(
+                "candle-cpu",
+                dir,
+                batch_size,
+                attic_config.semantic.dimension,
+                None,
+            );
         }
     }
 
@@ -330,6 +337,38 @@ fn resolve_semantic_provider(
         attic_config.semantic.dimension,
     );
     deferred
+}
+
+/// r06/r07: build the supervised worker-backed provider for a neural backend.
+/// The parent never loads model tensors; the child loads lazily on first
+/// embed and can be killed/restarted if the native stack hangs.
+fn supervised_provider(
+    backend: &str,
+    cache_dir: &Path,
+    batch_size: usize,
+    dimension: Option<usize>,
+    onnx_dir: Option<PathBuf>,
+) -> Arc<dyn attic_semantic::SemanticProvider> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("attic"));
+    let launch = attic_inference_protocol::supervisor::WorkerLaunch {
+        program: exe,
+        args: vec!["inference-worker".to_string()],
+        env: vec![],
+    };
+    let load = attic_inference_protocol::supervisor::LoadParams {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        batch_size,
+        dimension,
+        backend: backend.to_string(),
+        onnx_model_dir: onnx_dir.map(|p| p.to_string_lossy().into_owned()),
+        seq_len: Some(512),
+    };
+    Arc::new(attic_semantic::SupervisedWorkerProvider::new(
+        launch,
+        load,
+        attic_semantic::expected_fingerprint(backend, dimension),
+        attic_semantic::expected_max_input_bytes(backend, 512),
+    ))
 }
 
 /// Phase 2: background model acquisition. Downloads weights OFF the startup
@@ -352,15 +391,12 @@ fn spawn_model_download_task(
             const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
             for attempt in 1..=MAX_ATTEMPTS {
                 deferred.set_lifecycle(ModelLifecycle::Downloading { attempt });
-                // Qwen3Embedder::new downloads via hf-hub when the local cache
-                // is absent, then builds — one call covers the whole acquire.
-                match attic_semantic::Qwen3Embedder::new(
-                    &cache_dir,
-                    batch_size,
-                    dimension,
-                    attic_semantic::QwenPooling::LastToken,
-                ) {
-                    Ok(embedder) => {
+                // r07: the parent only PROVISIONS assets (download at the
+                // pinned revision + manifest verification); the supervised
+                // worker process builds tensors lazily on first embed, so no
+                // 1.2 GB model ever maps into the server process.
+                match attic_semantic::Qwen3Embedder::download_assets(&cache_dir) {
+                    Ok(_revision) => {
                         deferred.set_lifecycle(ModelLifecycle::Verifying);
                         // r05: verify the active snapshot against the pinned
                         // SHA-256 manifest BEFORE swap-in. Checksum/validation
@@ -374,9 +410,15 @@ fn spawn_model_download_task(
                         );
                         match mgr.verify_active_snapshot() {
                             Ok(_) => {
-                                deferred.swap_in(Arc::new(embedder));
+                                deferred.swap_in(supervised_provider(
+                                    "candle-cpu",
+                                    &cache_dir,
+                                    batch_size,
+                                    dimension,
+                                    None,
+                                ));
                                 tracing::info!(
-                                    "Qwen3 model verified against pinned manifest and provider swapped in — semantic retrieval is now live"
+                                    "Qwen3 model verified against pinned manifest; supervised worker provider swapped in — semantic retrieval is now live"
                                 );
                                 return;
                             }

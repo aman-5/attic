@@ -79,7 +79,9 @@ pub use throughput_controller::{
     CandidateAllocation, ControllerAction, ControllerPhase, ThroughputController,
     ThroughputControllerConfig,
 };
-pub use worker_supervisor::SupervisedWorkerProvider;
+pub use worker_supervisor::{
+    SupervisedWorkerProvider, expected_fingerprint, expected_max_input_bytes,
+};
 
 /// Re-exported canonical read types the layer consumes.
 pub use attic_storage::{SemanticUnitRow, UnitAnchor};

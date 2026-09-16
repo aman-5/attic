@@ -299,6 +299,25 @@ impl Qwen3Embedder {
         )
     }
 
+    /// Download the pinned model assets into `cache_dir` WITHOUT building
+    /// the model (r07): the parent process provisions and verifies; the
+    /// supervised worker builds tensors. Returns the pinned revision.
+    pub fn download_assets(cache_dir: &Path) -> Result<String, SemanticError> {
+        let pinned = crate::model_assets::ModelManifest::qwen3_default().pinned_revision;
+        let client = hf_hub::HFClient::builder()
+            .cache_dir(cache_dir.to_path_buf())
+            .build_sync()
+            .map_err(|e| SemanticError::ProviderUnavailable {
+                provider: QWEN_PROVIDER_ID.into(),
+                reason: format!("failed to build hf-hub client: {e}"),
+            })?;
+        let repo = client.model(HF_QWEN_OWNER.to_string(), HF_QWEN_REPO.to_string());
+        Self::fetch(&repo, "config.json", &pinned)?;
+        Self::fetch(&repo, "tokenizer.json", &pinned)?;
+        Self::fetch(&repo, "model.safetensors", &pinned)?;
+        Ok(pinned)
+    }
+
     fn fetch(
         repo: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>,
         filename: &str,
