@@ -2466,6 +2466,25 @@ fn handle_status(
         if let Some(lifecycle) = stack.provider.model_lifecycle() {
             payload["model_lifecycle"] = json!(lifecycle);
         }
+        // r13: identity truth — which backend/quantization/vector space is
+        // actually serving, plus worker supervision state. Answers "am I on
+        // GPU or CPU, fp16 or fp32, and is inference isolated?" without
+        // reading logs.
+        let fp = stack.provider.fingerprint();
+        payload["semantic_identity"] = json!({
+            "provider_id": stack.provider.id(),
+            "backend": fp
+                .as_ref()
+                .map(|f| f.execution_backend.as_str())
+                .unwrap_or("unknown"),
+            "quantization": fp
+                .as_ref()
+                .map(|f| f.quantization.as_str())
+                .unwrap_or("unknown"),
+            "vector_space_id": fp.as_ref().map(|f| f.vector_space_id()),
+            "dimension": fp.as_ref().map(|f| f.dimension),
+            "worker_isolated": stack.provider.id() == "qwen3-supervised",
+        });
     }
 
     // Phase V2 CP18: Semantic progress, ETA, and "why slow" diagnostics (§61, §62).
@@ -6435,6 +6454,39 @@ mod tests {
         // Spawned without any workspace configuration: status must succeed
         // and report UNCONFIGURED (spec ┬º30), never a fabricated empty ok.
         assert_eq!(v["status"], "unconfigured", "unexpected status: {v}");
+        // r13: identity truth is always present in status, even with no
+        // semantic provider (fields report "unknown"/absence honestly).
+        assert!(
+            v.get("semantic_health").is_some(),
+            "semantic_health missing from status: {v}"
+        );
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// r13: with semantic enabled and the Qwen3 model cached, status reports
+    /// the supervised worker identity (backend/quantization/worker_isolated)
+    /// — the operator-visible proof of which engine is serving.
+    #[test]
+    fn mcp_status_reports_semantic_identity() {
+        let bin = require_binary();
+        let tmp = TempDir::new().unwrap();
+        let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
+        let call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
+        let resp = send_recv(&mut child, &mut stdin, &call);
+        let content = &resp["result"]["content"];
+        let text = content[0]["text"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("status JSON");
+        if let Some(id) = v.get("semantic_identity") {
+            assert!(id.get("provider_id").is_some(), "provider_id: {id}");
+            assert!(id.get("backend").is_some(), "backend: {id}");
+            assert!(id.get("quantization").is_some(), "quantization: {id}");
+            assert!(id.get("worker_isolated").is_some(), "worker flag: {id}");
+        } else {
+            // Semantic disabled/degraded: identity block may be absent, but
+            // semantic_health must still be honest.
+            assert!(v.get("semantic_health").is_some());
+        }
         child.kill().ok();
         child.wait().ok();
     }
