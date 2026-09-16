@@ -23,6 +23,18 @@ pub const PRESSURE_WARNING_PCT: u64 = 70;
 /// RSS percentage of the memory budget at which pressure transitions to Critical.
 pub const PRESSURE_CRITICAL_PCT: u64 = 85;
 
+/// r08 live SYSTEM thresholds (whole-machine usage, not just Attic's share):
+/// the developer's IDE/browser/build always win. Reduce background work when
+/// total system usage reaches 75%.
+pub const SYSTEM_WARNING_PCT: u64 = 75;
+/// Total system usage at which background work pauses (r08).
+pub const SYSTEM_CRITICAL_PCT: u64 = 82;
+/// Total system usage at which background work halts outright (r08).
+pub const SYSTEM_EMERGENCY_PCT: u64 = 90;
+/// Absolute reserve: fewer available MiB than this is Emergency regardless
+/// of percentages (r08).
+pub const SYSTEM_MIN_AVAILABLE_MIB: u64 = 2048;
+
 const HYSTERESIS_EXIT_WARNING_PCT: u64 = 65;
 const HYSTERESIS_EXIT_CRITICAL_PCT: u64 = 78;
 const HYSTERESIS_EXIT_EMERGENCY_PCT: u64 = 82;
@@ -89,6 +101,31 @@ pub fn sample_process_rss_mib() -> Option<u64> {
     );
     sys.process(Pid::from_u32(std::process::id()))
         .map(|p| p.memory() / (1024 * 1024))
+}
+
+/// Sample WHOLE-SYSTEM memory in MiB: (used, available). r08 — pressure must
+/// see the developer's other applications, not just Attic's own RSS.
+///
+/// Under `cfg(test)` this returns None (unit tests must not observe the
+/// developer machine's real memory — that would make assertions flaky);
+/// tests drive the stored fields via `set_system_memory_for_testing`.
+pub fn sample_system_memory_mib() -> Option<(u64, u64)> {
+    #[cfg(test)]
+    {
+        return None;
+    }
+    #[allow(unreachable_code)]
+    {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let used = sys.used_memory() / (1024 * 1024);
+        let available = sys.available_memory() / (1024 * 1024);
+        if used == 0 {
+            return None;
+        }
+        Some((used, available))
+    }
 }
 
 // ── Phase 93+: Recovery stage ──────────────────────────────────────────────
@@ -283,6 +320,12 @@ pub struct ResourceMonitor {
     embedding_capacity_notify: Arc<(Mutex<()>, Condvar)>,
     // Phase 96: deterministic testing hooks
     forced_pressure_tier: AtomicU64,
+    // r08: whole-system memory facts (0/0/0 = not sampled yet). Pressure is
+    // the MAX of Attic-share pressure and system pressure — the developer's
+    // other applications always count.
+    system_total_mib: AtomicU64,
+    system_used_mib: AtomicU64,
+    system_available_mib: AtomicU64,
 }
 
 // ── RAII guards ────────────────────────────────────────────────────────────
@@ -429,6 +472,9 @@ impl ResourceMonitor {
             indexing_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
             embedding_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
             forced_pressure_tier: AtomicU64::new(forced_val),
+            system_total_mib: AtomicU64::new(0),
+            system_used_mib: AtomicU64::new(0),
+            system_available_mib: AtomicU64::new(0),
         };
         if forced_val != 0 {
             monitor.update_effective_limits();
@@ -615,6 +661,7 @@ impl ResourceMonitor {
             return;
         }
 
+        let mut attic_effective: Option<u64> = None;
         if let Some(rss) = sample_process_rss_mib() {
             self.process_rss_mib.store(rss, Ordering::Relaxed);
             let accounted = self.memory_used.load(Ordering::Relaxed);
@@ -623,6 +670,25 @@ impl ResourceMonitor {
             if effective > prev_peak {
                 self.peak_memory_used.store(effective, Ordering::Relaxed);
             }
+            attic_effective = Some(effective);
+        }
+
+        // r08: whole-system memory feeds the same pressure tiers. Sampled on
+        // every refresh (not gated on RSS success) so a process-level
+        // sampling failure can never blind us to system pressure.
+        let mut sampled = attic_effective.is_some();
+        if let Some((sys_used, sys_avail)) = sample_system_memory_mib() {
+            self.system_used_mib.store(sys_used, Ordering::Relaxed);
+            self.system_available_mib
+                .store(sys_avail, Ordering::Relaxed);
+            self.system_total_mib
+                .store(sys_used + sys_avail, Ordering::Relaxed);
+            sampled = true;
+        }
+
+        if sampled {
+            let effective =
+                attic_effective.unwrap_or_else(|| self.process_rss_mib.load(Ordering::Relaxed));
             let old_pressure = self.guidance_pressure();
             self.recompute_pressure_hysteresis(effective);
             let new_pressure = self.guidance_pressure();
@@ -634,13 +700,64 @@ impl ResourceMonitor {
         self.update_effective_limits();
     }
 
+    /// Pressure implied by whole-system memory facts (r08). Normal until the
+    /// first sample lands (all-zero fields).
+    fn system_pressure(&self) -> ResourcePressure {
+        let total = self.system_total_mib.load(Ordering::Relaxed);
+        if total == 0 {
+            return ResourcePressure::Normal;
+        }
+        let avail = self.system_available_mib.load(Ordering::Relaxed);
+        let used = self.system_used_mib.load(Ordering::Relaxed);
+        if avail < SYSTEM_MIN_AVAILABLE_MIB {
+            return ResourcePressure::Emergency;
+        }
+        let pct = used.saturating_mul(100) / total;
+        if pct >= SYSTEM_EMERGENCY_PCT {
+            ResourcePressure::Emergency
+        } else if pct >= SYSTEM_CRITICAL_PCT {
+            ResourcePressure::Critical
+        } else if pct >= SYSTEM_WARNING_PCT {
+            ResourcePressure::Warning
+        } else {
+            ResourcePressure::Normal
+        }
+    }
+
+    /// Percentage basis for hysteresis de-escalation: the worse of Attic's
+    /// own share and total system usage, so pressure driven by OTHER
+    /// applications cannot de-escalate while the system is still hot.
+    fn pressure_pct_basis(&self, attic_effective_mib: u64) -> u64 {
+        let max = self.max_memory_mib.load(Ordering::Relaxed);
+        let attic_pct = attic_effective_mib
+            .saturating_mul(100)
+            .checked_div(max)
+            .unwrap_or(0);
+        let total = self.system_total_mib.load(Ordering::Relaxed);
+        let system_pct = if total == 0 {
+            0
+        } else {
+            self.system_used_mib.load(Ordering::Relaxed) * 100 / total
+        };
+        attic_pct.max(system_pct)
+    }
+
+    #[cfg(test)]
+    fn set_system_memory_for_testing(&self, total_mib: u64, used_mib: u64, available_mib: u64) {
+        self.system_total_mib.store(total_mib, Ordering::Relaxed);
+        self.system_used_mib.store(used_mib, Ordering::Relaxed);
+        self.system_available_mib
+            .store(available_mib, Ordering::Relaxed);
+    }
+
     fn recompute_pressure_hysteresis(&self, effective_mib: u64) {
         let max = self.max_memory_mib.load(Ordering::Relaxed);
         let min_free = self.min_free_memory_mib.load(Ordering::Relaxed);
         let now = self.elapsed_ms();
 
-        // Compute instantaneous raw pressure.
-        let raw = if let Some(used_pct) = effective_mib.saturating_mul(100).checked_div(max) {
+        // Compute instantaneous raw pressure: Attic's own share AND the
+        // whole system's state — the developer's other apps always win.
+        let raw_attic = if let Some(used_pct) = effective_mib.saturating_mul(100).checked_div(max) {
             let free_mib = max.saturating_sub(effective_mib);
             if free_mib <= min_free {
                 ResourcePressure::Emergency
@@ -653,6 +770,12 @@ impl ResourceMonitor {
             }
         } else {
             ResourcePressure::Normal
+        };
+        let sys = self.system_pressure();
+        let raw = if tier_from_pressure(sys) > tier_from_pressure(raw_attic) {
+            sys
+        } else {
+            raw_attic
         };
 
         let current_tier = self.hysteresis_tier.load(Ordering::Relaxed);
@@ -681,11 +804,8 @@ impl ResourceMonitor {
                 ResourcePressure::Normal => return,
             };
 
-            let max_for_pct = self.max_memory_mib.load(Ordering::Relaxed);
-            let pct = effective_mib
-                .saturating_mul(100)
-                .checked_div(max_for_pct)
-                .unwrap_or(0);
+            // De-escalation basis merges Attic's share and system usage.
+            let pct = self.pressure_pct_basis(effective_mib);
 
             if pct >= exit_pct {
                 // Not yet below the exit band.
@@ -1204,6 +1324,64 @@ mod tests {
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Critical), 2);
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Emergency), 0);
         assert_eq!(adaptive_indexing_limit(1, ResourcePressure::Critical), 1);
+    }
+
+    /// r08: whole-system memory pressure escalates even when Attic itself is
+    /// tiny — the developer's other applications always win.
+    #[test]
+    fn system_memory_pressure_escalates_without_attic_usage() {
+        let m = monitor_with_budget(8192);
+
+        // 50% system usage, plenty free → Normal even at zero Attic RSS.
+        m.set_system_memory_for_testing(16_384, 8_192, 8_192);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Normal);
+
+        // 83% system usage → Critical regardless of Attic's tiny footprint.
+        m.set_system_memory_for_testing(16_384, 13_600, 2_784);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
+
+        // Under 2 GiB available → Emergency by the absolute reserve rule.
+        m.set_system_memory_for_testing(16_384, 15_000, 1_384);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Emergency);
+    }
+
+    /// r08: pressure driven by OTHER applications must not de-escalate while
+    /// the system is still hot, even if Attic's own usage dropped to zero.
+    #[test]
+    fn system_pressure_blocks_deescalation_while_hot() {
+        let m = monitor_with_budget(8192);
+        // Escalate via system pressure (83%).
+        m.set_system_memory_for_testing(16_384, 13_600, 2_784);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
+
+        // Attic's own usage falls to zero; system still at 83% — above the
+        // 78% Critical exit threshold — so the tier must hold.
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(
+            m.guidance_pressure(),
+            ResourcePressure::Critical,
+            "system-hot de-escalation must not happen"
+        );
+
+        // System cools below the exit band → de-escalation can begin (hold
+        // timers apply; tier must not be Critical-stuck forever).
+        m.set_system_memory_for_testing(16_384, 8_192, 8_192);
+        m.recompute_pressure_hysteresis(0);
+        assert_ne!(m.guidance_pressure(), ResourcePressure::Emergency);
+    }
+
+    /// r08: an unsampled system (all-zero facts, e.g. before the first
+    /// refresh or on platforms without sysinfo data) is Normal, never a
+    /// false Emergency.
+    #[test]
+    fn unsampled_system_is_normal_not_emergency() {
+        let m = monitor_with_budget(8192);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Normal);
     }
 
     #[test]

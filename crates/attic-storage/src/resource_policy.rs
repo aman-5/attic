@@ -355,11 +355,14 @@ impl ResourcePolicy {
         };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
+        // r08: reserve two physical cores for the developer's foreground
+        // work — background indexing/embedding never gets the whole machine.
+        let usable_cores = snapshot.cpu_cores.saturating_sub(2).max(1);
         EffectiveResourceConfig {
             memory_budget_mib,
             min_free_memory_mib,
-            scheduler_workers: self.scheduler_workers.min(snapshot.cpu_cores).max(1),
-            embedding_worker_count: self.embedding_worker_count.min(snapshot.cpu_cores).max(1),
+            scheduler_workers: self.scheduler_workers.min(usable_cores).max(1),
+            embedding_worker_count: self.embedding_worker_count.min(usable_cores).max(1),
             ..self.into()
         }
     }
@@ -739,7 +742,25 @@ mod tests {
     fn clamp_never_exceeds_real_core_count() {
         let p = ResourcePolicy::baseline_for_mode(ResourceMode::Performance); // wants 8 workers
         let effective = p.clamp_to_hardware(&snap(32768, 4));
-        assert_eq!(effective.scheduler_workers, 4);
+        // r08: 4 cores − 2 reserved for foreground = 2.
+        assert_eq!(effective.scheduler_workers, 2);
+    }
+
+    /// r08: two physical cores stay reserved for the developer's foreground
+    /// work; on tiny machines (≤2 cores) one worker still runs.
+    #[test]
+    fn clamp_reserves_two_cores_for_foreground() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
+        let eff14 = p.clone().clamp_to_hardware(&snap(65536, 14));
+        assert_eq!(eff14.scheduler_workers, 8, "wants 8, 14-2=12 allows 8");
+        let eff4 = p.clone().clamp_to_hardware(&snap(65536, 4));
+        assert_eq!(eff4.scheduler_workers, 2, "4 cores reserve 2");
+        assert_eq!(eff4.embedding_worker_count, 2, "embedding respects reserve");
+        let eff2 = p.clamp_to_hardware(&snap(65536, 2));
+        assert_eq!(
+            eff2.scheduler_workers, 1,
+            "tiny machine still makes progress"
+        );
     }
 
     #[test]

@@ -241,7 +241,12 @@ fn resolve_analysis_threads(requested: usize, file_count: usize) -> usize {
     let available = if requested > 0 {
         requested
     } else {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        // r08: reserve two logical processors for the developer's foreground
+        // work — analysis must never claim the whole machine by default.
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .saturating_sub(2)
+            .max(1)
     };
     available.clamp(1, file_count.max(1))
 }
