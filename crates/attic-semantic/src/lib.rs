@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod disk_safety;
 pub mod enrich;
 pub mod error;
+pub mod fallback;
 pub mod generation;
 pub mod identity;
 pub mod instruction;
@@ -49,6 +50,7 @@ pub use diagnostics::{
 pub use disk_safety::{DiskClearance, DiskFootprintSummary, DiskSafetyConfig, DiskSafetyGuard};
 pub use enrich::{BackgroundEnricher, EnrichStats, EnrichmentConfig, drive};
 pub use error::SemanticError;
+pub use fallback::{FallbackConfig, FallbackCoordinator};
 pub use generation::{GenerationManager, GenerationRecord, GenerationStatus};
 pub use identity::{SemanticUnitIdentity, content_hash};
 pub use instruction::{CODE_RETRIEVAL_V1_ID, CODE_RETRIEVAL_V1_TEMPLATE, format_query_instruction};
@@ -81,6 +83,7 @@ pub use throughput_controller::{
 };
 pub use worker_supervisor::{
     SupervisedWorkerProvider, expected_fingerprint, expected_max_input_bytes,
+    fingerprint_capabilities, verify_identity_capabilities,
 };
 
 /// Re-exported canonical read types the layer consumes.

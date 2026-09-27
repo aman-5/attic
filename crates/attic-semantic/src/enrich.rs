@@ -19,13 +19,12 @@ use attic_discovery::secrets;
 use rusqlite::Connection;
 
 use crate::error::SemanticError;
-use crate::identity::SemanticUnitIdentity;
 use crate::invalidate::reconcile;
 use crate::provider::{
     CancelFlag, EmbeddingFingerprint, EmbeddingInput, ResourceUsage, SemanticProvider,
 };
 use crate::selection::{SEMANTIC_SELECTION_VERSION, SelectionConfig};
-use crate::store::{EmbeddingRecord, SemanticStore};
+use crate::store::SemanticStore;
 
 /// Ensure an active or building generation is ready to receive vectors for this fingerprint.
 /// Returns the generation ID to tag the batch with.
@@ -158,7 +157,36 @@ pub struct EnrichStats {
 ///
 /// `conn` is a CANONICAL READ-ONLY connection; nothing here writes to the
 /// canonical database.
+///
+/// Production work assignment is the v2 leased/fenced queue
+/// (`sem_queue_v2`): every claim carries an owner + fencing token, a killed
+/// worker's stale token can never commit, and an expired lease is reclaimed
+/// rather than lost. Canonical vectors are the v2 dedup unit
+/// (`sem_embeddings_v2`, keyed by vector-space + canonical hash) — computed
+/// at most once ever, regardless of how many occurrences share that body.
+/// Each completed vector is additionally projected into the existing
+/// per-generation `sem_embeddings` table so the already-proven HNSW
+/// candidate index and retrieval path keep working unchanged (see
+/// `SemanticStore::commit_v2_batch`).
 pub fn drive(
+    conn: &Connection,
+    store: &SemanticStore,
+    provider: &dyn SemanticProvider,
+    cfg: &EnrichmentConfig,
+    cancel: &CancelFlag,
+) -> Result<EnrichStats, SemanticError> {
+    // A provider with no fingerprint has no stable vector-space identity to
+    // key v2 occurrences/queue rows by (`reconcile` never enqueues anything
+    // into v2 for it either) — every real production provider always
+    // returns one; only test doubles (`OomProvider`, `HashingEmbedder`) hit
+    // this fallback.
+    if provider.fingerprint().is_none() {
+        return drive_v1(conn, store, provider, cfg, cancel);
+    }
+    drive_v2(conn, store, provider, cfg, cancel)
+}
+
+fn drive_v2(
     conn: &Connection,
     store: &SemanticStore,
     provider: &dyn SemanticProvider,
@@ -171,6 +199,368 @@ pub fn drive(
     // r07 OOM-adaptive cap: after a provider BudgetExhausted (GPU/native
     // OOM), batches are retried at half size (floor 1) instead of failing
     // items. Clears only when the process restarts — conservative by design.
+    let mut oom_batch_cap: Option<usize> = None;
+
+    // Crash/restart hygiene: a lease abandoned by a killed worker or a
+    // server that died mid-batch surfaces here as retryable PENDING before
+    // this drive claims anything new.
+    store.queue_v2_reclaim_expired()?;
+
+    // Canonical-dedup catch-up: an occurrence that lost the selection-time
+    // dedup tiebreak is never queued (see `invalidate::reconcile`) — it only
+    // becomes retrievable once its canonical vector exists, whether that
+    // happened before this occurrence was even registered or gets produced
+    // by a claim later in this very call. Run it both before and after the
+    // claim loop so neither ordering leaves it stranded.
+    let fp_for_orphans = provider.fingerprint();
+    if let Some(ref fp) = fp_for_orphans
+        && let Ok(gen_id) = ensure_generation_for_fingerprint(store, fp)
+    {
+        let _ = store.project_resolved_orphan_occurrences(
+            gen_id,
+            provider.id(),
+            provider.model_id(),
+            SEMANTIC_SELECTION_VERSION,
+        );
+    }
+
+    // One owner id per `drive()` call/thread — distinct concurrent
+    // `embedding_worker_count` threads each get their own identity so a
+    // heartbeat/complete from one can never satisfy another's claim.
+    static OWNER_SEQ: AtomicU64 = AtomicU64::new(0);
+    let owner = format!(
+        "pid{}-drive{}",
+        std::process::id(),
+        OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    // Generous relative to EMBED_DEADLINE-class batch latency; a drive loop
+    // that outlives this without completing would need heartbeating, which
+    // single-shot `drive()` calls (bounded by `cfg.budget_ms`) don't reach.
+    const LEASE_MS: i64 = 300_000;
+
+    loop {
+        if cancel.is_cancelled() || Instant::now() >= deadline {
+            break;
+        }
+        let mut batch_size = cfg.effective_batch_size();
+        if let Some(cap) = oom_batch_cap {
+            batch_size = batch_size.min(cap);
+        }
+        if batch_size == 0 {
+            break;
+        }
+        let claims = store.queue_v2_claim_batch(&owner, LEASE_MS, batch_size)?;
+        if claims.is_empty() {
+            break;
+        }
+        // occurrence_id == retrieval_unit_id by construction (one occurrence
+        // row per retrieval unit; see `invalidate::reconcile`).
+        let token_of: std::collections::HashMap<String, i64> = claims.iter().cloned().collect();
+        // [FIX] Everything below this point must NEVER return `Err` out of
+        // this loop iteration without first releasing every claimed
+        // occurrence back to PENDING/FAILED — a bare `?` here would abandon
+        // it INFLIGHT forever (the bug behind observed queue_inflight growth
+        // with queue_done stuck at 0, now with a fencing token so any such
+        // release cannot race a legitimate concurrent reclaim).
+
+        let target_gen_id = match provider.fingerprint() {
+            Some(ref fp) => match ensure_generation_for_fingerprint(store, fp) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("failed to resolve embedding generation: {e}");
+                    reset_all(store, &owner, &token_of);
+                    continue;
+                }
+            },
+            None => {
+                // No stable vector-space identity to commit under. Nothing
+                // in v2 is ever enqueued without a fingerprint (see
+                // `reconcile`), so this is defensive: release and stop.
+                reset_all(store, &owner, &token_of);
+                break;
+            }
+        };
+
+        let occurrences: std::collections::HashMap<String, crate::store::OccurrenceRecord> = {
+            let ids: Vec<String> = claims.iter().map(|(id, _)| id.clone()).collect();
+            let m = match store.occurrences_by_ids(&ids) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("occurrence lookup failed: {e}");
+                    reset_all(store, &owner, &token_of);
+                    continue;
+                }
+            };
+            // Claimed but its occurrence row is gone (e.g. the unit was
+            // deleted after being queued). Nothing to commit for it —
+            // quarantine explicitly instead of leaving it claimable forever.
+            for occ_id in &ids {
+                if !m.contains_key(occ_id)
+                    && let Some(token) = token_of.get(occ_id)
+                {
+                    let _ = store.queue_v2_fail_permanently(
+                        occ_id,
+                        &owner,
+                        *token,
+                        "occurrence record missing",
+                    );
+                }
+            }
+            m
+        };
+        let ids: Vec<String> = occurrences.keys().cloned().collect();
+        let rows = match attic_storage::semantic_units_by_ids(conn, &ids) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("failed to load semantic units for batch: {e}");
+                reset_all(store, &owner, &token_of);
+                continue;
+            }
+        };
+
+        // Build provider inputs; refuse anything that fails the security
+        // gate BEFORE it can reach the provider (§18 defense-in-depth —
+        // Phase 1B already redacted retrieval_text upstream).
+        let mut inputs: Vec<EmbeddingInput> = Vec::with_capacity(rows.len());
+        let mut meta: std::collections::HashMap<String, attic_storage::SemanticUnitRow> =
+            std::collections::HashMap::new();
+        for r in rows {
+            meta.insert(r.unit_id.clone(), r.clone());
+            let Some(token) = token_of.get(&r.unit_id).copied() else {
+                continue;
+            };
+            // Scan the CANONICAL text — that is what reaches the provider
+            // (r03). retrieval_text may carry pointer/env headers; canonical
+            // text is the exact embedded body.
+            let scan = secrets::scan_and_redact(&r.canonical_text);
+            if !scan.findings.is_empty() {
+                tracing::warn!("semantic enrichment refused secret-bearing unit");
+                let _ = store.queue_v2_fail_permanently(
+                    &r.unit_id,
+                    &owner,
+                    token,
+                    "secret-bearing content",
+                );
+                stats.skipped_secret += 1;
+                continue;
+            }
+            if r.canonical_text.len() > provider.max_input_bytes() {
+                let _ =
+                    store.queue_v2_fail_permanently(&r.unit_id, &owner, token, "input too large");
+                stats.failed_items += 1;
+                continue;
+            }
+            inputs.push(EmbeddingInput {
+                unit_key: r.unit_id.clone(),
+                text: r.canonical_text.clone(),
+            });
+        }
+        // [FIX] An occurrence claimed via `ids` that never came back from
+        // `semantic_units_by_ids` (e.g. its canonical row was deleted after
+        // being queued) was previously left INFLIGHT forever with no error
+        // and no resolution. Quarantine it explicitly instead.
+        for id in &ids {
+            if !meta.contains_key(id)
+                && let Some(token) = token_of.get(id)
+            {
+                let _ =
+                    store.queue_v2_fail_permanently(id, &owner, *token, "canonical row missing");
+            }
+        }
+
+        let mut usage = ResourceUsage::default();
+        let plan = crate::cpu_isolation::CpuIsolationPlan::compute(
+            cfg.effective_cpu_threads(),
+            cfg.embedding_worker_count,
+        );
+
+        // Content-addressed reuse: identical canonical body already embedded
+        // in THIS vector space gets its stored vector copied instead of
+        // re-running inference — the v2 canonical table IS the dedup unit
+        // (one row per vector-space + canonical hash, ever), so this is now
+        // an exact lookup rather than a best-effort cache. Across a fleet of
+        // similar repositories (shared boilerplate, copied components) or a
+        // full re-index (fresh unit ids, unchanged bytes) this is the
+        // difference between embedding each unique byte sequence once and
+        // paying inference again for it.
+        let mut handled: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(inputs.len());
+        let mut commit_entries: Vec<crate::store::V2CommitEntry> = Vec::with_capacity(inputs.len());
+        let mut to_embed: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len());
+        let mut hash_of: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for input in inputs {
+            let Some(occ) = occurrences.get(&input.unit_key) else {
+                continue;
+            };
+            hash_of.insert(input.unit_key.clone(), occ.canonical_hash.clone());
+            match store.embedding_for_canonical(&occ.vector_space_id, &occ.canonical_hash) {
+                Ok(Some(vector)) => {
+                    handled.insert(input.unit_key.clone());
+                    if let Some(r) = meta.get(&input.unit_key) {
+                        commit_entries
+                            .push(commit_entry(provider, &owner, &token_of, occ, r, vector));
+                    }
+                }
+                Ok(None) => to_embed.push(input),
+                Err(e) => {
+                    tracing::warn!("canonical embedding lookup failed: {e}");
+                    to_embed.push(input);
+                }
+            }
+        }
+
+        // Enrichment's own wall-clock budget is the provider deadline: a
+        // slow/hung backend must never hold the drive loop past it.
+        // Isolation plan ensures Qwen CPU execution respects orchestrator thread limits.
+        let embed_res = if to_embed.is_empty() {
+            // Every claimed unit was satisfied by content reuse — no
+            // inference to run. Per §11 nothing about cancellation semantics
+            // changes: the commit below still either happens whole or not at
+            // all.
+            Ok(Vec::new())
+        } else {
+            plan.execute_isolated(|| {
+                provider.embed_batch(&to_embed, cancel, &mut usage, Some(deadline))
+            })
+        };
+        match embed_res {
+            Ok(outputs) => {
+                for out in outputs {
+                    if out.vector.len() != provider.dimensions() {
+                        return Err(SemanticError::DimensionMismatch {
+                            record: out.vector.len(),
+                            expected: provider.dimensions(),
+                        });
+                    }
+                    if let (Some(r), Some(occ)) =
+                        (meta.get(&out.unit_key), occurrences.get(&out.unit_key))
+                    {
+                        handled.insert(out.unit_key.clone());
+                        commit_entries.push(commit_entry(
+                            provider, &owner, &token_of, occ, r, out.vector,
+                        ));
+                    }
+                }
+                // [FIX] Any requested input the provider silently dropped
+                // (returned fewer vectors than inputs) previously stayed
+                // INFLIGHT forever with no error raised anywhere.
+                for input in &to_embed {
+                    if !handled.contains(&input.unit_key)
+                        && let Some(token) = token_of.get(&input.unit_key)
+                    {
+                        let _ = store.queue_v2_mark_failed(
+                            &input.unit_key,
+                            &owner,
+                            *token,
+                            cfg.max_attempts,
+                            "provider dropped input",
+                        );
+                        stats.failed_items += 1;
+                    }
+                }
+                // [FIX] The commit itself is fallible (canonical/semantic DB
+                // contention, disk errors). Previously a bare `?` here threw
+                // away already-computed embeddings AND left the batch
+                // permanently INFLIGHT. Reset on failure so it's retried
+                // instead of leaked. Insertion, occurrence completion, and
+                // the generation unit-count bump all happen in ONE
+                // transaction (`commit_v2_batch`).
+                let committed_ids: std::collections::HashSet<String> = commit_entries
+                    .iter()
+                    .map(|e| e.occurrence_id.clone())
+                    .collect();
+                match store.commit_v2_batch(
+                    &commit_entries,
+                    target_gen_id,
+                    SEMANTIC_SELECTION_VERSION,
+                ) {
+                    Ok(committed) => {
+                        stats.embedded += committed.len() as u64;
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to commit embedding batch: {e}");
+                        for occ_id in &committed_ids {
+                            if let Some(token) = token_of.get(occ_id) {
+                                let _ = store.queue_v2_reset(occ_id, &owner, *token);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(SemanticError::Cancelled { .. }) => {
+                // Cancellation is NOT failure: by contract the provider
+                // commits NOTHING when it reports cancellation, so every
+                // item in this batch returns to PENDING untouched and a
+                // later drive resumes cleanly (§11).
+                stats.cancelled = true;
+                reset_all(store, &owner, &token_of);
+                break;
+            }
+            Err(SemanticError::BudgetExhausted(reason)) => {
+                // r07: OOM is NOT an item failure. Halve the batch cap
+                // (floor 1), return items to PENDING, retry smaller. A
+                // single-item OOM is permanent for this content on this
+                // device — quarantine it instead of looping forever.
+                let current = oom_batch_cap.unwrap_or(batch_size).max(1);
+                let next = (current / 2).max(1);
+                stats.oom_reductions += 1;
+                if claims.len() <= 1 && next == 1 {
+                    tracing::warn!(
+                        "embedding OOM at single-item batch ({reason}); quarantining item"
+                    );
+                    fail_all(store, &owner, &token_of, cfg.max_attempts);
+                    stats.failed_items += 1;
+                } else {
+                    tracing::warn!(
+                        "embedding OOM ({reason}); batch cap {current} -> {next}, retrying"
+                    );
+                    oom_batch_cap = Some(next);
+                    reset_all(store, &owner, &token_of);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("embedding batch failed: {e}");
+                fail_all(store, &owner, &token_of, cfg.max_attempts);
+                stats.failed_items += token_of.len() as u64;
+            }
+        }
+    }
+
+    if let Some(ref fp) = fp_for_orphans
+        && let Ok(gen_id) = ensure_generation_for_fingerprint(store, fp)
+    {
+        let _ = store.project_resolved_orphan_occurrences(
+            gen_id,
+            provider.id(),
+            provider.model_id(),
+            SEMANTIC_SELECTION_VERSION,
+        );
+    }
+
+    stats.elapsed_ms = t0.elapsed().as_millis() as u64;
+    stats.queue_remaining = store
+        .queue_v2_counts()
+        .map(|(pending, _, _, _)| pending)
+        .unwrap_or(0);
+    Ok(stats)
+}
+
+/// Fallback drive loop for a provider with no fingerprint — no stable
+/// vector-space identity to key v2 occurrences by, so this uses the
+/// original v1 unit-keyed queue and per-unit `sem_embeddings` storage
+/// directly. Only test doubles (`OomProvider`, `HashingEmbedder`) hit this;
+/// every real production provider always returns a fingerprint (Phase 2).
+fn drive_v1(
+    conn: &Connection,
+    store: &SemanticStore,
+    provider: &dyn SemanticProvider,
+    cfg: &EnrichmentConfig,
+    cancel: &CancelFlag,
+) -> Result<EnrichStats, SemanticError> {
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_millis(cfg.budget_ms.max(1));
+    let mut stats = EnrichStats::default();
     let mut oom_batch_cap: Option<usize> = None;
 
     loop {
@@ -188,25 +578,6 @@ pub fn drive(
         if items.is_empty() {
             break;
         }
-        // [FIX] Everything below this point must NEVER return `Err` out of
-        // this loop iteration without first releasing `items` back to
-        // PENDING/FAILED — `queue_take_batch` already flipped them to
-        // INFLIGHT, and a bare `?` here would abandon them there forever
-        // (the bug behind observed queue_inflight growth with queue_done
-        // stuck at 0).
-        let target_gen_id = match provider.fingerprint() {
-            Some(ref fp) => match ensure_generation_for_fingerprint(store, fp) {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!("failed to resolve embedding generation: {e}");
-                    for it in &items {
-                        store.queue_reset(&it.retrieval_unit_id)?;
-                    }
-                    continue;
-                }
-            },
-            None => None,
-        };
         let ids: Vec<String> = items.iter().map(|i| i.retrieval_unit_id.clone()).collect();
         let rows = match attic_storage::semantic_units_by_ids(conn, &ids) {
             Ok(rows) => rows,
@@ -219,17 +590,11 @@ pub fn drive(
             }
         };
 
-        // Build provider inputs; refuse anything that fails the security
-        // gate BEFORE it can reach the provider (§18 defense-in-depth —
-        // Phase 1B already redacted retrieval_text upstream).
         let mut inputs: Vec<EmbeddingInput> = Vec::with_capacity(rows.len());
         let mut meta: std::collections::HashMap<String, attic_storage::SemanticUnitRow> =
             std::collections::HashMap::new();
         for r in rows {
             meta.insert(r.unit_id.clone(), r.clone());
-            // Scan the CANONICAL text — that is what reaches the provider
-            // (r03). retrieval_text may carry pointer/env headers; canonical
-            // text is the exact embedded body.
             let scan = secrets::scan_and_redact(&r.canonical_text);
             if !scan.findings.is_empty() {
                 tracing::warn!("semantic enrichment refused secret-bearing unit");
@@ -247,10 +612,6 @@ pub fn drive(
                 text: r.canonical_text.clone(),
             });
         }
-        // [FIX] A unit claimed via `items`/`ids` that never came back from
-        // `semantic_units_by_ids` (e.g. its canonical row was deleted after
-        // being queued) was previously left INFLIGHT forever with no error
-        // and no resolution. Quarantine it explicitly instead.
         for id in &ids {
             if !meta.contains_key(id) {
                 store.queue_fail_permanently(id)?;
@@ -263,14 +624,6 @@ pub fn drive(
             cfg.embedding_worker_count,
         );
 
-        // Content-addressed reuse: identical text already embedded under this
-        // exact provider/model/dim gets its stored vector copied instead of
-        // re-running CPU inference. Across a fleet of similar repositories
-        // (shared boilerplate, copied components) this is the difference
-        // between embedding each unique byte sequence once and embedding it
-        // once per repository. The lookup is fallible — on error the claimed
-        // items go back to PENDING exactly like the other pre-embed failures
-        // above, rather than leaking INFLIGHT.
         let hashes: Vec<String> = inputs
             .iter()
             .map(|i| crate::identity::content_hash(&i.text))
@@ -292,14 +645,14 @@ pub fn drive(
         };
 
         let record_for = |r: &attic_storage::SemanticUnitRow, vector: Vec<f32>| {
-            let identity = SemanticUnitIdentity::new(
+            let identity = crate::identity::SemanticUnitIdentity::new(
                 r.unit_id.clone(),
                 r.source_revision_id.clone(),
                 r.index_generation_id.clone(),
                 SEMANTIC_SELECTION_VERSION,
                 &r.canonical_text,
             );
-            EmbeddingRecord {
+            crate::store::EmbeddingRecord {
                 retrieval_unit_id: identity.retrieval_unit_id,
                 repository_id: r.repository_id.clone(),
                 source_revision_id: identity.source_revision_id,
@@ -315,20 +668,16 @@ pub fn drive(
 
         let mut handled: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(inputs.len());
-        let mut batch_records: Vec<EmbeddingRecord> = Vec::with_capacity(inputs.len());
+        let mut batch_records: Vec<crate::store::EmbeddingRecord> =
+            Vec::with_capacity(inputs.len());
         let mut to_embed: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len());
         for (input, ch) in inputs.into_iter().zip(hashes) {
             match existing.get(&ch) {
                 Some(vector) => {
-                    // Same text, same provider/model/dim ⇒ same vector; the
-                    // record is re-stamped with THIS unit's own identity.
                     if let Some(r) = meta.get(&input.unit_key) {
                         handled.insert(input.unit_key.clone());
                         batch_records.push(record_for(r, vector.clone()));
                     } else {
-                        // Unreachable by construction (inputs are built from
-                        // meta rows); route through the provider path so the
-                        // dropped-input check below resolves it explicitly.
                         to_embed.push(input);
                     }
                 }
@@ -336,14 +685,7 @@ pub fn drive(
             }
         }
 
-        // Enrichment's own wall-clock budget is the provider deadline: a
-        // slow/hung backend must never hold the drive loop past it.
-        // Isolation plan ensures Qwen CPU execution respects orchestrator thread limits.
         let embed_res = if to_embed.is_empty() {
-            // Every claimed unit was satisfied by content reuse — no
-            // inference to run. Per §11 nothing about cancellation semantics
-            // changes: the commit below still either happens whole or not at
-            // all.
             Ok(Vec::new())
         } else {
             plan.execute_isolated(|| {
@@ -364,26 +706,13 @@ pub fn drive(
                         batch_records.push(record_for(r, out.vector));
                     }
                 }
-                // [FIX] Any requested input the provider silently dropped
-                // (returned fewer vectors than inputs) previously stayed
-                // INFLIGHT forever with no error raised anywhere.
                 for input in &to_embed {
                     if !handled.contains(&input.unit_key) {
                         store.queue_mark_failed(&input.unit_key, cfg.max_attempts)?;
                         stats.failed_items += 1;
                     }
                 }
-                // [FIX] The commit itself is fallible (canonical/semantic DB
-                // contention, disk errors). Previously a bare `?` here threw
-                // away already-computed embeddings AND left the batch
-                // permanently INFLIGHT. Reset on failure so it's retried
-                // instead of leaked.
-                let commit = if let Some(gen_id) = target_gen_id {
-                    store.put_batch_for_generation(&batch_records, gen_id)
-                } else {
-                    store.put_batch_and_mark_done(&batch_records)
-                };
-                match commit {
+                match store.put_batch_and_mark_done(&batch_records) {
                     Ok(()) => {
                         stats.embedded += batch_records.len() as u64;
                     }
@@ -396,10 +725,6 @@ pub fn drive(
                 }
             }
             Err(SemanticError::Cancelled { .. }) => {
-                // Cancellation is NOT failure: by contract the provider
-                // commits NOTHING when it reports cancellation, so every
-                // item in this batch returns to PENDING untouched and a
-                // later drive resumes cleanly (§11).
                 stats.cancelled = true;
                 for it in &items {
                     store.queue_reset(&it.retrieval_unit_id)?;
@@ -407,10 +732,6 @@ pub fn drive(
                 break;
             }
             Err(SemanticError::BudgetExhausted(reason)) => {
-                // r07: OOM is NOT an item failure. Halve the batch cap
-                // (floor 1), return items to PENDING, retry smaller. A
-                // single-item OOM is permanent for this content on this
-                // device — quarantine it instead of looping forever.
                 let current = oom_batch_cap.unwrap_or(batch_size).max(1);
                 let next = (current / 2).max(1);
                 stats.oom_reductions += 1;
@@ -448,6 +769,54 @@ pub fn drive(
         .map(|m| m.get(crate::store::Q_PENDING).copied().unwrap_or(0))
         .unwrap_or(0);
     Ok(stats)
+}
+
+/// Release every claimed occurrence back to PENDING without incrementing
+/// attempts (cancellation, transient pre-embed failure).
+fn reset_all(store: &SemanticStore, owner: &str, token_of: &std::collections::HashMap<String, i64>) {
+    for (occ_id, token) in token_of {
+        let _ = store.queue_v2_reset(occ_id, owner, *token);
+    }
+}
+
+/// Record a failed attempt for every claimed occurrence (quarantines as
+/// FAILED once `max_attempts` is reached, otherwise back to PENDING).
+fn fail_all(
+    store: &SemanticStore,
+    owner: &str,
+    token_of: &std::collections::HashMap<String, i64>,
+    max_attempts: u32,
+) {
+    for (occ_id, token) in token_of {
+        let _ = store.queue_v2_mark_failed(occ_id, owner, *token, max_attempts, "");
+    }
+}
+
+/// Build one commit entry for a resolved (occurrence, unit row, vector)
+/// triple — shared by both the content-reuse path and the freshly-embedded
+/// path above.
+fn commit_entry(
+    provider: &dyn SemanticProvider,
+    owner: &str,
+    token_of: &std::collections::HashMap<String, i64>,
+    occ: &crate::store::OccurrenceRecord,
+    r: &attic_storage::SemanticUnitRow,
+    vector: Vec<f32>,
+) -> crate::store::V2CommitEntry {
+    crate::store::V2CommitEntry {
+        occurrence_id: occ.occurrence_id.clone(),
+        owner: owner.to_string(),
+        fencing_token: token_of.get(&occ.occurrence_id).copied().unwrap_or(0),
+        retrieval_unit_id: occ.retrieval_unit_id.clone(),
+        repository_id: r.repository_id.clone(),
+        source_revision_id: occ.source_revision_id.clone(),
+        index_generation_id: occ.index_generation_id.clone(),
+        vector_space_id: occ.vector_space_id.clone(),
+        canonical_hash: occ.canonical_hash.clone(),
+        provider_id: provider.id().to_owned(),
+        model_id: provider.model_id().to_owned(),
+        vector,
+    }
 }
 
 /// Simple bounded background worker (§9): small batches, yields between

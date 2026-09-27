@@ -502,6 +502,74 @@ fn duplicate_units_are_selected_once() {
 }
 
 #[test]
+fn duplicate_content_across_files_keeps_every_occurrence_retrievable() {
+    // r02/Phase 1: canonical dedup must compute the embedding once but never
+    // drop the OTHER occurrences of that content — each still needs its own
+    // retrievable row (repo/path provenance), or a query hitting exactly the
+    // duplicate's own path would silently come back empty.
+    let body = "def duplicated_helper(x):\n    return x * 3\n";
+    let fx = Fixture::seed_pub(&[
+        ("src/main/java/com/sable/Router.java", common::ROUTER_JAVA),
+        ("config/app.yml", common::APP_YML),
+        ("lib/a.py", body),
+        ("lib/b_copy.py", body),
+    ]);
+    let svc = fx.service_with_semantic(hashing()).unwrap();
+    let stack = svc.semantic.as_ref().unwrap().clone();
+    let conn = fx.read_conn();
+    let stats = enrich_to_completion(&conn, &stack, &FULL).expect("enrich");
+    assert!(stats.embedded > 0);
+
+    let rows = attic_storage::semantic_unit_rows(&conn, 1_000).unwrap();
+    let py_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.path == "lib/a.py" || r.path == "lib/b_copy.py")
+        .collect();
+    assert_eq!(
+        py_rows.len(),
+        2,
+        "both duplicate files must still be discovered units"
+    );
+
+    // Both units — winner AND dedup loser — must be independently
+    // retrievable from the projected v1 table the candidate index reads.
+    for r in &py_rows {
+        let looked_up = stack
+            .store
+            .lookup(&r.unit_id, stack.provider.id(), stack.provider.model_id())
+            .unwrap();
+        assert!(
+            looked_up.is_some(),
+            "unit at {} must have a retrievable vector despite canonical dedup",
+            r.path
+        );
+    }
+    // And they must share the exact same vector (one embedding, N occurrences).
+    let v0 = stack
+        .store
+        .lookup(
+            &py_rows[0].unit_id,
+            stack.provider.id(),
+            stack.provider.model_id(),
+        )
+        .unwrap()
+        .unwrap();
+    let v1 = stack
+        .store
+        .lookup(
+            &py_rows[1].unit_id,
+            stack.provider.id(),
+            stack.provider.model_id(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        v0.vector, v1.vector,
+        "identical canonical bodies share one vector"
+    );
+}
+
+#[test]
 fn generated_output_is_never_embedded() {
     let fx = Fixture::seed_pub(&[
         ("src/main/java/com/sable/Router.java", common::ROUTER_JAVA),

@@ -55,7 +55,7 @@ pub fn reconcile(
     let demand = selection::demand_from_store(Some(store));
     let max_units = sel_cfg.max_units_total.min(200_000) as u32;
     let rows = attic_storage::semantic_unit_rows(conn, max_units)?;
-    let (selected, sel_report) = selection::select_units(&rows, &demand, sel_cfg);
+    let (selected, duplicates, sel_report) = selection::select_units(&rows, &demand, sel_cfg);
     report.selection = sel_report;
 
     // Expected per-unit state under the active model.
@@ -126,9 +126,70 @@ pub fn reconcile(
     // 6. Bounded queue hygiene: drop entries no longer selected.
     let all_selected: Vec<String> = selected.iter().map(|s| s.row.unit_id.clone()).collect();
     report.queue_dropped = store.queue_retain_only(&all_selected)?;
+    // v2 queue gets the same "only currently-selected units stay claimable"
+    // hygiene as v1 above — otherwise a deselected unit's PENDING v2 row
+    // (occurrence_id == retrieval_unit_id) would stay claimable forever.
+    store.queue_v2_retain_only(&all_selected)?;
+
+    // 7. v2 identity registration + enqueue (r02/§5, Phase 1). Every selected
+    // unit not yet embedded gets a durable occurrence (repo/path/revision/
+    // generation provenance) linked to this vector space + its canonical
+    // hash, then an entry in the leased/fenced v2 queue. Units that lost the
+    // canonical-dedup tiebreak (`duplicates`) still get an occurrence linked
+    // to the SAME canonical hash — no queue entry, since the winning unit's
+    // completion already produces that vector — so their repo/path/env
+    // provenance is never silently dropped by deduplication.
+    //
+    // A provider with no fingerprint (test doubles such as `OomProvider`,
+    // `HashingEmbedder` — no real production provider lacks one; see
+    // Phase 2's identity gate) has no stable vector-space identity to key
+    // occurrences by, so it falls back to the v1 queue entirely.
+    if let Some(fp) = provider.fingerprint() {
+        let vsid = store.ensure_vector_space(&fp, &fp.quantization)?;
+        let cgid = store.ensure_content_generation(&fp, selection::SEMANTIC_SELECTION_VERSION)?;
+
+        let missing_ids: std::collections::HashSet<&str> =
+            missing.iter().map(|(id, _)| id.as_str()).collect();
+        for su in &selected {
+            if !missing_ids.contains(su.row.unit_id.as_str()) {
+                continue;
+            }
+            let hash = su
+                .row
+                .canonical_hash
+                .clone()
+                .unwrap_or_else(|| crate::identity::content_hash(&su.row.canonical_text));
+            store.add_occurrence(
+                &su.row.unit_id,
+                &su.row.unit_id,
+                &vsid,
+                &hash,
+                &su.row.repository_id,
+                &su.row.source_revision_id,
+                &su.row.index_generation_id,
+                &cgid,
+                "{}",
+            )?;
+            store.queue_v2_enqueue(&su.row.unit_id, su.score)?;
+        }
+        for (drow, hash) in &duplicates {
+            store.add_occurrence(
+                &drow.unit_id,
+                &drow.unit_id,
+                &vsid,
+                hash,
+                &drow.repository_id,
+                &drow.source_revision_id,
+                &drow.index_generation_id,
+                &cgid,
+                "{}",
+            )?;
+        }
+    } else if !missing.is_empty() {
+        store.queue_enqueue_scored(&missing)?;
+    }
 
     if !missing.is_empty() {
-        store.queue_enqueue_scored(&missing)?;
         report.enqueued = missing.len();
     }
 

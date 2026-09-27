@@ -19,8 +19,8 @@ use crate::{
 };
 use std::io::{BufReader, BufWriter};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
@@ -76,10 +76,19 @@ pub struct LoadParams {
     pub seq_len: Option<usize>,
 }
 
+/// Verifies the actual loaded worker identity (carried in the LoadModel
+/// response's capabilities) against whatever identity was assumed before
+/// the worker existed. Returns `Err(reason)` on any mismatch — every
+/// mismatch is rejected explicitly, on first load AND every lazy restart,
+/// so a differently-identified worker (wrong provider, backend, dimension,
+/// quantization, ...) can never be silently accepted.
+pub type IdentityVerifier = dyn Fn(&[String]) -> Result<(), String> + Send + Sync;
+
 pub struct WorkerSupervisor {
     launch: WorkerLaunch,
     load: Mutex<Option<LoadParams>>,
     state: Mutex<State>,
+    identity_verifier: Mutex<Option<Arc<IdentityVerifier>>>,
 }
 
 impl WorkerSupervisor {
@@ -92,7 +101,41 @@ impl WorkerSupervisor {
                 model_loaded: false,
                 next_id: 1,
             }),
+            identity_verifier: Mutex::new(None),
         }
+    }
+
+    /// Install the identity check run against every LoadModel response
+    /// (initial load and lazy restart alike). Caller-supplied so this
+    /// protocol-layer crate stays free of any provider-identity type.
+    pub fn set_identity_verifier(
+        &self,
+        f: impl Fn(&[String]) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        if let Ok(mut v) = self.identity_verifier.lock() {
+            *v = Some(Arc::new(f));
+        }
+    }
+
+    /// Run the installed identity verifier (if any) against a LoadModel
+    /// response's capabilities. On mismatch the worker is killed — an
+    /// unverified worker must never be reused for embedding.
+    fn verify_capabilities(
+        &self,
+        state: &mut State,
+        capabilities: &[String],
+    ) -> Result<(), SupervisorError> {
+        let verifier = self.identity_verifier.lock().ok().and_then(|v| v.clone());
+        if let Some(verify) = verifier
+            && let Err(reason) = verify(capabilities)
+        {
+            Self::kill_child(state);
+            return Err(SupervisorError::Engine {
+                class: WorkerErrorClass::Artifact,
+                message: format!("worker identity mismatch, worker killed: {reason}"),
+            });
+        }
+        Ok(())
     }
 
     /// Process id of the current worker (for tests/diagnostics).
@@ -271,7 +314,8 @@ impl WorkerSupervisor {
             seq_len: params.seq_len,
         };
         match self.roundtrip(&mut state, req, Duration::from_secs(600))? {
-            WorkerResponse::HelloOk { .. } => {
+            WorkerResponse::HelloOk { capabilities, .. } => {
+                self.verify_capabilities(&mut state, &capabilities)?;
                 state.model_loaded = true;
                 if let Ok(mut l) = self.load.lock() {
                     *l = Some(params);
@@ -342,7 +386,10 @@ impl WorkerSupervisor {
                 seq_len: params.seq_len,
             };
             match self.roundtrip(&mut state, req, Duration::from_secs(600))? {
-                WorkerResponse::HelloOk { .. } => state.model_loaded = true,
+                WorkerResponse::HelloOk { capabilities, .. } => {
+                    self.verify_capabilities(&mut state, &capabilities)?;
+                    state.model_loaded = true;
+                }
                 WorkerResponse::Error { class, message, .. } => {
                     return Err(SupervisorError::Engine { class, message });
                 }

@@ -96,9 +96,17 @@ impl WorkerEngine for NeuralEngine {
         self.backend = spec.backend.clone();
         self.provider = Some(provider);
         let p = self.provider()?;
+        let mut capabilities = vec!["qwen3-embedding".into()];
+        if let Some(fp) = fp.as_ref() {
+            // Carry the ACTUAL loaded identity back to the supervisor so it
+            // can be verified against the identity assumed before this
+            // worker existed, rather than trusting that load did what was
+            // asked.
+            capabilities.extend(attic_semantic::fingerprint_capabilities(fp));
+        }
         Ok(EngineInfo {
             backend: self.backend.clone(),
-            capabilities: vec!["qwen3-embedding".into()],
+            capabilities,
             dimension: fp.as_ref().map(|f| f.dimension).unwrap_or(0),
             max_input_bytes: p.max_input_bytes(),
         })

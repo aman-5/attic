@@ -20,7 +20,7 @@
 //!   and sub-batched so `batch_items × padded_seq_len` stays under budget.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use half::f16;
@@ -30,12 +30,38 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
+use attic_storage::gpu_telemetry::{AdmissionDecision, GpuAdmissionController, GpuTelemetry};
+
 use crate::error::SemanticError;
 use crate::instruction::CODE_RETRIEVAL_V1_ID;
 use crate::provider::{
     CancelFlag, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput, ExecutionBackend,
     ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
+
+/// Conservative default dedicated-VRAM ceiling admission enforces against —
+/// deliberately below the smallest GPU this provider has actually been
+/// validated on (RTX A500, 4096 MiB) so admission leaves headroom for the
+/// OS/driver/other processes rather than assuming this process owns the
+/// whole device. Override with `ATTIC_VRAM_CEILING_MIB` for a known-larger
+/// (or smaller) dedicated GPU.
+const DEFAULT_VRAM_CEILING_MIB: u64 = 3072;
+
+fn vram_telemetry() -> &'static GpuTelemetry {
+    static TELEMETRY: OnceLock<GpuTelemetry> = OnceLock::new();
+    TELEMETRY.get_or_init(GpuTelemetry::new)
+}
+
+fn vram_admission() -> &'static GpuAdmissionController {
+    static ADMISSION: OnceLock<GpuAdmissionController> = OnceLock::new();
+    ADMISSION.get_or_init(|| {
+        let ceiling = std::env::var("ATTIC_VRAM_CEILING_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_VRAM_CEILING_MIB);
+        GpuAdmissionController::new(ceiling)
+    })
+}
 
 /// Provider id for the ORT/DirectML path.
 pub const ORT_PROVIDER_ID: &str = "qwen3-ort";
@@ -339,6 +365,46 @@ impl SemanticProvider for OrtDirectMlProvider {
                 total: inputs.len(),
             });
         }
+
+        // Proactive VRAM admission (Phase 5): estimate this batch's cost and
+        // check it against the current pressure/budget BEFORE submitting to
+        // the device, rather than only reacting after a real OOM. Both a
+        // required shrink and an outright rejection are reported the same
+        // way the reactive OOM path already is (`BudgetExhausted`) — the
+        // existing `oom_batch_cap` halving logic in `enrich.rs`'s drive loop
+        // already handles that signal correctly, so this reuses it instead
+        // of inventing a second batch-shrinking mechanism. Sustained
+        // Critical pressure escalates to `ProviderUnavailable`, which the
+        // fallback coordinator classifies as a permanent failure and acts on
+        // immediately.
+        let snapshot = vram_telemetry().current_snapshot();
+        let bytes_per_item = attic_storage::gpu_telemetry::estimate_batch_bytes(
+            1,
+            self.seq_len,
+            self.target_dims,
+            NUM_LAYERS,
+            2, // fp16
+        );
+        match vram_admission().admission_check(
+            &snapshot,
+            inputs.len(),
+            bytes_per_item,
+            Instant::now(),
+        ) {
+            AdmissionDecision::Admit { .. } => {}
+            AdmissionDecision::Shrink { .. } | AdmissionDecision::Reject => {
+                return Err(SemanticError::BudgetExhausted(
+                    "VRAM admission: insufficient budget for this batch".into(),
+                ));
+            }
+            AdmissionDecision::FallbackToCpu => {
+                return Err(SemanticError::ProviderUnavailable {
+                    provider: ORT_PROVIDER_ID.into(),
+                    reason: "sustained critical VRAM pressure; falling back to CPU".into(),
+                });
+            }
+        }
+
         let t0 = Instant::now();
 
         // Sort by estimated length so each sub-batch pads to its own widest

@@ -729,6 +729,7 @@ impl SemanticProvider for Qwen3Embedder {
 /// completion, exactly as it did when a call was a single chunk. `cancel`
 /// (user/shutdown) stays responsive between sub-batches. Both exit paths commit
 /// nothing, per the §11 contract.
+#[allow(clippy::type_complexity)]
 fn run_sub_batches(
     indexed: &[(usize, &EmbeddingInput)],
     total: usize,

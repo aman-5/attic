@@ -31,6 +31,15 @@ pub struct SupervisedWorkerProvider {
     fingerprint: EmbeddingFingerprint,
     max_input_bytes: usize,
     ready: AtomicBool,
+    /// Set once a load attempt has actually failed (handshake, model load,
+    /// or identity mismatch) — distinct from "never attempted yet". Without
+    /// this, gating `available()` purely on `ready` deadlocks retrieval: the
+    /// query path's cheap availability probe (`SemanticCandidateGenerator`)
+    /// runs BEFORE ever calling `embed_batch`, which is the only place
+    /// `ready` gets set, so a freshly-restarted-but-never-yet-queried
+    /// worker would report unavailable forever and never get the one real
+    /// attempt that would actually set `ready = true`.
+    load_failed: AtomicBool,
 }
 
 impl SupervisedWorkerProvider {
@@ -44,12 +53,21 @@ impl SupervisedWorkerProvider {
     ) -> Self {
         let supervisor = WorkerSupervisor::new(launch);
         // Remember load params immediately so lazy restart works.
-        let _ = supervisor.load_model_params_only(load);
+        supervisor.load_model_params_only(load);
+        // The worker reports its ACTUAL identity on every load (first load
+        // and every lazy restart); reject any mismatch against what this
+        // provider was constructed to expect rather than assuming the
+        // worker loaded what was asked for.
+        let expected = fingerprint.clone();
+        supervisor.set_identity_verifier(move |caps: &[String]| {
+            verify_identity_capabilities(&expected, caps)
+        });
         Self {
             supervisor,
             fingerprint,
             max_input_bytes,
             ready: AtomicBool::new(false),
+            load_failed: AtomicBool::new(false),
         }
     }
 
@@ -57,12 +75,26 @@ impl SupervisedWorkerProvider {
         if self.ready.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.supervisor.handshake().map_err(map_supervisor_error)?;
-        self.supervisor
-            .load_model_remembered()
-            .map_err(map_supervisor_error)?;
-        self.ready.store(true, Ordering::Release);
-        Ok(())
+        let result = self
+            .supervisor
+            .handshake()
+            .map_err(map_supervisor_error)
+            .and_then(|_| {
+                self.supervisor
+                    .load_model_remembered()
+                    .map_err(map_supervisor_error)
+            });
+        match result {
+            Ok(()) => {
+                self.load_failed.store(false, Ordering::Release);
+                self.ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                self.load_failed.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -108,8 +140,13 @@ impl SemanticProvider for SupervisedWorkerProvider {
     }
 
     fn available(&self) -> bool {
-        // The worker is lazily spawned; availability means "configured".
-        true
+        // Truthful readiness (Phase 4): "available" means "not known to be
+        // broken", not "has already loaded". A worker that hasn't been
+        // tried yet gets the benefit of the doubt so the first real query
+        // or drive() call can actually attempt the one load that proves it
+        // one way or the other; a worker whose load has genuinely failed
+        // must never be reported as active.
+        !self.load_failed.load(Ordering::Acquire)
     }
 
     fn concurrency_contract(&self) -> ProviderConcurrencyContract {
@@ -159,10 +196,31 @@ impl SemanticProvider for SupervisedWorkerProvider {
             None => EMBED_DEADLINE,
         };
 
-        let vectors = self
-            .supervisor
-            .embed_batch(items, effective_deadline)
-            .map_err(map_supervisor_error)?;
+        let vectors = match self.supervisor.embed_batch(items, effective_deadline) {
+            Ok(v) => v,
+            Err(e) => {
+                // `ready` only reflects the state as of the last successful
+                // `ensure_ready()` and is otherwise never touched — without
+                // this, one successful load at startup would make
+                // `available()` report healthy forever, even through a
+                // later worker crash/identity-mismatch-on-restart that
+                // keeps failing every subsequent call. An OOM is a
+                // per-batch resource signal the adaptive batch-cap halving
+                // in `enrich.rs` already owns, not evidence the worker
+                // itself is broken, so it alone does not flip readiness.
+                if !matches!(
+                    e,
+                    SupervisorError::Engine {
+                        class: WorkerErrorClass::OutOfMemory,
+                        ..
+                    }
+                ) {
+                    self.load_failed.store(true, Ordering::Release);
+                    self.ready.store(false, Ordering::Release);
+                }
+                return Err(map_supervisor_error(e));
+            }
+        };
 
         if vectors.len() != keys.len() {
             return Err(SemanticError::EmbeddingFailed(format!(
@@ -190,7 +248,7 @@ impl SemanticProvider for SupervisedWorkerProvider {
 pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> EmbeddingFingerprint {
     use crate::provider::ExecutionBackend;
     let base = EmbeddingFingerprint {
-        provider: "qwen3".into(),
+        provider: crate::qwen3_provider::QWEN_PROVIDER_ID.into(),
         model_id: crate::qwen3_provider::QWEN_MODEL_ID.into(),
         model_revision: String::new(),
         dimension: dimension.unwrap_or(1024),
@@ -204,6 +262,10 @@ pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> Embeddin
     };
     match backend {
         "ort-directml" => EmbeddingFingerprint {
+            // Must match `ort_directml::ORT_PROVIDER_ID`; kept as a literal
+            // here because that module is `#[cfg(feature = "ort-directml")]`
+            // and this function must resolve regardless of feature flags.
+            provider: "qwen3-ort".into(),
             model_revision: "onnx-community-fp16".into(),
             execution_backend: ExecutionBackend::OrtDirectMl,
             quantization: "fp16-onnx".into(),
@@ -218,6 +280,72 @@ pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> Embeddin
     }
 }
 
+/// Wire encoding of a worker's ACTUAL loaded [`EmbeddingFingerprint`],
+/// carried in the LoadModel response's `capabilities` (a free-form
+/// `Vec<String>` — the protocol layer stays free of any provider-identity
+/// type). One `"fp:<field>:<value>"` entry per fingerprint field.
+pub fn fingerprint_capabilities(fp: &EmbeddingFingerprint) -> Vec<String> {
+    vec![
+        format!("fp:provider:{}", fp.provider),
+        format!("fp:model_id:{}", fp.model_id),
+        format!("fp:model_revision:{}", fp.model_revision),
+        format!("fp:dimension:{}", fp.dimension),
+        format!("fp:pooling_version:{}", fp.pooling_version),
+        format!("fp:normalization_version:{}", fp.normalization_version),
+        format!("fp:tokenizer_version:{}", fp.tokenizer_version),
+        format!("fp:chunking_version:{}", fp.chunking_version),
+        format!(
+            "fp:query_instruction_version:{}",
+            fp.query_instruction_version
+        ),
+        format!("fp:execution_backend:{}", fp.execution_backend.as_str()),
+        format!("fp:quantization:{}", fp.quantization),
+    ]
+}
+
+fn capability_value<'a>(caps: &'a [String], field: &str) -> Option<&'a str> {
+    let prefix = format!("fp:{field}:");
+    caps.iter().find_map(|c| c.strip_prefix(prefix.as_str()))
+}
+
+/// Compare the actual identity a worker reported on load (via
+/// [`fingerprint_capabilities`]) against the identity expected before the
+/// worker existed ([`expected_fingerprint`]). Every mismatched or missing
+/// field is collected and rejected explicitly — persistence must never be
+/// keyed off an assumed identity the loaded worker didn't actually report.
+pub fn verify_identity_capabilities(
+    expected: &EmbeddingFingerprint,
+    caps: &[String],
+) -> Result<(), String> {
+    let mut mismatches = Vec::new();
+    let mut check = |field: &str, expected_val: &str| match capability_value(caps, field) {
+        Some(actual) if actual == expected_val => {}
+        Some(actual) => mismatches.push(format!(
+            "{field}: expected '{expected_val}', got '{actual}'"
+        )),
+        None => mismatches.push(format!("{field}: missing from worker response")),
+    };
+    check("provider", &expected.provider);
+    check("model_id", &expected.model_id);
+    check("model_revision", &expected.model_revision);
+    check("dimension", &expected.dimension.to_string());
+    check("pooling_version", &expected.pooling_version);
+    check("normalization_version", &expected.normalization_version);
+    check("tokenizer_version", &expected.tokenizer_version);
+    check("chunking_version", &expected.chunking_version);
+    check(
+        "query_instruction_version",
+        &expected.query_instruction_version,
+    );
+    check("execution_backend", expected.execution_backend.as_str());
+    check("quantization", &expected.quantization);
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("; "))
+    }
+}
+
 /// The max_input_bytes the worker's provider will enforce, without loading
 /// the model (mirrors each provider's contract).
 pub fn expected_max_input_bytes(backend: &str, seq_len: usize) -> usize {
@@ -226,5 +354,86 @@ pub fn expected_max_input_bytes(backend: &str, seq_len: usize) -> usize {
         "ort-directml" => seq_len * 2,
         // Candle: DEFAULT_MAX_TOKENS (1024) x MIN_BYTES_PER_TOKEN (2).
         _ => 1024 * 2,
+    }
+}
+
+#[cfg(test)]
+mod expected_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn candle_cpu_provider_matches_qwen3_provider_id() {
+        let fp = expected_fingerprint("candle-cpu", Some(1024));
+        assert_eq!(fp.provider, crate::qwen3_provider::QWEN_PROVIDER_ID);
+        assert_eq!(
+            fp.execution_backend,
+            crate::provider::ExecutionBackend::CandleCpu
+        );
+    }
+
+    #[test]
+    fn ort_directml_provider_matches_real_worker_provider_id() {
+        // Must match `ort_directml::ORT_PROVIDER_ID` ("qwen3-ort") exactly —
+        // this is the value the real DirectML worker reports on load, and a
+        // mismatch here previously caused every DirectML load to be rejected
+        // as an identity mismatch.
+        let fp = expected_fingerprint("ort-directml", Some(1024));
+        assert_eq!(fp.provider, "qwen3-ort");
+        assert_ne!(fp.provider, crate::qwen3_provider::QWEN_PROVIDER_ID);
+        assert_eq!(
+            fp.execution_backend,
+            crate::provider::ExecutionBackend::OrtDirectMl
+        );
+    }
+
+    #[test]
+    fn provider_is_available_before_first_attempt_and_unavailable_after_a_real_failure() {
+        // `available()` means "not known to be broken", not "has already
+        // loaded" — a never-tried worker gets the benefit of the doubt (so
+        // the first real query/drive() call can make the one attempt that
+        // actually proves it works), but a genuinely failed load must never
+        // be reported as active.
+        let launch = WorkerLaunch {
+            program: std::path::PathBuf::from("attic-inference-worker-does-not-exist"),
+            args: vec![],
+            env: vec![],
+        };
+        let load = LoadParams {
+            cache_dir: "unused".into(),
+            batch_size: 1,
+            dimension: Some(4),
+            backend: "candle-cpu".into(),
+            onnx_model_dir: None,
+            seq_len: None,
+        };
+        let fp = expected_fingerprint("candle-cpu", Some(4));
+        let provider = SupervisedWorkerProvider::new(launch, load, fp, 4096);
+        assert!(
+            provider.available(),
+            "a never-attempted worker must be optimistically available"
+        );
+
+        let cancel = CancelFlag::new();
+        let mut usage = ResourceUsage::default();
+        let inputs = [EmbeddingInput {
+            unit_key: "u1".into(),
+            text: "hello".into(),
+        }];
+        let err = provider.embed_batch(&inputs, &cancel, &mut usage, None);
+        assert!(err.is_err(), "spawning a nonexistent program must fail");
+        assert!(
+            !provider.available(),
+            "a worker whose load attempt genuinely failed must report unavailable"
+        );
+    }
+
+    #[test]
+    fn every_fingerprint_field_differs_when_expected() {
+        let cpu = expected_fingerprint("candle-cpu", Some(1024));
+        let gpu = expected_fingerprint("ort-directml", Some(1024));
+        assert_ne!(cpu.provider, gpu.provider);
+        assert_ne!(cpu.model_revision, gpu.model_revision);
+        assert_ne!(cpu.execution_backend, gpu.execution_backend);
+        assert_ne!(cpu.quantization, gpu.quantization);
     }
 }

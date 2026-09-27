@@ -237,10 +237,12 @@ pub(crate) struct AtticServer {
 /// `Qwen3Embedder` is the sole production neural provider. If unavailable
 /// (e.g. offline with no cached weights), it degrades to `UnavailableProvider`,
 /// never corrupting the vector space and never falling back to a hashing embedder.
+#[cfg_attr(not(feature = "ort-directml"), allow(unused_variables))]
 fn resolve_semantic_provider(
     attic_config: &attic_core::AtticConfig,
     batch_size: usize,
     model_cache_dir: &Path,
+    store: &Arc<attic_semantic::SemanticStore>,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
     if !attic_config.semantic.enabled {
         tracing::info!("semantic intelligence is disabled in configuration");
@@ -284,6 +286,32 @@ fn resolve_semantic_provider(
     // (cheap) and hands the worker the load spec; the child loads lazily on
     // the first batch and can be killed/restarted if the native stack hangs.
 
+    // Cheap presence probe only — never construct the model in-process.
+    // Resolved up front (not just inside the CPU-only branch below) because
+    // the GPU branch also needs to know whether a CPU fallback target
+    // exists before it can wire `FallbackCoordinator` (Phase 3 escalation
+    // gap: a permanent GPU failure must have somewhere real to fall back
+    // to, not just a coordinator that always answers from a dead GPU path).
+    let cpu_provider = |dir: &Path| {
+        supervised_provider(
+            "candle-cpu",
+            dir,
+            batch_size,
+            attic_config.semantic.dimension,
+            None,
+        )
+    };
+    let cpu_dir = candidate_dirs.iter().find(|dir| {
+        let mgr = attic_semantic::ModelAssetManager::new(
+            dir,
+            attic_semantic::ModelManifest::qwen3_default(),
+        );
+        matches!(
+            mgr.check_status(),
+            attic_semantic::ModelAssetStatus::Active { .. }
+        )
+    });
+
     // Phase 4: prefer the ORT/DirectML GPU provider when a local ONNX model
     // directory is configured/present — measured ~195× faster than the candle
     // CPU path on an RTX A500 (3,130 vs 16 tok/s). Set ATTIC_ONNX_MODEL_DIR
@@ -292,36 +320,39 @@ fn resolve_semantic_provider(
     if let Ok(onnx_dir) = std::env::var("ATTIC_ONNX_MODEL_DIR") {
         let dir = PathBuf::from(onnx_dir);
         if dir.join("model_fp16.onnx").is_file() && dir.join("tokenizer.json").is_file() {
-            tracing::info!("using supervised ORT/DirectML GPU worker for Qwen3");
-            return supervised_provider(
+            let gpu = supervised_provider(
                 "ort-directml",
                 model_cache_dir,
                 batch_size,
                 attic_config.semantic.dimension,
                 Some(dir),
             );
+            return match cpu_dir {
+                Some(cpu_dir) => {
+                    tracing::info!(
+                        "using supervised ORT/DirectML GPU worker for Qwen3, with candle-cpu fallback wired"
+                    );
+                    let cpu = cpu_provider(cpu_dir);
+                    Arc::new(attic_semantic::FallbackCoordinator::new(
+                        gpu,
+                        cpu,
+                        store.clone(),
+                        attic_semantic::FallbackConfig::default(),
+                    ))
+                }
+                None => {
+                    tracing::warn!(
+                        "using supervised ORT/DirectML GPU worker for Qwen3 WITHOUT a CPU fallback target — no local Qwen3 CPU weights found in {candidate_dirs:?}; a permanent GPU failure will surface as semantic errors instead of falling back"
+                    );
+                    gpu
+                }
+            };
         }
     }
 
-    for dir in &candidate_dirs {
-        // Cheap presence probe only — never construct the model in-process.
-        let mgr = attic_semantic::ModelAssetManager::new(
-            dir,
-            attic_semantic::ModelManifest::qwen3_default(),
-        );
-        if matches!(
-            mgr.check_status(),
-            attic_semantic::ModelAssetStatus::Active { .. }
-        ) {
-            tracing::info!("Qwen3 assets present; using supervised candle-cpu worker");
-            return supervised_provider(
-                "candle-cpu",
-                dir,
-                batch_size,
-                attic_config.semantic.dimension,
-                None,
-            );
-        }
+    if let Some(dir) = cpu_dir {
+        tracing::info!("Qwen3 assets present; using supervised candle-cpu worker");
+        return cpu_provider(dir);
     }
 
     tracing::warn!(
@@ -481,6 +512,11 @@ fn spawn_model_download_task(
 #[cfg(test)]
 mod resolve_provider_tests {
     use attic_core::AtticConfig;
+    use std::sync::Arc;
+
+    fn test_store() -> Arc<attic_semantic::SemanticStore> {
+        Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap())
+    }
 
     #[test]
     fn resolve_provider_never_falls_back_to_hashing_when_qwen_unavailable() {
@@ -488,7 +524,7 @@ mod resolve_provider_tests {
         let cache_dir = tmp.path().join("cache");
         let mut cfg = AtticConfig::default();
         cfg.semantic.model = "unknown_legacy_provider".to_string();
-        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir);
+        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir, &test_store());
         assert!(
             !provider.available(),
             "provider must be unavailable when non-qwen provider is requested"
@@ -506,7 +542,7 @@ mod resolve_provider_tests {
         let cache_dir = tmp.path().join("cache");
         let mut cfg = AtticConfig::default();
         cfg.semantic.enabled = false;
-        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir);
+        let provider = super::resolve_semantic_provider(&cfg, 16, &cache_dir, &test_store());
         assert!(
             !provider.available(),
             "provider must be unavailable when semantic layer is disabled"
@@ -641,10 +677,12 @@ impl AtticServer {
         let semantic = if semantic_opt_in {
             match attic_semantic::SemanticStore::open(&semantic_path) {
                 Ok(store) => {
+                    let store = Arc::new(store);
                     let provider = resolve_semantic_provider(
                         &attic_config,
                         effective.embedding_batch_size,
                         &model_cache_dir,
+                        &store,
                     );
                     info!(
                         provider = provider.id(),
@@ -652,7 +690,7 @@ impl AtticServer {
                         "semantic layer ENABLED"
                     );
                     let stack = attic_retrieval::semantic::SemanticStack {
-                        store: Arc::new(store),
+                        store,
                         provider,
                     };
                     Some(Arc::new(stack))
@@ -2484,6 +2522,11 @@ fn handle_status(
             "vector_space_id": fp.as_ref().map(|f| f.vector_space_id()),
             "dimension": fp.as_ref().map(|f| f.dimension),
             "worker_isolated": stack.provider.id() == "qwen3-supervised",
+            // GPU->CPU escalation state, when the active provider is a
+            // `FallbackCoordinator` (or any provider that overrides
+            // `fallback_reason`). `None` (never fabricated) when this
+            // provider never fell back — see `attic_semantic::fallback`.
+            "fallback_reason": stack.provider.fallback_reason(),
         });
     }
 
@@ -3908,12 +3951,16 @@ pub(crate) fn build_server_and_enricher(
                 std::thread::available_parallelism().map_or(1, usize::from),
             ),
             selection: {
-                let mut sel = attic_semantic::SelectionConfig::default();
-                sel.exclude_globs = server.attic_config.semantic.exclude_globs.clone();
-                if let Some(max_bytes) = server.attic_config.semantic.max_file_bytes {
-                    sel.max_file_bytes = max_bytes;
+                let defaults = attic_semantic::SelectionConfig::default();
+                attic_semantic::SelectionConfig {
+                    exclude_globs: server.attic_config.semantic.exclude_globs.clone(),
+                    max_file_bytes: server
+                        .attic_config
+                        .semantic
+                        .max_file_bytes
+                        .unwrap_or(defaults.max_file_bytes),
+                    ..defaults
                 }
-                sel
             },
             ..attic_semantic::EnrichmentConfig::default()
         };

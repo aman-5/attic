@@ -16,6 +16,7 @@ pub mod connection;
 pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
+pub mod gpu_telemetry;
 pub mod indexing_publication;
 pub mod invalidation_ops;
 pub mod machine_telemetry;

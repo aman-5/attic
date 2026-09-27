@@ -1,10 +1,14 @@
-# Attic
+# 🗄️ Attic
 
-Attic is a local MCP server that gives AI coding agents persistent,
-evidence-backed understanding of large codebases and multi-repository
-workspaces.
+**A local MCP server that gives AI coding agents persistent, evidence-backed understanding of large codebases and multi-repository workspaces.**
 
-## Why Attic?
+[![CI](https://github.com/aman-5/attic/actions/workflows/ci.yml/badge.svg)](https://github.com/aman-5/attic/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust 2024 edition](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](rust-toolchain.toml)
+
+Repositories on disk are always the source of truth — every index, graph, and cache Attic builds is derived and disposable.
+
+## ✨ At a glance
 
 - **Fast code search** — full-text search over indexed content, not a slow re-grep every turn.
 - **Structural understanding** — symbols, definitions, and relationships for supported languages.
@@ -14,7 +18,22 @@ workspaces.
 - **Curated project knowledge** — a `knowledge/` tier for facts that aren't obvious from source.
 - **Local-first** — runs entirely on your machine; nothing leaves it unless you opt in to the (disabled-by-default) semantic layer.
 
-## Quick Start
+## Contents
+
+- [Quick Start](#quick-start)
+- [Connect to your AI/MCP client](#connect-to-your-aimcp-client)
+- [Use Attic](#use-attic)
+- [MCP Tools](#mcp-tools)
+- [Workspaces & Multiple Repositories](#workspaces--multiple-repositories)
+- [Project Knowledge](#project-knowledge)
+- [Language Support](#language-support)
+- [How It Works](#how-it-works)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Build from Source](#build-from-source)
+- [Documentation](#documentation)
+
+## 🚀 Quick Start
 
 No Rust, Cargo, or a native compiler required — this downloads a prebuilt
 binary and verifies its checksum before installing it (no admin/sudo).
@@ -44,7 +63,7 @@ configuration block below with your installed binary's path filled in.
 Building from source is also supported and is the right choice if you're
 contributing to Attic itself — see [Build from Source](#build-from-source).
 
-## Connect to your AI/MCP client
+## 🔌 Connect to your AI/MCP client
 
 Attic is an MCP server: transport is **stdio**. Your AI client starts the
 Attic process directly (no port, no `localhost` URL) — the first launch for
@@ -282,7 +301,7 @@ Rich language support is additive, not a gate on usability — every
 text-based file in your workspace is searchable from the first index,
 regardless of language.
 
-## How It Works
+## 🏗️ How It Works
 
 ```mermaid
 flowchart TD
@@ -303,9 +322,12 @@ and cache is derived and disposable. See
 retrieval/evidence model, incremental-recovery behavior, and
 cross-repository diagrams.
 
-## Configuration
+## ⚙️ Configuration
 
 All configuration is via environment variables — there are no CLI flags.
+
+<details>
+<summary><strong>Full environment variable reference</strong> (click to expand)</summary>
 
 | Variable | Purpose |
 |---|---|
@@ -337,6 +359,8 @@ a startup error — unset it or provide a valid path. `ATTIC_DB_PATH` is
 supported as an explicit database path override for advanced/testing use.
 Attic never writes into your workspace — all index state is stored under the
 Attic home directory.
+
+</details>
 
 ### Semantic search (optional)
 
@@ -385,7 +409,10 @@ production semantic engine. `scheduler_workers`, SQLite `cache`/`mmap`
 sizing, and `embedding_batch_size` are mode-derived/automatic and not
 user-tunable in `attic.toml` by design.
 
-## Troubleshooting
+## 🛠️ Troubleshooting
+
+<details>
+<summary><strong>Common issues and what to check</strong> (click to expand)</summary>
 
 - **Server exits immediately on startup**: check stderr for a fail-closed
   message — usually a corrupted database (try a fresh `ATTIC_HOME` to
@@ -408,7 +435,9 @@ user-tunable in `attic.toml` by design.
 See `docs/PLAYBOOK.md` for a fuller troubleshooting table and recovery
 procedures.
 
-## Build from Source
+</details>
+
+## 🔧 Build from Source
 
 This is the **contributor path** — normal users should use
 [Quick Start](#quick-start) above instead.
@@ -468,9 +497,10 @@ workflow: schema migrations, adding an analyzer, and the release process
 (`tools/package.sh`, which is what CI runs to produce the archives
 `setup.sh`/`setup.ps1` download).
 
-## Documentation
+## 📚 Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — visual system design:
-  pipeline, ownership model, storage concurrency, security, crash recovery.
-- [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) — operations manual: install,
-  connect, troubleshoot, recover, update, and develop.
+| Doc | Covers |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Visual system design: pipeline, ownership model, storage concurrency, security, crash recovery. |
+| [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) | Operations manual: install, connect, troubleshoot, recover, update, and develop. |
+| [`docs/TIMING-R16.md`](docs/TIMING-R16.md) | Measured indexing/embedding timings from the acceptance machine. |

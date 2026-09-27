@@ -1,4 +1,4 @@
-# Attic — Architecture
+# 🏛️ Attic — Architecture
 
 This document describes Attic **as it exists in the current codebase**, not
 as a history of how it was built. "Key design decisions" and "Core
@@ -6,6 +6,24 @@ behavioral invariants" below consolidate what used to be a separate ADR/
 contract document set; this file is now the single authoritative
 architecture reference — nothing else needs to be read to understand how
 the system behaves.
+
+## Contents
+
+- [What Attic is](#what-attic-is)
+- [Architecture overview](#architecture-overview)
+- [Process and ownership model](#process-and-ownership-model)
+- [Storage concurrency](#storage-concurrency)
+- [Language support](#language-support)
+- [Project Knowledge authority model](#project-knowledge-authority-model)
+- [Known design limitations](#known-design-limitations-not-blocking-no-action-taken)
+- [Key design decisions](#key-design-decisions)
+- [Core behavioral invariants](#core-behavioral-invariants)
+- [Semantic layer](#semantic-layer-optional-default-enabled)
+- [Resource management](#resource-management)
+- [Security](#security)
+- [Crash recovery](#crash-recovery)
+- [Logical workspace model](#logical-workspace-model-multi-root-mcp-configured)
+- [MCP surface](#mcp-surface)
 
 ## What Attic is
 
@@ -265,12 +283,15 @@ contradictions. The boundary is the `knowledge/` path prefix only —
 filenames are never special-cased outside it. See `knowledge/README.md` in
 this repository for the end-user-facing explanation and template.
 
-## Known design limitations (not blocking, no action taken)
+## ⚠️ Known design limitations (not blocking, no action taken)
 
 These are honest, currently-accurate statements about gaps between the
 schema/contracts and the current implementation — not defects introduced by
 this pass, and not silently resolved by it. Each needs a product decision
 before being closed:
+
+<details>
+<summary><strong>Show the five known limitations</strong></summary>
 
 - **`core_knowledge_items` is schema-only.** The table exists (referenced by
   cascading invalidation in `attic-storage::invalidation_ops`) but nothing
@@ -303,11 +324,16 @@ before being closed:
   validate()` only rejects `0`; there is no configured ceiling on how high
   `ATTIC_MAX_CONTEXT_TOKENS` (default `8192`) can be set.
 
-## Key design decisions
+</details>
+
+## 🧭 Key design decisions
 
 Permanent, non-obvious decisions worth knowing when changing this system —
 condensed from the project's ADR history (full alternatives-considered
 rationale lives only in the archive branch's git history now):
+
+<details>
+<summary><strong>Show all design decisions</strong></summary>
 
 - **SQLite WAL checkpointing**: automatic frame-count checkpointing
   (`PRAGMA wal_autocheckpoint = 1000`, PASSIVE) on the writer connection,
@@ -377,13 +403,18 @@ rationale lives only in the archive branch's git history now):
   pipeline does not allow a claim in a `context` response to reference
   evidence that isn't part of the assembled context returned alongside it.
 
-## Core behavioral invariants
+</details>
+
+## ✅ Core behavioral invariants
 
 A condensed reference of the invariants that most affect correctness and
 observable behavior, verified against the current implementation. This is
 not exhaustive engineering detail (that level of specification now exists
 only in git history on the archive branch) — it's what a maintainer changing
 this system needs to not accidentally break.
+
+<details>
+<summary><strong>Show invariants by area</strong> (Discovery, Identity, Secrets, Storage, Freshness, Evidence, Recovery, Resources)</summary>
 
 **Discovery & security**
 - A path marked security-forbidden is never made eligible by any include
@@ -455,7 +486,9 @@ this system needs to not accidentally break.
 - The writer queue is drained (bounded) before process exit — shutdown never
   abandons a write mid-flight without at least attempting to finish it.
 
-## Semantic layer (optional, default-enabled)
+</details>
+
+## 🧠 Semantic layer (optional, default-enabled)
 
 Semantic (embedding-based) retrieval is **enabled by default**; set
 `ATTIC_SEMANTIC=0` to disable it. When enabled, `Qwen3Embedder` — a
@@ -470,6 +503,23 @@ retrieval is entirely unaffected; the semantic layer never gates or blocks
 an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
 rationale.
 
+Backend selection (see README's Semantic engine notes for the exact env
+vars and build flags):
+
+```mermaid
+flowchart TD
+    S[Semantic layer enabled] --> D{ort-directml build<br/>+ ATTIC_ONNX_MODEL_DIR set?}
+    D -- yes --> G[GPU: ORT/DirectML fp16<br/>Qwen3-Embedding-0.6B]
+    D -- no --> C[CPU: Candle Qwen3Embedder<br/>safetensors / Q8 GGUF]
+    G --> R[status: semantic_identity<br/>reports active backend]
+    C --> R
+```
+
+Isolation: neural embedding always runs inside the supervised
+`attic inference-worker` child process regardless of which backend is
+selected — a hung or crashed model runtime is killed and restarted without
+touching the MCP server (see README's "Isolated inference worker" note).
+
 The background embedding worker (`crates/attic-semantic/src/enrich.rs`)
 runs a resource-tier-scaled number of threads — 1 on `low`, 3 on
 `balanced`/`performance` (`crates/attic-storage/src/resource_policy.rs`) —
@@ -478,7 +528,7 @@ gate prevents the (expensive) rescan from running redundantly per thread,
 an atomic queue-claim prevents two threads from claiming the same unit,
 and backoff sleeps are jittered to avoid thundering-herd wakeups.
 
-## Resource management
+## 📊 Resource management
 
 A `ResourceMonitor` (`attic-storage::resource_manager`) tracks real process
 RSS and enforces configurable budgets: total memory, foreground MCP query
@@ -488,7 +538,7 @@ background capacity is capped strictly below foreground capacity, and under
 memory pressure (`Pause`/`Emergency` advisories) expensive `DEEP` retrieval
 mode is automatically downgraded to `NORMAL` rather than failing outright.
 
-## Security
+## 🔒 Security
 
 - Path traversal and symlink escapes are rejected before any file is read
   (`canonicalize_within_root`).
@@ -499,7 +549,7 @@ mode is automatically downgraded to `NORMAL` rather than failing outright.
   bounds) before use; no raw string is interpolated into SQL — dynamic SQL
   uses compile-time-literal identifiers only.
 
-## Crash recovery
+## 🩹 Crash recovery
 
 On every startup, before serving any MCP request, Attic runs
 `run_startup_recovery`: it resets orphaned tasks, reconciles any indexing run

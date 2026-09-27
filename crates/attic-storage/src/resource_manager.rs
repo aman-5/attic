@@ -734,11 +734,12 @@ impl ResourceMonitor {
             .checked_div(max)
             .unwrap_or(0);
         let total = self.system_total_mib.load(Ordering::Relaxed);
-        let system_pct = if total == 0 {
-            0
-        } else {
-            self.system_used_mib.load(Ordering::Relaxed) * 100 / total
-        };
+        let system_pct = self
+            .system_used_mib
+            .load(Ordering::Relaxed)
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0);
         attic_pct.max(system_pct)
     }
 

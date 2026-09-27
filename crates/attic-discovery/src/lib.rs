@@ -458,6 +458,7 @@ where
 ///   are scanned; a `PARTIAL_SECRET_SCAN` diagnostic is recorded; the
 ///   classification is always [`DownstreamClassification::PartialScan`], never
 ///   `Safe`, because the mid-body was not inspected.
+///
 /// r03: explicit terminal verdict for document formats Attic does not parse.
 /// Extension selects the candidate; when the file's bytes are already in hand
 /// (SMALL-tier prefetch), the magic signature must confirm — a `.pdf`-named

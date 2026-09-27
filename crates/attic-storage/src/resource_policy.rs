@@ -751,9 +751,9 @@ mod tests {
     #[test]
     fn clamp_reserves_two_cores_for_foreground() {
         let p = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
-        let eff14 = p.clone().clamp_to_hardware(&snap(65536, 14));
+        let eff14 = p.clamp_to_hardware(&snap(65536, 14));
         assert_eq!(eff14.scheduler_workers, 8, "wants 8, 14-2=12 allows 8");
-        let eff4 = p.clone().clamp_to_hardware(&snap(65536, 4));
+        let eff4 = p.clamp_to_hardware(&snap(65536, 4));
         assert_eq!(eff4.scheduler_workers, 2, "4 cores reserve 2");
         assert_eq!(eff4.embedding_worker_count, 2, "embedding respects reserve");
         let eff2 = p.clamp_to_hardware(&snap(65536, 2));

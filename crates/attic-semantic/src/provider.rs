@@ -108,6 +108,15 @@ pub trait SemanticProvider: Send + Sync {
         None
     }
 
+    /// Truthful fallback-state explanation, for providers that wrap more
+    /// than one backend and may have switched away from their primary
+    /// (e.g. GPU→CPU escalation after a permanent GPU failure). `None`
+    /// means "never fell back" — never fabricated, and cleared again once
+    /// a provider is back on its primary backend.
+    fn fallback_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Embed a batch under an ENFORCEABLE time contract (§20): `deadline`
     /// (when set) bounds the whole call — implementations must check it
     /// cooperatively between items/slices and return
@@ -144,7 +153,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Execution backend that produced a vector — TELEMETRY ONLY (Final Master
 /// Plan identity split). Two backends may write to the same vector space only
 /// after measured parity; the backend itself never participates in identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBackend {
     CandleCpu,
@@ -153,13 +162,8 @@ pub enum ExecutionBackend {
     OrtDirectMl,
     OrtCoreMl,
     Hashing,
+    #[default]
     Unknown,
-}
-
-impl Default for ExecutionBackend {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl ExecutionBackend {

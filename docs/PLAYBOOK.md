@@ -1,8 +1,20 @@
-# Attic — Operations & Development Playbook
+# 📘 Attic — Operations & Development Playbook
 
 Practical manual for operating, troubleshooting, recovering, and developing
 Attic. For what Attic is and how it's built, see `docs/ARCHITECTURE.md`. For
 install/config quick-starts, see `README.md`.
+
+## Contents
+
+- [Operation](#operation)
+  - [Start](#start) · [Stop](#stop) · [First indexing](#first-indexing) · [Subsequent startup](#subsequent-startup)
+  - [Incremental indexing](#incremental-indexing) · [Health / status](#health--status)
+  - [Repository add/remove](#repository-addremove) · [Multi-repository operation](#multi-repository-operation)
+  - [Project Knowledge](#project-knowledge) · [Semantic enable/disable](#semantic-enabledisable)
+- [🛠️ Troubleshooting](#troubleshooting)
+- [🩹 Recovery](#recovery)
+- [👩‍💻 Development](#development)
+- [🔧 Maintenance](#maintenance)
 
 ## Operation
 
@@ -150,7 +162,7 @@ embedding worker runs a resource-tier-scaled number of threads (1 on `low`,
 the initial backlog on a large corpus drains faster on higher tiers without
 redundant rescans.
 
-## Troubleshooting
+## 🛠️ Troubleshooting
 
 Quick reference — see the detailed entries below each row for exact checks:
 
@@ -166,6 +178,9 @@ Quick reference — see the detailed entries below each row for exact checks:
 | Semantic unavailable | expected unless `ATTIC_SEMANTIC=1`; check stderr `semantic layer unavailable` |
 | High disk usage | `attic.db*`, `semantic.db`, `backups/` under the data dir — not `target/` (see Development) |
 | High memory / "server busy" | `status.resource_pressure`, `ATTIC_TOTAL_MEMORY_BUDGET_MIB` / `ATTIC_MAX_FOREGROUND_QUERIES` |
+
+<details>
+<summary><strong>Detailed troubleshooting entries</strong> (click to expand)</summary>
 
 - **MCP connection failure**: confirm the client is invoking the exact
   binary path and that stdio is not being intercepted by another wrapper.
@@ -230,7 +245,9 @@ Quick reference — see the detailed entries below each row for exact checks:
   and `semantic.db`, so on-disk size does shrink over time after deletes —
   it is not expected to grow unbounded.
 
-## Recovery
+</details>
+
+## 🩹 Recovery
 
 - **Interrupted indexing** (process killed mid-run): handled automatically
   by `run_startup_recovery` on the next start — no manual action needed.
@@ -259,7 +276,7 @@ Quick reference — see the detailed entries below each row for exact checks:
   is intentional fail-closed behavior, not a bug. Upgrade the binary, or
   restore/rebuild the database as above.
 
-## Development
+## 👩‍💻 Development
 
 ```sh
 git clone <repo>
@@ -311,7 +328,10 @@ index (that lives in the user-global data directory, see README) and is
 not part of the product repository or a release archive. `cargo clean`
 safely removes it at any time; it will be regenerated on the next build.
 
-## Maintenance
+## 🔧 Maintenance
+
+<details>
+<summary><strong>Show maintenance procedures</strong> (schema migration, analyzer updates, adding a language, release process)</summary>
 
 - **Schema migration**: QA starts from the frozen core baseline
   `migrations/0001_initial.sql` and semantic baseline
@@ -369,3 +389,5 @@ safely removes it at any time; it will be regenerated on the next build.
 Never recommend weakening endpoint security controls (antivirus/EDR
 exclusions, code-signing bypass, etc.) to work around a build or packaging
 failure — diagnose the actual cause instead.
+
+</details>

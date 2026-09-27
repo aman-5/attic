@@ -241,6 +241,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "attic-gpu-telemetry-win"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "attic-incremental"
 version = "0.1.0"
 dependencies = [
@@ -374,6 +381,7 @@ name = "attic-storage"
 version = "0.1.0"
 dependencies = [
  "attic-core",
+ "attic-gpu-telemetry-win",
  "blake3",
  "rusqlite",
  "serde",

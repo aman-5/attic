@@ -350,7 +350,11 @@ pub fn select_units(
     rows: &[SemanticUnitRow],
     demand: &HashMap<String, u64>,
     cfg: &SelectionConfig,
-) -> (Vec<SelectedUnit>, SelectionReport) {
+) -> (
+    Vec<SelectedUnit>,
+    Vec<(SemanticUnitRow, String)>,
+    SelectionReport,
+) {
     let mut report = SelectionReport {
         scanned: rows.len(),
         ..Default::default()
@@ -369,6 +373,12 @@ pub fn select_units(
 
     // Deterministic duplicate handling: first occurrence by unit id wins.
     let mut seen_content: HashMap<String, ()> = HashMap::new();
+    // Excluded-as-duplicate rows still need an occurrence record (r02/§5):
+    // the winning unit above does the one embedding job, but every OTHER
+    // unit sharing that canonical body is still a real repo/path/environment
+    // occurrence and must stay retrievable, not silently vanish because it
+    // lost the "first by unit id" tiebreak.
+    let mut duplicates: Vec<(SemanticUnitRow, String)> = Vec::new();
 
     let mut scored: Vec<SelectedUnit> = Vec::new();
     // Pass 1: hard exclusions + scoring (deterministic input order).
@@ -412,8 +422,9 @@ pub fn select_units(
             .canonical_hash
             .clone()
             .unwrap_or_else(|| crate::identity::content_hash(&r.canonical_text));
-        if seen_content.insert(ch, ()).is_some() {
+        if seen_content.insert(ch.clone(), ()).is_some() {
             report.exclude(EX_DUPLICATE);
+            duplicates.push((r.clone(), ch));
             continue;
         }
 
@@ -497,7 +508,7 @@ pub fn select_units(
         out.push(su);
     }
     report.selected = out.len();
-    (out, report)
+    (out, duplicates, report)
 }
 
 /// Convenience: read demand from the disposable store when available.
@@ -555,9 +566,18 @@ mod tests {
         );
         a.canonical_hash = Some(hash.clone());
         b.canonical_hash = Some(hash);
-        let (sel, rep) = select_units(&vec![a, b], &HashMap::new(), &SelectionConfig::default());
+        let (sel, dups, rep) = select_units(&[a, b], &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 1, "identical canonical bodies dedup to one");
         assert_eq!(rep.excluded.get(EX_DUPLICATE), Some(&1));
+        // The dedup loser must still be reported so its occurrence can be
+        // registered (r02): its metadata must never be silently dropped.
+        assert_eq!(
+            dups.len(),
+            1,
+            "duplicate must still surface for occurrence linking"
+        );
+        assert_eq!(dups[0].1, sel[0].row.canonical_hash.clone().unwrap());
+        assert_ne!(dups[0].0.unit_id, sel[0].row.unit_id);
     }
 
     #[test]
@@ -578,7 +598,7 @@ mod tests {
             // Nested build output caught by the /build/ path marker.
             row("u4", "debug/build/out_gen.rs", "SOURCE", "artifact bytes"),
         ];
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].row.unit_id, "u1");
         assert_eq!(rep.excluded.get(EX_GENERATED_TYPE), Some(&1));
@@ -592,7 +612,7 @@ mod tests {
             row("u-b", "src/b.rs", "SOURCE", text),
             row("u-a", "src/a_copy.rs", "SOURCE", text),
         ];
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].row.unit_id, "u-b"); // first in deterministic scan order
         assert_eq!(rep.excluded.get(EX_DUPLICATE), Some(&1));
@@ -602,7 +622,7 @@ mod tests {
     fn oversized_units_never_embed() {
         let big = "x".repeat(20_000);
         let rows = vec![row("big", "src/big.rs", "SOURCE", &big)];
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 0);
         assert_eq!(rep.excluded.get(EX_TOO_LARGE), Some(&1));
     }
@@ -618,7 +638,7 @@ mod tests {
             dump,
             row("u2", "docs/guide.md", "DOCUMENT", "ordinary chunk text 2"),
         ];
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].row.unit_id, "u2");
         assert_eq!(rep.excluded.get(EX_FILE_TOO_BIG), Some(&1));
@@ -635,7 +655,7 @@ mod tests {
             row("u2", "fixtures/seed.rs", "SOURCE", "body two"),
             row("u3", "src/main.rs", "SOURCE", "body three"),
         ];
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &cfg);
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].row.unit_id, "u3");
         assert_eq!(rep.excluded.get(EX_EXCLUDED_GLOB), Some(&2));
@@ -681,7 +701,7 @@ mod tests {
             max_units_total: 5,
             ..Default::default()
         };
-        let (sel, rep) = select_units(&rows, &HashMap::new(), &cfg);
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
         assert_eq!(sel.len(), 3); // repo cap binds before global cap
         assert_eq!(rep.excluded.get(EX_CAP_REPO), Some(&7));
     }

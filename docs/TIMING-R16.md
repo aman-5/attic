@@ -1,9 +1,18 @@
-# Timing Rebaseline (r16) — measured, not promised
+# ⏱️ Timing Rebaseline (r16) — measured, not promised
 
 All numbers below were produced on the acceptance machine: Intel i7-1370P
 (14C/20T), 31.66 GB RAM, NVIDIA RTX A500 Laptop GPU (4 GB), Windows.
 Everything here is either a direct measurement or a computed estimate whose
 inputs are direct measurements (labeled ESTIMATE where so).
+
+## Contents
+
+- [Measured — lexical + structural indexing](#measured--lexical--structural-indexing-production-pipeline-cold-db)
+- [Measured — embedding throughput](#measured--embedding-throughput-qwen3-embedding-06b)
+- [Computed — full semantic coverage](#computed--full-semantic-coverage-estimate-from-measured-throughput)
+- [Excluded from indexing time](#excluded-from-indexing-time-per-contract)
+- [Reproduce](#reproduce)
+- [What remains unmeasured](#what-remains-unmeasured)
 
 ## Measured — lexical + structural indexing (production pipeline, cold DB)
 
@@ -46,7 +55,7 @@ Model download/verification is reported separately and never counted in
 warm-model indexing time. On first run it is a one-time ~1.2 GB download
 plus SHA-256 verification.
 
-## Reproduce
+## 🔁 Reproduce
 
 ```powershell
 # Dump / HDFC lexical acceptance + timings

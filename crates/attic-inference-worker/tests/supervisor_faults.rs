@@ -117,6 +117,69 @@ fn corrupt_frame_kills_worker_with_protocol_error() {
 }
 
 #[test]
+fn identity_mismatch_on_load_is_rejected_and_worker_killed() {
+    // An installed identity verifier represents Phase 2's "loaded worker
+    // identity must be authoritative" gate: whatever the worker actually
+    // reports must match what was expected before it existed, or the load
+    // is rejected outright and the worker is not left running.
+    let sup = WorkerSupervisor::new(launch("echo"));
+    sup.handshake().unwrap();
+    sup.set_identity_verifier(|_caps: &[String]| Err("simulated fingerprint mismatch".into()));
+
+    let err = sup.load_model(params()).unwrap_err();
+    assert!(
+        matches!(err, SupervisorError::Engine { .. }),
+        "expected Engine error, got {err:?}"
+    );
+    assert!(format!("{err}").contains("worker identity mismatch"));
+    assert!(
+        sup.worker_pid().is_none(),
+        "a worker with rejected identity must not be left running"
+    );
+    sup.shutdown();
+}
+
+#[test]
+fn identity_is_reverified_on_every_lazy_restart() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // First load must pass; the restart after shutdown must be re-checked
+    // rather than trusting the first successful verification forever.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in_verifier = calls.clone();
+
+    let sup = WorkerSupervisor::new(launch("echo"));
+    sup.handshake().unwrap();
+    sup.set_identity_verifier(move |_caps: &[String]| {
+        let n = calls_in_verifier.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(())
+        } else {
+            Err("second load rejected".into())
+        }
+    });
+
+    sup.load_model(params()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    sup.shutdown();
+    let err = sup
+        .embed_batch(items(&["after-shutdown"]), Duration::from_secs(10))
+        .unwrap_err();
+    assert!(
+        matches!(err, SupervisorError::Engine { .. }),
+        "restart's reload must be re-verified, got {err:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "lazy restart must invoke the identity verifier again, not skip it"
+    );
+    sup.shutdown();
+}
+
+#[test]
 fn shutdown_then_embed_recovers_via_lazy_restart() {
     // After an explicit shutdown the child is gone; the next embed must
     // restart the worker, reload the model lazily, and answer correctly —
