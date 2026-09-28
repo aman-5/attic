@@ -27,6 +27,11 @@ pub mod identity;
 pub mod instruction;
 pub mod invalidate;
 pub mod model_assets;
+// Deliberately NOT feature-gated. The download and the ability to *use*
+// what it downloads are separate concerns: leaving acquisition available in
+// every build means a CPU-only binary can still report honestly on ONNX
+// asset state instead of pretending the concept does not exist.
+pub mod onnx_assets;
 #[cfg(feature = "ort-directml")]
 pub mod ort_directml;
 pub mod provider;

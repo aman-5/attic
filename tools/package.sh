@@ -111,21 +111,51 @@ esac
 
 cd "$REPO_ROOT"
 
-# GPU backend defaults ON for Windows release builds.
+# Per-target GPU backend defaults.
 #
-# `ort-directml` is the ONLY real GPU backend in the codebase, and
-# `attic-server`'s `default = []` meant every published Windows binary was
-# compiled without it. The provider code existed and CI even compile-checked
-# it, but the artifact users actually installed could never construct
-# anything except `ExecutionBackend::CandleCpu` — so real GPUs sat idle while
-# status reported a deliberate-looking "candle-cpu" with no fallback reason.
+# `attic-server`'s `default = []` meant every published binary was compiled
+# without any GPU backend. The provider code existed and CI even
+# compile-checked it, but the artifact users actually installed could never
+# construct anything except `ExecutionBackend::CandleCpu` — so real GPUs sat
+# idle while status reported a deliberate-looking "candle-cpu" with no
+# fallback reason. A backend that is not compiled in is not a backend.
 #
-# Non-Windows targets keep the default feature set: there is no CUDA, Metal
-# or CoreML provider implemented, so enabling anything here would only
-# produce a build failure, not acceleration.
-if [[ -z "$FEATURES" && "$TARGET" == *windows* ]]; then
-  FEATURES="ort-directml"
-  echo "== enabling default Windows GPU backend feature: $FEATURES"
+# Windows      -> ort-directml. Vendor-agnostic across NVIDIA/AMD/Intel
+#                 because DirectML targets DX12 rather than a vendor SDK,
+#                 and the `ort` crate pulls its own runtime binaries and
+#                 copies them beside the executable, so nothing extra has to
+#                 be staged by hand.
+#
+# macOS arm64  -> candle-metal. Metal ships with the OS and needs no SDK
+#                 beyond the Xcode command line tools, so this cannot fail
+#                 to build on any machine that can already build the target,
+#                 and every Apple Silicon Mac can actually use it.
+#
+# macOS x86_64 -> nothing. Intel Macs are deliberately CPU-only; Metal on
+#                 those machines would target GPUs this project does not
+#                 support.
+#
+# Linux        -> nothing, DESPITE candle-cuda existing and working. It is a
+#                 deliberate omission, not an oversight: linking it requires
+#                 the NVIDIA CUDA toolkit *at build time*, so defaulting it
+#                 on would turn a routine release build into a hard failure
+#                 on every machine and CI runner without the toolkit
+#                 installed — and would do so for the majority of Linux
+#                 users, who have no NVIDIA card at all. Build the CUDA
+#                 variant explicitly on a toolkit-equipped machine:
+#
+#                     tools/package.sh --target x86_64-unknown-linux-gnu \
+#                       --features candle-cuda
+#
+# In every case `device.rs` resolves the actual device at runtime and falls
+# back to CPU with a stated reason, so a binary built with a GPU feature
+# still runs correctly on a machine that has no such device.
+if [[ -z "$FEATURES" ]]; then
+  case "$TARGET" in
+    *windows*)          FEATURES="ort-directml" ;;
+    aarch64-apple-darwin) FEATURES="candle-metal" ;;
+  esac
+  [[ -n "$FEATURES" ]] && echo "== enabling default GPU backend for $TARGET: $FEATURES"
 fi
 
 echo "== building attic-server for $TARGET${FEATURES:+ (features: $FEATURES)}"

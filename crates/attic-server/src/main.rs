@@ -450,20 +450,31 @@ fn resolve_semantic_provider(
     // directory is configured/present — measured ~195× faster than the candle
     // CPU path on an RTX A500 (3,130 vs 16 tok/s).
     //
-    // Configuration precedence: `[semantic] onnx_model_dir` in attic.toml
-    // first, then the legacy `ATTIC_ONNX_MODEL_DIR` environment variable.
-    // The env var used to be the ONLY way to enable this and was documented
-    // nowhere, which is why real GPUs sat idle with no explanation. See
-    // `gpu_capability_report` for the status surfaced to users.
+    // Directory precedence: `[semantic] onnx_model_dir` in attic.toml, then
+    // the legacy `ATTIC_ONNX_MODEL_DIR` environment variable, then the
+    // cache directory Attic manages itself.
+    //
+    // That last fallback is the important one. Previously this path required
+    // the user to have manually downloaded a 1.2 GB ONNX export and pointed
+    // an undocumented environment variable at it; if they had not, GPU
+    // acceleration was skipped in silence. Meanwhile the safetensors path
+    // downloaded its own weights automatically. Attic now acquires both.
     #[cfg(feature = "ort-directml")]
-    if let Some(onnx_dir) = attic_config
-        .semantic
-        .onnx_model_dir
-        .clone()
-        .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok())
     {
-        let dir = PathBuf::from(onnx_dir);
-        if dir.join("model_fp16.onnx").is_file() && dir.join("tokenizer.json").is_file() {
+        let configured = attic_config
+            .semantic
+            .onnx_model_dir
+            .clone()
+            .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok())
+            .map(PathBuf::from);
+        // A hand-configured directory is authoritative and is never
+        // downloaded into: an operator who pointed us at their own export
+        // gets exactly that export, or a clear failure — never a silent
+        // substitution with something we fetched.
+        let managed = attic_semantic::onnx_assets::onnx_dir(model_cache_dir);
+        let dir = configured.clone().unwrap_or_else(|| managed.clone());
+
+        if attic_semantic::onnx_assets::assets_present(&dir) {
             let gpu = supervised_provider(
                 "ort-directml",
                 model_cache_dir,
@@ -492,6 +503,24 @@ fn resolve_semantic_provider(
                 }
             };
         }
+
+        if let Some(explicit) = configured {
+            // Do not quietly download over an explicit choice; say what is
+            // wrong with the directory the operator actually named.
+            tracing::warn!(
+                dir = %explicit.display(),
+                "[semantic] onnx_model_dir is set but does not contain both model_fp16.onnx and tokenizer.json; \
+                 GPU acceleration is disabled this run. Unset it to let Attic download and manage the export itself"
+            );
+        } else {
+            tracing::info!(
+                dir = %managed.display(),
+                "ONNX GPU assets not present; starting background download. \
+                 Semantic embedding runs on the CPU backend until it completes, \
+                 and the GPU backend is selected automatically on the next start"
+            );
+            spawn_onnx_download_task(model_cache_dir.to_path_buf());
+        }
     }
 
     if let Some(dir) = cpu_dir {
@@ -516,6 +545,47 @@ fn resolve_semantic_provider(
         configured_backend,
     );
     deferred
+}
+
+/// Background acquisition of the ONNX export used by the GPU backend.
+///
+/// Mirrors `spawn_model_download_task`'s policy — off the startup path, 3
+/// attempts, 5s apart, failure reported rather than fatal — but does not
+/// hot-swap the live provider. Swapping a running CPU provider for a GPU one
+/// mid-session would change `execution_backend` underneath in-flight batches
+/// for a purely optional speedup, so the GPU backend is picked up on the next
+/// start instead. Indexing is never blocked either way.
+#[cfg(feature = "ort-directml")]
+fn spawn_onnx_download_task(cache_dir: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        const ATTEMPTS: u32 = 3;
+        for attempt in 1..=ATTEMPTS {
+            match attic_semantic::onnx_assets::ensure_onnx_assets(&cache_dir, None) {
+                Ok(dir) => {
+                    tracing::info!(
+                        dir = %dir.display(),
+                        "ONNX GPU assets ready; the GPU backend is selected on the next start"
+                    );
+                    return;
+                }
+                Err(e) if attempt < ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "ONNX GPU asset download failed; retrying in 5s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ONNX GPU asset download failed after {ATTEMPTS} attempts; \
+                         semantic embedding continues on the CPU backend"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// r06/r07: build the supervised worker-backed provider for a neural backend.
