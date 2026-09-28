@@ -1924,10 +1924,8 @@ impl SemanticStore {
     pub fn queue_v2_retain_only(&self, keep: &[String]) -> Result<usize, SemanticError> {
         use rusqlite::ToSql;
         let n = if keep.is_empty() {
-            self.guard()?.execute(
-                "DELETE FROM sem_queue_v2 WHERE state != 'INFLIGHT'",
-                [],
-            )?
+            self.guard()?
+                .execute("DELETE FROM sem_queue_v2 WHERE state != 'INFLIGHT'", [])?
         } else {
             let paramslice: Vec<&dyn ToSql> = keep.iter().map(|s| s as &dyn ToSql).collect();
             let placeholders = vec!["?"; keep.len()].join(",");

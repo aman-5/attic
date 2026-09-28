@@ -42,16 +42,16 @@ pub fn upsert_file_identity(
     repository_id: &RepositoryId,
     stable_id_basis: &str,
 ) -> Result<(), StorageError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO core_file_identities
              (id, repository_id, stable_id_basis)
          VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            id.to_string_repr(),
-            repository_id.to_string_repr(),
-            stable_id_basis,
-        ],
-    )?;
+    )?
+    .execute(rusqlite::params![
+        id.to_string_repr(),
+        repository_id.to_string_repr(),
+        stable_id_basis,
+    ])?;
     Ok(())
 }
 
@@ -109,7 +109,7 @@ pub fn insert_file_occurrence(
     conn: &Connection,
     rec: &NewFileOccurrence<'_>,
 ) -> Result<(), StorageError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO core_file_occurrences
              (id, occurrence_seq, file_identity_id, source_revision_id, index_generation_id,
               path, content_hash, size_bytes, language,
@@ -117,21 +117,21 @@ pub fn insert_file_occurrence(
          VALUES (?1,
                  (SELECT COALESCE(MAX(occurrence_seq), 0) + 1 FROM core_file_occurrences),
                  ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        rusqlite::params![
-            rec.id.to_string_repr(),
-            rec.file_identity_id.to_string_repr(),
-            rec.source_revision_id.to_string_repr(),
-            rec.index_generation_id.map(|id| id.to_string_repr()),
-            rec.path,
-            rec.content_hash,
-            rec.size_bytes,
-            rec.language,
-            rec.file_type.as_str(),
-            rec.discovery_class.as_str(),
-            rec.security_state.as_str(),
-            rec.existence_state.as_str(),
-        ],
-    )?;
+    )?
+    .execute(rusqlite::params![
+        rec.id.to_string_repr(),
+        rec.file_identity_id.to_string_repr(),
+        rec.source_revision_id.to_string_repr(),
+        rec.index_generation_id.map(|id| id.to_string_repr()),
+        rec.path,
+        rec.content_hash,
+        rec.size_bytes,
+        rec.language,
+        rec.file_type.as_str(),
+        rec.discovery_class.as_str(),
+        rec.security_state.as_str(),
+        rec.existence_state.as_str(),
+    ])?;
     Ok(())
 }
 
@@ -144,10 +144,11 @@ pub fn insert_file_occurrence_with_freshness(
     freshness: attic_core::FreshnessState,
 ) -> Result<(), StorageError> {
     insert_file_occurrence(conn, rec)?;
-    conn.execute(
-        "UPDATE core_file_occurrences SET freshness_state = ?2 WHERE id = ?1",
-        rusqlite::params![rec.id.to_string_repr(), freshness.as_str()],
-    )?;
+    conn.prepare_cached("UPDATE core_file_occurrences SET freshness_state = ?2 WHERE id = ?1")?
+        .execute(rusqlite::params![
+            rec.id.to_string_repr(),
+            freshness.as_str()
+        ])?;
     Ok(())
 }
 

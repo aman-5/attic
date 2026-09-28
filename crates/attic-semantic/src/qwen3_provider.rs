@@ -26,7 +26,7 @@ use crate::provider::{
 use crate::qwen3_model::{Qwen3Config, Qwen3Model};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
 pub const HF_QWEN_OWNER: &str = "Qwen";
 pub const HF_QWEN_REPO: &str = "Qwen3-Embedding-0.6B";
@@ -390,8 +390,13 @@ impl Qwen3Embedder {
                 reason: format!("failed to load tokenizer: {e}"),
             }
         })?;
+        // Right padding is load-bearing: the CPU attention path relies on a
+        // causal mask to keep real tokens from ever seeing padding (see
+        // `Qwen3Attention::forward`), and last-token pooling / RoPE positions
+        // assume real tokens start at position 0.
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
             ..Default::default()
         }));
         // No tokenizer truncation (r04): silently clipping an over-budget
@@ -582,6 +587,15 @@ impl Qwen3Embedder {
             .iter()
             .map(|e| e.get_attention_mask().to_vec())
             .collect();
+        if let Some(row) = attention_mask_rows
+            .iter()
+            .position(|row| !is_right_padded(row))
+        {
+            return Err(SemanticError::EmbeddingFailed(format!(
+                "tokenizer produced a non-right-padded attention mask for batch row {row}; \
+                 batched inference requires right padding"
+            )));
+        }
 
         let token_ids_tensor = Tensor::new(token_ids, &self.device)
             .map_err(|e| SemanticError::EmbeddingFailed(format!("tensor build failed: {e}")))?;
@@ -710,6 +724,13 @@ impl SemanticProvider for Qwen3Embedder {
 
         Ok(outputs)
     }
+}
+
+/// `true` when `row` is some real tokens followed only by padding
+/// (`1…1 0…0`), which is what right padding produces.
+fn is_right_padded(row: &[u32]) -> bool {
+    let real = row.iter().take_while(|&&v| v > 0).count();
+    row[real..].iter().all(|&v| v == 0)
 }
 
 /// Embed `indexed` (sorted ascending by text length) in token-budgeted
@@ -945,6 +966,22 @@ mod tests {
         assert!(
             matches!(err, SemanticError::Cancelled { total: 4, .. }),
             "user/shutdown cancellation must remain responsive between sub-batches"
+        );
+    }
+
+    #[test]
+    fn right_padding_detection() {
+        assert!(is_right_padded(&[]));
+        assert!(is_right_padded(&[1, 1, 1]));
+        assert!(is_right_padded(&[1, 1, 0, 0]));
+        assert!(is_right_padded(&[0, 0]));
+        assert!(
+            !is_right_padded(&[0, 1, 1]),
+            "left padding must be rejected"
+        );
+        assert!(
+            !is_right_padded(&[1, 0, 1]),
+            "interior padding must be rejected"
         );
     }
 

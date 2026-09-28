@@ -102,6 +102,17 @@ const PEM_PRIVATE_KEY_MARKER: &str = "PRIVATE KEY-----";
 const PEM_END: &str = "-----END";
 const PEM_PLACEHOLDER: &str = "[REDACTED:PRIVATE-KEY]";
 
+/// `true` when `text` contains anything [`scan_and_redact`] would report.
+///
+/// Equivalent to `!scan_and_redact(text).findings.is_empty()` (every match of
+/// the first detector that fires survives overlap resolution), but stops at the
+/// first detector that matches and never builds the redacted copy. Use it for
+/// pure admission gates, such as refusing secret-bearing text before it can
+/// reach an embedding provider.
+pub fn contains_secret(text: &str) -> bool {
+    DETECTORS.iter().any(|d| !d.find_all(text).is_empty())
+}
+
 pub fn scan_and_redact(text: &str) -> ScanResult {
     struct PM<'d> {
         start: usize,
@@ -1111,6 +1122,26 @@ mod tests {
         let r = scan_and_redact("");
         assert!(r.redacted.is_empty());
         assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn contains_secret_agrees_with_scan_and_redact() {
+        let samples = [
+            "",
+            "Hello, world! No secrets here.",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+            "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----\n",
+            "key: AKIAIOSFODNN7EXAMPLE",
+            "AKIAIOSFODNN7EXAMPLE and ghp_abcdefghijklmnopqrstuvwxyz1234567890ab",
+            "fn main() { let total = items.iter().map(|i| i.price).sum::<u64>(); }",
+        ];
+        for text in samples {
+            assert_eq!(
+                contains_secret(text),
+                !scan_and_redact(text).findings.is_empty(),
+                "contains_secret disagrees with scan_and_redact for {text:?}"
+            );
+        }
     }
 
     #[test]

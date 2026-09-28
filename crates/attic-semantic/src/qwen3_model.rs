@@ -180,11 +180,16 @@ impl Qwen3Attention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            let flash_mask = match attn_mask {
-                Some(m) if b == 1 => AttnMask::Mask(m.clone()),
-                None => AttnMask::causal_with_offset(0),
-                _ => AttnMask::None,
-            };
+            // Callers pad on the RIGHT (see `Qwen3Embedder`), so every
+            // padding position comes after every real token of its row. A
+            // causal mask alone therefore gives each real token exactly the
+            // attention it would get unbatched: it can only see earlier
+            // positions, all of which are real. Padding rows' own outputs
+            // are never read (pooling uses the attention-mask rows). The
+            // previous `AttnMask::None` for batches let every token attend to
+            // later tokens and to padding, so the same text embedded
+            // differently depending on its batch neighbours.
+            let flash_mask = AttnMask::causal_with_offset(0);
 
             if let Ok(ctx) =
                 flash_attn::<f32>(&q_flash, &k_flash, &v_flash, scale, flash_mask, None, None)
@@ -377,5 +382,77 @@ impl Qwen3Model {
             h = layer.forward(&h, attention_mask)?;
         }
         self.norm.forward(&h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::IndexOp;
+    use candle_nn::{VarBuilder, VarMap};
+
+    fn tiny_config() -> Qwen3Config {
+        Qwen3Config {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            head_dim: 16,
+            attention_bias: false,
+            num_key_value_heads: 2,
+            max_position_embeddings: 64,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    /// Batched (right-padded) inference must reproduce single-sequence
+    /// inference for every real token. A missing causal mask on the batched
+    /// CPU path made each row attend to later tokens and to padding, so the
+    /// same text embedded differently depending on its batch neighbours.
+    #[test]
+    fn batched_right_padded_forward_matches_single_sequence_forward() {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = Qwen3Model::new(&tiny_config(), vb).unwrap();
+
+        let short: Vec<u32> = vec![5, 9, 3];
+        let long: Vec<u32> = vec![7, 2, 11, 4, 8, 6];
+        let seq_len = long.len();
+        let pad = 0u32;
+        let mut short_padded = short.clone();
+        short_padded.resize(seq_len, pad);
+
+        let batch_ids = Tensor::new(vec![short_padded, long.clone()], &device).unwrap();
+        let rows = vec![
+            [vec![1u32; short.len()], vec![0u32; seq_len - short.len()]].concat(),
+            vec![1u32; seq_len],
+        ];
+        let mask = Qwen3Model::build_attention_mask(&rows, seq_len, &device).unwrap();
+        let batched = model.forward(&batch_ids, Some(&mask)).unwrap();
+
+        for (row, ids) in [(0usize, &short), (1usize, &long)] {
+            let single_ids = Tensor::new(vec![ids.clone()], &device).unwrap();
+            let single_rows = vec![vec![1u32; ids.len()]];
+            let single_mask =
+                Qwen3Model::build_attention_mask(&single_rows, ids.len(), &device).unwrap();
+            let single = model.forward(&single_ids, Some(&single_mask)).unwrap();
+            for pos in 0..ids.len() {
+                let a: Vec<f32> = batched.i((row, pos)).unwrap().to_vec1().unwrap();
+                let b: Vec<f32> = single.i((0, pos)).unwrap().to_vec1().unwrap();
+                let max_diff = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_diff < 1e-4,
+                    "row {row} position {pos}: batched output diverges from single-sequence \
+                     output by {max_diff}"
+                );
+            }
+        }
     }
 }

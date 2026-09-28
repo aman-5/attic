@@ -331,9 +331,9 @@ fn drive_v2(
             };
             // Scan the CANONICAL text — that is what reaches the provider
             // (r03). retrieval_text may carry pointer/env headers; canonical
-            // text is the exact embedded body.
-            let scan = secrets::scan_and_redact(&r.canonical_text);
-            if !scan.findings.is_empty() {
+            // text is the exact embedded body. A yes/no gate: no redacted
+            // copy is built, so the check costs one pass over the text.
+            if secrets::contains_secret(&r.canonical_text) {
                 tracing::warn!("semantic enrichment refused secret-bearing unit");
                 let _ = store.queue_v2_fail_permanently(
                     &r.unit_id,
@@ -595,8 +595,7 @@ fn drive_v1(
             std::collections::HashMap::new();
         for r in rows {
             meta.insert(r.unit_id.clone(), r.clone());
-            let scan = secrets::scan_and_redact(&r.canonical_text);
-            if !scan.findings.is_empty() {
+            if secrets::contains_secret(&r.canonical_text) {
                 tracing::warn!("semantic enrichment refused secret-bearing unit");
                 store.queue_fail_permanently(&r.unit_id)?;
                 stats.skipped_secret += 1;
@@ -773,7 +772,11 @@ fn drive_v1(
 
 /// Release every claimed occurrence back to PENDING without incrementing
 /// attempts (cancellation, transient pre-embed failure).
-fn reset_all(store: &SemanticStore, owner: &str, token_of: &std::collections::HashMap<String, i64>) {
+fn reset_all(
+    store: &SemanticStore,
+    owner: &str,
+    token_of: &std::collections::HashMap<String, i64>,
+) {
     for (occ_id, token) in token_of {
         let _ = store.queue_v2_reset(occ_id, owner, *token);
     }

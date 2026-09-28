@@ -62,6 +62,72 @@ opt-level = 3
 [profile.test.package.attic-semantic]
 opt-level = 3
 
+# Candle's CPU matmul kernels live in the `gemm*` crates (with `pulp` SIMD
+# dispatch and `half` conversions), not in candle-core itself, and BPE
+# tokenization lives in `tokenizers`. Optimizing only the candle crates above
+# left the actual arithmetic unoptimized: a real Qwen3 CPU run under the test
+# profile measured 3.7 tokens/s. Release builds are unaffected (everything is
+# already opt-level 3 there).
+[profile.dev.package.gemm]
+opt-level = 3
+
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[profile.dev.package.gemm-f32]
+opt-level = 3
+
+[profile.dev.package.gemm-f64]
+opt-level = 3
+
+[profile.dev.package.gemm-c32]
+opt-level = 3
+
+[profile.dev.package.gemm-c64]
+opt-level = 3
+
+[profile.dev.package.pulp]
+opt-level = 3
+
+[profile.dev.package.half]
+opt-level = 3
+
+[profile.dev.package.tokenizers]
+opt-level = 3
+
+[profile.test.package.gemm]
+opt-level = 3
+
+[profile.test.package.gemm-common]
+opt-level = 3
+
+[profile.test.package.gemm-f16]
+opt-level = 3
+
+[profile.test.package.gemm-f32]
+opt-level = 3
+
+[profile.test.package.gemm-f64]
+opt-level = 3
+
+[profile.test.package.gemm-c32]
+opt-level = 3
+
+[profile.test.package.gemm-c64]
+opt-level = 3
+
+[profile.test.package.pulp]
+opt-level = 3
+
+[profile.test.package.half]
+opt-level = 3
+
+[profile.test.package.tokenizers]
+opt-level = 3
+
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
@@ -71,7 +137,7 @@ license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/aman-5/attic"
 
 [workspace.dependencies]
-rusqlite           = { version = "0.40.2",  default-features = false, features = ["bundled"] }
+rusqlite           = { version = "0.40.2",  default-features = false, features = ["bundled", "cache"] }
 thiserror          = "2.0.20"
 serde              = { version = "1.0.219", features = ["derive"] }
 serde_json         = "1.0.140"
