@@ -54,15 +54,19 @@ flowchart TD
 ```
 
 - **Discovery + security** (`attic-discovery`) — gitignore-aware walk,
-  path-traversal/symlink guards, secrets scan. Any nested Git repository —
+  path-traversal/symlink guards, secrets scan. Hidden entries (dot-prefixed,
+  plus the hidden attribute on Windows) are skipped, except content-bearing
+  dot-files listed in `INDEXED_HIDDEN_FILE_NAMES` (AEM/FileVault
+  `.content.xml`). Any nested Git repository —
   submodule or plain independent checkout — becomes one `core_repositories`
   entry each (ADR-006).
 - **Analyzers** (`attic-analyzers`) — `GenericAnalyzer` (universal
-  fallback, every text file searchable) plus two structural tiers: full
-  hand-written tree-sitter analyzers (Java, Python, Go, JavaScript,
-  TypeScript) and a generic `tags.scm`-driven engine (symbols + intra-file
-  references only) covering ten more languages — see
-  [Language support](#language-support) below.
+  fallback, every text file searchable) plus pluggable language and
+  platform analyzers composed from a `PluginCatalog`: full hand-written
+  tree-sitter analyzers (Java, Python, Go, JavaScript, TypeScript), a
+  generic `tags.scm`-driven engine (symbols + intra-file references only)
+  covering ten more languages, a JSON analyzer, and the AEM platform plugin
+  — see [Language support](#language-support) below.
 - **Canonical index** (`attic-storage`, SQLite + FTS5) — files, retrieval
   units, structural nodes, symbols, relationships. One coordinated
   `WriterQueue` (single writer, serialized transactions); a `DbPool` of
@@ -106,6 +110,19 @@ Each file's `SourceRevision` (content-addressed identity via BLAKE3) and
 the workspace's `WorkspaceSnapshot` are computed during discovery, before
 the analyzer stage — every downstream artifact traces back to the exact
 revision it was derived from.
+
+**Throughput design.** Per-file analysis is pure (no database access), so
+both full and incremental indexing run it on a bounded worker pool
+(`[indexing] analysis_threads`, default logical CPUs minus two). Workers
+pull files from one shared cursor over a largest-first order, so a few
+multi-megabyte files never leave the other workers idle; results are
+reassembled in discovery order, so output never depends on thread count.
+The analyzer registry is built once per configuration and shared. The
+single atomic publication reuses prepared statements for every per-row
+insert/delete (retrieval units, FTS rows, structural nodes, symbols,
+relationships), and structural nodes of a replaced file are deleted with
+one statement per file (the self-referential `parent_id` foreign key is
+`NO ACTION`, checked at statement end).
 
 ### Retrieval & evidence
 
@@ -237,17 +254,58 @@ text-based language or format not on either list — Kotlin, config files,
 docs, build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
 still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
-gate on usability. A file's language hint (`AnalyzerInput.language_hint`,
-populated by `attic-indexing`'s `infer_language_hint`) is tried against the
-tier-2 table before falling back to the existing `FileType`-keyed
-registry lookup, so tier-1 languages are never shadowed by a tier-2 entry.
+gate on usability.
+
+### Analyzer plugins
+
+Every language or platform is an `AnalyzerPlugin`
+(`crates/attic-analyzers/src/plugin.rs`): a stable config-facing id, a
+`language_hint(path)` that claims repository-relative paths, and a
+`register` that adds its analyzers to an `AnalyzerRegistry`. The
+`PluginCatalog` orders plugins (path-specific platform plugins such as AEM
+first, so they win over extension rules) and builds a registry from an
+`AnalyzerSelection` — `attic.toml [indexing] analyzers` /
+`disabled_analyzers`, where empty means every plugin and unknown ids fail
+startup. `attic-indexing`'s `infer_language_hint` delegates to the catalog,
+so hint tags and registered tags come from one place and cannot drift. A
+hint is tried against the language-tag map before the `FileType`-keyed map,
+so tier-1 languages are never shadowed by a tier-2 entry, and a disabled
+plugin's tag is simply unregistered: its files fall through to
+`GenericAnalyzer` and stay fully searchable. Paths are matched with `/`
+separators and ASCII case-insensitively on every platform. Third-party
+plugins join a catalog through `PluginCatalog::with_plugin` (duplicate ids
+are rejected). The analysis cache is keyed on the effective plugin set, so a
+retry after a configuration change never replays output from different
+analyzers.
+
+### AEM platform plugin
+
+`crates/attic-analyzers/src/aem.rs` classifies FileVault content by path —
+`.content.xml` and `*.xml` under `jcr_root/` (JCR content), `*.html` under
+`jcr_root/` and `*.htl` (HTL), `*.cfg.json` and Felix `*.config` in
+`config*`/`osgiconfig` folders (OSGi configuration), and `js.txt`/`css.txt`
+under `jcr_root/` (clientlib manifests). Plain HTML/XML/JSON elsewhere is
+never claimed. It extracts path-qualified JCR nodes (FileVault names such as
+`_cq_dialog` decode to `cq:dialog`) with `jcr:primaryType`,
+`sling:resourceType`/`resourceSuperType`, `cq:template` and clientlib
+metadata; HTL `data-sly-template` definitions and `data-sly-use` bindings;
+OSGi PIDs, factory names, run modes and properties; and clientlib sources.
+Resource types, super types, templates, HTL use/include/resource targets and
+clientlib embeds/dependencies are recorded as imports. Retrieval units come
+from `GenericAnalyzer`, so lexical coverage is unchanged. Parsing is
+tolerant (malformed input yields partial structure plus a warning, never a
+dispatch error) and bounded by the entity cap, time budget and
+cancellation. Capabilities are declared honestly: symbols and imports only,
+no cross-file resolution.
 
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
 | Java / Python / Go / JS / TS (incl. `.tsx`) | Tier 1 — hand-written tree-sitter | Full symbols, definitions, imports, relationships |
 | C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Tier 2 — generic tags.scm | Symbol definitions + intra-file references only |
-| Everything else (Kotlin, etc.) | Tier 3 — `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later without changing the pipeline |
+| JSON | `JsonAnalyzer` | Canonical subtree chunks with JSON-pointer addressing |
+| AEM (JCR content, HTL, OSGi configs, clientlibs) | `aem` platform plugin | Path-qualified nodes/symbols and imports; lexical units from `GenericAnalyzer` |
+| Everything else (Kotlin, etc.) | Tier 3 — `GenericAnalyzer` (today) | Full-text search; a dedicated analyzer can be added as a plugin without changing the pipeline |
 
 ## Project Knowledge authority model
 
@@ -528,6 +586,15 @@ gate prevents the (expensive) rescan from running redundantly per thread,
 an atomic queue-claim prevents two threads from claiming the same unit,
 and backoff sleeps are jittered to avoid thundering-herd wakeups.
 
+**Batching never changes a vector.** Batches are right-padded and the CPU
+attention path applies a causal mask, so every real token attends exactly
+as it would unbatched; the provider refuses any batch that is not
+right-padded. A regression test (`qwen3_model::tests`) and the real-model
+benchmark (`crates/attic-semantic/tests/qwen3_throughput_bench.rs`, min
+batched-vs-single cosine) guard this. Dev/test builds optimize the `gemm*`,
+`pulp`, `half` and `tokenizers` crates alongside `candle-*`, because the
+CPU matmul kernels live there.
+
 ## 📊 Resource management
 
 A `ResourceMonitor` (`attic-storage::resource_manager`) tracks real process
@@ -537,6 +604,14 @@ calls) is never starved by background work (indexing, semantic enrichment) —
 background capacity is capped strictly below foreground capacity, and under
 memory pressure (`Pause`/`Emergency` advisories) expensive `DEEP` retrieval
 mode is automatically downgraded to `NORMAL` rather than failing outright.
+
+Resource values resolve as environment variable > `attic.toml [resources]`
+> hardware-detected mode baseline, are range-validated
+(`ResourcePolicy::validate`), and are clamped to the machine as the final
+step, so no override can exceed real hardware. `scheduler_workers`,
+`embedding_batch_size` and `embedding_worker_count` are user-tunable; SQLite
+cache/mmap sizing stays mode-derived. Unparsable environment values and
+unknown `attic.toml` tables/keys fail startup rather than being ignored.
 
 ## 🔒 Security
 

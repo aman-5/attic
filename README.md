@@ -295,11 +295,24 @@ this repository for a ready-to-copy template.
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
 | Java / Python / Go / JavaScript / TypeScript (incl. `.tsx`) | Structural (hand-written tree-sitter) | Full symbols, definitions, imports, relationships |
 | C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Structural (generic tags.scm) | Symbol definitions + intra-file references only — no import/relationship resolution (honestly declared, not overclaimed) |
-| Everything else (Kotlin, etc.) | `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later |
+| JSON | `JsonAnalyzer` | Canonical subtree chunks with JSON-pointer addressing (cross-environment dedup) |
+| Adobe Experience Manager (AEM) | `aem` platform plugin | JCR content (`.content.xml`, `*.xml` under `jcr_root/`): path-qualified JCR nodes with `jcr:primaryType`, `sling:resourceType`/`resourceSuperType`, `cq:template`; HTL (`*.html` under `jcr_root/`, `*.htl`): `data-sly-template` definitions and `data-sly-use`/`include`/`resource` targets; OSGi configs (`*.cfg.json`, Felix `*.config`): PID, factory name, run modes, properties; clientlib `js.txt`/`css.txt` sources. Imports only — no cross-file resolution |
+| Everything else (Kotlin, etc.) | `GenericAnalyzer` (today) | Full-text search; a dedicated analyzer can be added as a plugin |
 
 Rich language support is additive, not a gate on usability — every
 text-based file in your workspace is searchable from the first index,
 regardless of language.
+
+Each language or platform is an **analyzer plugin**
+(`attic_analyzers::AnalyzerPlugin`): it declares which paths it claims and
+registers its analyzers. Plugins are enabled or disabled in `attic.toml`
+(`[indexing] analyzers` / `disabled_analyzers`, by id: `aem`, `java`,
+`python`, `go`, `javascript`, `typescript`, `json`, `c`, `cpp`, `ruby`,
+`csharp`, `scala`, `php`, `swift`, `lua`, `rust`, `dockerfile`). A disabled
+plugin's files are still indexed lexically. Adding a language means writing
+one plugin and adding it to `PluginCatalog` — indexing, storage and the
+server need no changes. Path matching is separator- and case-insensitive,
+so plugins behave identically on Windows, macOS and Linux.
 
 ## 🏗️ How It Works
 
@@ -343,6 +356,8 @@ All configuration is via environment variables — there are no CLI flags.
 | `ATTIC_MAX_FOREGROUND_QUERIES` | Concurrent foreground MCP query cap. |
 | `ATTIC_MIN_FREE_MEMORY_MIB` / `ATTIC_MAX_IO_OPS_PER_SEC` | Additional resource-pressure tuning — see `crates/attic-storage/src/resource_policy.rs`. |
 | `ATTIC_WRITER_BATCH_SIZE` / `ATTIC_WRITER_FLUSH_INTERVAL_MS` / `ATTIC_WRITER_QUEUE_CAPACITY` | Writer-queue tuning for indexing throughput. |
+| `ATTIC_SCHEDULER_WORKERS` | Concurrent incremental reindex tasks / bootstrapped repositories (same as `[resources] scheduler_workers`). |
+| `ATTIC_EMBEDDING_BATCH_SIZE` / `ATTIC_EMBEDDING_WORKERS` | Items per embedding call and concurrent embedding workers (same as `[resources] embedding_batch_size` / `embedding_worker_count`). |
 | `ATTIC_INCREMENTAL_TASK_QUEUE_CAPACITY` / `ATTIC_RECONCILIATION_TASK_QUEUE_CAPACITY` | Maximum pending incremental / reconciliation task-queue depth. |
 | `ATTIC_MAX_GRAPH_DEPTH` / `ATTIC_MAX_GRAPH_NODES` | Bounds on graph traversal depth/breadth during evidence expansion. |
 | `ATTIC_MAX_CONTEXT_TOKENS` | Maximum tokens consumed by context building for a single `context` query (default `8192`). |
@@ -359,6 +374,11 @@ a startup error — unset it or provide a valid path. `ATTIC_DB_PATH` is
 supported as an explicit database path override for advanced/testing use.
 Attic never writes into your workspace — all index state is stored under the
 Attic home directory.
+
+Resource variables fail closed: a set but unparsable value (for example
+`ATTIC_WRITER_BATCH_SIZE=abc` or `ATTIC_RESOURCE_MODE=fast`) stops startup
+with an error naming the variable, instead of being silently ignored. Empty
+values are treated as unset.
 
 </details>
 
@@ -380,11 +400,15 @@ needed on subsequent runs. To use it on a machine without network access,
 pre-populate the cache on a machine that does, then copy that cache directory
 over and point `ATTIC_MODEL_CACHE_DIR` at it.
 
-### `attic.toml` (optional resource/embedding tuning)
+### `attic.toml` (resource, semantic, indexing and analyzer tuning)
 
 A second, optional file living alongside `<ATTIC_HOME>/config.toml` (which
 keeps its existing `[[repositories]]` workspace-membership role, untouched).
-`attic.toml` exposes hardware-aware runtime tuning:
+A fresh install writes a fully commented template. Precedence is
+environment variable > `attic.toml` > hardware-detected default, and every
+resource value is validated and then clamped to what the machine supports.
+Unknown tables or keys, zero sizes, empty patterns and unknown analyzer ids
+fail startup with an actionable error.
 
 ```toml
 [resources]
@@ -398,16 +422,30 @@ mode = "auto"  # or "low" / "balanced" / "performance" to force a tier
 # writer_flush_interval_ms = 50
 # writer_queue_capacity = 512
 # max_io_ops_per_sec = 200
+# scheduler_workers = 4          # concurrent reindex tasks / repositories
+# embedding_batch_size = 16      # items per embedding call
+# embedding_worker_count = 1     # serialized providers still run one lane
 
 [semantic]
 enabled = true
 model = "qwen3-embedding-0.6b"
+# max_file_bytes = 262144
+# exclude_globs = ["*-Code.json", "fixtures/"]
+
+[indexing]
+# exclude = ["**/pom.xml"]
+# structural = true              # false = lexical-only kill-switch
+# max_units_per_file = 100000    # fail-closed per-file ceiling
+# analysis_threads = 0           # 0 = logical CPUs minus two
+# analyzers = ["java", "typescript", "aem"]   # empty = every plugin
+# disabled_analyzers = ["php"]
 ```
 
-Absent, the file defaults to `mode = "auto"` (hardware-detected) and the
-production semantic engine. `scheduler_workers`, SQLite `cache`/`mmap`
-sizing, and `embedding_batch_size` are mode-derived/automatic and not
-user-tunable in `attic.toml` by design.
+Absent, the file defaults to `mode = "auto"` (hardware-detected), the
+production semantic engine and every analyzer plugin. SQLite `cache`/`mmap`
+sizing stays mode-derived. With the neural provider, `embedding_batch_size`
+defaults to at most 16 to bound memory; an explicit value is honoured and
+still bounded by the provider's token budget.
 
 ## 🛠️ Troubleshooting
 
