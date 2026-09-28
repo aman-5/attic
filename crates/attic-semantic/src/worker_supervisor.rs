@@ -24,7 +24,24 @@ use crate::provider::{
 /// How long a single embedding batch may run inside the worker before the
 /// supervisor kills it. Generous for cold starts; the resource governor
 /// (r08) tightens effective behavior via batch size, not this bound.
-const EMBED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+///
+/// Derived from [`crate::diagnostics::EMBED_DEADLINE_SECS`] so stall
+/// diagnostics and the actual kill deadline can never drift apart. They did:
+/// status declared "STALLED — restart the embedding worker" at 120s while the
+/// supervisor would not kill the hung worker until 300s, so for three minutes
+/// operators were told to intervene manually in a situation that recovers on
+/// its own.
+const EMBED_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(crate::diagnostics::EMBED_DEADLINE_SECS);
+
+/// The batch deadline the supervisor actually enforces.
+///
+/// Exposed so diagnostics can assert that the number quoted to operators is
+/// the number that governs the kill, rather than trusting two constants to
+/// stay in sync by convention.
+pub(crate) fn embed_deadline() -> std::time::Duration {
+    EMBED_DEADLINE
+}
 
 pub struct SupervisedWorkerProvider {
     supervisor: WorkerSupervisor,

@@ -130,6 +130,14 @@ pub struct StallAssessment {
 /// in-flight 20+ min, 0 completed — this detector flags exactly that.
 pub const STALL_THRESHOLD_SECS: u64 = 120;
 
+/// Wall-clock budget the supervisor gives a single embedding batch before it
+/// kills the worker process and restarts it.
+///
+/// This lives here, and `worker_supervisor::EMBED_DEADLINE` is derived from
+/// it, so the number quoted in operator-facing diagnostics is provably the
+/// same number the supervisor enforces.
+pub const EMBED_DEADLINE_SECS: u64 = 300;
+
 pub fn assess_stall(
     inflight: u64,
     done: u64,
@@ -140,9 +148,28 @@ pub fn assess_stall(
         && chunks_per_sec < 0.01
         && secs_since_last_completed_batch > STALL_THRESHOLD_SECS;
     let verdict = if stalled {
-        format!(
-            "STALLED: {inflight} items in-flight, 0 completed batches for {secs_since_last_completed_batch}s (threshold {STALL_THRESHOLD_SECS}s) — inference worker is hung; restart the embedding worker"
-        )
+        // Past the detection threshold but still inside the supervisor's kill
+        // deadline, recovery is already scheduled and automatic. Telling an
+        // operator to "restart the embedding worker" here is wrong advice: it
+        // reads as "this is dead", when in fact the worker gets killed and
+        // restarted without intervention. Only once the deadline has passed
+        // without a restart is something genuinely wedged.
+        if secs_since_last_completed_batch <= EMBED_DEADLINE_SECS {
+            let secs_to_recovery = EMBED_DEADLINE_SECS - secs_since_last_completed_batch;
+            format!(
+                "STALLED: {inflight} items in-flight, 0 completed batches for \
+                 {secs_since_last_completed_batch}s (threshold {STALL_THRESHOLD_SECS}s) — the \
+                 supervisor kills and restarts a hung worker at {EMBED_DEADLINE_SECS}s, so \
+                 recovery is automatic in ~{secs_to_recovery}s; no action needed yet"
+            )
+        } else {
+            format!(
+                "STALLED: {inflight} items in-flight, 0 completed batches for \
+                 {secs_since_last_completed_batch}s — past the {EMBED_DEADLINE_SECS}s supervisor \
+                 deadline without a restart, so the worker is genuinely wedged; restart the \
+                 embedding worker"
+            )
+        }
     } else if inflight > 0 && chunks_per_sec < 0.01 {
         format!(
             "SLOW: {inflight} items in-flight, no batch completed yet ({secs_since_last_completed_batch}s) — within tolerance, first batch may still be running"
@@ -407,6 +434,57 @@ mod stall_tests {
         let a = assess_stall(16, 0, 0.0, 1209);
         assert!(a.stalled);
         assert!(a.verdict.contains("STALLED"));
+    }
+
+    #[test]
+    fn stall_inside_the_supervisor_deadline_does_not_demand_a_manual_restart() {
+        // Regression: an operator polling at 245s was told "inference worker
+        // is hung; restart the embedding worker" while the supervisor was
+        // still 55s away from killing and restarting it automatically. The
+        // stall is real, but the prescribed action was wrong.
+        let a = assess_stall(8, 0, 0.0, 245);
+        assert!(a.stalled, "245s with 8 in-flight is still a stall");
+        assert!(
+            !a.verdict.contains("restart the embedding worker"),
+            "must not demand manual intervention while auto-recovery is pending: {}",
+            a.verdict
+        );
+        assert!(
+            a.verdict.contains("automatic"),
+            "must say recovery is automatic: {}",
+            a.verdict
+        );
+        assert!(
+            a.verdict.contains("55s"),
+            "must state the remaining time to recovery: {}",
+            a.verdict
+        );
+    }
+
+    #[test]
+    fn stall_past_the_supervisor_deadline_does_demand_a_manual_restart() {
+        // Past the kill deadline with no restart, the supervisor itself has
+        // failed — this is the only case where manual action is correct.
+        let a = assess_stall(8, 0, 0.0, EMBED_DEADLINE_SECS + 1);
+        assert!(a.stalled);
+        assert!(
+            a.verdict.contains("restart the embedding worker"),
+            "a genuinely wedged worker must ask for a restart: {}",
+            a.verdict
+        );
+        assert!(a.verdict.contains("genuinely wedged"));
+    }
+
+    #[test]
+    fn stall_diagnostics_quote_the_deadline_the_supervisor_enforces() {
+        // The verdict cites EMBED_DEADLINE_SECS; worker_supervisor derives its
+        // kill deadline from the same constant. If someone re-hardcodes one of
+        // them, the advice silently becomes wrong again.
+        assert_eq!(
+            crate::worker_supervisor::embed_deadline().as_secs(),
+            EMBED_DEADLINE_SECS,
+            "supervisor kill deadline must match the one reported to operators"
+        );
     }
 
     #[test]

@@ -205,6 +205,30 @@ fn try_metal() -> Result<ResolvedDevice, String> {
     }
 }
 
+/// The GPU [`DevicePreference`] that this binary can actually honour, or
+/// [`DevicePreference::Cpu`] when no GPU backend was compiled in.
+///
+/// This exists because resolving `auto` from `target_os` alone is a lie: a
+/// Windows build made *without* the `candle-cuda` feature would still report
+/// `backend = "candle-cuda"`, then fall back to CPU inside the worker. The
+/// startup log and `semantic_identity` claimed a GPU that was never once
+/// attempted — precisely the ambiguity this module was written to remove.
+///
+/// Feature detection must happen in *this* crate: the `candle-cuda` and
+/// `candle-metal` features are declared here, so `cfg!` in a dependent crate
+/// sees whatever that crate declares, not what Candle was actually built with.
+pub fn compiled_gpu_preference() -> DevicePreference {
+    if cfg!(feature = "candle-metal") && is_apple_silicon() {
+        DevicePreference::Metal
+    } else if cfg!(feature = "candle-cuda")
+        && cfg!(any(target_os = "linux", target_os = "windows"))
+    {
+        DevicePreference::Cuda
+    } else {
+        DevicePreference::Cpu
+    }
+}
+
 /// Process-wide device preference, set once at startup from config.
 ///
 /// A global is the right shape here specifically because embedding inference
@@ -277,6 +301,41 @@ pub fn resolve(pref: DevicePreference) -> ResolvedDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_gpu_preference_never_claims_an_uncompiled_backend() {
+        // Regression: `auto` used to resolve from `target_os` alone, so a
+        // Windows build without `candle-cuda` requested (and reported) CUDA,
+        // then silently ran on CPU. The requested backend must only ever name
+        // a device this binary could actually construct.
+        let pref = compiled_gpu_preference();
+
+        match pref {
+            DevicePreference::Cuda => assert!(
+                cfg!(feature = "candle-cuda"),
+                "claimed CUDA without the candle-cuda feature compiled in"
+            ),
+            DevicePreference::Metal => assert!(
+                cfg!(feature = "candle-metal"),
+                "claimed Metal without the candle-metal feature compiled in"
+            ),
+            DevicePreference::Cpu => {}
+            DevicePreference::Auto => {
+                panic!("auto must resolve to a concrete device, never back to auto")
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_gpu_preference_is_cpu_when_no_gpu_feature_is_present() {
+        if !cfg!(feature = "candle-cuda") && !cfg!(feature = "candle-metal") {
+            assert_eq!(
+                compiled_gpu_preference(),
+                DevicePreference::Cpu,
+                "a CPU-only build must request CPU so status output stays honest"
+            );
+        }
+    }
 
     #[test]
     fn explicit_cpu_is_not_reported_as_a_fallback() {

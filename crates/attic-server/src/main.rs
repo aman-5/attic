@@ -250,18 +250,14 @@ fn candle_backend_from_config(attic_config: &attic_core::AtticConfig) -> &'stati
     }
 
     let pref = match pref {
-        // Resolve `auto` to the backend that actually exists for this
-        // platform, so the requested backend string is honest rather than a
-        // placeholder the worker has to reinterpret.
-        DevicePreference::Auto => {
-            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                DevicePreference::Metal
-            } else if cfg!(any(target_os = "linux", target_os = "windows")) {
-                DevicePreference::Cuda
-            } else {
-                DevicePreference::Cpu
-            }
-        }
+        // Resolve `auto` to a backend this binary can actually honour.
+        //
+        // Resolving by platform alone produced a false claim: a Windows build
+        // without the `candle-cuda` feature requested "candle-cuda", failed
+        // inside the worker, and ran on CPU while startup logs and
+        // `semantic_identity` both said CUDA. Asking the semantic crate — which
+        // owns the feature flags — keeps the requested backend honest.
+        DevicePreference::Auto => attic_semantic::device::compiled_gpu_preference(),
         explicit => explicit,
     };
 

@@ -304,6 +304,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Windows (recommended):** rustup's default `x86_64-pc-windows-msvc` plus
   "Build Tools for Visual Studio" with the C++ workload. The GPU build
   (`--features ort-directml`) requires MSVC.
+
+  > **The GNU override below silently disables the GPU build.** ONNX Runtime
+  > publishes no `x86_64-pc-windows-gnu` binaries, so a `[build] target`
+  > override in `%USERPROFILE%\.cargo\config.toml` makes
+  > `--features ort-directml` fail with
+  > `no prebuilt binaries available for target x86_64-pc-windows-gnu` —
+  > not a GPU that merely goes unused, but a build that cannot happen at
+  > all. If you have that override set, pass the target explicitly:
+  >
+  > ```
+  > cargo build --release --features ort-directml --target x86_64-pc-windows-msvc
+  > ```
+  >
+  > and install from `target/x86_64-pc-windows-msvc/release/`, copying the
+  > `onnxruntime*.dll` and `DirectML.dll` staged beside the binary along
+  > with it — DirectML fails to load if they are not adjacent to the exe.
 - **Windows without MSVC:** MinGW via [Scoop](https://scoop.sh)
   (`scoop install mingw`, no admin), `rustup target add x86_64-pc-windows-gnu`,
   and a **local, untracked** override in `%USERPROFILE%\.cargo\config.toml`:

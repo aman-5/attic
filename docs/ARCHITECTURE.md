@@ -571,12 +571,33 @@ vars and build flags):
 
 ```mermaid
 flowchart TD
-    S[Semantic layer enabled] --> D{ort-directml build<br/>+ ATTIC_ONNX_MODEL_DIR set?}
-    D -- yes --> G[GPU: ORT/DirectML fp16<br/>Qwen3-Embedding-0.6B]
-    D -- no --> C[CPU: Candle Qwen3Embedder<br/>safetensors / Q8 GGUF]
-    G --> R[status: semantic_identity<br/>reports active backend]
+    S[Semantic layer enabled] --> P{Which GPU feature<br/>is compiled in?}
+    P -- ort-directml --> O{fp16 ONNX assets present?}
+    O -- yes --> G[GPU: ORT/DirectML fp16<br/>Qwen3-Embedding-0.6B]
+    O -- no --> DL[Background download<br/>CPU this run, GPU next start]
+    P -- candle-cuda / candle-metal --> DEV{Device actually available?}
+    DEV -- yes --> GC[GPU: Candle f32<br/>same safetensors as CPU]
+    DEV -- no --> C
+    P -- none --> C[CPU: Candle Qwen3Embedder<br/>safetensors f32]
+    DL --> C
+    G --> R[status: semantic_identity<br/>reports active backend<br/>+ fallback reason]
+    GC --> R
     C --> R
 ```
+
+Two distinct GPU stories, which is easy to conflate:
+
+* **DirectML** is a *different provider* — a separate fp16 ONNX export with
+  its own fingerprint (`qwen3-ort` / `fp16-onnx`), so its vectors occupy a
+  different vector space from the Candle ones and the two must never mix.
+* **CUDA and Metal** are the *same* Candle provider on a different device.
+  They load the identical `model.safetensors` the CPU path downloads, and
+  `DTYPE` stays `F32` on every device precisely so that moving between CPU
+  and GPU never invalidates an existing index.
+
+Every GPU path falls back to CPU with a stated reason rather than failing,
+and `execution_backend` is deliberately excluded from identity verification
+so a fallback degrades instead of erroring.
 
 Isolation: neural embedding always runs inside the supervised
 `attic inference-worker` child process regardless of which backend is
