@@ -165,30 +165,6 @@ pub fn exists_file_occurrence(
     Ok(count > 0)
 }
 
-/// Mark a file occurrence as indexed by recording the generation and timestamp.
-///
-/// Also updates `freshness_state` to `'CURRENT'`.
-pub fn set_file_occurrence_indexed(
-    conn: &Connection,
-    id: &FileOccurrenceId,
-    index_generation_id: &IndexGenerationId,
-    last_indexed_at_us: i64,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "UPDATE core_file_occurrences
-         SET index_generation_id = ?2,
-             last_indexed_at     = ?3,
-             freshness_state     = 'CURRENT'
-         WHERE id = ?1",
-        rusqlite::params![
-            id.to_string_repr(),
-            index_generation_id.to_string_repr(),
-            last_indexed_at_us,
-        ],
-    )?;
-    Ok(())
-}
-
 /// Look up a file identity ID by its `stable_id_basis`, returning `None` if absent.
 ///
 /// Used by `attic-indexing` to reuse the same UUID across reindex runs.

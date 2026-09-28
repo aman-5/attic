@@ -409,43 +409,6 @@ impl StructuralGenerator {
         }
         Ok(out)
     }
-
-    /// Nodes by node-type fragment within one repository (architecture
-    /// questions with no symbol hint).
-    pub fn run_by_type(
-        env: &mut GeneratorEnv<'_>,
-        node_type_like: &str,
-    ) -> Result<Vec<Candidate>, RetrievalError> {
-        let Some(repo) = repo_filter(env).map(str::to_owned) else {
-            return Ok(Vec::new());
-        };
-        let rows = attic_storage::structural_nodes_by_type(
-            env.conn,
-            &repo,
-            node_type_like,
-            env.limit.min(48),
-        )?;
-        let mut out = Vec::new();
-        for n in rows.into_iter().filter(|_| env.budget.admit_candidate()) {
-            let header = attic_storage::file_header_by_id(env.conn, &n.file_occurrence_id)?;
-            let mut ev = Evidence::new(uuid::Uuid::new_v4().to_string(), n.id.clone());
-            if let Some(h) = &header {
-                ev.repository_id = h.repository_id.clone();
-                ev.source_revision_id = Some(h.source_revision_id.clone());
-                ev.index_generation_id = h.index_generation_id.clone();
-                ev.content_hash = Some(h.content_hash.clone());
-            }
-            ev.source_type = EvidenceSourceType::SourceCode;
-            ev.source_id = n.file_occurrence_id.clone();
-            ev.path = n.path.clone();
-            ev.freshness_state = freshness_of(&n.freshness_state);
-            ev.authority = AuthorityLevel::Implementation;
-            ev.confidence = 0.45;
-            ev.signals.structural_proximity = Some(0.8);
-            out.push(Candidate::new(RetrieverKind::Structural, ev));
-        }
-        Ok(out)
-    }
 }
 
 /// Relationship generator: direct edges of seed entities.

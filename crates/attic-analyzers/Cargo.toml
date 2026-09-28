@@ -14,7 +14,6 @@ attic-discovery = { workspace = true }
 thiserror       = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
-uuid            = { workspace = true }
 tracing         = { workspace = true }
 tempfile        = { workspace = true }
 blake3          = { workspace = true }
@@ -37,8 +36,3 @@ tree-sitter-containerfile = { workspace = true }
 tree-sitter-kotlin-ng  = { workspace = true }
 tree-sitter-swift      = { workspace = true }
 tree-sitter-lua        = { workspace = true }
-
-[dev-dependencies]
-tempfile           = { workspace = true }
-attic-core         = { workspace = true }
-uuid               = { workspace = true }

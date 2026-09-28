@@ -39,169 +39,6 @@ pub enum ResourceModeSetting {
     Performance,
 }
 
-/// Policy defining the aggressiveness of resource consumption under a specific mode.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ModePolicy {
-    /// Relative CPU aggressiveness (0.0 to 1.0).
-    pub cpu_aggressiveness: f32,
-    /// Relative memory aggressiveness (0.0 to 1.0).
-    pub memory_aggressiveness: f32,
-    /// Relative disk aggressiveness (0.0 to 1.0).
-    pub disk_aggressiveness: f32,
-    /// Fraction of machine resources strictly reserved for developer workflows (0.0 to 1.0).
-    pub developer_headroom: f32,
-    /// Speed/aggressiveness of upscale transitions (0.0 to 1.0).
-    pub scale_up_aggressiveness: f32,
-    /// Priority weight given to interactive MCP latency (0.0 to 1.0).
-    pub interactive_latency_priority: f32,
-    /// Multiplier when operating on battery power (0.0 to 1.0).
-    pub battery_aggressiveness: f32,
-}
-
-impl ModePolicy {
-    /// Conservative policy for Low mode.
-    pub fn low() -> Self {
-        Self {
-            cpu_aggressiveness: 0.25,
-            memory_aggressiveness: 0.30,
-            disk_aggressiveness: 0.30,
-            developer_headroom: 0.35,
-            scale_up_aggressiveness: 0.20,
-            interactive_latency_priority: 0.90,
-            battery_aggressiveness: 0.40,
-        }
-    }
-
-    /// Moderate policy for Balanced mode.
-    pub fn balanced() -> Self {
-        Self {
-            cpu_aggressiveness: 0.55,
-            memory_aggressiveness: 0.60,
-            disk_aggressiveness: 0.60,
-            developer_headroom: 0.20,
-            scale_up_aggressiveness: 0.50,
-            interactive_latency_priority: 0.80,
-            battery_aggressiveness: 0.50,
-        }
-    }
-
-    /// High-throughput policy for Performance mode.
-    pub fn performance() -> Self {
-        Self {
-            cpu_aggressiveness: 0.90,
-            memory_aggressiveness: 0.85,
-            disk_aggressiveness: 0.85,
-            developer_headroom: 0.10,
-            scale_up_aggressiveness: 0.80,
-            interactive_latency_priority: 0.70,
-            battery_aggressiveness: 0.60,
-        }
-    }
-
-    /// Resolve policy for a given mode setting.
-    pub fn for_mode(setting: ResourceModeSetting) -> Self {
-        match setting {
-            ResourceModeSetting::Low => Self::low(),
-            ResourceModeSetting::Balanced | ResourceModeSetting::Auto => Self::balanced(),
-            ResourceModeSetting::Performance => Self::performance(),
-        }
-    }
-}
-
-impl Default for ModePolicy {
-    fn default() -> Self {
-        Self::balanced()
-    }
-}
-
-/// Source of electrical power powering the current host machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PowerSource {
-    /// Running on wall / AC power.
-    Ac,
-    /// Running on battery power.
-    Battery,
-    /// Power source unknown or unreadable.
-    Unknown,
-}
-
-/// Real-time physical telemetry captured from the host system.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MachineSnapshot {
-    /// Total system RAM in MiB.
-    pub total_memory_mib: u64,
-    /// Currently available (unallocated or reclaimable) system RAM in MiB.
-    pub available_memory_mib: u64,
-    /// Resident Set Size (RSS) of the Attic process in MiB.
-    pub attic_rss_mib: u64,
-    /// Number of logical CPU cores on the host.
-    pub logical_cpus: usize,
-    /// Host system-wide CPU utilization (0.0 to 100.0%).
-    pub cpu_utilization: f32,
-    /// Fraction of CPU capacity currently available for use (0.0 to 1.0).
-    pub available_cpu_fraction: f32,
-    /// Free disk space available on the volume holding the semantic store in MiB.
-    pub semantic_disk_free_mib: u64,
-    /// Machine power source, if detectable.
-    pub power_source: Option<PowerSource>,
-}
-
-/// Real-time snapshot of current queue depths and processing throughput across Attic.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkloadSnapshot {
-    /// Number of files/items pending canonical indexing.
-    pub indexing_pending: u64,
-    /// Number of active canonical indexing worker threads.
-    pub indexing_active: usize,
-    /// Number of semantic units awaiting embedding.
-    pub semantic_pending: u64,
-    /// Number of semantic units currently in-flight across inference lanes.
-    pub semantic_inflight: u64,
-    /// Total semantic units successfully embedded.
-    pub semantic_completed: u64,
-    /// Number of interactive MCP embedding queries pending.
-    pub interactive_embedding_pending: u64,
-    /// Recent canonical indexing rate (files/sec).
-    pub indexing_rate: f64,
-    /// Recent semantic embedding rate (chunks/sec).
-    pub embedding_rate: f64,
-    /// Recent average semantic batch latency in milliseconds.
-    pub embedding_batch_latency_ms: f64,
-    /// Recent average interactive MCP request latency in milliseconds.
-    pub mcp_interactive_latency_ms: f64,
-}
-
-/// Explicit resource allocation computed by the Global Resource Orchestrator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceAllocation {
-    /// Number of worker threads granted to canonical indexing.
-    pub indexing_workers: usize,
-    /// Dedicated CPU thread count allocated to the semantic inference runtime.
-    pub semantic_cpu_threads: usize,
-    /// Number of parallel inference lanes for embedding generation.
-    pub semantic_inference_lanes: usize,
-    /// Batch size allocated per inference pass.
-    pub semantic_batch_size: usize,
-    /// Maximum number of items pre-fetched from the durable semantic queue.
-    pub semantic_prefetch_limit: usize,
-    /// Dedicated concurrency slots reserved for interactive MCP requests.
-    pub mcp_reserved_capacity: usize,
-}
-
-impl Default for ResourceAllocation {
-    fn default() -> Self {
-        Self {
-            indexing_workers: 2,
-            semantic_cpu_threads: 2,
-            semantic_inference_lanes: 1,
-            semantic_batch_size: 16,
-            semantic_prefetch_limit: 32,
-            mcp_reserved_capacity: 4,
-        }
-    }
-}
-
 /// Helper returning true as default for semantic.enabled.
 fn default_semantic_enabled() -> bool {
     true
@@ -514,11 +351,11 @@ impl AtticConfig {
 /// "auto"` ships active; every concrete `[resources]` field ships commented
 /// out — shipping concrete numbers uncommented would make every install
 /// silently override auto-tuning, defeating `ResourcePolicy` entirely.
-pub const ATTIC_TOML_TEMPLATE: &str = r#"# attic.toml — resource/embedding/indexing tunables.
-# Separate from <ATTIC_HOME>/config.toml, which continues to hold
-# [[repositories]] workspace membership exactly as it does today, untouched.
+pub const ATTIC_TOML_TEMPLATE: &str = r#"# attic.toml — resource, semantic and indexing tunables.
+# Workspace membership lives separately in <ATTIC_HOME>/config.toml
+# ([[repositories]]), managed by the `workspace` MCP tool.
 # Unknown tables or keys are rejected at startup. Environment variables
-# (ATTIC_*) override values set here.
+# (ATTIC_*) override values set here. Restart Attic to apply changes.
 
 [resources]
 # Automatically selects low/balanced/performance from available RAM and CPU.
@@ -550,12 +387,12 @@ model = "qwen3-embedding-0.6b"
 # multi-megabyte exports/dumps are generated data, not prose.
 # max_file_bytes = 262144
 # Additional paths to keep out of the embedding queue.
-# exclude_globs = ["*-Code.json", "fixtures/"]
+# exclude_globs = ["**/*.min.js", "testdata/"]
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
-# Attic's built-in defaults (node_modules/, target/, build output, etc.).
-# exclude = ["**/pom.xml"]
+# Attic's built-in defaults (node_modules/, target/, build/, dist/, .venv/, …).
+# exclude = ["**/*.generated.ts", "docs/archive/**"]
 
 # Kill-switch: set to false to fall back to lexical-only indexing (no
 # structural/AST analysis) if structural analysis misbehaves on this codebase.
@@ -571,7 +408,7 @@ model = "qwen3-embedding-0.6b"
 # Analyzer plugins. Empty = every built-in plugin. Files a disabled plugin
 # would handle remain fully searchable through the generic lexical analyzer.
 # Built-in ids: aem, java, python, go, javascript, typescript, json, c, cpp,
-# ruby, csharp, scala, php, swift, lua, rust, dockerfile.
+# ruby, csharp, scala, php, swift, lua, rust, kotlin, dockerfile.
 # analyzers = ["java", "typescript", "aem"]
 # disabled_analyzers = ["php"]
 "#;

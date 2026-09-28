@@ -16,7 +16,6 @@ build_errors*.txt
 *.db-wal
 *.db-shm
 *.db-journal
-!fixtures/**/*.db
 
 # Attic runtime data
 .mcp/

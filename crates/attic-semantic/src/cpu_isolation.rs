@@ -1,7 +1,7 @@
-//! CPU thread isolation and oversubscription guard (Master Plan V2 §21, CP14).
+//! CPU thread isolation and oversubscription guard for semantic inference.
 //!
 //! Enforces:
-//! - Strict compliance with Orchestrator's granted CPU allocation (`semantic_cpu_threads`).
+//! - Strict compliance with the granted semantic CPU thread budget.
 //! - Prevention of the forbidden multiplication state (§21):
 //!   `granted_threads = 4`, but `4 lanes * 8 threads = 32 threads`.
 //! - Per-lane thread budgeting: `threads_per_lane = (granted_threads / lanes).max(1)`.
@@ -42,9 +42,14 @@ impl CpuIsolationPlan {
     /// Configure global Rayon, native math, and BLAS thread ceilings once during startup,
     /// before runtime initialization. Subsequent thread resizing at runtime via environment
     /// variables is explicitly forbidden as it is ignored by already initialized pools.
+    ///
+    /// Must be called while the process is still single-threaded (first thing
+    /// in `main`): mutating the environment is only sound when no other thread
+    /// can read it concurrently. Values the user already set are respected.
     pub fn configure_startup_thread_ceiling(max_threads: usize) {
         let threads = max_threads.max(1);
         let threads_str = threads.to_string();
+        // SAFETY: called from `main` before any other thread is spawned.
         unsafe {
             if std::env::var("RAYON_NUM_THREADS").is_err() {
                 std::env::set_var("RAYON_NUM_THREADS", &threads_str);
@@ -62,9 +67,9 @@ impl CpuIsolationPlan {
     ///
     /// Note on native math concurrency: A local Rayon pool controls Attic tasks and
     /// Rayon-based operations executed within it, but does not claim to override external
-    /// native BLAS/C runtime pools once initialized. Dynamic Qwen CPU containment is
-    /// governed proactively by `ResourceOrchestrator` admission control and lane throttling,
-    /// backed by startup environment ceilings.
+    /// native BLAS/C runtime pools once initialized. Those are bounded by the startup
+    /// environment ceilings ([`Self::configure_startup_thread_ceiling`]) and by the
+    /// resource monitor's admission control.
     pub fn create_lane_pool(&self) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads_per_lane)
@@ -93,21 +98,21 @@ mod tests {
 
     #[test]
     fn plan_prevents_oversubscription() {
-        // Orchestrator grants 4 threads, requests 4 lanes
+        // 4 granted threads, 4 requested lanes
         let plan = CpuIsolationPlan::compute(4, 4);
         assert_eq!(plan.inference_lanes, 4);
         assert_eq!(plan.threads_per_lane, 1);
         assert_eq!(plan.total_allocated_threads, 4);
         assert!(!plan.is_oversubscribed());
 
-        // Orchestrator grants 8 threads, requests 2 lanes
+        // 8 granted threads, 2 requested lanes
         let plan = CpuIsolationPlan::compute(8, 2);
         assert_eq!(plan.inference_lanes, 2);
         assert_eq!(plan.threads_per_lane, 4);
         assert_eq!(plan.total_allocated_threads, 8);
         assert!(!plan.is_oversubscribed());
 
-        // Orchestrator grants 2 threads, requests 4 lanes: lanes clamped to 2
+        // 2 granted threads, 4 requested lanes: lanes clamped to 2
         let plan = CpuIsolationPlan::compute(2, 4);
         assert_eq!(plan.inference_lanes, 2);
         assert_eq!(plan.threads_per_lane, 1);
@@ -130,7 +135,7 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
 
-        // Validate real execution under dynamic Orchestrator allocations: 8 -> 4 -> 2 -> 6
+        // Validate real execution across changing allocations: 8 -> 4 -> 2 -> 6
         let transitions = [(8, 2), (4, 4), (2, 2), (6, 2)];
 
         for &(granted, lanes) in &transitions {

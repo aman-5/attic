@@ -1,6 +1,14 @@
-//! r15/r17: real-corpus acceptance against the actual Dump folder
-//! (C:\Users\amanbansal\Desktop\Dump). Env-gated: runs only with
-//! ATTIC_ACCEPTANCE_DUMP=1 on the machine holding the corpus.
+//! Real-corpus acceptance gates. Each test is env-gated by a variable that
+//! holds the corpus location, so they only run on a machine that has the
+//! reference corpus:
+//!
+//! - `ATTIC_ACCEPTANCE_DUMP=<dir>` — a JSON-export corpus (see the frozen
+//!   counts below).
+//! - `ATTIC_ACCEPTANCE_WORKSPACE=<dir>` — a container of nested git
+//!   repositories indexed as one multi-repository workspace.
+//!
+//! The frozen counts describe the reference corpora; pointing a variable at a
+//! different corpus is expected to fail on the exact-count assertions.
 //!
 //! Asserts the complete-coverage contract on real data: every eligible file
 //! reaches a terminal state, JSON canonical dedup collapses the environment
@@ -32,15 +40,32 @@ const DUMP_DISTINCT_CANONICAL: i64 = 10_596;
 
 #[test]
 fn dump_corpus_indexes_completely_with_canonical_dedup() {
-    if std::env::var("ATTIC_ACCEPTANCE_DUMP").ok().as_deref() != Some("1") {
-        eprintln!("ATTIC_ACCEPTANCE_DUMP!=1; skipping real-corpus acceptance");
+    let Some(corpus) = corpus_from_env("ATTIC_ACCEPTANCE_DUMP") else {
         return;
-    }
-    let corpus = Path::new(r"C:\Users\amanbansal\Desktop\Dump");
-    run_corpus(corpus, true);
+    };
+    run_corpus(&corpus, true);
 }
 
-/// r15/r17: the full HDFC interlinked-repository workspace.
+/// Corpus directory named by `var`, or `None` (test skipped) when unset.
+fn corpus_from_env(var: &str) -> Option<std::path::PathBuf> {
+    match std::env::var_os(var) {
+        Some(dir) if !dir.is_empty() => {
+            let dir = std::path::PathBuf::from(dir);
+            assert!(
+                dir.is_dir(),
+                "{var} must name the corpus directory, got {dir:?}"
+            );
+            Some(dir)
+        }
+        _ => {
+            eprintln!("{var} not set; skipping real-corpus acceptance");
+            None
+        }
+    }
+}
+
+/// The reference multi-repository workspace: an enterprise AEM/Java estate
+/// of interlinked repositories.
 ///
 /// The container root holds 20 nested git repositories; discovery correctly
 /// refuses to cross repo boundaries (SubmoduleDetected). A workspace indexes
@@ -61,23 +86,19 @@ fn dump_corpus_indexes_completely_with_canonical_dedup() {
 /// Every
 /// intended repository must appear with at least one indexed file — a repo
 /// silently contributing zero files is exactly the "intended repository
-/// disappears silently" failure the gate forbids. If the HDFC workspace
+/// disappears silently" failure the gate forbids. If the reference workspace
 /// legitimately changes (a repo added/removed, content edited), update
 /// these constants to the new measured values rather than loosening them
 /// back into inequalities.
 #[test]
-fn hdfc_workspace_indexes_completely() {
-    if std::env::var("ATTIC_ACCEPTANCE_HDFC").ok().as_deref() != Some("1") {
-        eprintln!("ATTIC_ACCEPTANCE_HDFC!=1; skipping HDFC acceptance");
+fn multi_repo_workspace_indexes_completely() {
+    let Some(corpus) = corpus_from_env("ATTIC_ACCEPTANCE_WORKSPACE") else {
         return;
-    }
-    let corpus = Path::new(r"C:\Adobe-Projects\HDFC-Bank-on-prem\HDFC Repo");
-    if !corpus.is_dir() {
-        panic!("corpus not present at {corpus:?}");
-    }
-    const HDFC_REPO_COUNT: usize = 20;
-    const HDFC_TOTAL_FILES: usize = 12_161;
-    const HDFC_TOTAL_UNITS: usize = 95_886;
+    };
+    let corpus = corpus.as_path();
+    const WORKSPACE_REPO_COUNT: usize = 20;
+    const WORKSPACE_TOTAL_FILES: usize = 12_161;
+    const WORKSPACE_TOTAL_UNITS: usize = 95_886;
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("attic.db");
@@ -122,7 +143,7 @@ fn hdfc_workspace_indexes_completely() {
         let r = attic_indexing::index_repository(&store, root, &policy, &opts)
             .unwrap_or_else(|e| panic!("repo {name} must index: {e}"));
         eprintln!(
-            "ACCEPTANCE hdfc repo={name} files={} units={}",
+            "ACCEPTANCE workspace repo={name} files={} units={}",
             r.files_indexed, r.units_inserted
         );
         // Gate: no discovered file in this repo may be left in a retryable
@@ -143,7 +164,7 @@ fn hdfc_workspace_indexes_completely() {
         total_units += r.units_inserted;
     }
     eprintln!(
-        "ACCEPTANCE hdfc: repos={} files={} units={} elapsed={:?}",
+        "ACCEPTANCE workspace: repos={} files={} units={} elapsed={:?}",
         roots.len(),
         total_files,
         total_units,
@@ -153,16 +174,16 @@ fn hdfc_workspace_indexes_completely() {
     // r17: exact frozen accounting (plan Phase 8 gate) — not a lower bound.
     assert_eq!(
         roots.len(),
-        HDFC_REPO_COUNT,
+        WORKSPACE_REPO_COUNT,
         "nested repository count drifted from the frozen baseline: found {:?}",
         per_repo.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
     );
     assert_eq!(
-        total_files, HDFC_TOTAL_FILES,
+        total_files, WORKSPACE_TOTAL_FILES,
         "total indexed file count drifted from the frozen baseline (per-repo: {per_repo:?})"
     );
     assert_eq!(
-        total_units, HDFC_TOTAL_UNITS,
+        total_units, WORKSPACE_TOTAL_UNITS,
         "total unit count drifted from the frozen baseline"
     );
 }

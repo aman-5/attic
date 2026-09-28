@@ -245,8 +245,6 @@ fn decode_bytes_lossy(bytes: &[u8]) -> (String, bool) {
 
 struct ParsedLine {
     content: String,
-    #[allow(dead_code)]
-    byte_len_with_terminator: usize,
 }
 
 /// Split `text` into lines. Does NOT use `str::lines()` (CRLF-aware).
@@ -265,20 +263,12 @@ fn split_lines_bytes(text: &str) -> Vec<ParsedLine> {
                     nl
                 };
                 let content = text[pos..content_end].to_string();
-                let byte_len_with_terminator = nl + 1 - pos;
-                result.push(ParsedLine {
-                    content,
-                    byte_len_with_terminator,
-                });
+                result.push(ParsedLine { content });
                 pos = nl + 1;
             }
             None => {
                 let content = text[pos..].to_string();
-                let byte_len_with_terminator = len - pos;
-                result.push(ParsedLine {
-                    content,
-                    byte_len_with_terminator,
-                });
+                result.push(ParsedLine { content });
                 pos = len;
             }
         }

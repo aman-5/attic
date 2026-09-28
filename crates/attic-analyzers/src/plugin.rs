@@ -497,6 +497,12 @@ fn builtin_plugins() -> Vec<Arc<dyn AnalyzerPlugin>> {
         tier2("lua", "Lua: tags.scm symbols", &[], &[("lua", "lua")]),
         tier2("rust", "Rust: tags.scm symbols", &[], &[("rs", "rust")]),
         tier2(
+            "kotlin",
+            "Kotlin: classes, objects, functions and type aliases",
+            &[],
+            &[("kt", "kotlin"), ("kts", "kotlin")],
+        ),
+        tier2(
             "dockerfile",
             "Dockerfile: tags.scm symbols",
             &[("dockerfile", "dockerfile")],
@@ -548,6 +554,26 @@ mod tests {
                 "missing built-in plugin {expected}"
             );
         }
+    }
+
+    /// The `attic.toml` written on first run documents every built-in
+    /// plugin id, so users never have to read the source to find them.
+    #[test]
+    fn attic_toml_template_lists_every_builtin_plugin() {
+        let template = attic_core::ATTIC_TOML_TEMPLATE;
+        let marker = "# Built-in ids:";
+        let start = template.find(marker).expect("template lists built-in ids") + marker.len();
+        let rest = &template[start..];
+        let list = &rest[..rest.find('.').expect("id list ends with a period")];
+        let listed: BTreeSet<&str> = list
+            .split(|c: char| c == ',' || c == '#' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let builtin: BTreeSet<&str> = PluginCatalog::builtin().plugin_ids().into_iter().collect();
+        assert_eq!(
+            listed, builtin,
+            "attic.toml template id list is out of date"
+        );
     }
 
     /// Every tag a plugin can hint must be registered by that same plugin,

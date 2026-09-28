@@ -260,9 +260,10 @@ fn canonical(v: &serde_json::Value) -> String {
             let inner: Vec<String> = keys
                 .into_iter()
                 .map(|k| {
+                    // Serializing a `String` / `Value` to JSON text cannot fail.
                     format!(
                         "{}:{}",
-                        serde_json::to_string(k).unwrap(),
+                        serde_json::to_string(k).unwrap_or_default(),
                         canonical(&map[k])
                     )
                 })
@@ -273,7 +274,7 @@ fn canonical(v: &serde_json::Value) -> String {
             let inner: Vec<String> = arr.iter().map(canonical).collect();
             format!("[{}]", inner.join(","))
         }
-        other => serde_json::to_string(other).unwrap(),
+        other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 

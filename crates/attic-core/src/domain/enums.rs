@@ -214,14 +214,8 @@ str_enum! {
         SymbolOccurrence => "SYMBOL_OCCURRENCE",
         /// A text chunk indexed for search.
         RetrievalUnit    => "RETRIEVAL_UNIT",
-        /// An embedding or semantic vector (future — Phase 5).
-        SemanticRepr     => "SEMANTIC_REPR",
         /// A dependency/call/import edge.
         Relationship     => "RELATIONSHIP",
-        /// A canonical evidence record.
-        Evidence         => "EVIDENCE",
-        /// A knowledge document record.
-        KnowledgeItem    => "KNOWLEDGE_ITEM",
     }
 }
 

@@ -328,27 +328,6 @@ pub fn structural_nodes_for_file(
     )
 }
 
-/// Nodes by analyzer node-type fragment (e.g. `%class%`) within one repo.
-pub fn structural_nodes_by_type(
-    conn: &Connection,
-    repository_id: &str,
-    node_type_like: &str,
-    limit: usize,
-) -> Result<Vec<NodeRow>, StorageError> {
-    query_nodes(
-        conn,
-        &node_rows_sql(
-            "n.repository_id IS NOT NULL AND n.freshness_state != 'INVALID'
-             AND n.node_type LIKE ?2 ESCAPE '\\'
-             AND n.file_occurrence_id IN (
-                 SELECT id FROM core_file_occurrences
-                  WHERE repository_id = ?1 AND existence_state != 'deleted')",
-        ),
-        &[&repository_id, &node_type_like],
-        limit,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // File headers
 // ---------------------------------------------------------------------------

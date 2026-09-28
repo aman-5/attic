@@ -603,36 +603,26 @@ impl ResourceMonitor {
         }
     }
 
+    /// Fault-injection hook for integration tests and chaos drills. Only
+    /// active when `ATTIC_PRESSURE_OVERRIDE_FILE` names a file: while that
+    /// file exists its content (`normal` / `warning` / `critical` /
+    /// `emergency`) forces the pressure tier; once it is removed, measured
+    /// pressure applies again. Normal operation never touches the
+    /// filesystem here.
     fn check_file_pressure_override(&self) {
-        let mut paths = Vec::new();
-        if let Ok(p) = std::env::var("ATTIC_PRESSURE_OVERRIDE_FILE") {
-            paths.push(std::path::PathBuf::from(p));
-        }
-        if let Ok(home) = std::env::var("ATTIC_HOME") {
-            paths.push(std::path::PathBuf::from(home).join("pressure_override"));
-        }
-        if let Ok(db) = std::env::var("ATTIC_DB_PATH")
-            && let Some(parent) = std::path::Path::new(&db).parent()
-        {
-            paths.push(parent.join("pressure_override"));
-        }
-
-        for p in paths {
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                let trimmed = content.trim().to_lowercase();
-                let forced = match trimmed.as_str() {
-                    "normal" => Some(ResourcePressure::Normal),
-                    "warning" => Some(ResourcePressure::Warning),
-                    "critical" => Some(ResourcePressure::Critical),
-                    "emergency" => Some(ResourcePressure::Emergency),
-                    _ => None,
-                };
-                self.set_forced_pressure_for_testing(forced);
-                return;
-            }
-        }
-
-        if std::env::var("ATTIC_FORCE_RESOURCE_PRESSURE").is_err()
+        let Some(path) = std::env::var_os("ATTIC_PRESSURE_OVERRIDE_FILE") else {
+            return;
+        };
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let forced = match content.trim().to_ascii_lowercase().as_str() {
+                "normal" => Some(ResourcePressure::Normal),
+                "warning" => Some(ResourcePressure::Warning),
+                "critical" => Some(ResourcePressure::Critical),
+                "emergency" => Some(ResourcePressure::Emergency),
+                _ => None,
+            };
+            self.set_forced_pressure_for_testing(forced);
+        } else if std::env::var_os("ATTIC_FORCE_RESOURCE_PRESSURE").is_none()
             && self.forced_pressure_tier.load(Ordering::Relaxed) != 0
         {
             self.set_forced_pressure_for_testing(None);
@@ -849,14 +839,6 @@ impl ResourceMonitor {
         }
         // Recompute effective limits on every tier transition.
         self.update_effective_limits();
-    }
-
-    /// Return the effective memory used in MiB — the maximum of the
-    /// accountable watermark and the last sampled process RSS.
-    pub fn effective_memory_used(&self) -> u64 {
-        let accounted = self.memory_used.load(Ordering::Relaxed);
-        let rss = self.process_rss_mib.load(Ordering::Relaxed);
-        accounted.max(rss)
     }
 
     /// Record an increase in accountable memory usage by `mib` MiB.
@@ -1135,33 +1117,6 @@ impl ResourceMonitor {
         self.start_time.elapsed().as_secs()
     }
 
-    /// Apply a new [`ResourceConfig`], updating all limits and recomputing
-    /// effective values.
-    pub fn apply_config(&self, config: &ResourceConfig) {
-        let max_memory_mib = config
-            .total_memory_budget_mib
-            .unwrap_or(self.max_memory_mib.load(Ordering::Relaxed))
-            .max(1);
-        self.max_memory_mib.store(max_memory_mib, Ordering::Release);
-        if let Some(v) = config.per_repo_memory_budget_mib {
-            self.per_repo_memory_mib.store(v, Ordering::Release);
-        }
-        let min_free = safe_min_free_mib(
-            max_memory_mib,
-            config
-                .min_free_memory_mib
-                .unwrap_or(self.min_free_memory_mib.load(Ordering::Relaxed)),
-        );
-        self.min_free_memory_mib.store(min_free, Ordering::Release);
-        if let Some(v) = config.max_foreground_queries {
-            self.foreground_capacity.store(v.max(1), Ordering::Release);
-        }
-        if let Some(v) = config.max_background_workers {
-            self.background_capacity.store(v, Ordering::Release);
-        }
-        self.update_effective_limits();
-    }
-
     /// Manually force a resource pressure tier for deterministic testing.
     ///
     /// Pass `Some(tier)` to override dynamic RSS/hysteresis tracking, or `None`
@@ -1294,11 +1249,6 @@ impl ResourceConfig {
             return Err("max_foreground_queries must be > 0".to_string());
         }
         Ok(())
-    }
-
-    /// Apply this configuration to `monitor`.
-    pub fn apply_to(&self, monitor: &ResourceMonitor) {
-        monitor.apply_config(self);
     }
 }
 

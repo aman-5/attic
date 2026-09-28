@@ -30,34 +30,6 @@ use crate::resolver::{self, RepoCatalogData, ResolutionDiagnostics};
 use crate::{CancelToken, Deadline};
 
 // ---------------------------------------------------------------------------
-// Progress reporting
-// ---------------------------------------------------------------------------
-
-/// Stage of a workspace sync operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncStage {
-    /// Scanning manifests for a repository.
-    ScanningManifests,
-    /// Resolving cross-repo edges.
-    Resolving,
-    /// Persisting resolved edges.
-    PersistingEdges,
-}
-
-/// Progress event emitted during workspace sync.
-#[derive(Debug, Clone)]
-pub struct SyncProgress {
-    /// Current stage.
-    pub stage: SyncStage,
-    /// Repository being processed (when applicable).
-    pub repository_id: String,
-    /// Current index in the batch (0-based).
-    pub current: usize,
-    /// Total repositories in the batch.
-    pub total: usize,
-}
-
-// ---------------------------------------------------------------------------
 // Single-repository sync
 // ---------------------------------------------------------------------------
 
@@ -293,6 +265,8 @@ pub fn sync_workspace(
             proto_index.insert(repo_id.clone(), proto_specs);
         }
 
+        let provides_count = provides.len();
+        let declarations_count = declarations.len();
         all_repo_data.push(RepoCatalogData {
             repository_id: repo_id.clone(),
             root_path,
@@ -311,8 +285,8 @@ pub fn sync_workspace(
 
         result.repository_reports.push(SyncReport {
             repository_id: repo_id.clone(),
-            provides_count: all_repo_data.last().unwrap().provides.len(),
-            declarations_count: all_repo_data.last().unwrap().declarations.len(),
+            provides_count,
+            declarations_count,
             oversized: oversized_count,
             unreadable: unreadable_count,
             manifest_hash,
@@ -440,30 +414,6 @@ pub fn sync_workspace(
 // ---------------------------------------------------------------------------
 // Convenience wrapper: membership-scoped workspace maintenance
 // ---------------------------------------------------------------------------
-
-/// Run a full workspace sync scoped to the given active repository IDs.
-///
-/// Equivalent to calling `sync_workspace` but restricts the sync to only the
-/// repositories listed in `active_ids` (§14 membership is authoritative).
-/// Repositories present in the database but absent from `active_ids` are
-/// excluded from scanning, edge resolution and snapshot provenance.
-///
-/// `pool` provides the reader connection; `writer` is the single write queue.
-pub fn run_workspace_maintenance_with_membership(
-    pool: &attic_storage::DbPool,
-    writer: &attic_storage::WriterQueueHandle,
-    active_ids: Vec<String>,
-) -> Result<WorkspaceSyncResult, CrossRepoError> {
-    let opts = WorkspaceSyncOptions {
-        active_repository_ids: Some(active_ids),
-        ..Default::default()
-    };
-    pool.with_reader(|conn| {
-        sync_workspace(conn, writer, &opts)
-            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
-    })
-    .map_err(CrossRepoError::Storage)
-}
 
 // ---------------------------------------------------------------------------
 // Repository removal

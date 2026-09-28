@@ -1,5 +1,6 @@
--- Attic canonical database baseline schema for pre-release QA.
--- Fresh databases only; pre-QA development migration history was intentionally squashed.
+-- Attic canonical database schema — the single baseline.
+-- attic.db is derived from source: a database created by any other schema is
+-- wiped and rebuilt automatically (see crates/attic-storage/src/migration.rs).
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE core_dependency_declarations (
@@ -20,28 +21,6 @@ CREATE TABLE core_dependency_declarations (
     freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT',
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL
-);
-
-CREATE TABLE core_evidence (
-    id                      TEXT    NOT NULL PRIMARY KEY,   -- UUID
-    repository_id           TEXT    NOT NULL REFERENCES core_repositories(id),
-    -- source_type enum: SOURCE_CODE | TEST | CONFIGURATION | DOCUMENTATION | KNOWLEDGE | RELATIONSHIP | GENERATED_SOURCE
-    source_type             TEXT    NOT NULL,
-    source_id               TEXT    NOT NULL,   -- FK to file_occurrence_id or knowledge_item_id
-    path                    TEXT    NOT NULL,   -- workspace-relative normalized path
-    source_revision_id      TEXT    NOT NULL REFERENCES core_source_revisions(id),
-    index_generation_id     TEXT    NOT NULL REFERENCES core_index_generations(id),
-    source_span             TEXT,               -- NULL for whole-file evidence
-    content_hash            TEXT    NOT NULL,   -- BLAKE3 hex of evidence content
-    -- freshness_state enum: CURRENT | STALE | INVALID | PENDING_REFRESH
-    freshness_state         TEXT    NOT NULL DEFAULT 'CURRENT',
-    -- authority enum: SOURCE_CODE | TEST | KNOWLEDGE | CONFIGURATION | RELATIONSHIP
-    authority               TEXT    NOT NULL,
-    confidence              REAL    NOT NULL DEFAULT 1.0,
-    relationship_confidence REAL,               -- NULL if not derived from a relationship
-    -- verification_state enum: UNVERIFIED | VERIFIED | STALE | CONTRADICTED
-    verification_state      TEXT    NOT NULL DEFAULT 'UNVERIFIED',
-    ranking_signals_json    TEXT    -- JSON object of RankingSignals; no secret content
 );
 
 CREATE TABLE core_file_identities (
@@ -122,22 +101,6 @@ CREATE TABLE core_invalidation_records (
     recomputed_at   INTEGER             -- NULL until the artifact has been recomputed
 );
 
-CREATE TABLE core_knowledge_items (
-    id                  TEXT    NOT NULL PRIMARY KEY,   -- UUID
-    repository_id       TEXT    NOT NULL REFERENCES core_repositories(id),
-    file_occurrence_id  TEXT    NOT NULL REFERENCES core_file_occurrences(id),
-    source              TEXT    NOT NULL,   -- e.g., "knowledge/architecture.md"
-    -- authority enum: SOURCE_CODE | TEST | KNOWLEDGE | CONFIGURATION | RELATIONSHIP
-    authority           TEXT    NOT NULL,
-    last_verified_at    INTEGER,            -- microseconds since Unix epoch; NULL if never verified
-    applicable_versions TEXT,               -- semver range string; NULL if version-agnostic
-    supersedes_id       TEXT    REFERENCES core_knowledge_items(id),  -- NULL if not a supersession
-    confidence          REAL    NOT NULL DEFAULT 1.0,  -- [0.0, 1.0]
-    content_hash        TEXT    NOT NULL,   -- BLAKE3 hex
-    -- freshness_state enum: CURRENT | STALE | INVALID
-    freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT'
-);
-
 CREATE TABLE core_relationships (
     id                    TEXT    NOT NULL PRIMARY KEY,   -- UUID
     source_repository_id  TEXT    NOT NULL REFERENCES core_repositories(id),
@@ -190,8 +153,26 @@ CREATE TABLE core_retrieval_units (
     -- semantic_state enum: NONE | PENDING | CURRENT | STALE
     semantic_state      TEXT    NOT NULL DEFAULT 'NONE',
     -- freshness_state enum: CURRENT | STALE | INVALID | PENDING_REFRESH
-    freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT'
-, analyzer_id TEXT, analyzer_version TEXT, start_line INTEGER, end_line INTEGER, is_redacted INTEGER NOT NULL DEFAULT 0);
+    freshness_state     TEXT    NOT NULL DEFAULT 'CURRENT',
+    analyzer_id         TEXT,
+    analyzer_version    TEXT,
+    start_line          INTEGER,
+    end_line            INTEGER,
+    is_redacted         INTEGER NOT NULL DEFAULT 0,
+    -- canonical_text: exact text handed to the embedding provider (NULL =
+    -- retrieval_text is canonical); canonical_hash: BLAKE3 of that text, so
+    -- identical bodies across files/environments share one embedding.
+    canonical_text      TEXT,
+    canonical_hash      TEXT,
+    -- occurrence_metadata: per-occurrence provenance JSON, e.g.
+    -- {"json_pointer": "/services/0", "environment": "PROD"}; never hashed.
+    occurrence_metadata TEXT,
+    -- coverage_state enum: COMPLETE | PARTIAL | TRUNCATED
+    coverage_state      TEXT    NOT NULL DEFAULT 'COMPLETE'
+);
+
+CREATE INDEX idx_retrieval_units_canonical_hash
+    ON core_retrieval_units(canonical_hash);
 
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
     id          TEXT    NOT NULL PRIMARY KEY,  -- e.g., "0001_initial"
@@ -285,14 +266,6 @@ CREATE VIRTUAL TABLE fts_retrieval_units USING fts5(
     tokenize='unicode61 remove_diacritics 1'
 );
 
-CREATE VIRTUAL TABLE fts_symbol_names USING fts5(
-    qualified_name,
-    kind,
-    content='core_symbol_identities',
-    content_rowid='rowid',
-    tokenize='unicode61'
-);
-
 CREATE TABLE index_analysis_cache (
     repository_id   TEXT    NOT NULL REFERENCES core_repositories(id),
     repo_relative   TEXT    NOT NULL,
@@ -311,39 +284,6 @@ CREATE TABLE index_analysis_cache (
     structural INTEGER NOT NULL DEFAULT 1,
     max_units_per_file INTEGER NOT NULL DEFAULT 512,
     PRIMARY KEY (repository_id, repo_relative)
-);
-
-CREATE TABLE ops_freshness_log (
-    id          TEXT    NOT NULL PRIMARY KEY,   -- UUID
-    entity_type TEXT    NOT NULL,   -- e.g., FILE_OCCURRENCE | RETRIEVAL_UNIT | EVIDENCE
-    entity_id   TEXT    NOT NULL,
-    prior_state TEXT    NOT NULL,
-    new_state   TEXT    NOT NULL,
-    changed_at  INTEGER NOT NULL,   -- microseconds since Unix epoch (UTC)
-    reason      TEXT                -- human-readable reason; no secret content
-);
-
-CREATE TABLE ops_indexing_log (
-    id              TEXT    NOT NULL PRIMARY KEY,   -- UUID (= generation_id being built)
-    generation_id   TEXT    NOT NULL,               -- correlates with core_index_generations.id
-    repository_id   TEXT    NOT NULL REFERENCES core_repositories(id),
-    -- status enum: RUNNING | COMPLETED | ABANDONED | FAILED
-    status          TEXT    NOT NULL DEFAULT 'RUNNING',
-    files_total     INTEGER,
-    files_processed INTEGER NOT NULL DEFAULT 0,
-    started_at      INTEGER NOT NULL,
-    completed_at    INTEGER,
-    error_message   TEXT
-);
-
-CREATE TABLE ops_migration_log (
-    id              TEXT    NOT NULL PRIMARY KEY,   -- migration id, e.g., "0001_initial"
-    -- status enum: RUNNING | COMPLETED | FAILED
-    status          TEXT    NOT NULL DEFAULT 'RUNNING',
-    progress_json   TEXT,   -- JSON: { "last_completed_statement": N } for crash recovery
-    started_at      INTEGER NOT NULL,
-    completed_at    INTEGER,
-    error_message   TEXT    -- populated if status = FAILED
 );
 
 CREATE TABLE ops_retrieval_log (
@@ -400,19 +340,6 @@ CREATE TABLE ops_tasks (
     error_message       TEXT    -- last error if state = FAILED; no secret content
 );
 
-CREATE INDEX idx_evidence_freshness
-    ON core_evidence(freshness_state)
-    WHERE freshness_state IN ('STALE', 'INVALID');
-
-CREATE INDEX idx_evidence_repo
-    ON core_evidence(repository_id);
-
-CREATE INDEX idx_evidence_revision
-    ON core_evidence(source_revision_id);
-
-CREATE INDEX idx_evidence_source
-    ON core_evidence(source_id, source_type);
-
 CREATE INDEX idx_file_identities_repo
     ON core_file_identities(repository_id);
 
@@ -439,9 +366,6 @@ CREATE INDEX idx_file_occ_secret_scan
     ON core_file_occurrences(secret_scan_state)
     WHERE secret_scan_state = 'PENDING';
 
-CREATE INDEX idx_freshness_log_entity
-    ON ops_freshness_log(entity_id, entity_type, changed_at DESC);
-
 CREATE INDEX idx_identity_links_from
     ON core_identity_links(from_identity_id);
 
@@ -457,25 +381,12 @@ CREATE INDEX idx_index_analysis_cache_repo
 CREATE INDEX idx_index_generations_revision
     ON core_index_generations(source_revision_id, created_at DESC);
 
-CREATE INDEX idx_indexing_log_generation
-    ON ops_indexing_log(generation_id);
-
-CREATE INDEX idx_indexing_log_running
-    ON ops_indexing_log(status)
-    WHERE status = 'RUNNING';
-
 CREATE INDEX idx_invalidation_artifact
     ON core_invalidation_records(artifact_type, artifact_id);
 
 CREATE INDEX idx_invalidation_pending
     ON core_invalidation_records(recomputed_at)
     WHERE recomputed_at IS NULL;
-
-CREATE INDEX idx_knowledge_items_file
-    ON core_knowledge_items(file_occurrence_id);
-
-CREATE INDEX idx_knowledge_items_repo
-    ON core_knowledge_items(repository_id);
 
 CREATE INDEX idx_relationships_cross_repo
     ON core_relationships(source_repository_id, target_repository_id)
@@ -573,5 +484,3 @@ CREATE INDEX idx_xrepo_decls_repo
     ON core_dependency_declarations(repository_id);
 
 INSERT OR IGNORE INTO core_schema_migrations (id, applied_at) VALUES ('0001_initial', strftime('%s', 'now') * 1000000);
-
-INSERT OR IGNORE INTO ops_migration_log (id, status, started_at, completed_at) VALUES ('0001_initial', 'COMPLETED', strftime('%s', 'now') * 1000000, strftime('%s', 'now') * 1000000);

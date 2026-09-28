@@ -441,7 +441,7 @@ fn redacted_java_secret_never_reaches_published_artifacts() {
 // re-analysis / deletion / rename.
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Fix 1 verification: a full refresh re-runs symbol-identity insertion for
+/// Regression: a full refresh re-runs symbol-identity insertion for
 /// every file; the upsert path must reuse identities WITHOUT panicking and
 /// must not duplicate identity rows.
 #[test]

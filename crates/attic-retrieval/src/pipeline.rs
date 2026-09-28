@@ -166,8 +166,6 @@ struct DbPhaseOutcome {
 
 /// Generation context: everything the per-step generator invocations share.
 struct GenCtx<'a> {
-    #[allow(dead_code)] // reserved for generator-side service callbacks
-    service: &'a RetrievalService,
     conn: &'a Connection,
     repo_filter: &'a Option<String>,
     budget: &'a mut BudgetAccountant,
@@ -428,7 +426,6 @@ impl RetrievalService {
 
         {
             let mut ctx = GenCtx {
-                service: self,
                 conn,
                 repo_filter,
                 budget: &mut budget,
@@ -481,7 +478,6 @@ impl RetrievalService {
 
         {
             let mut ctx = GenCtx {
-                service: self,
                 conn,
                 repo_filter,
                 budget: &mut budget,

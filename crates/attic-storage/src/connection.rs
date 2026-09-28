@@ -74,8 +74,8 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 /// the crash recovery contract.
 ///
 /// * The WAL checkpoint is handled by SQLite's internal autocheckpoint
-///   mechanism (`wal_autocheckpoint = 1000`), which fires every 1 000 WAL
-///   frames or every 5 minutes — whichever comes first.
+///   mechanism (`wal_autocheckpoint = 1000`), which fires at commit time once
+///   the WAL exceeds 1 000 frames; shutdown adds a `TRUNCATE` checkpoint.
 /// * The backup is retained for the most recent 3 checkpoints (REC-B2).
 /// * The backup write runs on the main thread during shutdown; it is
 ///   designed to be low-overhead and must not block the write path since it

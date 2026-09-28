@@ -45,12 +45,6 @@ impl BudgetAccountant {
         self.started.elapsed().as_millis() as u64
     }
 
-    pub fn remaining_ms(&self) -> u64 {
-        self.max_time
-            .saturating_sub(self.started.elapsed())
-            .as_millis() as u64
-    }
-
     pub fn time_exceeded(&self) -> bool {
         self.started.elapsed() >= self.max_time
     }
@@ -75,27 +69,6 @@ impl BudgetAccountant {
     /// Whether any candidate slots remain.
     pub fn candidates_available(&self) -> bool {
         self.candidates_used < self.max_candidates
-    }
-
-    /// Charge a filesystem read attempt (AM-E4). Returns false when the FS
-    /// budget forbids or exhausted the read.
-    pub fn charge_file_read(&mut self, bytes: u64) -> bool {
-        if self.max_fs_files == 0 || self.max_fs_bytes == 0 {
-            self.note_limit("max_fs_files");
-            return false;
-        }
-        if self.fs_files_used >= self.max_fs_files {
-            self.note_limit("max_fs_files");
-            return false;
-        }
-        let new_bytes = self.fs_bytes_used.saturating_add(bytes);
-        if new_bytes > self.max_fs_bytes {
-            self.note_limit("max_fs_bytes");
-            return false;
-        }
-        self.fs_files_used += 1;
-        self.fs_bytes_used = new_bytes;
-        true
     }
 
     /// Whether another filesystem file slot is available (byte budget

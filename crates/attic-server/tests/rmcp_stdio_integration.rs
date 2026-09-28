@@ -64,13 +64,11 @@ async fn connect(bin: &Path, db: &Path, workspace_root: Option<&Path>) -> Server
     cmd.env("ATTIC_HOME", &attic_home)
         .env("ATTIC_DB_PATH", db)
         .env("ATTIC_SEMANTIC", "0")
-        // This suite drives the server directly over its own stdio pipes,
-        // one process per `connect()` call. `ATTIC_NO_DAEMON=1` keeps every
-        // test here exercising exactly the legacy single-process path,
-        // unaffected by the daemon/relay election added alongside it (see
-        // `crates/attic-server/src/daemon.rs` and
-        // `tests/daemon_relay_integration.rs` for daemon-mode coverage).
-        .env("ATTIC_NO_DAEMON", "1")
+        // Each `connect()` owns a private database, so this process always
+        // wins the election and serves its own stdio. A zero idle timeout
+        // makes it exit as soon as the client disconnects instead of
+        // lingering for relays that will never come.
+        .env("ATTIC_DAEMON_IDLE_TIMEOUT_MS", "0")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
         .stdin(Stdio::piped())
@@ -329,8 +327,8 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
         let mut cmd = tokio::process::Command::new(bin);
         cmd.env("ATTIC_HOME", home)
             .env("ATTIC_SEMANTIC", "0")
-            // See the comment in `connect()` above: this gate is stdio-only.
-            .env("ATTIC_NO_DAEMON", "1")
+            // See the comment in `connect()` above.
+            .env("ATTIC_DAEMON_IDLE_TIMEOUT_MS", "0")
             .env_remove("ATTIC_DB_PATH")
             .env_remove("ATTIC_CONFIG")
             .env_remove("ATTIC_WORKSPACE_ROOT")

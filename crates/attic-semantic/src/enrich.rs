@@ -64,8 +64,6 @@ pub struct EnrichmentConfig {
     pub embedding_worker_count: usize,
     /// Maximum CPU threads available to semantic inference across all lanes.
     pub cpu_threads: usize,
-    /// Optional dynamic resource allocation handle from ResourceOrchestrator (Master Plan §12, §15, CP15).
-    pub dynamic_allocation: Option<Arc<std::sync::RwLock<attic_storage::ResourceAllocation>>>,
     /// Admission policy used by the reconcile pass this enricher runs: which
     /// units ever enter the queue (per-file size ceiling, path globs, caps).
     /// Carried here so the server's `[semantic]` config reaches the one place
@@ -74,7 +72,7 @@ pub struct EnrichmentConfig {
 }
 
 impl EnrichmentConfig {
-    /// Construct a standalone config with no dynamic orchestrator allocation.
+    /// Construct a standalone config (baseline selection policy, 2 CPU threads).
     pub const fn standalone(
         batch_size: usize,
         max_attempts: u32,
@@ -87,41 +85,8 @@ impl EnrichmentConfig {
             budget_ms,
             embedding_worker_count,
             cpu_threads: 2,
-            dynamic_allocation: None,
             selection: SelectionConfig::baseline(),
         }
-    }
-
-    /// Effective batch size after checking dynamic orchestrator allocation.
-    pub fn effective_batch_size(&self) -> usize {
-        if let Some(ref alloc) = self.dynamic_allocation {
-            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
-            if guard.semantic_batch_size == 0 {
-                return 0;
-            }
-            return guard.semantic_batch_size.min(self.batch_size);
-        }
-        self.batch_size
-    }
-
-    /// Effective prefetch limit after checking dynamic orchestrator allocation.
-    pub fn effective_prefetch_limit(&self) -> usize {
-        if let Some(ref alloc) = self.dynamic_allocation {
-            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
-            return guard.semantic_prefetch_limit;
-        }
-        self.batch_size * 2
-    }
-}
-
-impl EnrichmentConfig {
-    /// Effective CPU threads granted by orchestrator.
-    pub fn effective_cpu_threads(&self) -> usize {
-        if let Some(ref alloc) = self.dynamic_allocation {
-            let guard = alloc.read().unwrap_or_else(|e| e.into_inner());
-            return guard.semantic_cpu_threads;
-        }
-        self.cpu_threads.max(1)
     }
 }
 
@@ -133,7 +98,6 @@ impl Default for EnrichmentConfig {
             budget_ms: 2_000,
             embedding_worker_count: 1,
             cpu_threads: 2,
-            dynamic_allocation: None,
             selection: SelectionConfig::default(),
         }
     }
@@ -167,7 +131,7 @@ pub struct EnrichStats {
 /// Each completed vector is additionally projected into the existing
 /// per-generation `sem_embeddings` table so the already-proven HNSW
 /// candidate index and retrieval path keep working unchanged (see
-/// `SemanticStore::commit_v2_batch`).
+/// `SemanticStore::commit_batch`).
 pub fn drive(
     conn: &Connection,
     store: &SemanticStore,
@@ -175,18 +139,16 @@ pub fn drive(
     cfg: &EnrichmentConfig,
     cancel: &CancelFlag,
 ) -> Result<EnrichStats, SemanticError> {
-    // A provider with no fingerprint has no stable vector-space identity to
-    // key v2 occurrences/queue rows by (`reconcile` never enqueues anything
-    // into v2 for it either) — every real production provider always
-    // returns one; only test doubles (`OomProvider`, `HashingEmbedder`) hit
-    // this fallback.
+    // No fingerprint means no vector space to embed into: the provider is an
+    // unavailable placeholder (model still downloading or disabled).
+    // `reconcile` enqueues nothing for it either, so there is no work.
     if provider.fingerprint().is_none() {
-        return drive_v1(conn, store, provider, cfg, cancel);
+        return Ok(EnrichStats::default());
     }
-    drive_v2(conn, store, provider, cfg, cancel)
+    drive_leased(conn, store, provider, cfg, cancel)
 }
 
-fn drive_v2(
+fn drive_leased(
     conn: &Connection,
     store: &SemanticStore,
     provider: &dyn SemanticProvider,
@@ -204,7 +166,7 @@ fn drive_v2(
     // Crash/restart hygiene: a lease abandoned by a killed worker or a
     // server that died mid-batch surfaces here as retryable PENDING before
     // this drive claims anything new.
-    store.queue_v2_reclaim_expired()?;
+    store.queue_reclaim_expired()?;
 
     // Canonical-dedup catch-up: an occurrence that lost the selection-time
     // dedup tiebreak is never queued (see `invalidate::reconcile`) — it only
@@ -242,14 +204,14 @@ fn drive_v2(
         if cancel.is_cancelled() || Instant::now() >= deadline {
             break;
         }
-        let mut batch_size = cfg.effective_batch_size();
+        let mut batch_size = cfg.batch_size;
         if let Some(cap) = oom_batch_cap {
             batch_size = batch_size.min(cap);
         }
         if batch_size == 0 {
             break;
         }
-        let claims = store.queue_v2_claim_batch(&owner, LEASE_MS, batch_size)?;
+        let claims = store.queue_claim_batch(&owner, LEASE_MS, batch_size)?;
         if claims.is_empty() {
             break;
         }
@@ -298,7 +260,7 @@ fn drive_v2(
                 if !m.contains_key(occ_id)
                     && let Some(token) = token_of.get(occ_id)
                 {
-                    let _ = store.queue_v2_fail_permanently(
+                    let _ = store.queue_fail_permanently(
                         occ_id,
                         &owner,
                         *token,
@@ -335,7 +297,7 @@ fn drive_v2(
             // copy is built, so the check costs one pass over the text.
             if secrets::contains_secret(&r.canonical_text) {
                 tracing::warn!("semantic enrichment refused secret-bearing unit");
-                let _ = store.queue_v2_fail_permanently(
+                let _ = store.queue_fail_permanently(
                     &r.unit_id,
                     &owner,
                     token,
@@ -345,8 +307,7 @@ fn drive_v2(
                 continue;
             }
             if r.canonical_text.len() > provider.max_input_bytes() {
-                let _ =
-                    store.queue_v2_fail_permanently(&r.unit_id, &owner, token, "input too large");
+                let _ = store.queue_fail_permanently(&r.unit_id, &owner, token, "input too large");
                 stats.failed_items += 1;
                 continue;
             }
@@ -363,14 +324,13 @@ fn drive_v2(
             if !meta.contains_key(id)
                 && let Some(token) = token_of.get(id)
             {
-                let _ =
-                    store.queue_v2_fail_permanently(id, &owner, *token, "canonical row missing");
+                let _ = store.queue_fail_permanently(id, &owner, *token, "canonical row missing");
             }
         }
 
         let mut usage = ResourceUsage::default();
         let plan = crate::cpu_isolation::CpuIsolationPlan::compute(
-            cfg.effective_cpu_threads(),
+            cfg.cpu_threads.max(1),
             cfg.embedding_worker_count,
         );
 
@@ -385,7 +345,7 @@ fn drive_v2(
         // paying inference again for it.
         let mut handled: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(inputs.len());
-        let mut commit_entries: Vec<crate::store::V2CommitEntry> = Vec::with_capacity(inputs.len());
+        let mut commit_entries: Vec<crate::store::CommitEntry> = Vec::with_capacity(inputs.len());
         let mut to_embed: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len());
         let mut hash_of: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -449,7 +409,7 @@ fn drive_v2(
                     if !handled.contains(&input.unit_key)
                         && let Some(token) = token_of.get(&input.unit_key)
                     {
-                        let _ = store.queue_v2_mark_failed(
+                        let _ = store.queue_mark_failed(
                             &input.unit_key,
                             &owner,
                             *token,
@@ -465,16 +425,13 @@ fn drive_v2(
                 // permanently INFLIGHT. Reset on failure so it's retried
                 // instead of leaked. Insertion, occurrence completion, and
                 // the generation unit-count bump all happen in ONE
-                // transaction (`commit_v2_batch`).
+                // transaction (`commit_batch`).
                 let committed_ids: std::collections::HashSet<String> = commit_entries
                     .iter()
                     .map(|e| e.occurrence_id.clone())
                     .collect();
-                match store.commit_v2_batch(
-                    &commit_entries,
-                    target_gen_id,
-                    SEMANTIC_SELECTION_VERSION,
-                ) {
+                match store.commit_batch(&commit_entries, target_gen_id, SEMANTIC_SELECTION_VERSION)
+                {
                     Ok(committed) => {
                         stats.embedded += committed.len() as u64;
                     }
@@ -482,7 +439,7 @@ fn drive_v2(
                         tracing::warn!("failed to commit embedding batch: {e}");
                         for occ_id in &committed_ids {
                             if let Some(token) = token_of.get(occ_id) {
-                                let _ = store.queue_v2_reset(occ_id, &owner, *token);
+                                let _ = store.queue_reset(occ_id, &owner, *token);
                             }
                         }
                     }
@@ -539,234 +496,7 @@ fn drive_v2(
     }
 
     stats.elapsed_ms = t0.elapsed().as_millis() as u64;
-    stats.queue_remaining = store
-        .queue_v2_counts()
-        .map(|(pending, _, _, _)| pending)
-        .unwrap_or(0);
-    Ok(stats)
-}
-
-/// Fallback drive loop for a provider with no fingerprint — no stable
-/// vector-space identity to key v2 occurrences by, so this uses the
-/// original v1 unit-keyed queue and per-unit `sem_embeddings` storage
-/// directly. Only test doubles (`OomProvider`, `HashingEmbedder`) hit this;
-/// every real production provider always returns a fingerprint (Phase 2).
-fn drive_v1(
-    conn: &Connection,
-    store: &SemanticStore,
-    provider: &dyn SemanticProvider,
-    cfg: &EnrichmentConfig,
-    cancel: &CancelFlag,
-) -> Result<EnrichStats, SemanticError> {
-    let t0 = Instant::now();
-    let deadline = t0 + Duration::from_millis(cfg.budget_ms.max(1));
-    let mut stats = EnrichStats::default();
-    let mut oom_batch_cap: Option<usize> = None;
-
-    loop {
-        if cancel.is_cancelled() || Instant::now() >= deadline {
-            break;
-        }
-        let mut batch_size = cfg.effective_batch_size();
-        if let Some(cap) = oom_batch_cap {
-            batch_size = batch_size.min(cap);
-        }
-        if batch_size == 0 {
-            break;
-        }
-        let items = store.queue_take_batch(batch_size)?;
-        if items.is_empty() {
-            break;
-        }
-        let ids: Vec<String> = items.iter().map(|i| i.retrieval_unit_id.clone()).collect();
-        let rows = match attic_storage::semantic_units_by_ids(conn, &ids) {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!("failed to load semantic units for batch: {e}");
-                for it in &items {
-                    store.queue_reset(&it.retrieval_unit_id)?;
-                }
-                continue;
-            }
-        };
-
-        let mut inputs: Vec<EmbeddingInput> = Vec::with_capacity(rows.len());
-        let mut meta: std::collections::HashMap<String, attic_storage::SemanticUnitRow> =
-            std::collections::HashMap::new();
-        for r in rows {
-            meta.insert(r.unit_id.clone(), r.clone());
-            if secrets::contains_secret(&r.canonical_text) {
-                tracing::warn!("semantic enrichment refused secret-bearing unit");
-                store.queue_fail_permanently(&r.unit_id)?;
-                stats.skipped_secret += 1;
-                continue;
-            }
-            if r.canonical_text.len() > provider.max_input_bytes() {
-                store.queue_fail_permanently(&r.unit_id)?;
-                stats.failed_items += 1;
-                continue;
-            }
-            inputs.push(EmbeddingInput {
-                unit_key: r.unit_id.clone(),
-                text: r.canonical_text.clone(),
-            });
-        }
-        for id in &ids {
-            if !meta.contains_key(id) {
-                store.queue_fail_permanently(id)?;
-            }
-        }
-
-        let mut usage = ResourceUsage::default();
-        let plan = crate::cpu_isolation::CpuIsolationPlan::compute(
-            cfg.effective_cpu_threads(),
-            cfg.embedding_worker_count,
-        );
-
-        let hashes: Vec<String> = inputs
-            .iter()
-            .map(|i| crate::identity::content_hash(&i.text))
-            .collect();
-        let existing = match store.vectors_for_contents(
-            provider.id(),
-            provider.model_id(),
-            provider.dimensions(),
-            &hashes,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("embedding reuse lookup failed: {e}");
-                for it in &items {
-                    store.queue_reset(&it.retrieval_unit_id)?;
-                }
-                continue;
-            }
-        };
-
-        let record_for = |r: &attic_storage::SemanticUnitRow, vector: Vec<f32>| {
-            let identity = crate::identity::SemanticUnitIdentity::new(
-                r.unit_id.clone(),
-                r.source_revision_id.clone(),
-                r.index_generation_id.clone(),
-                SEMANTIC_SELECTION_VERSION,
-                &r.canonical_text,
-            );
-            crate::store::EmbeddingRecord {
-                retrieval_unit_id: identity.retrieval_unit_id,
-                repository_id: r.repository_id.clone(),
-                source_revision_id: identity.source_revision_id,
-                index_generation_id: identity.index_generation_id,
-                selection_version: identity.selection_version,
-                provider_id: provider.id().to_owned(),
-                model_id: provider.model_id().to_owned(),
-                content_hash: identity.content_hash,
-                dim: vector.len(),
-                vector,
-            }
-        };
-
-        let mut handled: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(inputs.len());
-        let mut batch_records: Vec<crate::store::EmbeddingRecord> =
-            Vec::with_capacity(inputs.len());
-        let mut to_embed: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len());
-        for (input, ch) in inputs.into_iter().zip(hashes) {
-            match existing.get(&ch) {
-                Some(vector) => {
-                    if let Some(r) = meta.get(&input.unit_key) {
-                        handled.insert(input.unit_key.clone());
-                        batch_records.push(record_for(r, vector.clone()));
-                    } else {
-                        to_embed.push(input);
-                    }
-                }
-                None => to_embed.push(input),
-            }
-        }
-
-        let embed_res = if to_embed.is_empty() {
-            Ok(Vec::new())
-        } else {
-            plan.execute_isolated(|| {
-                provider.embed_batch(&to_embed, cancel, &mut usage, Some(deadline))
-            })
-        };
-        match embed_res {
-            Ok(outputs) => {
-                for out in outputs {
-                    if let Some(r) = meta.get(&out.unit_key) {
-                        if out.vector.len() != provider.dimensions() {
-                            return Err(SemanticError::DimensionMismatch {
-                                record: out.vector.len(),
-                                expected: provider.dimensions(),
-                            });
-                        }
-                        handled.insert(out.unit_key.clone());
-                        batch_records.push(record_for(r, out.vector));
-                    }
-                }
-                for input in &to_embed {
-                    if !handled.contains(&input.unit_key) {
-                        store.queue_mark_failed(&input.unit_key, cfg.max_attempts)?;
-                        stats.failed_items += 1;
-                    }
-                }
-                match store.put_batch_and_mark_done(&batch_records) {
-                    Ok(()) => {
-                        stats.embedded += batch_records.len() as u64;
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to commit embedding batch: {e}");
-                        for r in &batch_records {
-                            store.queue_reset(&r.retrieval_unit_id)?;
-                        }
-                    }
-                }
-            }
-            Err(SemanticError::Cancelled { .. }) => {
-                stats.cancelled = true;
-                for it in &items {
-                    store.queue_reset(&it.retrieval_unit_id)?;
-                }
-                break;
-            }
-            Err(SemanticError::BudgetExhausted(reason)) => {
-                let current = oom_batch_cap.unwrap_or(batch_size).max(1);
-                let next = (current / 2).max(1);
-                stats.oom_reductions += 1;
-                if items.len() <= 1 && next == 1 {
-                    tracing::warn!(
-                        "embedding OOM at single-item batch ({reason}); quarantining item"
-                    );
-                    for it in &items {
-                        store.queue_mark_failed(&it.retrieval_unit_id, cfg.max_attempts)?;
-                        stats.failed_items += 1;
-                    }
-                } else {
-                    tracing::warn!(
-                        "embedding OOM ({reason}); batch cap {current} -> {next}, retrying"
-                    );
-                    oom_batch_cap = Some(next);
-                    for it in &items {
-                        store.queue_reset(&it.retrieval_unit_id)?;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("embedding batch failed: {e}");
-                for it in &items {
-                    store.queue_mark_failed(&it.retrieval_unit_id, cfg.max_attempts)?;
-                    stats.failed_items += 1;
-                }
-            }
-        }
-    }
-
-    stats.elapsed_ms = t0.elapsed().as_millis() as u64;
-    stats.queue_remaining = store
-        .queue_counts()
-        .map(|m| m.get(crate::store::Q_PENDING).copied().unwrap_or(0))
-        .unwrap_or(0);
+    stats.queue_remaining = store.queue_counts().map(|c| c.pending).unwrap_or(0);
     Ok(stats)
 }
 
@@ -778,7 +508,7 @@ fn reset_all(
     token_of: &std::collections::HashMap<String, i64>,
 ) {
     for (occ_id, token) in token_of {
-        let _ = store.queue_v2_reset(occ_id, owner, *token);
+        let _ = store.queue_reset(occ_id, owner, *token);
     }
 }
 
@@ -791,7 +521,7 @@ fn fail_all(
     max_attempts: u32,
 ) {
     for (occ_id, token) in token_of {
-        let _ = store.queue_v2_mark_failed(occ_id, owner, *token, max_attempts, "");
+        let _ = store.queue_mark_failed(occ_id, owner, *token, max_attempts, "");
     }
 }
 
@@ -805,8 +535,8 @@ fn commit_entry(
     occ: &crate::store::OccurrenceRecord,
     r: &attic_storage::SemanticUnitRow,
     vector: Vec<f32>,
-) -> crate::store::V2CommitEntry {
-    crate::store::V2CommitEntry {
+) -> crate::store::CommitEntry {
+    crate::store::CommitEntry {
         occurrence_id: occ.occurrence_id.clone(),
         owner: owner.to_string(),
         fencing_token: token_of.get(&occ.occurrence_id).copied().unwrap_or(0),
@@ -1094,27 +824,6 @@ impl BackgroundEnricher {
         Self { stop, handles }
     }
 
-    /// Spawn background enrichment workers wired directly to the ResourceOrchestrator (§12, §15, CP15).
-    pub fn spawn_with_orchestrator(
-        canonical_db_path: std::path::PathBuf,
-        store: std::sync::Arc<SemanticStore>,
-        provider: std::sync::Arc<dyn SemanticProvider>,
-        mut cfg: EnrichmentConfig,
-        resource_monitor: Option<std::sync::Arc<attic_storage::resource_manager::ResourceMonitor>>,
-        write_generation: Arc<AtomicU64>,
-        orchestrator: &attic_storage::ResourceOrchestrator,
-    ) -> Self {
-        cfg.dynamic_allocation = Some(orchestrator.shared_allocation());
-        Self::spawn(
-            canonical_db_path,
-            store,
-            provider,
-            cfg,
-            resource_monitor,
-            write_generation,
-        )
-    }
-
     /// Request stop and join every worker thread against a SHARED timeout
     /// budget; true only when ALL of them exited within it (matching the
     /// original single-handle contract, generalized to N handles).
@@ -1225,35 +934,6 @@ mod generation_driven_enrichment_tests {
         assert_eq!(building.fingerprint, fp2);
     }
 
-    #[test]
-    fn effective_batch_size_obeys_dynamic_allocation_and_clamps() {
-        use std::sync::{Arc, RwLock};
-
-        let mut cfg = EnrichmentConfig {
-            batch_size: 16,
-            ..EnrichmentConfig::default()
-        };
-        assert_eq!(cfg.effective_batch_size(), 16);
-
-        let alloc = Arc::new(RwLock::new(attic_storage::ResourceAllocation {
-            semantic_batch_size: 32,
-            ..Default::default()
-        }));
-
-        cfg.dynamic_allocation = Some(alloc.clone());
-        // Dynamic batch is 32, but cfg.batch_size is 16 (e.g. from ResourceMonitor clamp),
-        // so min(32, 16) = 16.
-        assert_eq!(cfg.effective_batch_size(), 16);
-
-        // If cfg.batch_size is higher (e.g. 64), then dynamic allocation of 32 limits it to 32.
-        cfg.batch_size = 64;
-        assert_eq!(cfg.effective_batch_size(), 32);
-
-        // If dynamic allocation sets semantic_batch_size to 0 (emergency halt), effective is 0.
-        alloc.write().unwrap().semantic_batch_size = 0;
-        assert_eq!(cfg.effective_batch_size(), 0);
-    }
-
     /// r07: an OOM (BudgetExhausted) batch must NOT fail items — the drive
     /// halves the batch cap, returns items to PENDING, and completes them at
     /// the reduced size.
@@ -1339,10 +1019,22 @@ mod generation_driven_enrichment_tests {
             .unwrap();
             unit_ids.push(unit_id);
         }
-        store.queue_enqueue(&unit_ids, 0.5).unwrap();
 
-        // Batch 4 requested; provider OOMs above 2.
+        // Batch 4 requested; provider OOMs above 2. `reconcile` enqueues the
+        // four units on the same leased queue production enrichment uses
+        // (threshold 0: these one-line fixtures would not pass selection).
         let provider = crate::testing::OomProvider { max_items: 2 };
+        let report = crate::invalidate::reconcile(
+            &conn,
+            &store,
+            &provider,
+            &crate::selection::SelectionConfig {
+                min_score: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.enqueued, unit_ids.len(), "{report:?}");
         let cfg = EnrichmentConfig {
             batch_size: 4,
             budget_ms: 30_000,

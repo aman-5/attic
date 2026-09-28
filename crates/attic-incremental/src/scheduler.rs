@@ -238,7 +238,6 @@ pub fn spawn_scheduler(
     config: SchedulerConfig,
     pool: DbPool,
     writer: WriterQueueHandle,
-    root: std::path::PathBuf,
     policy: attic_discovery::DiscoveryPolicy,
     monitor: Option<Arc<ResourceMonitor>>,
 ) -> Result<SchedulerHandle, IncrementalError> {
@@ -252,7 +251,6 @@ pub fn spawn_scheduler(
         let cfg = config.clone();
         let pool = pool.clone();
         let writer = writer.clone();
-        let root = root.clone();
         let policy = policy.clone();
         let worker_shutdown = Arc::clone(&shutdown);
         let st = Arc::clone(&state);
@@ -264,7 +262,6 @@ pub fn spawn_scheduler(
                     cfg,
                     pool,
                     writer,
-                    root,
                     policy,
                     worker_shutdown,
                     st,
@@ -306,12 +303,10 @@ fn wait_for_wake_or_timeout(state: &ShutdownState, timeout: Duration) {
     let _ = state.cv.wait_timeout_while(g, timeout, |stopped| !*stopped);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     config: SchedulerConfig,
     pool: DbPool,
     writer: WriterQueueHandle,
-    root: std::path::PathBuf,
     policy: attic_discovery::DiscoveryPolicy,
     shutdown: Arc<AtomicBool>,
     state: Arc<ShutdownState>,
@@ -344,15 +339,8 @@ fn worker_loop(
         match claimed {
             Ok(Some(task)) => {
                 debug!(task = %task.id, kind = %task.task_type, "executing task");
-                let outcome = execute_task(
-                    &pool,
-                    &writer,
-                    &root,
-                    &policy,
-                    &config,
-                    &task,
-                    monitor.as_deref(),
-                );
+                let outcome =
+                    execute_task(&pool, &writer, &policy, &config, &task, monitor.as_deref());
                 let task_id = task.id.clone();
                 let finished: Result<(), IncrementalError> = run_on_writer(&writer, move |conn| {
                     finish_task(conn, &task_id, &outcome, crate::now_micros())
@@ -389,20 +377,17 @@ fn worker_loop(
 fn execute_task(
     pool: &DbPool,
     writer: &WriterQueueHandle,
-    root: &std::path::Path,
     policy: &attic_discovery::DiscoveryPolicy,
     config: &SchedulerConfig,
     task: &ClaimedTask,
     monitor: Option<&ResourceMonitor>,
 ) -> TaskOutcome {
-    // Multi-root correctness: the scheduler's task queue is shared across
-    // every configured repository, so the caller-supplied `root` (a single
-    // default, kept for legacy single-repo callers) must never be applied
-    // to a task that actually belongs to a different repository. Resolve
-    // the task's OWN repository root from storage and shadow `root` with
-    // it; only tasks with no repository_id (legacy/global reconciliation)
-    // fall back to the caller-supplied default.
-    let resolved_root: std::path::PathBuf = task
+    // The task queue is shared by every configured repository, so each task
+    // carries its own repository and its root is resolved from storage. A
+    // task whose repository is unknown (e.g. removed from the workspace
+    // after the task was queued) fails loudly instead of running against
+    // some other root.
+    let Some(resolved_root) = task
         .repository_id
         .as_deref()
         .and_then(|rid| rid.parse::<attic_core::RepositoryId>().ok())
@@ -412,7 +397,14 @@ fn execute_task(
                 .flatten()
         })
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.to_path_buf());
+    else {
+        return TaskOutcome::Failed {
+            error: format!(
+                "task {} has no registered repository (repository_id = {:?})",
+                task.id, task.repository_id
+            ),
+        };
+    };
     let root: &std::path::Path = &resolved_root;
     match task.task_type.as_str() {
         TASK_INCREMENTAL_INDEX => {
@@ -476,21 +468,8 @@ fn execute_task(
             // every other change: invalidation (cheap, sync) → schedule
             // INCREMENTAL_INDEX recomputation (separate task).  A converged
             // tree yields an empty change set and no follow-up work, so the
-            // loop terminates.
-            // Phase 7: if resource pressure is critical or emergency, skip
-            // scheduling new incremental index tasks so foreground work is not
-            // starved.  The diff itself is still performed (it's cheap and
-            // non-blocking), but scheduling is deferred.
-            let _should_defer_scheduling = monitor
-                .map(|m| {
-                    matches!(
-                        m.pressure(),
-                        attic_core::domain::enums::ResourcePressure::Emergency
-                            | attic_core::domain::enums::ResourcePressure::Critical
-                    )
-                })
-                .unwrap_or(false);
-
+            // loop terminates.  Resource-pressure gating of the follow-up
+            // work happens inside `invalidate_and_schedule` (via `monitor`).
             match crate::recovery::reconcile_repository(pool, writer, root, policy) {
                 Ok(report) => {
                     debug!(
@@ -551,7 +530,7 @@ fn execute_task(
                             &cs,
                             config.max_pending,
                             TaskOrigin::Reconciliation,
-                            monitor, // pass monitor for pressure gate inside
+                            monitor,
                         ) {
                             Ok(outcome) => {
                                 debug!(?outcome, "reconciliation scheduled recomputation");
@@ -586,7 +565,6 @@ fn execute_task(
 pub fn run_next_task_synchronously(
     pool: &DbPool,
     writer: &WriterQueueHandle,
-    root: &std::path::Path,
     policy: &attic_discovery::DiscoveryPolicy,
     monitor: Option<&ResourceMonitor>,
 ) -> Result<bool, IncrementalError> {
@@ -600,7 +578,6 @@ pub fn run_next_task_synchronously(
     let outcome = execute_task(
         pool,
         writer,
-        root,
         policy,
         &SchedulerConfig::default(),
         &task,

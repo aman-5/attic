@@ -59,14 +59,8 @@ fn single_event_flushes_after_quiet_period_without_second_event() {
     let _report = svc
         .apply_pending(&fx.pool, &fx.writer, Some(far_future))
         .expect("tick apply");
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     let hits = fx.search("solo_after_token");
     assert_eq!(hits.len(), 1);
@@ -148,30 +142,19 @@ fn reconciliation_task_updates_fts_and_canonical_state() {
 
     // Schedule an actual RECONCILIATION task and execute it.
     assert!(
-        attic_incremental::recovery::schedule_reconciliation(&fx.writer).unwrap(),
+        attic_incremental::recovery::schedule_reconciliation(&fx.writer, &fx.repo_id).unwrap(),
         "reconciliation task must be schedulable"
     );
     // First synchronous execution runs the RECONCILIATION itself; it must
     // invalidate + schedule INCREMENTAL_INDEX work.
-    let ran = attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap();
+    let ran =
+        attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+            .unwrap();
     assert!(ran, "RECONCILIATION task claimed");
 
     // Drain follow-up recomputation.
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
 
     // Canonical + FTS converged.
@@ -219,14 +202,8 @@ fn watcher_overflow_then_reconciliation_converges() {
             .unwrap();
     svc.apply_verified_change_set(&fx.pool, &fx.writer, &report.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
 
     // Every overflowed file is CURRENT and searchable — no silent loss.
@@ -306,9 +283,7 @@ fn gitignore_change_updates_inclusion_and_exclusion_end_to_end() {
         svc.apply_verified_change_set(&pool, &writer, &rep.change_set)
             .unwrap();
     }
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
-        .unwrap()
-    {}
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &policy, None).unwrap() {}
     assert!(
         search("keeper_token").is_empty(),
         "newly ignored file must leave FTS before the inclusion phase"
@@ -327,9 +302,7 @@ fn gitignore_change_updates_inclusion_and_exclusion_end_to_end() {
         svc.apply_verified_change_set(&pool, &writer, &rep.change_set)
             .unwrap();
     }
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
-        .unwrap()
-    {}
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &policy, None).unwrap() {}
 
     let hits = search("keeper_token");
     assert_eq!(hits.len(), 1, "newly included file must be indexed");
@@ -396,14 +369,8 @@ fn unreadable_hash_failure_degrades_to_unknown_never_deleted() {
     // Restore reality: put the file back; authoritative pass recovers CURRENT.
     std::fs::remove_dir(fx.root().join("src/cursed.rs")).unwrap();
     write_file(fx.root(), "src/cursed.rs", "fn cursed_token() {}\n");
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     // State-based assertion: whether an earlier RECONCILIATION already
     // restored trust or this pass does it, the end state must be CURRENT.
@@ -412,14 +379,8 @@ fn unreadable_hash_failure_degrades_to_unknown_never_deleted() {
             .unwrap();
     svc.apply_verified_change_set(&fx.pool, &fx.writer, &report2.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     let occ = fx.occurrence("src/cursed.rs").unwrap();
     assert_eq!(
@@ -545,7 +506,6 @@ fn scheduler_zero_worker_config_is_rejected() {
         },
         fx.pool.clone(),
         fx.writer.clone(),
-        fx.root().to_path_buf(),
         fx.policy(),
         None,
     )
@@ -563,7 +523,6 @@ fn scheduler_zero_worker_config_is_rejected() {
         },
         fx.pool.clone(),
         fx.writer.clone(),
-        fx.root().to_path_buf(),
         fx.policy(),
         None,
     )
@@ -635,7 +594,7 @@ fn watcher_start_failure_falls_back_to_periodic_reconciliation() {
     );
     svc.apply_verified_change_set(&pool, &writer, &report.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo, svc.policy(), None)
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, svc.policy(), None)
         .unwrap()
     {}
     let hits = pool

@@ -46,8 +46,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Minimum duration between real VRAM telemetry queries. Mirrors
-/// `machine_telemetry.rs`'s `MIN_SAMPLE_INTERVAL`: `QueryVideoMemoryInfo` is a
+/// Minimum duration between real VRAM telemetry queries: `QueryVideoMemoryInfo` is a
 /// COM/syscall-backed query, not something to run on every single embed call
 /// — foreground responsiveness depends on this being cheap and cached.
 const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -148,8 +147,7 @@ pub fn query_vram_snapshot() -> VramSnapshot {
 
 // ── Cached/throttled sampler ────────────────────────────────────────────────
 
-/// Samples [`query_vram_snapshot`] no more often than [`MIN_SAMPLE_INTERVAL`],
-/// mirroring `machine_telemetry.rs`'s `MachineTelemetrySampler`. This is what
+/// Samples [`query_vram_snapshot`] no more often than [`MIN_SAMPLE_INTERVAL`]. This is what
 /// keeps the VRAM check off the hot path: a real DXGI query is a syscall, not
 /// something to run per-embed-call.
 pub struct GpuTelemetrySampler {
@@ -185,8 +183,7 @@ impl Default for GpuTelemetrySampler {
     }
 }
 
-/// Thread-safe handle for periodic VRAM telemetry sampling, mirroring
-/// `machine_telemetry.rs`'s `MachineTelemetry`.
+/// Thread-safe handle for periodic VRAM telemetry sampling.
 #[derive(Clone)]
 pub struct GpuTelemetry {
     inner: Arc<Mutex<GpuTelemetrySampler>>,
@@ -248,12 +245,6 @@ pub fn estimate_batch_bytes(
     tokens
         .saturating_mul(per_token)
         .saturating_mul(layer_multiplier)
-}
-
-/// Convert bytes to whole MiB (rounded down — conservative for budget checks
-/// that treat MiB as the unit of account).
-pub fn bytes_to_mib(bytes: u64) -> u64 {
-    bytes / (1024 * 1024)
 }
 
 // ── Pressure classification ─────────────────────────────────────────────────

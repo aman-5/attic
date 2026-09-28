@@ -182,7 +182,6 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-tags",
  "tree-sitter-typescript",
- "uuid",
 ]
 
 [[package]]
@@ -263,7 +262,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -293,7 +291,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -301,9 +298,7 @@ dependencies = [
 name = "attic-retrieval"
 version = "0.1.0"
 dependencies = [
- "attic-analyzers",
  "attic-core",
- "attic-crossrepo",
  "attic-discovery",
  "attic-evidence",
  "attic-indexing",
@@ -356,7 +351,6 @@ dependencies = [
  "attic-core",
  "attic-crossrepo",
  "attic-discovery",
- "attic-evidence",
  "attic-incremental",
  "attic-indexing",
  "attic-inference-worker",
@@ -364,7 +358,6 @@ dependencies = [
  "attic-semantic",
  "attic-storage",
  "interprocess",
- "regex",
  "rmcp",
  "serde",
  "serde_json",

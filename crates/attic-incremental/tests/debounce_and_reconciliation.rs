@@ -84,7 +84,6 @@ fn native_pump_has_no_production_lifetime_and_stays_live() {
         },
         pool.clone(),
         writer.clone(),
-        repo.clone(),
         policy.clone(),
         None,
     )
@@ -195,9 +194,7 @@ fn git_ignored_events_never_become_indexed() {
         kind: FsEventKind::Created,
     }]);
     svc.apply_pending(&pool, &writer, Some(FAR_FUTURE)).unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
-        .unwrap()
-    {}
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &policy, None).unwrap() {}
 
     let hits = pool
         .with_reader(|c| {
@@ -287,9 +284,7 @@ fn nested_gitignore_and_negation_match_discovery_exactly() {
         }]);
     }
     svc.apply_pending(&pool, &writer, Some(FAR_FUTURE)).unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_dir, &policy, None)
-        .unwrap()
-    {}
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &policy, None).unwrap() {}
 
     // Indexed set for these paths must EQUAL discovery's verdict.
     let indexed: Vec<String> = pool
@@ -347,14 +342,8 @@ fn explicit_reincluded_vendor_path_receives_updates() {
     }]);
     svc.apply_pending(&fx.pool, &fx.writer, Some(FAR_FUTURE))
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
 
     let hits = fx.search("vendored_update_token");
@@ -389,17 +378,8 @@ fn explicit_reincluded_vendor_path_receives_updates() {
 #[test]
 fn saturation_schedules_deduplicated_reconciliation() {
     let t0 = Instant::now();
-    let dir = tempfile::TempDir::new().unwrap();
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let (conn, pool) = attic_storage::open_db(dir.path().join("db.sqlite")).unwrap();
-    attic_storage::run_migrations(&conn).unwrap();
-    let queue = attic_storage::WriterQueue::new(conn).unwrap();
-    let writer = queue.handle();
-    let svc = Arc::new(
-        IncrementalService::new(&repo, attic_discovery::DiscoveryPolicy::default_non_git())
-            .with_quiet_period_ms(5),
-    );
+    let fx = Fixture::new(&[("src/sat.rs", "fn saturation_seed() {}\n")]);
+    let svc = fx.service();
 
     // Simulate three saturation bursts through the same production entry
     // point the pump uses.
@@ -410,21 +390,14 @@ fn saturation_schedules_deduplicated_reconciliation() {
         let n = svc.note_raw_drops(&dropped);
         assert_eq!(n, 1);
         if n > 0 {
-            attic_incremental::recovery::schedule_reconciliation(&writer).unwrap();
+            attic_incremental::recovery::schedule_reconciliation(&fx.writer, &fx.repo_id).unwrap();
         }
     }
     assert!(svc.reconciliation_required());
 
-    let recon_tasks: i64 = pool
-        .with_reader(|c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM ops_tasks WHERE task_type='RECONCILIATION' AND state='PENDING'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(attic_storage::StorageError::from)
-        })
-        .unwrap();
+    let recon_tasks = fx.sql_count(
+        "SELECT COUNT(*) FROM ops_tasks WHERE task_type='RECONCILIATION' AND state='PENDING'",
+    );
     assert_eq!(
         recon_tasks, 1,
         "repeated saturation must deduplicate to ONE reconciliation task"
@@ -443,15 +416,10 @@ fn reconciliation_origin_gets_reconciliation_priority() {
 
     // Offline drift, then a RECONCILIATION task runs and spawns follow-up work.
     write_file(fx.root(), "src/origin.rs", "fn after_origin_token() {}\n");
-    attic_incremental::recovery::schedule_reconciliation(&fx.writer).unwrap();
-    let ran = attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap();
+    attic_incremental::recovery::schedule_reconciliation(&fx.writer, &fx.repo_id).unwrap();
+    let ran =
+        attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+            .unwrap();
     assert!(ran);
 
     // The spawned INCREMENTAL_INDEX task must carry reconciliation origin.
@@ -480,14 +448,8 @@ fn reconciliation_origin_gets_reconciliation_priority() {
     );
 
     // Finish the work: converged CURRENT.
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     let hits = fx.search("after_origin_token");
     assert_eq!(hits.len(), 1);

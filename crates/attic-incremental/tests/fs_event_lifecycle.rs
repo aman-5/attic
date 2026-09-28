@@ -293,14 +293,8 @@ fn duplicate_watcher_events_do_not_duplicate_work_or_rows() {
     );
     let _ = o1;
 
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
 
     let units = fx.sql_count("SELECT COUNT(*) FROM core_retrieval_units");

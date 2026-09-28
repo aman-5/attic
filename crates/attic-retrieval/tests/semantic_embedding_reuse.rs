@@ -4,9 +4,9 @@
 //! makes every stored embedding identity-stale even when not one byte of
 //! content changed — historically this re-embedded the entire workspace
 //! (measured on a real corpus: the full queue re-enqueued after a restart).
-//! Reconcile now keeps those rows as reuse donors and enrichment clones the
-//! stored vectors by content hash: the provider must see zero texts on the
-//! second pass.
+//! Canonical vectors are keyed by vector space + content hash, independent of
+//! unit ids, so enrichment reuses them for the new units: the provider must
+//! see zero texts on the second pass.
 
 mod common;
 
@@ -98,9 +98,9 @@ fn reindexed_unchanged_content_is_reused_not_re_embedded() {
     )
     .expect("re-index");
 
-    // Second pass: same content under new identities. Reconcile must keep the
-    // old rows as donors and enqueue the new units; drive must satisfy every
-    // one of them by cloning — the provider sees nothing new.
+    // Second pass: same content under new identities. Reconcile enqueues the
+    // new units; drive must satisfy every one of them from the canonical
+    // vectors — the provider sees nothing new.
     {
         let conn = fx.read_conn();
         let report = attic_semantic::reconcile(
@@ -111,8 +111,8 @@ fn reindexed_unchanged_content_is_reused_not_re_embedded() {
         )
         .unwrap();
         assert!(
-            report.reuse_donors_kept > 0,
-            "unchanged content must leave reuse donors: {report:?}"
+            report.enqueued > 0,
+            "the new generation's units must be enqueued: {report:?}"
         );
         let stats = attic_semantic::drive(
             &conn,

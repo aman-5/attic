@@ -23,7 +23,7 @@
 //!   half-built CPU generation.
 //! * Queued work is never touched here: a failed claim's lease already
 //!   resets/fails via the v2 queue's existing lease/attempts machinery
-//!   (`queue_v2_reset`/`queue_v2_mark_failed`, driven by `enrich::drive`).
+//!   (`queue_reset`/`queue_mark_failed`, driven by `enrich::drive`).
 //!   This coordinator only changes which fingerprint future claims get
 //!   embedded — and therefore generation-tagged — under.
 //!
@@ -207,14 +207,12 @@ impl FallbackCoordinator {
             return; // some other generation is building; not ours
         }
         let vsid = fp.vector_space_id();
-        let Ok((pending, inflight, done, _failed)) =
-            self.store.queue_v2_counts_for_vector_space(&vsid)
-        else {
+        let Ok(counts) = self.store.queue_counts_for_vector_space(&vsid) else {
             return;
         };
-        if pending == 0
-            && inflight == 0
-            && done > 0
+        if counts.pending == 0
+            && counts.inflight == 0
+            && counts.done > 0
             && self
                 .store
                 .activate_generation(building.generation_id)
@@ -596,7 +594,7 @@ mod tests {
             "{}",
         )
         .unwrap();
-        s.queue_v2_enqueue("occ-1", 0.0).unwrap();
+        s.queue_enqueue("occ-1", 0.0).unwrap();
 
         // Before the queue drains, promotion must not happen even if called.
         coord.try_promote_cpu_generation();
@@ -608,7 +606,7 @@ mod tests {
         // mark done — this is the "queued work is not lost" proof: the
         // occurrence claimed under the old GPU identity's failure is
         // completed under the CPU generation instead of disappearing.
-        let claims = s.queue_v2_claim_batch("owner-1", 60_000, 8).unwrap();
+        let claims = s.queue_claim_batch("owner-1", 60_000, 8).unwrap();
         assert_eq!(claims.len(), 1);
         let (occ_id, token) = claims[0].clone();
         let out = coord
@@ -623,7 +621,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.len(), 1);
-        s.queue_v2_complete("occ-1", "owner-1", token).unwrap();
+        s.queue_complete("occ-1", "owner-1", token).unwrap();
 
         // Now the CPU vector space's queue is fully drained with progress —
         // promotion may fire (either from the embed_batch success path

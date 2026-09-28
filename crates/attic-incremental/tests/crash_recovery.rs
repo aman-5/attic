@@ -105,14 +105,8 @@ fn crash_between_invalidation_and_recomputation_never_serves_current() {
     );
 
     // Now finish recomputation → CURRENT restored.
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     let hits = fx.search("gap_new_token");
     assert_eq!(hits.len(), 1);
@@ -313,14 +307,9 @@ fn cancellation_removes_pending_task_before_execution() {
     .unwrap();
     assert!(cancelled, "PENDING task must be cancellable");
 
-    let executed = attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap();
+    let executed =
+        attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+            .unwrap();
     assert!(!executed, "cancelled task must not execute");
     let state: String = fx
         .pool
@@ -349,7 +338,6 @@ fn graceful_shutdown_with_pending_work_preserves_queue() {
         },
         fx.pool.clone(),
         fx.writer.clone(),
-        fx.root().to_path_buf(),
         fx.policy(),
         None,
     )

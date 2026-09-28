@@ -159,8 +159,14 @@ impl WorkerSupervisor {
         let mut child = cmd
             .spawn()
             .map_err(|e| SupervisorError::Spawn(format!("{e}")))?;
-        let stdin = BufWriter::new(child.stdin.take().expect("piped stdin"));
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            return Err(SupervisorError::Spawn(
+                "worker stdin/stdout were not captured".into(),
+            ));
+        };
+        let stdin = BufWriter::new(stdin);
+        let mut stdout = BufReader::new(stdout);
 
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -220,7 +226,9 @@ impl WorkerSupervisor {
             state.live = Some(self.spawn_child()?);
             state.model_loaded = false;
         }
-        let live = state.live.as_mut().expect("just spawned");
+        let Some(live) = state.live.as_mut() else {
+            return Err(SupervisorError::Spawn("worker is not running".into()));
+        };
 
         write_request(&mut live.stdin, &req)?;
 

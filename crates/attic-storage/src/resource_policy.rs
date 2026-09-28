@@ -451,35 +451,70 @@ impl From<ResourcePolicy> for EffectiveResourceConfig {
     }
 }
 
+/// Resource-monitor admission limits that sit outside [`ResourcePolicy`]
+/// (they gate admission, not hardware sizing), read from
+/// `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_BACKGROUND_WORKERS`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MonitorOverrides {
+    /// Per-repository memory budget used for admission decisions, in MiB.
+    pub per_repo_memory_budget_mib: Option<u64>,
+    /// Maximum concurrent background workers.
+    pub max_background_workers: Option<usize>,
+}
+
 impl EffectiveResourceConfig {
-    /// Project onto the existing [`ResourceConfig`] shape so
-    /// `ResourceMonitor::from_config` can consume it without a parallel
-    /// admission-control code path. `per_repo_memory_budget_mib` and
-    /// `max_background_workers` are outside `ResourcePolicy`'s 12 fields
-    /// (per Low-Level Design §1), so they're not part of the hardware/mode
-    /// policy pipeline — but they're still real, live admission-control
-    /// gates in `ResourceMonitor::from_config`, so their `ATTIC_*` env
-    /// overrides (read by the removed `ResourceConfig::load()`) are read
-    /// directly here rather than silently dropped.
-    pub fn as_resource_config(&self) -> ResourceConfig {
-        // ResourceConfig only covers the fields that ResourceMonitor consumes
-        // (memory budget, foreground/background admission).  The writer/IO
-        // fields (writer_batch_size, writer_queue_capacity,
-        // writer_flush_interval_ms, max_io_ops_per_sec) are consumed directly
-        // from EffectiveResourceConfig by the writer and scheduler subsystems —
-        // they are NOT ResourceMonitor concerns and must not be set here.
+    /// Project onto the [`ResourceConfig`] shape `ResourceMonitor::from_config`
+    /// consumes, so admission control has no parallel configuration path.
+    ///
+    /// Only the fields the monitor enforces (memory budget, foreground and
+    /// background admission) are set; the writer/IO fields are consumed
+    /// directly from this struct by the writer and scheduler.
+    pub fn as_resource_config(&self, monitor: MonitorOverrides) -> ResourceConfig {
         ResourceConfig {
             total_memory_budget_mib: Some(self.memory_budget_mib),
             min_free_memory_mib: Some(self.min_free_memory_mib),
             max_foreground_queries: Some(self.max_foreground_queries),
-            per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            per_repo_memory_budget_mib: monitor.per_repo_memory_budget_mib,
+            max_background_workers: monitor.max_background_workers,
         }
     }
+}
+
+fn parse_env_value<T: std::str::FromStr>(
+    key: &str,
+    raw: Option<String>,
+) -> Result<Option<T>, attic_core::config::ConfigError> {
+    raw.map(|v| {
+        v.trim().parse::<T>().map_err(|_| {
+            attic_core::config::ConfigError::Invalid(format!(
+                "environment variable {key}={v:?} is not a valid value"
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// Read the [`MonitorOverrides`] environment variables. Fails closed exactly
+/// like [`env_resource_overrides`].
+pub fn env_monitor_overrides() -> Result<MonitorOverrides, attic_core::config::ConfigError> {
+    env_monitor_overrides_from(|key| std::env::var(key).ok())
+}
+
+/// [`env_monitor_overrides`] over an injectable lookup.
+pub fn env_monitor_overrides_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<MonitorOverrides, attic_core::config::ConfigError> {
+    let get = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
+    Ok(MonitorOverrides {
+        per_repo_memory_budget_mib: parse_env_value(
+            "ATTIC_PER_REPO_MEMORY_BUDGET_MIB",
+            get("ATTIC_PER_REPO_MEMORY_BUDGET_MIB"),
+        )?,
+        max_background_workers: parse_env_value(
+            "ATTIC_MAX_BACKGROUND_WORKERS",
+            get("ATTIC_MAX_BACKGROUND_WORKERS"),
+        )?,
+    })
 }
 
 /// Read `ATTIC_RESOURCE_MODE` / the `ATTIC_*` resource env vars as a
@@ -501,19 +536,6 @@ pub fn env_resource_overrides_from(
     use attic_core::config::ConfigError;
 
     let get = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
-    fn parse<T: std::str::FromStr>(
-        key: &str,
-        raw: Option<String>,
-    ) -> Result<Option<T>, ConfigError> {
-        raw.map(|v| {
-            v.trim().parse::<T>().map_err(|_| {
-                ConfigError::Invalid(format!(
-                    "environment variable {key}={v:?} is not a valid value"
-                ))
-            })
-        })
-        .transpose()
-    }
 
     // `None` here means "ATTIC_RESOURCE_MODE not set", distinct from
     // `Some(Auto)` ("explicitly set to auto") — see the field doc on
@@ -535,34 +557,46 @@ pub fn env_resource_overrides_from(
     };
     Ok(ResourceOverrides {
         mode,
-        total_memory_budget_mib: parse(
+        total_memory_budget_mib: parse_env_value(
             "ATTIC_TOTAL_MEMORY_BUDGET_MIB",
             get("ATTIC_TOTAL_MEMORY_BUDGET_MIB"),
         )?,
-        min_free_memory_mib: parse(
+        min_free_memory_mib: parse_env_value(
             "ATTIC_MIN_FREE_MEMORY_MIB",
             get("ATTIC_MIN_FREE_MEMORY_MIB"),
         )?,
-        max_foreground_queries: parse(
+        max_foreground_queries: parse_env_value(
             "ATTIC_MAX_FOREGROUND_QUERIES",
             get("ATTIC_MAX_FOREGROUND_QUERIES"),
         )?,
-        writer_batch_size: parse("ATTIC_WRITER_BATCH_SIZE", get("ATTIC_WRITER_BATCH_SIZE"))?,
-        writer_flush_interval_ms: parse(
+        writer_batch_size: parse_env_value(
+            "ATTIC_WRITER_BATCH_SIZE",
+            get("ATTIC_WRITER_BATCH_SIZE"),
+        )?,
+        writer_flush_interval_ms: parse_env_value(
             "ATTIC_WRITER_FLUSH_INTERVAL_MS",
             get("ATTIC_WRITER_FLUSH_INTERVAL_MS"),
         )?,
-        writer_queue_capacity: parse(
+        writer_queue_capacity: parse_env_value(
             "ATTIC_WRITER_QUEUE_CAPACITY",
             get("ATTIC_WRITER_QUEUE_CAPACITY"),
         )?,
-        max_io_ops_per_sec: parse("ATTIC_MAX_IO_OPS_PER_SEC", get("ATTIC_MAX_IO_OPS_PER_SEC"))?,
-        scheduler_workers: parse("ATTIC_SCHEDULER_WORKERS", get("ATTIC_SCHEDULER_WORKERS"))?,
-        embedding_batch_size: parse(
+        max_io_ops_per_sec: parse_env_value(
+            "ATTIC_MAX_IO_OPS_PER_SEC",
+            get("ATTIC_MAX_IO_OPS_PER_SEC"),
+        )?,
+        scheduler_workers: parse_env_value(
+            "ATTIC_SCHEDULER_WORKERS",
+            get("ATTIC_SCHEDULER_WORKERS"),
+        )?,
+        embedding_batch_size: parse_env_value(
             "ATTIC_EMBEDDING_BATCH_SIZE",
             get("ATTIC_EMBEDDING_BATCH_SIZE"),
         )?,
-        embedding_worker_count: parse("ATTIC_EMBEDDING_WORKERS", get("ATTIC_EMBEDDING_WORKERS"))?,
+        embedding_worker_count: parse_env_value(
+            "ATTIC_EMBEDDING_WORKERS",
+            get("ATTIC_EMBEDDING_WORKERS"),
+        )?,
     })
 }
 
@@ -752,6 +786,28 @@ mod tests {
         .unwrap();
         assert_eq!(o.mode, None);
         assert_eq!(o.scheduler_workers, None);
+    }
+
+    #[test]
+    fn monitor_overrides_parse_and_fail_closed() {
+        let o = env_monitor_overrides_from(env_of(&[
+            ("ATTIC_PER_REPO_MEMORY_BUDGET_MIB", "768"),
+            ("ATTIC_MAX_BACKGROUND_WORKERS", " 3 "),
+        ]))
+        .unwrap();
+        assert_eq!(o.per_repo_memory_budget_mib, Some(768));
+        assert_eq!(o.max_background_workers, Some(3));
+        assert_eq!(
+            env_monitor_overrides_from(env_of(&[])).unwrap(),
+            MonitorOverrides::default()
+        );
+        for key in [
+            "ATTIC_PER_REPO_MEMORY_BUDGET_MIB",
+            "ATTIC_MAX_BACKGROUND_WORKERS",
+        ] {
+            let err = env_monitor_overrides_from(env_of(&[(key, "lots")])).unwrap_err();
+            assert!(err.to_string().contains(key), "{key} → {err}");
+        }
     }
 
     #[test]

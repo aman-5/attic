@@ -261,11 +261,6 @@ impl SemanticLatencyBreakdown {
             total_ms,
         }
     }
-
-    /// Evaluates if total end-to-end latency meets SLA (never derived only from vector_search_ms).
-    pub fn is_within_sla(&self, sla_ms: f64) -> bool {
-        self.total_ms <= sla_ms
-    }
 }
 
 #[cfg(test)]

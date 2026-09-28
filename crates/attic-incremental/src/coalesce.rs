@@ -54,7 +54,6 @@ pub struct EventCoalescer {
     /// Rename destination → matched origin (consumed at drain).
     renamed_origins: BTreeMap<String, String>,
     overflowed: bool,
-    total_events_in: u64,
 }
 
 impl EventCoalescer {
@@ -68,18 +67,12 @@ impl EventCoalescer {
             renames_from: BTreeMap::new(),
             renamed_origins: BTreeMap::new(),
             overflowed: false,
-            total_events_in: 0,
         }
     }
 
     /// Whether events had to be shed because the pending set was full.
     pub fn overflowed(&self) -> bool {
         self.overflowed
-    }
-
-    /// Total accepted raw events (observability).
-    pub fn total_events(&self) -> u64 {
-        self.total_events_in
     }
 
     /// Number of paths currently pending.
@@ -95,8 +88,6 @@ impl EventCoalescer {
     /// Returns `false` when the event had to be shed (overflow) — the caller
     /// MUST treat this as possible event loss.
     pub fn push(&mut self, ev: &NormalizedEvent, now_ms: u64) -> bool {
-        self.total_events_in += 1;
-
         match ev.kind {
             FsEventKind::RenamedFrom => {
                 if self.renames_from.len() >= self.capacity {

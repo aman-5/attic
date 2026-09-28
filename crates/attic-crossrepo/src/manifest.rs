@@ -9,8 +9,6 @@
 //!   bounded iteration; malformed input degrades to "no evidence" plus a
 //!   diagnostic, never an error that would block indexing.
 
-use std::collections::BTreeSet;
-
 use crate::{DeclarationKind, DependencyDeclaration, Ecosystem, ProvidedIdentity, limits};
 
 /// Result of parsing one manifest file.
@@ -1136,18 +1134,6 @@ fn parse_osgi_manifest(rel_path: &str, text: &str) -> ManifestParse {
     out
 }
 
-/// Deduplicate declarations preserving deterministic order.
-pub fn dedupe_declarations(decls: &mut Vec<DependencyDeclaration>) {
-    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
-    decls.retain(|d| {
-        seen.insert((
-            d.ecosystem.as_str().to_string(),
-            d.name.clone(),
-            d.local_hint.clone().unwrap_or_default(),
-        ))
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,15 +1310,15 @@ mod tests {
 mod osgi_tests {
     use super::*;
 
-    const BUNDLE: &str = "Manifest-Version: 1.0\r\nBundle-ManifestVersion: 2\r\nBundle-SymbolicName: com.hdfc.payment.core\r\nBundle-Version: 1.2.3\r\nExport-Package: com.hdfc.payment.api;version=\"1.0.0\",\r\n com.hdfc.payment.spi;version=\"[1.1,2.0)\"\r\nImport-Package: com.hdfc.audit;version=\"[2.0,3.0)\",com.hdfc.logging\r\n";
+    const BUNDLE: &str = "Manifest-Version: 1.0\r\nBundle-ManifestVersion: 2\r\nBundle-SymbolicName: com.acme.payment.core\r\nBundle-Version: 1.2.3\r\nExport-Package: com.acme.payment.api;version=\"1.0.0\",\r\n com.acme.payment.spi;version=\"[1.1,2.0)\"\r\nImport-Package: com.acme.audit;version=\"[2.0,3.0)\",com.acme.logging\r\n";
 
     #[test]
     fn osgi_manifest_provides_bundle_and_exports() {
         let out = parse_manifest("core/META-INF/MANIFEST.MF", BUNDLE.as_bytes());
         let names: Vec<&str> = out.provides.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"com.hdfc.payment.core"), "{names:?}");
-        assert!(names.contains(&"com.hdfc.payment.api"), "{names:?}");
-        assert!(names.contains(&"com.hdfc.payment.spi"), "{names:?}");
+        assert!(names.contains(&"com.acme.payment.core"), "{names:?}");
+        assert!(names.contains(&"com.acme.payment.api"), "{names:?}");
+        assert!(names.contains(&"com.acme.payment.spi"), "{names:?}");
         assert!(
             out.provides.iter().all(|p| p.ecosystem == Ecosystem::Osgi),
             "all provided identities are OSGI"
@@ -1348,10 +1334,10 @@ mod osgi_tests {
             .map(|d| (d.name.as_str(), d.version_req.as_deref()))
             .collect();
         assert!(
-            decls.contains(&("com.hdfc.audit", Some("[2.0,3.0)"))),
+            decls.contains(&("com.acme.audit", Some("[2.0,3.0)"))),
             "continuation line unfolded, quoted version parsed: {decls:?}"
         );
-        assert!(decls.contains(&("com.hdfc.logging", None)), "{decls:?}");
+        assert!(decls.contains(&("com.acme.logging", None)), "{decls:?}");
     }
 
     #[test]
@@ -1377,25 +1363,25 @@ mod aem_tests {
 <jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" xmlns:sling="http://sling.apache.org/jcr/sling/1.0"
     jcr:primaryType="cq:Component"
     jcr:title="Payment Summary"
-    sling:resourceSuperType="hdfc/components/core/basecomponent"/>"#;
+    sling:resourceSuperType="acme/components/core/basecomponent"/>"#;
 
     #[test]
     fn aem_component_provides_resource_type_and_declares_supertype() {
         let out = parse_manifest(
-            "ui.apps/src/main/content/jcr_root/apps/hdfc/components/paymentsummary/.content.xml",
+            "ui.apps/src/main/content/jcr_root/apps/acme/components/paymentsummary/.content.xml",
             COMPONENT.as_bytes(),
         );
         let names: Vec<&str> = out.provides.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["apps/hdfc/components/paymentsummary"],
+            vec!["apps/acme/components/paymentsummary"],
             "{names:?}"
         );
         assert_eq!(out.provides[0].ecosystem, Ecosystem::AemComponent);
         assert_eq!(out.declarations.len(), 1);
         assert_eq!(
             out.declarations[0].name,
-            "hdfc/components/core/basecomponent"
+            "acme/components/core/basecomponent"
         );
         assert_eq!(out.declarations[0].ecosystem, Ecosystem::AemComponent);
     }
@@ -1414,7 +1400,7 @@ mod aem_tests {
     fn content_xml_without_supertype_only_provides() {
         let plain = r#"<jcr:root jcr:primaryType="cq:Component" jcr:title="Standalone"/>"#;
         let out = parse_manifest(
-            "ui.apps/src/main/content/jcr_root/apps/hdfc/components/standalone/.content.xml",
+            "ui.apps/src/main/content/jcr_root/apps/acme/components/standalone/.content.xml",
             plain.as_bytes(),
         );
         assert_eq!(out.provides.len(), 1);

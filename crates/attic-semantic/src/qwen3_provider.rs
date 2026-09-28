@@ -86,7 +86,6 @@ pub const MIN_BYTES_PER_TOKEN: usize = 2;
 /// cutting a worst-case 1024-token batch from 16 items to 4 — a 4× reduction in
 /// the largest transient allocation the indexing pipeline makes.
 pub const DEFAULT_BATCH_TOKEN_BUDGET: usize = 4_096;
-pub const NATIVE_QWEN_DIMENSION: usize = 1024;
 const DTYPE: DType = DType::F32;
 
 /// Supported pooling strategies for Qwen embedding.
@@ -129,16 +128,6 @@ impl Qwen3Embedder {
     /// Native hidden dimensionality of the model before Matryoshka truncation.
     pub fn native_dims(&self) -> usize {
         self.native_dims
-    }
-
-    /// Update target Matryoshka dimension without reloading model tensors.
-    pub fn set_target_dims(&mut self, dims: usize) {
-        assert!(
-            dims > 0 && dims <= self.native_dims,
-            "target dimension must be <= native dims"
-        );
-        self.target_dims = dims;
-        self.fingerprint.dimension = dims;
     }
 
     /// Construct a `Qwen3Embedder` from a local cache directory or Hugging Face.
@@ -442,15 +431,6 @@ impl Qwen3Embedder {
     /// Current `batch_items × padded_seq_len` memory budget.
     pub fn batch_token_budget(&self) -> usize {
         self.batch_token_budget
-    }
-
-    /// Override the memory budget (operators tuning for a constrained host).
-    ///
-    /// Clamped to at least `max_tokens` so a single maximum-length unit can
-    /// always still be embedded: a budget that cannot fit one item would
-    /// deadlock the queue rather than protect memory.
-    pub fn set_batch_token_budget(&mut self, budget: usize) {
-        self.batch_token_budget = budget.max(self.max_tokens);
     }
 
     /// Conservative token estimate for `text`, used only for batch planning.

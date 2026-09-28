@@ -1491,13 +1491,13 @@ fn e2e_osgi_import_export_links_bundles() {
     std::fs::create_dir_all(provider_dir.path().join("META-INF")).unwrap();
     std::fs::write(
         provider_dir.path().join("META-INF/MANIFEST.MF"),
-        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.hdfc.payment.core\r\nExport-Package: com.hdfc.payment.api;version=\"1.0.0\"\r\n",
+        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.acme.payment.core\r\nExport-Package: com.acme.payment.api;version=\"1.0.0\"\r\n",
     )
     .unwrap();
     std::fs::create_dir_all(consumer_dir.path().join("META-INF")).unwrap();
     std::fs::write(
         consumer_dir.path().join("META-INF/MANIFEST.MF"),
-        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.hdfc.payment.ui\r\nImport-Package: com.hdfc.payment.api;version=\"[1.0,2.0)\"\r\n",
+        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.acme.payment.ui\r\nImport-Package: com.acme.payment.api;version=\"[1.0,2.0)\"\r\n",
     )
     .unwrap();
 
@@ -1532,7 +1532,7 @@ fn e2e_osgi_import_export_links_bundles() {
                 .unwrap_or_default(),
             provides: vec![ProvidedIdentity {
                 ecosystem: Ecosystem::Osgi,
-                name: "com.hdfc.payment.api".to_owned(),
+                name: "com.acme.payment.api".to_owned(),
             }],
             declarations: vec![],
             primary_anchor_occurrence: None,
@@ -1549,7 +1549,7 @@ fn e2e_osgi_import_export_links_bundles() {
             declarations: vec![DependencyDeclaration {
                 path: "META-INF/MANIFEST.MF".to_owned(),
                 ecosystem: Ecosystem::Osgi,
-                name: "com.hdfc.payment.api".to_owned(),
+                name: "com.acme.payment.api".to_owned(),
                 version_req: Some("[1.0,2.0)".to_owned()),
                 kind: DeclarationKind::External,
                 local_hint: None,

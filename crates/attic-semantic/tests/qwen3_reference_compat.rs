@@ -218,8 +218,6 @@ fn test_qwen3_batch_equivalence() {
 #[ignore = "expensive real Qwen3 neural model execution; run explicitly with `cargo test -p attic-semantic --test qwen3_reference_compat -- --ignored`"]
 fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
     use attic_semantic::cpu_isolation::CpuIsolationPlan;
-    use attic_semantic::model_lifecycle::SharedModelHandle;
-    use std::sync::Arc;
 
     let cache_dir = resolve_cache_dir();
     let embedder = Qwen3Embedder::new_pinned(
@@ -231,10 +229,7 @@ fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
     )
     .expect("failed to load real Qwen3 embedder");
 
-    // Single shared model handle managing the real loaded Qwen model
-    let handle = Arc::new(SharedModelHandle::new(Arc::new(embedder), 1200, 8));
-
-    // Dynamic orchestrator grant progression: 8 -> 4 -> 2 -> 6
+    // Changing CPU grants across one loaded model: 8 -> 4 -> 2 -> 6
     let grant_sequence = [8, 4, 2, 6];
     let requested_lanes = 4;
     let budget = EmbeddingExecutionBudget::default();
@@ -244,22 +239,17 @@ fn test_real_qwen3_cpu_isolation_dynamic_scaling_8_4_2_6() {
         assert!(!plan.is_oversubscribed());
         assert!(plan.total_allocated_threads <= granted_threads);
 
-        // Dynamically adjust CPU allocation and maximum inference lane capacity
-        handle.update_cpu_allocation(granted_threads, requested_lanes);
-        let plan = handle.isolation_plan();
-        assert_eq!(handle.max_concurrency(), plan.inference_lanes);
-
-        // Perform real Qwen inference under the dynamic plan strictly isolated in scoped pool
-        let vec = handle
-            .embed_query("fn authenticate_user(token: &str) -> bool", &budget)
-            .expect("real Qwen inference failed under dynamic CPU isolation plan");
+        // Real Qwen inference strictly inside the plan's per-lane pool.
+        let (vec, threads_used) = plan.execute_isolated(|| {
+            let vec = embedder.embed_query("fn authenticate_user(token: &str) -> bool", &budget);
+            (vec, rayon::current_num_threads())
+        });
+        let vec = vec.expect("real Qwen inference failed under the CPU isolation plan");
+        assert_eq!(threads_used, plan.threads_per_lane);
 
         assert_eq!(vec.len(), 512);
         assert!(vec.iter().all(|v| v.is_finite()));
         let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
-
-        // Verify active inferences drain cleanly to 0
-        assert_eq!(handle.active_inferences(), 0);
     }
 }

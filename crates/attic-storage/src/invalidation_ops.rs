@@ -6,9 +6,9 @@
 //! transaction (contract invariant 5).
 //!
 //! Propagation implemented per contract §Propagation Rules:
-//! FileOccurrence → StructuralNode → SymbolOccurrence / Relationship,
-//! FileOccurrence → RetrievalUnit (→ SemanticRepr, future),
-//! FileOccurrence → KnowledgeItem, and Evidence marked STALE.
+//! FileOccurrence → StructuralNode → SymbolOccurrence / Relationship, and
+//! FileOccurrence → RetrievalUnit. Evidence is computed at query time from
+//! these artifacts, so it has no stored state to invalidate.
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -30,10 +30,6 @@ pub struct InvalidationCounts {
     pub relationships: u64,
     /// Retrieval units invalidated.
     pub retrieval_units: u64,
-    /// Evidence records marked STALE.
-    pub evidence_stale: u64,
-    /// Knowledge items invalidated.
-    pub knowledge_items: u64,
 }
 
 impl InvalidationCounts {
@@ -44,8 +40,6 @@ impl InvalidationCounts {
             + self.symbol_occurrences
             + self.relationships
             + self.retrieval_units
-            + self.evidence_stale
-            + self.knowledge_items
     }
 }
 
@@ -324,65 +318,6 @@ pub fn invalidate_for_occurrences(
         )?;
     }
 
-    // Evidence stays but is marked STALE (INV-Q2).
-    let mut evidence_ids: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM core_evidence WHERE source_id = ?1 AND source_type != 'KNOWLEDGE'",
-        )?;
-        for occ in occurrence_ids {
-            let rows = stmt.query_map(rusqlite::params![occ], |r| r.get::<_, String>(0))?;
-            for row in rows {
-                evidence_ids.push(row?);
-            }
-        }
-    }
-    if !evidence_ids.is_empty() {
-        counts.evidence_stale = update_freshness(
-            conn,
-            "core_evidence",
-            "id",
-            &evidence_ids,
-            FreshnessState::Stale,
-        )?;
-        record_invalidation(
-            conn,
-            InvalidationArtifactType::Evidence,
-            &evidence_ids,
-            InvalidationCause::DependencyInvalid,
-            now_us,
-        )?;
-    }
-
-    // Knowledge items are first-class dependents of their source file.
-    let mut knowledge_ids: Vec<String> = Vec::new();
-    {
-        let mut stmt =
-            conn.prepare("SELECT id FROM core_knowledge_items WHERE file_occurrence_id = ?1")?;
-        for occ in occurrence_ids {
-            let rows = stmt.query_map(rusqlite::params![occ], |r| r.get::<_, String>(0))?;
-            for row in rows {
-                knowledge_ids.push(row?);
-            }
-        }
-    }
-    if !knowledge_ids.is_empty() {
-        counts.knowledge_items = update_freshness(
-            conn,
-            "core_knowledge_items",
-            "id",
-            &knowledge_ids,
-            FreshnessState::Invalid,
-        )?;
-        record_invalidation(
-            conn,
-            InvalidationArtifactType::KnowledgeItem,
-            &knowledge_ids,
-            InvalidationCause::DependencyInvalid,
-            now_us,
-        )?;
-    }
-
     Ok(counts)
 }
 
@@ -459,16 +394,16 @@ fn now_us() -> i64 {
 /// foreign key) IS the moment the deletion was recorded, and is used here as
 /// the age basis in place of a dedicated deletion timestamp.
 ///
-/// Five other tables carry a foreign key to `core_file_occurrences.id`
-/// (`core_dependency_declarations`, `core_knowledge_items`,
-/// `core_retrieval_units`, `core_structural_nodes`,
-/// `core_symbol_occurrences`); with `PRAGMA foreign_keys = ON` (always set by
+/// Four other tables carry a foreign key to `core_file_occurrences.id`
+/// (`core_dependency_declarations`, `core_retrieval_units`,
+/// `core_structural_nodes`, `core_symbol_occurrences`); with
+/// `PRAGMA foreign_keys = ON` (always set by
 /// [`crate::connection::configure_connection`]) deleting a tombstone that
 /// still has a live dependent in any of those tables would either raise a
-/// foreign-key constraint violation (the four `NOT NULL` FKs) or leave a
+/// foreign-key constraint violation (the three `NOT NULL` FKs) or leave a
 /// dangling pointer (the nullable FK on `core_dependency_declarations`). This
 /// function therefore only deletes tombstones with **no** live dependents in
-/// any of those five tables; a tombstone with lingering dependents is simply
+/// any of those four tables; a tombstone with lingering dependents is simply
 /// left for a later run, once whatever code path owns those dependents has
 /// cleaned them up.
 ///
@@ -489,10 +424,6 @@ pub fn prune_old_tombstones(
             AND NOT EXISTS (
                 SELECT 1 FROM core_dependency_declarations d
                  WHERE d.file_occurrence_id = core_file_occurrences.id
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM core_knowledge_items k
-                 WHERE k.file_occurrence_id = core_file_occurrences.id
             )
             AND NOT EXISTS (
                 SELECT 1 FROM core_retrieval_units r

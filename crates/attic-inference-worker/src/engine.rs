@@ -59,12 +59,6 @@ impl WorkerFail {
             message: msg.into(),
         }
     }
-    pub fn invalid_input(msg: impl Into<String>) -> Self {
-        Self {
-            class: WorkerErrorClass::InvalidInput,
-            message: msg.into(),
-        }
-    }
     pub fn artifact(msg: impl Into<String>) -> Self {
         Self {
             class: WorkerErrorClass::Artifact,

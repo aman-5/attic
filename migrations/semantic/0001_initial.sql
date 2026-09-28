@@ -1,12 +1,18 @@
--- Semantic database migration: 0001_initial
+-- Semantic database schema — the single baseline.
 --
--- Attic Phase 102 Clean Final Architecture baseline schema.
--- Contains the complete unified durable state for Qwen3-based semantic intelligence:
---   - Vector embeddings with generation isolation and repository-scoped composite indexes
---   - Durable crash-safe queue with priority and retry tracking
---   - Query demand tracking
---   - Semantic generations lifecycle
---   - Learned resource and throughput tuning per hardware/model/runtime
+--   sem_embeddings            per-generation vector projection behind the HNSW index
+--   sem_query_demand          query demand used by the selection policy
+--   sem_generations           semantic generation lifecycle
+--   sem_embeddings_v2         ONE canonical vector per (vector space, content hash);
+--                             vector_space_id / content_generation_id are derived
+--                             from the provider fingerprint
+--   sem_embedding_occurrences every place a canonical body occurs
+--   sem_queue_v2              leased/fenced embedding work queue: a claim sets an
+--                             owner, expiry and fencing token; a commit carrying an
+--                             older token is rejected
+--
+-- semantic.db is disposable: a database created by any other schema is wiped
+-- and rebuilt automatically (see SemanticStore::migrate).
 
 CREATE TABLE IF NOT EXISTS sem_schema_migrations (
     id          TEXT    PRIMARY KEY NOT NULL,
@@ -42,23 +48,6 @@ CREATE INDEX IF NOT EXISTS idx_sem_embeddings_gen_repo
 CREATE INDEX IF NOT EXISTS idx_sem_embeddings_model_repo
     ON sem_embeddings(provider_id, model_id, repository_id);
 
--- Content-addressed reuse: enrichment looks up already-computed vectors by
--- (provider, model, dim, content_hash) so identical text is never embedded
--- twice, across repositories and across generations.
-CREATE INDEX IF NOT EXISTS idx_sem_embeddings_content
-    ON sem_embeddings(provider_id, model_id, dim, content_hash);
-
-CREATE TABLE IF NOT EXISTS sem_queue (
-    retrieval_unit_id TEXT PRIMARY KEY,
-    priority          REAL    NOT NULL DEFAULT 0.5,
-    state             TEXT    NOT NULL DEFAULT 'PENDING',
-    attempts          INTEGER NOT NULL DEFAULT 0,
-    enqueued_at_ms    INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_sem_queue_state
-    ON sem_queue(state, priority DESC, enqueued_at_ms);
-
 CREATE TABLE IF NOT EXISTS sem_query_demand (
     path       TEXT PRIMARY KEY,
     hits       INTEGER NOT NULL DEFAULT 0,
@@ -78,20 +67,59 @@ CREATE TABLE IF NOT EXISTS sem_generations (
 CREATE INDEX IF NOT EXISTS idx_sem_gen_status
     ON sem_generations(status);
 
-CREATE TABLE IF NOT EXISTS sem_learned_tuning (
-    tuning_key_hash           TEXT PRIMARY KEY NOT NULL,
-    cpu_architecture          TEXT NOT NULL,
-    os_name                   TEXT NOT NULL,
-    model_id                  TEXT NOT NULL,
-    model_revision            TEXT NOT NULL,
-    dimension                 INTEGER NOT NULL,
-    runtime_version           TEXT NOT NULL,
-    recommended_lanes         INTEGER NOT NULL,
-    recommended_batch_size    INTEGER NOT NULL,
-    recommended_cpu_threads   INTEGER NOT NULL,
-    observed_chunks_per_sec   REAL NOT NULL,
-    updated_at_ms             INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS sem_embeddings_v2 (
+    vector_space_id TEXT    NOT NULL,
+    canonical_hash  TEXT    NOT NULL,
+    dim             INTEGER NOT NULL,
+    norm            REAL    NOT NULL,
+    vector          BLOB    NOT NULL,
+    created_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (vector_space_id, canonical_hash)
 );
+
+CREATE TABLE IF NOT EXISTS sem_embedding_occurrences (
+    occurrence_id         TEXT PRIMARY KEY,
+    retrieval_unit_id     TEXT NOT NULL,
+    vector_space_id       TEXT NOT NULL,
+    canonical_hash        TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    source_revision_id    TEXT NOT NULL,
+    index_generation_id   TEXT NOT NULL,
+    content_generation_id TEXT NOT NULL,
+    -- Per-occurrence provenance: {"json_pointer": "...", "environment": "..."}.
+    metadata_json         TEXT NOT NULL DEFAULT '{}',
+    created_at_ms         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sem_occ_unit
+    ON sem_embedding_occurrences(retrieval_unit_id);
+CREATE INDEX IF NOT EXISTS idx_sem_occ_canonical
+    ON sem_embedding_occurrences(vector_space_id, canonical_hash);
+CREATE INDEX IF NOT EXISTS idx_sem_occ_generation
+    ON sem_embedding_occurrences(index_generation_id);
+
+CREATE TABLE IF NOT EXISTS sem_queue_v2 (
+    occurrence_id       TEXT PRIMARY KEY REFERENCES sem_embedding_occurrences(occurrence_id),
+    priority            REAL    NOT NULL DEFAULT 0.5,
+    state               TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING | INFLIGHT | DONE | FAILED
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    enqueued_at_ms      INTEGER NOT NULL,
+    -- Lease supervision: a claim sets owner+expiry and bumps fencing_token.
+    -- Heartbeats extend the lease. Reclaim after expiry bumps the token
+    -- again, so any commit carrying an older token is rejected as stale.
+    lease_owner         TEXT,
+    lease_expires_at_ms INTEGER,
+    heartbeat_at_ms     INTEGER,
+    fencing_token       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at_ms  INTEGER,
+    last_error          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sem_queue_v2_state
+    ON sem_queue_v2(state, priority DESC, enqueued_at_ms);
+-- Reclaim scan: expired INFLIGHT leases surface first.
+CREATE INDEX IF NOT EXISTS idx_sem_queue_v2_lease
+    ON sem_queue_v2(state, lease_expires_at_ms);
 
 INSERT OR IGNORE INTO sem_schema_migrations (id, applied_at)
 VALUES ('0001_initial', strftime('%s', 'now') * 1000000);

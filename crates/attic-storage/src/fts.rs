@@ -126,39 +126,6 @@ pub fn fts_retrieval_unit_update(
 }
 
 // ---------------------------------------------------------------------------
-// fts_symbol_names — low-level insert / delete
-// ---------------------------------------------------------------------------
-
-/// Insert a row into the `fts_symbol_names` external-content FTS5 table.
-pub fn fts_symbol_name_insert(
-    conn: &Connection,
-    rowid: i64,
-    qualified_name: &str,
-    kind: &str,
-) -> Result<(), StorageError> {
-    conn.prepare_cached(
-        "INSERT INTO fts_symbol_names(rowid, qualified_name, kind) VALUES (?1, ?2, ?3)",
-    )?
-    .execute(params![rowid, qualified_name, kind])?;
-    Ok(())
-}
-
-/// Remove a row from the `fts_symbol_names` FTS5 table.
-pub fn fts_symbol_name_delete(
-    conn: &Connection,
-    rowid: i64,
-    old_qualified_name: &str,
-    old_kind: &str,
-) -> Result<(), StorageError> {
-    conn.prepare_cached(
-        "INSERT INTO fts_symbol_names(fts_symbol_names, rowid, qualified_name, kind)
-         VALUES ('delete', ?1, ?2, ?3)",
-    )?
-    .execute(params![rowid, old_qualified_name, old_kind])?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Retrieval unit — insert with FTS sync
 // ---------------------------------------------------------------------------
 

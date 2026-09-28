@@ -232,13 +232,7 @@ fn failing_provider_quarantines_after_attempts_without_corruption() {
     )
     .unwrap();
     assert!(stats.failed_items > 0, "failures must be observable");
-    let done = stack
-        .store
-        .queue_counts()
-        .unwrap()
-        .get("DONE")
-        .copied()
-        .unwrap_or(0);
+    let done = stack.store.queue_counts().unwrap().done;
     assert_eq!(done, 0);
 
     // Canonical intelligence untouched.
@@ -275,13 +269,7 @@ fn slow_provider_honors_drive_budget_and_leaves_nothing_inflight() {
     )
     .unwrap();
     assert!(stats.elapsed_ms < 5_000, "budget bound must hold");
-    let inflight = stack
-        .store
-        .queue_counts()
-        .unwrap()
-        .get("INFLIGHT")
-        .copied()
-        .unwrap_or(0);
+    let inflight = stack.store.queue_counts().unwrap().inflight;
     assert_eq!(inflight, 0, "no work stays INFLIGHT after a bounded drive");
 }
 
@@ -308,13 +296,7 @@ fn cancellation_flag_stops_embedding_without_quarantine() {
     )
     .unwrap();
     assert_eq!(stats.embedded, 0);
-    let failed = stack
-        .store
-        .queue_counts()
-        .unwrap()
-        .get("FAILED")
-        .copied()
-        .unwrap_or(0);
+    let failed = stack.store.queue_counts().unwrap().failed;
     assert_eq!(failed, 0, "cancellation must never quarantine items");
 }
 
@@ -358,14 +340,11 @@ fn crash_between_drives_retains_committed_and_reschedules_rest() {
         committed_after, committed_before,
         "committed work must survive"
     );
-    let inflight = reopened
-        .store
-        .queue_counts()
-        .unwrap()
-        .get("INFLIGHT")
-        .copied()
-        .unwrap_or(0);
-    assert_eq!(inflight, 0, "restart must reschedule INFLIGHT work");
+    let inflight = reopened.store.queue_counts().unwrap().inflight;
+    assert_eq!(
+        inflight, 0,
+        "no claimed work may be left INFLIGHT across a restart"
+    );
 
     let conn = fx.read_conn();
     let stats = enrich_to_completion(&conn, &reopened, &FULL).unwrap();

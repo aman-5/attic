@@ -16,6 +16,25 @@ use crate::provider::{
     SemanticProvider,
 };
 
+/// Fingerprint for test providers: a stable vector space derived from the
+/// provider's id, model and dimensions, so test doubles exercise exactly the
+/// same leased queue and canonical-vector path as production providers.
+pub fn test_fingerprint(provider: &dyn SemanticProvider) -> EmbeddingFingerprint {
+    EmbeddingFingerprint {
+        provider: provider.id().to_owned(),
+        model_id: provider.model_id().to_owned(),
+        model_revision: "v1".to_owned(),
+        dimension: provider.dimensions(),
+        pooling_version: "test".to_owned(),
+        normalization_version: "test".to_owned(),
+        tokenizer_version: "test".to_owned(),
+        chunking_version: "test".to_owned(),
+        query_instruction_version: "test".to_owned(),
+        execution_backend: ExecutionBackend::Unknown,
+        quantization: "test-none".to_owned(),
+    }
+}
+
 /// Deterministic feature-hashing embedder ("hashing", model "hashed-ngram-v1").
 #[derive(Debug)]
 pub struct HashingEmbedder {
@@ -30,13 +49,6 @@ impl HashingEmbedder {
     pub fn new() -> Self {
         Self {
             dims: 256,
-            max_input_bytes: 16_384,
-        }
-    }
-
-    pub fn with_dims(dims: usize) -> Self {
-        Self {
-            dims,
             max_input_bytes: 16_384,
         }
     }
@@ -117,19 +129,7 @@ impl SemanticProvider for HashingEmbedder {
     }
 
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
-        Some(EmbeddingFingerprint {
-            provider: self.id().to_owned(),
-            model_id: self.model_id().to_owned(),
-            model_revision: "v1".to_owned(),
-            dimension: self.dimensions(),
-            pooling_version: "test".to_owned(),
-            normalization_version: "test".to_owned(),
-            tokenizer_version: "test".to_owned(),
-            chunking_version: "test".to_owned(),
-            query_instruction_version: "test".to_owned(),
-            execution_backend: ExecutionBackend::Unknown,
-            quantization: "test-none".to_string(),
-        })
+        Some(test_fingerprint(self))
     }
 
     fn embed_batch(
@@ -242,19 +242,7 @@ impl SemanticProvider for FailingProvider {
         true
     }
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
-        Some(EmbeddingFingerprint {
-            provider: self.id().to_owned(),
-            model_id: self.model_id().to_owned(),
-            model_revision: "v1".to_owned(),
-            dimension: self.dimensions(),
-            pooling_version: "test".to_owned(),
-            normalization_version: "test".to_owned(),
-            tokenizer_version: "test".to_owned(),
-            chunking_version: "test".to_owned(),
-            query_instruction_version: "test".to_owned(),
-            execution_backend: ExecutionBackend::Unknown,
-            quantization: "test-none".to_string(),
-        })
+        Some(test_fingerprint(self))
     }
     fn embed_batch(
         &self,
@@ -304,19 +292,7 @@ impl SemanticProvider for SlowProvider {
         true
     }
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
-        Some(EmbeddingFingerprint {
-            provider: self.id().to_owned(),
-            model_id: self.model_id().to_owned(),
-            model_revision: "v1".to_owned(),
-            dimension: self.dimensions(),
-            pooling_version: "test".to_owned(),
-            normalization_version: "test".to_owned(),
-            tokenizer_version: "test".to_owned(),
-            chunking_version: "test".to_owned(),
-            query_instruction_version: "test".to_owned(),
-            execution_backend: ExecutionBackend::Unknown,
-            quantization: "test-none".to_string(),
-        })
+        Some(test_fingerprint(self))
     }
     fn embed_batch(
         &self,
@@ -380,6 +356,9 @@ impl SemanticProvider for RecordingProvider {
     fn available(&self) -> bool {
         true
     }
+    fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+        Some(test_fingerprint(self))
+    }
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
@@ -427,7 +406,7 @@ impl SemanticProvider for OomProvider {
         true
     }
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
-        None
+        Some(test_fingerprint(self))
     }
     fn embed_batch(
         &self,

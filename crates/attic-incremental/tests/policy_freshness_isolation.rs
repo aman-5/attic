@@ -65,14 +65,8 @@ fn discovery_policy_exclusion_removes_file_from_fts() {
     let svc = fx.service();
     svc.apply_verified_change_set(&fx.pool, &fx.writer, &report.change_set)
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(
-        &fx.pool,
-        &fx.writer,
-        fx.root(),
-        &fx.policy(),
-        None,
-    )
-    .unwrap()
+    while attic_incremental::run_next_task_synchronously(&fx.pool, &fx.writer, &fx.policy(), None)
+        .unwrap()
     {}
     assert!(fx.search("policy_doomed_token").is_empty());
     within_budget(&t0);
@@ -197,9 +191,7 @@ fn unaffected_repository_is_completely_untouched() {
     svc_a
         .apply_pending(&pool, &writer, Some(u64::MAX / 2))
         .unwrap();
-    while attic_incremental::run_next_task_synchronously(&pool, &writer, &repo_a, &policy, None)
-        .unwrap()
-    {}
+    while attic_incremental::run_next_task_synchronously(&pool, &writer, &policy, None).unwrap() {}
 
     // B's committed state must be byte-identical to before.
     let b_revs: i64 = pool

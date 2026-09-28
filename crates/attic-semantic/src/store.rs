@@ -18,14 +18,13 @@ use std::sync::Mutex;
 
 use crate::error::SemanticError;
 use crate::generation::{GenerationManager, GenerationRecord};
-#[allow(unused_imports)] // ExecutionBackend used by tests via super::*
-use crate::provider::{CancelFlag, EmbeddingFingerprint, ExecutionBackend};
+use crate::provider::{CancelFlag, EmbeddingFingerprint};
 use hnsw_rs::prelude::*;
 use rusqlite::{Connection, params};
 
-const SEMANTIC_MIGRATION_0001: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
-const SEMANTIC_MIGRATION_0002: &str =
-    include_str!("../../../migrations/semantic/0002_identity_leases.sql");
+const SEMANTIC_BASELINE_SQL: &str = include_str!("../../../migrations/semantic/0001_initial.sql");
+/// Id recorded in `sem_schema_migrations` by the baseline.
+const SEMANTIC_BASELINE_VERSION: &str = "0001_initial";
 
 /// One stored embedding with full lineage.
 #[derive(Debug, Clone)]
@@ -95,18 +94,19 @@ pub struct KnnResult {
     pub truncated_by_budget: bool,
 }
 
-/// Queue row states.
+/// Queue row states (`sem_queue_v2.state`).
 pub const Q_PENDING: &str = "PENDING";
 pub const Q_INFLIGHT: &str = "INFLIGHT";
 pub const Q_DONE: &str = "DONE";
 pub const Q_FAILED: &str = "FAILED";
 
-/// A queued work item as returned by [`SemanticStore::queue_take_batch`].
-#[derive(Debug, Clone)]
-pub struct QueueItem {
-    pub retrieval_unit_id: String,
-    pub priority: f64,
-    pub attempts: u32,
+/// Queue depth snapshot (`sem_queue_v2`), for status and ETA reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCounts {
+    pub pending: u64,
+    pub inflight: u64,
+    pub done: u64,
+    pub failed: u64,
 }
 
 /// Full lineage/provenance of one occurrence of canonical content, as
@@ -126,9 +126,9 @@ pub struct OccurrenceRecord {
 }
 
 /// One occurrence's completed embedding, ready for
-/// [`SemanticStore::commit_v2_batch`].
+/// [`SemanticStore::commit_batch`].
 #[derive(Debug, Clone)]
-pub struct V2CommitEntry {
+pub struct CommitEntry {
     pub occurrence_id: String,
     pub owner: String,
     pub fencing_token: i64,
@@ -174,7 +174,6 @@ struct CandidateEntry {
 /// restriction and correctly orders nearest neighbours for signed float32
 /// embeddings.
 struct GenerationIndex {
-    #[allow(dead_code)]
     generation_id: i64,
     hnsw: Hnsw<'static, f32, DistCosine>,
     metadata: HashMap<usize, CandidateEntry>,
@@ -322,17 +321,16 @@ fn encode_vector_blob(vector: &[f32]) -> (f32, Vec<u8>) {
 
 impl SemanticStore {
     /// Open (creating if needed) the disposable semantic database.
+    ///
+    /// Work claimed by a process that died is recovered by lease expiry in
+    /// the v2 queue (`queue_reclaim_expired`), not by a blanket reset
+    /// here, so a concurrently running worker's live leases are never
+    /// stolen.
     pub fn open(path: &Path) -> Result<Self, SemanticError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::migrate(&conn)?;
-        // Crash/power-loss resume semantics (§11): anything INFLIGHT when the
-        // process died was never committed → reschedule it.
-        conn.execute(
-            "UPDATE sem_queue SET state = ?1 WHERE state = ?2",
-            params![Q_PENDING, Q_INFLIGHT],
-        )?;
         Ok(Self {
             conn: Mutex::new(conn),
             candidate_index: Mutex::new(HashMap::new()),
@@ -369,22 +367,44 @@ impl SemanticStore {
         panic!("intentional poison");
     }
 
-    /// TEST/BENCHMARK SUPPORT ONLY: acquires the database guard directly.
-    #[doc(hidden)]
-    pub fn guard_for_test(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SemanticError> {
-        self.guard()
+    /// Apply the single baseline. `semantic.db` is disposable, so a database
+    /// created by any other schema is wiped and rebuilt (its vectors are
+    /// re-embedded in the background).
+    fn migrate(conn: &Connection) -> Result<(), SemanticError> {
+        if !Self::is_current_schema(conn)? {
+            tracing::warn!(
+                "semantic.db was created by a different schema; rebuilding it (embeddings are regenerated)"
+            );
+            attic_storage::migration::reset_schema(conn)?;
+        }
+        conn.execute_batch(SEMANTIC_BASELINE_SQL)?;
+        Ok(())
     }
 
-    fn migrate(conn: &Connection) -> Result<(), SemanticError> {
-        // Ordered, idempotent chain: each script is self-recording into
-        // sem_schema_migrations (INSERT OR IGNORE), so re-running is a no-op
-        // and an existing 0001-only database upgrades in place.
-        conn.execute_batch(SEMANTIC_MIGRATION_0001)?;
-        conn.execute_batch(
-            "INSERT OR IGNORE INTO sem_schema_migrations (id) VALUES ('0001_initial');",
-        )?;
-        conn.execute_batch(SEMANTIC_MIGRATION_0002)?;
-        Ok(())
+    /// `true` for a fresh database or one created by exactly this baseline.
+    fn is_current_schema(conn: &Connection) -> Result<bool, SemanticError> {
+        let table_count = |name: &str| -> Result<i64, SemanticError> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |r| r.get(0),
+            )?)
+        };
+        if table_count("sem_schema_migrations")? == 0 {
+            let tables: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )?;
+            return Ok(tables == 0);
+        }
+        let mut stmt = conn.prepare("SELECT id FROM sem_schema_migrations")?;
+        let applied: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        // An earlier baseline carried the same id plus the v1 `sem_queue`.
+        Ok(applied == [SEMANTIC_BASELINE_VERSION] && table_count("sem_queue")? == 0)
     }
 
     fn now_ms() -> i64 {
@@ -394,39 +414,11 @@ impl SemanticStore {
             .unwrap_or(0)
     }
 
-    // ── learned tuning (Final Master Plan V2 §25, CP17) ───────────────────
-
-    /// Read learned tuning matching the specified key.
-    pub fn read_learned_tuning(
-        &self,
-        key: &crate::learned_tuning::TuningKey,
-    ) -> Result<Option<crate::learned_tuning::LearnedTuningRecord>, SemanticError> {
-        let conn = self.guard()?;
-        crate::learned_tuning::LearnedTuningManager.read_tuning(&conn, key)
-    }
-
-    /// Save learned optimal execution tuning.
-    pub fn save_learned_tuning(
-        &self,
-        record: &crate::learned_tuning::LearnedTuningRecord,
-    ) -> Result<(), SemanticError> {
-        let conn = self.guard()?;
-        crate::learned_tuning::LearnedTuningManager.save_tuning(&conn, record)
-    }
-
-    /// Invalidate learned tuning for a specific key.
-    pub fn invalidate_learned_tuning(
-        &self,
-        key: &crate::learned_tuning::TuningKey,
-    ) -> Result<bool, SemanticError> {
-        let conn = self.guard()?;
-        crate::learned_tuning::LearnedTuningManager.invalidate_tuning(&conn, key)
-    }
-
     // ── embeddings ─────────────────────────────────────────────────────────
 
-    /// Insert or replace one embedding (idempotent per unit+model).
-    pub fn put(&self, rec: &EmbeddingRecord) -> Result<(), SemanticError> {
+    /// Test support: insert or replace one per-generation projection row.
+    #[cfg(test)]
+    fn put(&self, rec: &EmbeddingRecord) -> Result<(), SemanticError> {
         let (norm, blob) = encode_vector_blob(&rec.vector);
         self.guard()?.execute(
             "INSERT OR REPLACE INTO sem_embeddings
@@ -452,122 +444,12 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// Atomically persists a batch of embeddings and marks their queue entries
-    /// DONE under a single mutex acquisition and one SQLite transaction — the
-    /// batched counterpart to calling `put()` + `queue_mark_done()` once per
-    /// record, which issues 2 auto-committed statements per unit.
-    pub fn put_batch_and_mark_done(
-        &self,
-        records: &[EmbeddingRecord],
-    ) -> Result<(), SemanticError> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.guard()?;
-        let tx = conn.transaction()?;
-
-        {
-            let mut insert_stmt = tx.prepare(
-                "INSERT OR REPLACE INTO sem_embeddings
-                     (retrieval_unit_id, repository_id, source_revision_id,
-                      index_generation_id, selection_version, provider_id, model_id,
-                      content_hash, dim, norm, vector, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            )?;
-            let mut mark_stmt =
-                tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
-
-            let now = Self::now_ms();
-            for rec in records {
-                let (norm, blob) = encode_vector_blob(&rec.vector);
-                insert_stmt.execute(params![
-                    rec.retrieval_unit_id,
-                    rec.repository_id,
-                    rec.source_revision_id,
-                    rec.index_generation_id,
-                    rec.selection_version,
-                    rec.provider_id,
-                    rec.model_id,
-                    rec.content_hash,
-                    rec.dim as i64,
-                    norm,
-                    blob,
-                    now,
-                ])?;
-                mark_stmt.execute(params![rec.retrieval_unit_id, Q_DONE])?;
-            }
-        }
-
-        tx.commit()?;
-        Ok(())
-    }
-
-    // ── v2: vector spaces, canonical embeddings, occurrences, leases (r02) ─
-
-    /// Register (idempotently) the vector space described by a provider
-    /// fingerprint; returns its stable `vector_space_id`.
-    pub fn ensure_vector_space(
-        &self,
-        fp: &EmbeddingFingerprint,
-        quantization: &str,
-    ) -> Result<String, SemanticError> {
-        let id = fp.vector_space_id();
-        self.guard()?.execute(
-            "INSERT OR IGNORE INTO sem_vector_spaces
-                 (vector_space_id, provider_id, model_id, model_revision,
-                  quantization, dim, pooling_version, normalization_version,
-                  tokenizer_version, query_instruction_version,
-                  execution_backend, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                id,
-                fp.provider,
-                fp.model_id,
-                fp.model_revision,
-                quantization,
-                fp.dimension as i64,
-                fp.pooling_version,
-                fp.normalization_version,
-                fp.tokenizer_version,
-                fp.query_instruction_version,
-                fp.execution_backend.as_str(),
-                Self::now_ms()
-            ],
-        )?;
-        Ok(id)
-    }
-
-    /// Register (idempotently) the content-generation identity (chunking +
-    /// canonicalization + analyzer registry + selection versions).
-    pub fn ensure_content_generation(
-        &self,
-        fp: &EmbeddingFingerprint,
-        selection_version: &str,
-    ) -> Result<String, SemanticError> {
-        let id = fp.content_generation_id(selection_version);
-        self.guard()?.execute(
-            "INSERT OR IGNORE INTO sem_content_generations
-                 (content_generation_id, chunking_version,
-                  canonicalization_version, analyzer_registry_version,
-                  selection_version, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                id,
-                fp.chunking_version,
-                "canonical_v1",
-                attic_core::constants::ANALYZER_REGISTRY_VERSION,
-                selection_version,
-                Self::now_ms()
-            ],
-        )?;
-        Ok(id)
-    }
+    // ── canonical embeddings, occurrences, leases ──────────────────────────
 
     /// Store one canonical embedding; returns true when newly inserted
     /// (INSERT OR IGNORE — an identical canonical body in the same vector
     /// space is embedded exactly once, ever).
-    pub fn put_embedding_v2(
+    pub fn put_canonical_embedding(
         &self,
         vector_space_id: &str,
         canonical_hash: &str,
@@ -675,11 +557,7 @@ impl SemanticStore {
 
     /// Enqueue an occurrence for embedding (idempotent; preserves state of an
     /// already-queued row).
-    pub fn queue_v2_enqueue(
-        &self,
-        occurrence_id: &str,
-        priority: f64,
-    ) -> Result<(), SemanticError> {
+    pub fn queue_enqueue(&self, occurrence_id: &str, priority: f64) -> Result<(), SemanticError> {
         self.guard()?.execute(
             "INSERT OR IGNORE INTO sem_queue_v2
                  (occurrence_id, priority, state, attempts, enqueued_at_ms)
@@ -692,7 +570,7 @@ impl SemanticStore {
     /// Claim one pending (or lease-expired) occurrence for `owner`. Bumps the
     /// fencing token so any previous owner's later writes are stale.
     /// Returns the fencing token the caller MUST present on completion.
-    pub fn queue_v2_claim(
+    pub fn queue_claim(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -722,7 +600,7 @@ impl SemanticStore {
 
     /// Extend a lease; rejected (Ok(false)) when the presented fencing token
     /// is stale — i.e. the row was reclaimed by another worker.
-    pub fn queue_v2_heartbeat(
+    pub fn queue_heartbeat(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -742,7 +620,7 @@ impl SemanticStore {
 
     /// Mark an occurrence done; rejected (Ok(false)) on a stale fencing
     /// token, so a killed worker can never commit after reclaim.
-    pub fn queue_v2_complete(
+    pub fn queue_complete(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -760,7 +638,7 @@ impl SemanticStore {
 
     /// Crash/restart reclaim: expired INFLIGHT leases become PENDING again
     /// with an incremented attempt counter. Returns rows reclaimed.
-    pub fn queue_v2_reclaim_expired(&self) -> Result<u64, SemanticError> {
+    pub fn queue_reclaim_expired(&self) -> Result<u64, SemanticError> {
         let now = Self::now_ms();
         let changed = self.guard()?.execute(
             "UPDATE sem_queue_v2
@@ -774,11 +652,11 @@ impl SemanticStore {
 
     /// Claim up to `limit` occurrences for `owner` in one call: selects
     /// PENDING (or lease-expired INFLIGHT) candidates, then claims each
-    /// through the same atomic single-row UPDATE as [`Self::queue_v2_claim`]
+    /// through the same atomic single-row UPDATE as [`Self::queue_claim`]
     /// — the candidate scan is just discovery; exclusivity is enforced by
     /// that per-row UPDATE, so a candidate already claimed by a concurrent
     /// drive loop is silently skipped rather than double-assigned.
-    pub fn queue_v2_claim_batch(
+    pub fn queue_claim_batch(
         &self,
         owner: &str,
         lease_ms: i64,
@@ -799,7 +677,7 @@ impl SemanticStore {
         };
         let mut claimed = Vec::with_capacity(candidate_ids.len());
         for occ_id in candidate_ids {
-            if let Some(token) = self.queue_v2_claim(&occ_id, owner, lease_ms)? {
+            if let Some(token) = self.queue_claim(&occ_id, owner, lease_ms)? {
                 claimed.push((occ_id, token));
             }
         }
@@ -808,8 +686,8 @@ impl SemanticStore {
 
     /// Return a claimed occurrence to PENDING without incrementing attempts
     /// (cancellation, transient pre-embed failure) — rejected on a stale
-    /// fencing token exactly like [`Self::queue_v2_complete`].
-    pub fn queue_v2_reset(
+    /// fencing token exactly like [`Self::queue_complete`].
+    pub fn queue_reset(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -828,7 +706,7 @@ impl SemanticStore {
     /// Record a failed attempt; quarantines as FAILED once `max_attempts` is
     /// reached, otherwise returns to PENDING for retry. Rejected on a stale
     /// fencing token so a superseded worker can never affect queue state.
-    pub fn queue_v2_mark_failed(
+    pub fn queue_mark_failed(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -858,7 +736,7 @@ impl SemanticStore {
     /// Quarantine an occurrence immediately regardless of attempt count
     /// (secret-bearing content, oversized input, dropped-input, dimension
     /// mismatch — permanent for this content, never worth retrying).
-    pub fn queue_v2_fail_permanently(
+    pub fn queue_fail_permanently(
         &self,
         occurrence_id: &str,
         owner: &str,
@@ -909,7 +787,7 @@ impl SemanticStore {
     /// Batched form of [`Self::occurrence_by_id`] — one query for an entire
     /// claimed batch instead of one round-trip per occurrence (mirrors
     /// `attic_storage::semantic_units_by_ids`'s batching for the same set of
-    /// IDs, used right alongside this in `enrich::drive_v2`).
+    /// IDs, used right alongside this in `enrich::drive_leased`).
     pub fn occurrences_by_ids(
         &self,
         occurrence_ids: &[String],
@@ -959,9 +837,9 @@ impl SemanticStore {
     /// coverage (every occurrence gets its own retrievable row, including
     /// ones a canonical-dedup pass would otherwise have dropped silently).
     /// Returns the occurrence ids actually committed.
-    pub fn commit_v2_batch(
+    pub fn commit_batch(
         &self,
-        entries: &[V2CommitEntry],
+        entries: &[CommitEntry],
         generation_id: i64,
         selection_version: &str,
     ) -> Result<Vec<String>, SemanticError> {
@@ -1156,51 +1034,53 @@ impl SemanticStore {
     }
 
     /// Queue depth snapshot for status reporting.
-    pub fn queue_v2_counts(&self) -> Result<(u64, u64, u64, u64), SemanticError> {
+    pub fn queue_counts(&self) -> Result<QueueCounts, SemanticError> {
         let conn = self.guard()?;
-        let count = |state: &str| -> Result<i64, SemanticError> {
-            Ok(conn.query_row(
+        let count = |state: &str| -> Result<u64, SemanticError> {
+            let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sem_queue_v2 WHERE state = ?1",
                 params![state],
                 |r| r.get(0),
-            )?)
+            )?;
+            Ok(n as u64)
         };
-        Ok((
-            count("PENDING")? as u64,
-            count("INFLIGHT")? as u64,
-            count("DONE")? as u64,
-            count("FAILED")? as u64,
-        ))
+        Ok(QueueCounts {
+            pending: count(Q_PENDING)?,
+            inflight: count(Q_INFLIGHT)?,
+            done: count(Q_DONE)?,
+            failed: count(Q_FAILED)?,
+        })
     }
 
-    /// `(pending, inflight, done, failed)` queue depth scoped to ONE vector
-    /// space — distinct from [`Self::queue_v2_counts`] (global), this answers
-    /// "is there still outstanding work for backend X's vector space" so a
-    /// caller (e.g. GPU→CPU fallback) can tell a BUILDING generation for a
-    /// specific fingerprint is fully drained (and actually made progress)
-    /// before treating it as activation-ready. Joins through
+    /// Queue depth scoped to ONE vector space — distinct from
+    /// [`Self::queue_counts`] (global), this answers "is there still
+    /// outstanding work for backend X's vector space" so a caller (e.g.
+    /// GPU→CPU fallback) can tell a BUILDING generation for a specific
+    /// fingerprint is fully drained (and actually made progress) before
+    /// treating it as activation-ready. Joins through
     /// `sem_embedding_occurrences` because `sem_queue_v2` itself is keyed by
     /// `occurrence_id`, not vector space.
-    pub fn queue_v2_counts_for_vector_space(
+    pub fn queue_counts_for_vector_space(
         &self,
         vector_space_id: &str,
-    ) -> Result<(u64, u64, u64, u64), SemanticError> {
+    ) -> Result<QueueCounts, SemanticError> {
         let conn = self.guard()?;
-        let count = |state: &str| -> Result<i64, SemanticError> {
-            Ok(conn.query_row(
+        let count = |state: &str| -> Result<u64, SemanticError> {
+            let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sem_queue_v2 q
                    JOIN sem_embedding_occurrences o ON o.occurrence_id = q.occurrence_id
                   WHERE q.state = ?1 AND o.vector_space_id = ?2",
                 params![state, vector_space_id],
                 |r| r.get(0),
-            )?)
+            )?;
+            Ok(n as u64)
         };
-        Ok((
-            count("PENDING")? as u64,
-            count("INFLIGHT")? as u64,
-            count("DONE")? as u64,
-            count("FAILED")? as u64,
-        ))
+        Ok(QueueCounts {
+            pending: count(Q_PENDING)?,
+            inflight: count(Q_INFLIGHT)?,
+            done: count(Q_DONE)?,
+            failed: count(Q_FAILED)?,
+        })
     }
 
     fn tombstone_units_in_all_indexes<'a>(&self, unit_ids: impl Iterator<Item = &'a str>) {
@@ -1215,60 +1095,6 @@ impl SemanticStore {
                 }
             }
         }
-    }
-
-    /// Content-addressed vector lookup: for each given content hash, the
-    /// stored vector (if any) under this exact provider/model/dim. Enrichment
-    /// uses it to reuse an already-computed embedding for identical text —
-    /// across repositories (shared boilerplate, copied components) and across
-    /// generations — instead of paying CPU inference again. First row found
-    /// per hash wins; vectors for identical (provider, model, dim, content)
-    /// are interchangeable by construction.
-    pub fn vectors_for_contents(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-        dim: usize,
-        content_hashes: &[String],
-    ) -> Result<HashMap<String, Vec<f32>>, SemanticError> {
-        let mut out = HashMap::new();
-        if content_hashes.is_empty() {
-            return Ok(out);
-        }
-        let conn = self.guard()?;
-        for chunk in content_hashes.chunks(64) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT content_hash, vector FROM sem_embeddings
-                  WHERE provider_id = ?1 AND model_id = ?2 AND dim = ?3
-                    AND content_hash IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut param_values: Vec<Box<dyn rusqlite::ToSql>> =
-                Vec::with_capacity(chunk.len() + 3);
-            param_values.push(Box::new(provider_id.to_owned()));
-            param_values.push(Box::new(model_id.to_owned()));
-            param_values.push(Box::new(dim as i64));
-            for h in chunk {
-                param_values.push(Box::new(h.clone()));
-            }
-            let param_refs: Vec<&dyn rusqlite::ToSql> =
-                param_values.iter().map(|p| p.as_ref()).collect();
-            let mut rows = stmt.query(param_refs.as_slice())?;
-            while let Some(r) = rows.next()? {
-                let hash: String = r.get(0)?;
-                if out.contains_key(&hash) {
-                    continue;
-                }
-                let blob: Vec<u8> = r.get(1)?;
-                let mut vec = Vec::with_capacity(blob.len() / 4);
-                for b in blob.as_chunks::<4>().0 {
-                    vec.push(f32::from_le_bytes(*b));
-                }
-                out.insert(hash, vec);
-            }
-        }
-        Ok(out)
     }
 
     /// Delete every embedding for one unit (all models) or one exact record
@@ -1354,7 +1180,10 @@ impl SemanticStore {
             params![active_provider, active_model],
         )?;
         if n > 0 {
-            self.candidate_index.lock().unwrap().clear();
+            self.candidate_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
         Ok(n)
     }
@@ -1366,7 +1195,10 @@ impl SemanticStore {
             params![provider, model],
         )?;
         if n > 0 {
-            self.candidate_index.lock().unwrap().clear();
+            self.candidate_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
         Ok(n)
     }
@@ -1385,24 +1217,6 @@ impl SemanticStore {
             params![provider, model, repository_filter],
             |r| r.get::<_, i64>(0),
         )? as u64)
-    }
-
-    /// Distinct (provider, model) pairs present with row counts.
-    pub fn model_inventory(&self) -> Result<HashMap<(String, String), u64>, SemanticError> {
-        let conn = self.guard()?;
-        let mut stmt = conn.prepare(
-            "SELECT provider_id, model_id, COUNT(*) FROM sem_embeddings
-             GROUP BY provider_id, model_id",
-        )?;
-        let mut out = HashMap::new();
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            out.insert(
-                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
-                r.get::<_, i64>(2)? as u64,
-            );
-        }
-        Ok(out)
     }
 
     // ── semantic generations (Phase V2 §51–§55) ───────────────────────────
@@ -1440,45 +1254,10 @@ impl SemanticStore {
         GenerationManager::rollback_to_previous(&mut conn)
     }
 
-    /// Prune old superseded generations according to retention policy.
-    ///
-    /// In addition to deleting DB rows via [`GenerationManager::prune_old_generations`],
-    /// this also evicts the corresponding in-memory HNSW entries from
-    /// `candidate_index` so the memory they hold (HNSW graph + metadata map)
-    /// is promptly released.  The eviction query runs while `conn` is still
-    /// held so that the surviving-ID set is consistent with the post-prune DB
-    /// state; `conn` is then dropped before acquiring `candidate_index` to
-    /// preserve the established lock ordering (conn → candidate_index).
-    pub fn prune_generations(&self, keep_max: usize) -> Result<usize, SemanticError> {
-        let mut conn = self.guard()?;
-        let pruned = GenerationManager::prune_old_generations(&mut conn, keep_max)?;
-
-        if pruned > 0 {
-            // Collect the generation IDs that still exist post-prune.
-            let surviving: std::collections::HashSet<i64> = {
-                let mut stmt = conn.prepare("SELECT generation_id FROM sem_generations")?;
-                let mut rows = stmt.query([])?;
-                let mut set = std::collections::HashSet::new();
-                while let Some(r) = rows.next()? {
-                    set.insert(r.get::<_, i64>(0)?);
-                }
-                set
-            };
-            // Release the DB lock before acquiring candidate_index to maintain
-            // the consistent conn → candidate_index lock order.
-            drop(conn);
-
-            let mut index_guard = self.candidate_index.lock().map_err(|_| {
-                SemanticError::StoreUnavailable("candidate index mutex poisoned".into())
-            })?;
-            index_guard.retain(|gen_id, _| surviving.contains(gen_id));
-        }
-
-        Ok(pruned)
-    }
-
-    /// Insert a batch of embedding records tagged with a specific generation ID (§52).
-    pub fn put_batch_for_generation(
+    /// Test support: insert a batch of projection rows tagged with a
+    /// generation id (§52) and bump that generation's unit count.
+    #[cfg(test)]
+    fn put_batch_for_generation(
         &self,
         records: &[EmbeddingRecord],
         generation_id: i64,
@@ -1498,8 +1277,6 @@ impl SemanticStore {
                       content_hash, dim, norm, vector, created_at_ms, generation_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
-            let mut mark_stmt =
-                tx.prepare("UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1")?;
             let mut check_stmt = tx.prepare(
                 "SELECT 1 FROM sem_embeddings WHERE retrieval_unit_id=?1 AND provider_id=?2 AND model_id=?3 AND generation_id=?4"
             )?;
@@ -1532,7 +1309,6 @@ impl SemanticStore {
                     now,
                     generation_id,
                 ])?;
-                mark_stmt.execute(params![rec.retrieval_unit_id, Q_DONE])?;
             }
 
             if new_units > 0 {
@@ -1727,10 +1503,14 @@ impl SemanticStore {
 
         // Stage 1 & 2: Candidate search with metadata filtering
         let (candidate_ids, rows_scanned, truncated) = {
-            let index_guard = self.candidate_index.lock().unwrap();
-            let gen_idx = index_guard
-                .get(&generation_id)
-                .expect("index synced immediately above");
+            let index_guard = self.candidate_index.lock().map_err(|_| {
+                SemanticError::StoreUnavailable("candidate index mutex poisoned".into())
+            })?;
+            let gen_idx = index_guard.get(&generation_id).ok_or_else(|| {
+                SemanticError::StoreUnavailable(format!(
+                    "candidate index for generation {generation_id} missing after sync"
+                ))
+            })?;
             gen_idx.search_candidates(query, candidate_limit, repository_filter, budget)
         };
 
@@ -1752,111 +1532,7 @@ impl SemanticStore {
         })
     }
 
-    // ── enrichment queue ───────────────────────────────────────────────────
-
-    /// Enqueue units that are not DONE already. Priority replaces existing
-    /// entries (demand-driven re-prioritization is inspectable state).
-    pub fn queue_enqueue(&self, unit_ids: &[String], priority: f64) -> Result<(), SemanticError> {
-        let t = Self::now_ms();
-        for id in unit_ids {
-            self.guard()?.execute(
-                "INSERT INTO sem_queue (retrieval_unit_id, priority, state, attempts, enqueued_at_ms)
-                 VALUES (?1, ?2, ?3, 0, ?4)
-                 ON CONFLICT(retrieval_unit_id) DO UPDATE
-                   SET priority=excluded.priority, state=?3, enqueued_at_ms=?4",
-                params![id, priority, Q_PENDING, t],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Scored variant: per-unit priority from selection scores.
-    pub fn queue_enqueue_scored(&self, items: &[(String, f64)]) -> Result<(), SemanticError> {
-        let t = Self::now_ms();
-        for (id, priority) in items {
-            self.guard()?.execute(
-                "INSERT INTO sem_queue (retrieval_unit_id, priority, state, attempts, enqueued_at_ms)
-                 VALUES (?1, ?2, ?3, 0, ?4)
-                 ON CONFLICT(retrieval_unit_id) DO UPDATE
-                   SET priority=excluded.priority, state=?3, enqueued_at_ms=?4",
-                params![id, priority, Q_PENDING, t],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Atomically claim up to `limit` PENDING items (priority DESC, FIFO
-    /// within equal priority) and mark them INFLIGHT in one statement.
-    ///
-    /// [FIX] Previously a two-phase SELECT-then-UPDATE-loop: the guard was
-    /// released between the read and the write, so two threads racing this
-    /// call could both SELECT the same PENDING rows before either UPDATE
-    /// landed, double-claiming the same work. A single `UPDATE ... RETURNING`
-    /// statement, executed while holding one `guard()` acquisition for the
-    /// whole call, makes the claim atomic — SQLite's own serialization of
-    /// writers means no other connection can observe or claim these rows
-    /// between the SELECT-subquery and the UPDATE.
-    pub fn queue_take_batch(&self, limit: usize) -> Result<Vec<QueueItem>, SemanticError> {
-        let conn = self.guard()?;
-        let mut stmt = conn.prepare(
-            "UPDATE sem_queue SET state = ?1
-              WHERE retrieval_unit_id IN (
-                  SELECT retrieval_unit_id FROM sem_queue
-                  WHERE state = ?2
-                  ORDER BY priority DESC, enqueued_at_ms ASC, retrieval_unit_id ASC
-                  LIMIT ?3
-              )
-              RETURNING retrieval_unit_id, priority, attempts",
-        )?;
-        let mut out = Vec::new();
-        let mut rows = stmt.query(params![Q_INFLIGHT, Q_PENDING, limit as i64])?;
-        while let Some(r) = rows.next()? {
-            out.push(QueueItem {
-                retrieval_unit_id: r.get(0)?,
-                priority: r.get(1)?,
-                attempts: r.get::<_, i64>(2)? as u32,
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn queue_mark_done(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.guard()?.execute(
-            "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
-            params![unit_id, Q_DONE],
-        )?;
-        Ok(())
-    }
-
-    pub fn queue_mark_failed(&self, unit_id: &str, max_attempts: u32) -> Result<(), SemanticError> {
-        self.guard()?.execute(
-            "UPDATE sem_queue
-                SET attempts = attempts + 1,
-                    state = CASE WHEN attempts + 1 >= ?2 THEN ?3 ELSE ?4 END
-              WHERE retrieval_unit_id=?1",
-            params![unit_id, max_attempts as i64, Q_FAILED, Q_PENDING],
-        )?;
-        Ok(())
-    }
-
-    /// Permanently quarantine an item (security refusal / hard-invalid).
-    pub fn queue_fail_permanently(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.guard()?.execute(
-            "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1",
-            params![unit_id, Q_FAILED],
-        )?;
-        Ok(())
-    }
-
-    /// Return an INFLIGHT item to PENDING (cancellation / crash resume).
-    /// Items already DONE are unaffected.
-    pub fn queue_reset(&self, unit_id: &str) -> Result<(), SemanticError> {
-        self.guard()?.execute(
-            "UPDATE sem_queue SET state=?2 WHERE retrieval_unit_id=?1 AND state=?3",
-            params![unit_id, Q_PENDING, Q_INFLIGHT],
-        )?;
-        Ok(())
-    }
+    // ── reconcile inputs and queue hygiene ─────────────────────────────────
 
     /// Minimal identity metadata for every stored row of the ACTIVE model —
     /// the reconcile diff input.
@@ -1884,44 +1560,11 @@ impl SemanticStore {
         Ok(out)
     }
 
-    /// Drop queue entries for units no longer selected/existing.
-    ///
-    /// [FIX] Guarded with `AND state != Q_INFLIGHT` (both branches) so this
-    /// never deletes a row another thread currently owns mid-embedding —
-    /// without this, a concurrent `drive()` claim (INFLIGHT via
-    /// `queue_take_batch`) racing a `reconcile()` call here could have its
-    /// row deleted out from under it; the later `queue_mark_done`/
-    /// `queue_mark_failed`/`queue_reset` would then silently affect zero
-    /// rows instead of the claimed item.
+    /// Drop any non-INFLIGHT queue row (occurrence_id == retrieval_unit_id by
+    /// construction) for a unit that is no longer selected, so the queue only
+    /// ever holds currently-selected work. INFLIGHT rows are never deleted: a
+    /// concurrent worker owns them and completes or releases them itself.
     pub fn queue_retain_only(&self, keep: &[String]) -> Result<usize, SemanticError> {
-        use rusqlite::ToSql;
-        let n = if keep.is_empty() {
-            self.conn.lock().expect("semantic store mutex").execute(
-                "DELETE FROM sem_queue WHERE state != ?1",
-                params![Q_INFLIGHT],
-            )?
-        } else {
-            let mut paramslice: Vec<&dyn ToSql> = keep.iter().map(|s| s as &dyn ToSql).collect();
-            paramslice.push(&Q_INFLIGHT as &dyn ToSql);
-            let placeholders = vec!["?"; keep.len()].join(",");
-            let sql = format!(
-                "DELETE FROM sem_queue WHERE retrieval_unit_id NOT IN ({placeholders}) AND state != ?"
-            );
-            self.conn
-                .lock()
-                .expect("semantic store mutex")
-                .execute(&sql, paramslice.as_slice())?
-        };
-        Ok(n)
-    }
-
-    /// v2 analogue of [`Self::queue_retain_only`]: drop any non-INFLIGHT
-    /// `sem_queue_v2` row (occurrence_id == retrieval_unit_id by
-    /// construction) for a unit that is no longer selected — the same
-    /// "queue only ever contains currently-selected units" hygiene v1 had,
-    /// which the v2 cutover did not otherwise carry over (a deselected
-    /// unit's PENDING v2 row would stay claimable forever).
-    pub fn queue_v2_retain_only(&self, keep: &[String]) -> Result<usize, SemanticError> {
         use rusqlite::ToSql;
         let n = if keep.is_empty() {
             self.guard()?
@@ -1935,23 +1578,6 @@ impl SemanticStore {
             self.guard()?.execute(&sql, paramslice.as_slice())?
         };
         Ok(n)
-    }
-
-    pub fn queue_counts(&self) -> Result<HashMap<String, u64>, SemanticError> {
-        let conn = self.guard()?;
-        let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM sem_queue GROUP BY state")?;
-        let mut out = HashMap::new();
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            out.insert(r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64);
-        }
-        Ok(out)
-    }
-
-    /// Remove DONE rows entirely (bounded queue; done work needs no history).
-    pub fn queue_prune_done(&self) -> Result<usize, SemanticError> {
-        let conn = self.guard()?;
-        Ok(conn.execute("DELETE FROM sem_queue WHERE state=?1", params![Q_DONE])?)
     }
 
     // ── query demand (§4 signal; disposable observability) ─────────────────
@@ -1994,7 +1620,7 @@ impl SemanticStore {
     /// [`SemanticStore::guard`] elsewhere in the same call stack.
     ///
     /// `semantic.db` accumulates free pages from `delete`,
-    /// `purge_inactive_models`, `purge_model`, and `queue_prune_done`;
+    /// `purge_inactive_models`, `purge_model`, and completed queue rows;
     /// without an occasional `vacuum: true` call the file never shrinks.
     ///
     /// `VACUUM` must NOT run while a transaction is open on the underlying
@@ -2023,6 +1649,7 @@ impl SemanticStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ExecutionBackend;
 
     #[test]
     fn semantic_schema_is_migration_owned_and_idempotent() {
@@ -2039,21 +1666,9 @@ mod tests {
             .unwrap();
         assert_eq!(applied, 1);
 
-        let applied_0002: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sem_schema_migrations WHERE id='0002_identity_leases'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(applied_0002, 1, "0002 must be recorded and idempotent");
-
         for table in &[
             "sem_embeddings",
-            "sem_queue",
             "sem_query_demand",
-            "sem_vector_spaces",
-            "sem_content_generations",
             "sem_embeddings_v2",
             "sem_embedding_occurrences",
             "sem_queue_v2",
@@ -2087,21 +1702,18 @@ mod tests {
             execution_backend: ExecutionBackend::OrtDirectMl,
             quantization: "test-none".to_string(),
         };
-        let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
-        let cgid = s.ensure_content_generation(&fp, "sel_v1").unwrap();
-        // Idempotent registration.
-        assert_eq!(s.ensure_vector_space(&fp, "q8_0").unwrap(), vsid);
-        assert_eq!(s.ensure_content_generation(&fp, "sel_v1").unwrap(), cgid);
+        let vsid = fp.vector_space_id();
+        let cgid = fp.content_generation_id("sel_v1");
 
         let body = "{\"a\":1}";
         let hash = crate::identity::content_hash(body);
         assert!(
-            s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
+            s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
                 .unwrap()
         );
         // Identical canonical body: second put must NOT insert again.
         assert!(
-            !s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
+            !s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0, 0.0, 0.0])
                 .unwrap()
         );
 
@@ -2142,56 +1754,47 @@ mod tests {
             execution_backend: ExecutionBackend::CandleCpu,
             quantization: "test-none".to_string(),
         };
-        let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
-        let cgid = s.ensure_content_generation(&fp, "sel").unwrap();
+        let vsid = fp.vector_space_id();
+        let cgid = fp.content_generation_id("sel");
         let hash = crate::identity::content_hash("body");
-        s.put_embedding_v2(&vsid, &hash, &[1.0, 0.0]).unwrap();
+        s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0])
+            .unwrap();
         s.add_occurrence(
             "occ-1", "unit-1", &vsid, &hash, "repo", "rev", "gen", &cgid, "{}",
         )
         .unwrap();
-        s.queue_v2_enqueue("occ-1", 0.5).unwrap();
+        s.queue_enqueue("occ-1", 0.5).unwrap();
 
         // Worker A claims with a 1 ms lease.
-        let token_a = s.queue_v2_claim("occ-1", "worker-a", 1).unwrap().unwrap();
+        let token_a = s.queue_claim("occ-1", "worker-a", 1).unwrap().unwrap();
         // While A's lease is valid, worker B cannot claim.
         assert!(
-            s.queue_v2_claim("occ-1", "worker-b", 60_000)
+            s.queue_claim("occ-1", "worker-b", 60_000)
                 .unwrap()
                 .is_none()
         );
         // A can heartbeat with its token.
-        assert!(
-            s.queue_v2_heartbeat("occ-1", "worker-a", token_a, 1)
-                .unwrap()
-        );
+        assert!(s.queue_heartbeat("occ-1", "worker-a", token_a, 1).unwrap());
 
         // Lease expires (1 ms) → B reclaims with a NEW fencing token.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let reclaimed = s.queue_v2_reclaim_expired().unwrap();
+        let reclaimed = s.queue_reclaim_expired().unwrap();
         assert_eq!(reclaimed, 1);
-        let token_b = s
-            .queue_v2_claim("occ-1", "worker-b", 60_000)
-            .unwrap()
-            .unwrap();
+        let token_b = s.queue_claim("occ-1", "worker-b", 60_000).unwrap().unwrap();
         assert!(token_b > token_a, "reclaim must bump the fencing token");
 
         // Stale worker A: heartbeat and completion must both be rejected.
-        assert!(
-            !s.queue_v2_heartbeat("occ-1", "worker-a", token_a, 1)
-                .unwrap()
-        );
-        assert!(!s.queue_v2_complete("occ-1", "worker-a", token_a).unwrap());
+        assert!(!s.queue_heartbeat("occ-1", "worker-a", token_a, 1).unwrap());
+        assert!(!s.queue_complete("occ-1", "worker-a", token_a).unwrap());
 
         // Current worker B completes with its token.
-        assert!(s.queue_v2_complete("occ-1", "worker-b", token_b).unwrap());
-        let (_, _, done, _) = s.queue_v2_counts().unwrap();
-        assert_eq!(done, 1);
+        assert!(s.queue_complete("occ-1", "worker-b", token_b).unwrap());
+        assert_eq!(s.queue_counts().unwrap().done, 1);
     }
 
     /// r02: a stale fencing token must not be able to commit through
-    /// `commit_v2_batch` either — not just the narrower single-row
-    /// `queue_v2_complete`. Simulates "server death after inference but
+    /// `commit_batch` either — not just the narrower single-row
+    /// `queue_complete`. Simulates "server death after inference but
     /// before commit": worker A claims, its lease expires (server died),
     /// worker B reclaims and completes first; A's late commit attempt with
     /// its old token must be silently dropped, not accepted and not an
@@ -2212,29 +1815,26 @@ mod tests {
             execution_backend: ExecutionBackend::CandleCpu,
             quantization: "test-none".to_string(),
         };
-        let vsid = s.ensure_vector_space(&fp, "q8_0").unwrap();
-        let cgid = s.ensure_content_generation(&fp, "sel").unwrap();
+        let vsid = fp.vector_space_id();
+        let cgid = fp.content_generation_id("sel");
         let hash = crate::identity::content_hash("body");
         s.add_occurrence(
             "occ-1", "unit-1", &vsid, &hash, "repo", "rev", "gen", &cgid, "{}",
         )
         .unwrap();
-        s.queue_v2_enqueue("occ-1", 0.5).unwrap();
+        s.queue_enqueue("occ-1", 0.5).unwrap();
 
         // Worker A claims with an already-expired lease (simulates a server
         // that died mid-inference: the lease clock ran out before it could
         // commit).
-        let token_a = s.queue_v2_claim("occ-1", "worker-a", -1).unwrap().unwrap();
-        let reclaimed = s.queue_v2_reclaim_expired().unwrap();
+        let token_a = s.queue_claim("occ-1", "worker-a", -1).unwrap().unwrap();
+        let reclaimed = s.queue_reclaim_expired().unwrap();
         assert_eq!(reclaimed, 1, "A's expired lease must be reclaimable");
-        let token_b = s
-            .queue_v2_claim("occ-1", "worker-b", 60_000)
-            .unwrap()
-            .unwrap();
+        let token_b = s.queue_claim("occ-1", "worker-b", 60_000).unwrap().unwrap();
         assert!(token_b > token_a);
 
         // B completes normally.
-        let entry_b = V2CommitEntry {
+        let entry_b = CommitEntry {
             occurrence_id: "occ-1".into(),
             owner: "worker-b".into(),
             fencing_token: token_b,
@@ -2249,7 +1849,7 @@ mod tests {
             vector: vec![1.0, 0.0],
         };
         let committed = s
-            .commit_v2_batch(std::slice::from_ref(&entry_b), 1, "sel-v1")
+            .commit_batch(std::slice::from_ref(&entry_b), 1, "sel-v1")
             .unwrap();
         assert_eq!(committed, vec!["occ-1".to_string()]);
 
@@ -2260,7 +1860,7 @@ mod tests {
         entry_a.owner = "worker-a".into();
         entry_a.fencing_token = token_a;
         entry_a.vector = vec![9.0, 9.0]; // a divergent/late result
-        let committed_stale = s.commit_v2_batch(&[entry_a], 1, "sel-v1").unwrap();
+        let committed_stale = s.commit_batch(&[entry_a], 1, "sel-v1").unwrap();
         assert!(
             committed_stale.is_empty(),
             "stale-token commit must not be accepted"
@@ -2272,8 +1872,11 @@ mod tests {
             vec![1.0, 0.0],
             "no duplicate/overwritten canonical vector from the stale commit"
         );
-        let (_, _, done, _) = s.queue_v2_counts().unwrap();
-        assert_eq!(done, 1, "exactly one completion, not two");
+        assert_eq!(
+            s.queue_counts().unwrap().done,
+            1,
+            "exactly one completion, not two"
+        );
     }
 
     fn rec(unit: &str, vec: Vec<f32>) -> EmbeddingRecord {
@@ -2309,74 +1912,6 @@ mod tests {
     }
 
     #[test]
-    fn vectors_for_contents_returns_stored_vectors_by_hash() {
-        let s = SemanticStore::open_in_memory().unwrap();
-        let r1 = rec("u1", vec![1.0, 0.0]);
-        let r2 = rec("u2", vec![0.0, 1.0]);
-        let h1 = r1.content_hash.clone();
-        let h2 = r2.content_hash.clone();
-        let dim = r1.dim;
-        s.put(&r1).unwrap();
-        s.put(&r2).unwrap();
-
-        let got = s
-            .vectors_for_contents(
-                "hashing",
-                "hashed-ngram-v1",
-                dim,
-                &[h1.clone(), h2.clone(), "absent".to_string()],
-            )
-            .unwrap();
-        assert_eq!(got.get(&h1).map(Vec::as_slice), Some(&[1.0, 0.0][..]));
-        assert_eq!(got.get(&h2).map(Vec::as_slice), Some(&[0.0, 1.0][..]));
-        assert!(!got.contains_key("absent"));
-
-        // A different dim must NOT match: a stale 256-dim row can never
-        // satisfy a 1024-dim request after a dimension override change.
-        let wrong_dim = s
-            .vectors_for_contents(
-                "hashing",
-                "hashed-ngram-v1",
-                dim + 1,
-                std::slice::from_ref(&h1),
-            )
-            .unwrap();
-        assert!(wrong_dim.is_empty());
-        // Nor a different model.
-        let wrong_model = s
-            .vectors_for_contents("hashing", "other-model", dim, std::slice::from_ref(&h1))
-            .unwrap();
-        assert!(wrong_model.is_empty());
-    }
-
-    #[test]
-    fn put_batch_and_mark_done_persists_records_and_updates_queue() {
-        let s = SemanticStore::open_in_memory().unwrap();
-        s.queue_enqueue(&["u1".into(), "u2".into()], 1.0).unwrap();
-        let items = s.queue_take_batch(2).unwrap();
-        assert_eq!(items.len(), 2);
-
-        let records = vec![rec("u1", vec![1.0, 0.0]), rec("u2", vec![0.0, 1.0])];
-        s.put_batch_and_mark_done(&records).unwrap();
-
-        let got1 = s
-            .lookup("u1", "hashing", "hashed-ngram-v1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(got1.vector, vec![1.0, 0.0]);
-        let got2 = s
-            .lookup("u2", "hashing", "hashed-ngram-v1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(got2.vector, vec![0.0, 1.0]);
-
-        let counts = s.queue_counts().unwrap();
-        assert_eq!(counts.get(Q_DONE), Some(&2));
-        assert_eq!(counts.get(Q_INFLIGHT).copied().unwrap_or(0), 0);
-        assert_eq!(counts.get(Q_PENDING).copied().unwrap_or(0), 0);
-    }
-
-    #[test]
     fn purge_inactive_models_keeps_active_pair() {
         let s = SemanticStore::open_in_memory().unwrap();
         s.put(&rec("keep", vec![1.0])).unwrap();
@@ -2391,32 +1926,39 @@ mod tests {
     }
 
     #[test]
-    fn queue_lifecycle_and_crash_reset() {
+    fn database_from_another_schema_is_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("semantic.db");
         {
-            let s = SemanticStore::open(&path).unwrap();
-            s.queue_enqueue(&["a".into(), "b".into()], 0.9).unwrap();
-            let batch = s.queue_take_batch(1).unwrap();
-            assert_eq!(batch[0].retrieval_unit_id, "a");
-            // crash before marking done: "a" stays INFLIGHT on disk
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sem_schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER);
+                 INSERT INTO sem_schema_migrations VALUES ('0001_initial', 0), ('0002_identity_leases', 0);
+                 CREATE TABLE sem_queue (retrieval_unit_id TEXT PRIMARY KEY, state TEXT);
+                 CREATE TABLE sem_vector_spaces (vector_space_id TEXT PRIMARY KEY);
+                 CREATE TABLE sem_learned_tuning (tuning_key_hash TEXT PRIMARY KEY);",
+            )
+            .unwrap();
         }
-        {
-            let s = SemanticStore::open(&path).unwrap(); // reopen after "crash"
-            let counts = s.queue_counts().unwrap();
-            assert_eq!(
-                counts.get(Q_INFLIGHT).copied().unwrap_or(0),
-                0,
-                "inflight work must be gone after recovery"
-            );
-            assert_eq!(counts.get(Q_PENDING), Some(&2), "inflight rescheduled");
-            s.queue_mark_done("a").unwrap();
-            s.queue_mark_failed("b", 3).unwrap();
-            s.queue_mark_failed("b", 3).unwrap();
-            s.queue_mark_failed("b", 3).unwrap();
-            let counts = s.queue_counts().unwrap();
-            assert_eq!(counts.get(Q_FAILED), Some(&1));
-        }
+        let s = SemanticStore::open(&path).unwrap();
+        let conn = s.guard().unwrap();
+        let old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('sem_queue', 'sem_vector_spaces', 'sem_learned_tuning')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "tables from another schema must be gone");
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM sem_schema_migrations")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["0001_initial"]);
     }
 
     // -----------------------------------------------------------------------
@@ -2591,38 +2133,6 @@ mod tests {
     }
 
     #[test]
-    fn learned_tuning_store_roundtrip_and_invalidation() {
-        let store = SemanticStore::open_in_memory().unwrap();
-        let key = crate::learned_tuning::TuningKey {
-            cpu_architecture: "x86_64".into(),
-            os_name: "windows".into(),
-            model_id: "qwen3-embedding-0.6b".into(),
-            model_revision: "pinned_sha".into(),
-            dimension: 1024,
-            runtime_version: "0.1.0".into(),
-        };
-
-        // None initially
-        assert!(store.read_learned_tuning(&key).unwrap().is_none());
-
-        // Save tuning
-        let rec = crate::learned_tuning::LearnedTuningRecord::new(key.clone(), 4, 32, 4, 210.0);
-        store.save_learned_tuning(&rec).unwrap();
-
-        // Read back
-        let read = store.read_learned_tuning(&key).unwrap().unwrap();
-        assert_eq!(read.recommended_lanes, 4);
-        assert_eq!(read.recommended_batch_size, 32);
-        assert_eq!(read.recommended_cpu_threads, 4);
-        assert!((read.observed_chunks_per_sec - 210.0).abs() < 1e-3);
-
-        // Invalidate
-        let invalidated = store.invalidate_learned_tuning(&key).unwrap();
-        assert!(invalidated);
-        assert!(store.read_learned_tuning(&key).unwrap().is_none());
-    }
-
-    #[test]
     fn empty_db_initializes_exact_final_schema() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_semantic.db");
@@ -2635,12 +2145,8 @@ mod tests {
         let expected_tables = [
             "sem_schema_migrations",
             "sem_embeddings",
-            "sem_queue",
             "sem_query_demand",
             "sem_generations",
-            "sem_learned_tuning",
-            "sem_vector_spaces",
-            "sem_content_generations",
             "sem_embeddings_v2",
             "sem_embedding_occurrences",
             "sem_queue_v2",
@@ -2678,7 +2184,6 @@ mod tests {
             "idx_sem_embeddings_gen",
             "idx_sem_embeddings_gen_repo",
             "idx_sem_embeddings_model_repo",
-            "idx_sem_queue_state",
             "idx_sem_gen_status",
             "idx_sem_occ_unit",
             "idx_sem_occ_canonical",
@@ -2706,7 +2211,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 2, "0001 + 0002 must both be recorded");
+        assert_eq!(migration_count, 1, "only the baseline is recorded");
 
         let mut stmt = conn
             .prepare("SELECT id FROM sem_schema_migrations ORDER BY id")
@@ -2716,7 +2221,17 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert_eq!(ids, vec!["0001_initial", "0002_identity_leases"]);
+        assert_eq!(ids, vec!["0001_initial"]);
+        for gone in ["sem_vector_spaces", "sem_content_generations", "sem_queue"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    params![gone],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "{gone} must not exist");
+        }
     }
 
     #[test]
@@ -2733,7 +2248,7 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(count, 2);
+            assert_eq!(count, 1);
         }
 
         // Second open on existing database
@@ -2746,7 +2261,7 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(count, 2);
+            assert_eq!(count, 1);
         }
     }
 }

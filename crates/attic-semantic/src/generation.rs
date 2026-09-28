@@ -10,8 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SemanticError;
-#[allow(unused_imports)] // ExecutionBackend used by tests via super::*
-use crate::provider::{EmbeddingFingerprint, ExecutionBackend};
+use crate::provider::EmbeddingFingerprint;
 
 /// Operational status of a semantic generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,46 +255,12 @@ impl GenerationManager {
 
         Self::get_active_generation(conn)
     }
-
-    /// Prune old superseded and rolled back generations according to bounded retention policy.
-    pub fn prune_old_generations(
-        conn: &mut Connection,
-        keep_max: usize,
-    ) -> Result<usize, SemanticError> {
-        let tx = conn.transaction()?;
-
-        // Find IDs of superseded/rolled-back generations beyond keep_max
-        let mut stmt = tx.prepare(
-            "SELECT generation_id FROM sem_generations \
-             WHERE status IN ('SUPERSEDED', 'ROLLEDBACK') \
-             ORDER BY generation_id DESC LIMIT -1 OFFSET ?1",
-        )?;
-        let rows = stmt.query_map(params![keep_max as i64], |r| r.get::<_, i64>(0))?;
-        let to_prune: Vec<i64> = rows.filter_map(Result::ok).collect();
-        drop(stmt);
-
-        let count = to_prune.len();
-        for gen_id in to_prune {
-            // Delete vectors belonging to this generation
-            tx.execute(
-                "DELETE FROM sem_embeddings WHERE generation_id = ?1",
-                params![gen_id],
-            )?;
-            // Mark or delete generation row
-            tx.execute(
-                "DELETE FROM sem_generations WHERE generation_id = ?1",
-                params![gen_id],
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ExecutionBackend;
 
     fn test_fingerprint(model: &str) -> EmbeddingFingerprint {
         EmbeddingFingerprint {

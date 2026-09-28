@@ -23,7 +23,7 @@
 //! Everything else remains `SYNTACTIC` with an honest confidence ≤ 0.6.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use attic_analyzers::{Analyzer, GenericAnalyzer, ImportSpec, ResolutionLevel};
@@ -231,8 +231,6 @@ pub(crate) struct ResolverDeps<'a> {
 }
 
 pub(crate) struct StructuralPipeline {
-    #[allow(dead_code)]
-    repo_root: PathBuf,
     known_paths: BTreeSet<String>,
     go_module_prefix: Option<String>,
     files: Vec<CapturedFile>,
@@ -246,7 +244,6 @@ impl StructuralPipeline {
     pub(crate) fn new(repo_root: &Path, known_paths: BTreeSet<String>) -> Self {
         let go_module_prefix = read_go_module_prefix(repo_root);
         Self {
-            repo_root: repo_root.to_path_buf(),
             known_paths,
             go_module_prefix,
             files: Vec::new(),

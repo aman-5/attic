@@ -1,11 +1,8 @@
-//! Fix 1 integration gate: shared daemon per database, thin relay clients
-//! (`crates/attic-server/src/daemon.rs`).
+//! Integration gate for the process model: one shared daemon per database,
+//! thin relay clients (`crates/attic-server/src/daemon.rs`).
 //!
-//! Unlike `rmcp_stdio_integration.rs` (which forces `ATTIC_NO_DAEMON=1` so it
-//! keeps exercising the legacy single-process path unaffected by this
-//! change), every test here spawns real child `attic-server` processes with
-//! daemon mode ON, pointed at the same isolated `ATTIC_HOME`/database, and
-//! asserts:
+//! Every test here spawns real child `attic-server` processes pointed at the
+//! same isolated `ATTIC_HOME`/database, and asserts:
 //!   (a) exactly one process becomes the daemon (holds `attic.lock`) while
 //!       the other(s) become relays,
 //!   (b) both can make MCP tool calls concurrently against the shared state,
@@ -82,8 +79,8 @@ fn attic_home_and_db(tmp: &Path) -> (PathBuf, PathBuf) {
     (home, db)
 }
 
-/// Spawn an attic-server process with daemon mode ON (no `ATTIC_NO_DAEMON`)
-/// against a shared `home`/`db`, and connect an official rmcp client to
+/// Spawn an attic-server process against a shared `home`/`db`, and connect
+/// an official rmcp client to
 /// whatever ends up on the other end of its stdio — a direct daemon
 /// connection if this launch wins the election, or a relay splicing through
 /// to whichever process already won it.
@@ -96,7 +93,7 @@ async fn connect_daemon(
     connect_daemon_with_env(bin, home, db, idle_timeout_ms, &[]).await
 }
 
-/// Spawn an attic-server process with daemon mode ON and optional extra environment variables.
+/// Spawn an attic-server process with optional extra environment variables.
 async fn connect_daemon_with_env(
     bin: &Path,
     home: &Path,
@@ -110,7 +107,6 @@ async fn connect_daemon_with_env(
         .env("ATTIC_SEMANTIC", "0")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
-        .env_remove("ATTIC_NO_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -187,7 +183,6 @@ async fn spawn_raw_child(
         .env("ATTIC_SEMANTIC", "0")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
-        .env_remove("ATTIC_NO_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -259,10 +254,8 @@ async fn raw_initialize(
 }
 
 /// (a) + (b): the second launch against the same database does not hard-fail
-/// (unlike the legacy `ATTIC_NO_DAEMON=1` behavior covered by
-/// `rmcp_stdio_integration.rs`) — instead exactly one process ends up
-/// holding `attic.lock`, and BOTH connections can make MCP tool calls
-/// concurrently against the shared state.
+/// — exactly one process ends up holding `attic.lock`, and BOTH connections
+/// can make MCP tool calls concurrently against the shared state.
 #[tokio::test]
 async fn daemon_and_relay_serve_concurrent_status_calls() {
     let bin = require_bin();
@@ -1263,6 +1256,8 @@ async fn resource_capacity_recovers_gradually() {
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
+    let override_file = home.join("pressure_override");
+    let override_env = override_file.to_str().expect("utf-8 temp path").to_owned();
 
     let mut srv = connect_daemon_with_env(
         &bin,
@@ -1273,6 +1268,7 @@ async fn resource_capacity_recovers_gradually() {
             ("ATTIC_RESOURCE_MODE", "performance"),
             ("ATTIC_FORCE_RESOURCE_PRESSURE", "emergency"),
             ("ATTIC_FAST_RECOVERY_MS", "80"),
+            ("ATTIC_PRESSURE_OVERRIDE_FILE", &override_env),
         ],
     )
     .await;
@@ -1285,7 +1281,6 @@ async fn resource_capacity_recovers_gradually() {
 
     // Switch to normal pressure via file override so the running server
     // de-escalates to normal and begins graduated recovery.
-    let override_file = home.join("pressure_override");
     std::fs::write(&override_file, "normal").expect("write normal override");
 
     // Sample status periodically; verify monotonic capacity progression
@@ -1377,6 +1372,8 @@ async fn combined_pressure_and_daemon_failure_recovers() {
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
+    let override_file = home.join("pressure_override");
+    let override_env = override_file.to_str().expect("utf-8 temp path").to_owned();
 
     // 1. Start primary daemon in Performance mode
     let mut srv1 = connect_daemon_with_env(
@@ -1387,6 +1384,7 @@ async fn combined_pressure_and_daemon_failure_recovers() {
         &[
             ("ATTIC_RESOURCE_MODE", "performance"),
             ("ATTIC_FAST_RECOVERY_MS", "80"),
+            ("ATTIC_PRESSURE_OVERRIDE_FILE", &override_env),
         ],
     )
     .await;
@@ -1401,6 +1399,7 @@ async fn combined_pressure_and_daemon_failure_recovers() {
         &[
             ("ATTIC_RESOURCE_MODE", "performance"),
             ("ATTIC_FAST_RECOVERY_MS", "80"),
+            ("ATTIC_PRESSURE_OVERRIDE_FILE", &override_env),
         ],
     )
     .await;
@@ -1414,7 +1413,6 @@ async fn combined_pressure_and_daemon_failure_recovers() {
     assert_eq!(v0["resource_pressure"]["effective_indexing_heavy_limit"], 8);
 
     // 3. Inject memory pressure (warning) via file override
-    let override_file = home.join("pressure_override");
     std::fs::write(&override_file, "warning").expect("write pressure override");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -1706,7 +1704,6 @@ async fn no_raw_mcp_payloads_in_logs() {
         .env("ATTIC_LOG", "trace")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
-        .env_remove("ATTIC_NO_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -265,14 +265,6 @@ impl ModelAssetManager {
         Ok(target_dir)
     }
 
-    /// Clean up any leftover staging artifacts.
-    pub fn cleanup_staging(&self) {
-        let staging = self.staging_dir();
-        if staging.exists() {
-            let _ = fs::remove_dir_all(staging);
-        }
-    }
-
     /// Verify the ACTIVE snapshot against the pinned manifest (r05).
     /// `MissingFile`/`Offline` are transient (partial or absent download);
     /// `ChecksumMismatch`/`ValidationFailed` are permanent for this content —
