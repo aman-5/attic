@@ -249,7 +249,7 @@ impl Analyzer for AemAnalyzer {
             }
         }
 
-        let mut out = GenericAnalyzer::new().analyze(input);
+        let mut out = self.unit_output(input);
         out.analyzer_id = self.descriptor.name.clone();
         out.analyzer_version = self.descriptor.version.clone();
         out.diagnostics.extend(extraction.diagnostics);
@@ -265,6 +265,55 @@ impl Analyzer for AemAnalyzer {
         };
         out.structurally_complete = extraction.complete;
         out
+    }
+}
+
+impl AemAnalyzer {
+    /// Retrieval units exactly as the file would get without this plugin:
+    /// OSGi `.cfg.json` files keep the JSON analyzer's canonical,
+    /// JSON-pointer-addressed subtree units (falling back to generic chunks
+    /// when the JSON is malformed, as dispatch does); everything else uses
+    /// `GenericAnalyzer`. The plugin only ever adds structure.
+    fn unit_output(&self, input: AnalyzerInput) -> AnalyzerOutput {
+        let is_cfg_json = input.path.file_name().is_some_and(|n| {
+            n.to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".cfg.json")
+        });
+        if self.kind != AemKind::Osgi || !is_cfg_json {
+            return GenericAnalyzer::new().analyze(input);
+        }
+        let retry_bytes = match &input.content {
+            AnalyzerContent::FullBytes(b) => Some(AnalyzerContent::FullBytes(b.clone())),
+            AnalyzerContent::RedactedBytes(b) => Some(AnalyzerContent::RedactedBytes(b.clone())),
+            AnalyzerContent::StreamingHandle(_) => None,
+        };
+        let Some(retry_content) = retry_bytes else {
+            return GenericAnalyzer::new().analyze(input);
+        };
+        let retry_input = AnalyzerInput {
+            file_occurrence_id: input.file_occurrence_id,
+            path: input.path.clone(),
+            content: retry_content,
+            language_hint: input.language_hint.clone(),
+            file_type: input.file_type,
+            size_bytes: input.size_bytes,
+            is_partial_scan: input.is_partial_scan,
+            cancellation_token: input.cancellation_token.clone(),
+            resource_budget: input.resource_budget.clone(),
+        };
+        let json = crate::json::JsonAnalyzer::new().analyze(input);
+        if json.has_errors() {
+            let mut generic = GenericAnalyzer::new().analyze(retry_input);
+            generic.diagnostics.extend(
+                json.diagnostics
+                    .into_iter()
+                    .map(|d| AnalyzerDiagnostic::warning(d.code, d.message)),
+            );
+            generic
+        } else {
+            json
+        }
     }
 }
 
@@ -1408,6 +1457,47 @@ mod tests {
         assert!(!out.structurally_complete);
         assert!(!out.has_errors());
         assert_eq!(qualified(&out), ["com.acme.Svc"]);
+    }
+
+    /// `.cfg.json` keeps exactly the JSON analyzer's retrieval units (canonical
+    /// subtree chunks with JSON-pointer addressing); AEM only adds structure.
+    #[test]
+    fn cfg_json_units_match_the_json_analyzer() {
+        let path = "jcr_root/apps/site/osgiconfig/config/com.acme.Svc.cfg.json";
+        let text = "{\n  \"a\": {\"x\": 1, \"y\": [1, 2, 3]},\n  \"b\": \"value\"\n}\n";
+        let aem = run(AemKind::Osgi, path, text);
+        let json = crate::json::JsonAnalyzer::new().analyze(AnalyzerInput {
+            file_occurrence_id: FileOccurrenceId::new_v4(),
+            path: PathBuf::from(path),
+            content: AnalyzerContent::FullBytes(text.as_bytes().to_vec()),
+            language_hint: None,
+            file_type: FileType::Json,
+            size_bytes: text.len() as u64,
+            is_partial_scan: false,
+            cancellation_token: crate::CancellationToken::default(),
+            resource_budget: ResourceBudget::default(),
+        });
+        let texts = |o: &AnalyzerOutput| -> Vec<String> {
+            o.retrieval_units
+                .iter()
+                .map(|u| u.retrieval_text.clone())
+                .collect()
+        };
+        assert!(!json.retrieval_units.is_empty());
+        assert_eq!(texts(&aem), texts(&json));
+        assert_eq!(
+            qualified(&aem),
+            ["com.acme.Svc", "com.acme.Svc#a", "com.acme.Svc#b"]
+        );
+    }
+
+    /// Malformed `.cfg.json` still yields lexical units via the generic
+    /// fallback, never an error that would fail dispatch.
+    #[test]
+    fn malformed_cfg_json_falls_back_to_generic_units() {
+        let out = run(AemKind::Osgi, "x/com.acme.Broken.cfg.json", "{ not json");
+        assert!(!out.has_errors());
+        assert!(!out.retrieval_units.is_empty());
     }
 
     #[test]

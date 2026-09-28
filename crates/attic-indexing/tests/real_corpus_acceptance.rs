@@ -48,7 +48,17 @@ fn dump_corpus_indexes_completely_with_canonical_dedup() {
 /// configured member — which is what this test exercises.
 ///
 /// r17: exact frozen accounting (plan Phase 8 gate), captured by actually
-/// running this test on 2026-09-27: `repos=20 files=7382 units=71031`. Every
+/// running this test on 2026-09-27: `repos=20 files=7382 units=71031`.
+///
+/// 2026-09-28: re-measured at `repos=20 files=12161 units=95886` after
+/// discovery began indexing FileVault `.content.xml` dot-files (4,779 AEM
+/// JCR content files that were previously skipped as hidden) and the AEM
+/// plugin added structure to them. Every repository's unit count stayed
+/// equal or grew. Note: on this machine the per-repo terminal-state gate
+/// already fails for `impact-analyser` on the pre-change commit (1409da65:
+/// 96 terminal of 105 seen), independent of this change.
+///
+/// Every
 /// intended repository must appear with at least one indexed file — a repo
 /// silently contributing zero files is exactly the "intended repository
 /// disappears silently" failure the gate forbids. If the HDFC workspace
@@ -66,8 +76,8 @@ fn hdfc_workspace_indexes_completely() {
         panic!("corpus not present at {corpus:?}");
     }
     const HDFC_REPO_COUNT: usize = 20;
-    const HDFC_TOTAL_FILES: usize = 7_382;
-    const HDFC_TOTAL_UNITS: usize = 71_031;
+    const HDFC_TOTAL_FILES: usize = 12_161;
+    const HDFC_TOTAL_UNITS: usize = 95_886;
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("attic.db");
