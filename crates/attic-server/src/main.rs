@@ -229,6 +229,126 @@ pub(crate) struct AtticServer {
     watcher_start_failures: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
+/// Map the configured `semantic.device` preference onto the Candle backend
+/// string the supervised worker understands.
+///
+/// Returns a `'static` str because these are protocol tokens, not user text.
+/// An unrecognized config value warns and degrades to `auto` rather than
+/// failing startup — a typo in a performance tunable must never stop the
+/// server from booting.
+///
+/// Note this only expresses the *request*. Whether the device is actually
+/// obtained is decided in the worker process by `attic_semantic::device`,
+/// which falls back to CPU with a logged reason when it cannot be honoured.
+fn candle_backend_from_config(attic_config: &attic_core::AtticConfig) -> &'static str {
+    use attic_semantic::DevicePreference;
+
+    let raw = attic_config.semantic.device.as_deref().unwrap_or("auto");
+    let (pref, warning) = DevicePreference::parse_with_warning(raw);
+    if let Some(w) = warning {
+        tracing::warn!("{w}");
+    }
+
+    let pref = match pref {
+        // Resolve `auto` to the backend that actually exists for this
+        // platform, so the requested backend string is honest rather than a
+        // placeholder the worker has to reinterpret.
+        DevicePreference::Auto => {
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                DevicePreference::Metal
+            } else if cfg!(any(target_os = "linux", target_os = "windows")) {
+                DevicePreference::Cuda
+            } else {
+                DevicePreference::Cpu
+            }
+        }
+        explicit => explicit,
+    };
+
+    match pref {
+        DevicePreference::Cuda => "candle-cuda",
+        DevicePreference::Metal => "candle-metal",
+        _ => "candle-cpu",
+    }
+}
+
+/// Explain, in one honest sentence, why the process is (or is not) able to
+/// use GPU acceleration for embeddings.
+///
+/// This exists because `semantic_identity` previously reported
+/// `backend = "candle-cpu"` alongside `fallback_reason = null`, which reads
+/// as "CPU was chosen deliberately" when the truth was "no GPU provider was
+/// ever compiled in, so there was nothing to fall back *from*". A machine
+/// with a perfectly capable GPU therefore looked correctly configured while
+/// running ~195x slower than it could, with nothing in the status output
+/// pointing at the cause.
+///
+/// GPU acceleration needs BOTH conditions; this reports exactly which one
+/// is unmet so the answer is never ambiguous again.
+fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::Value {
+    let compiled = cfg!(feature = "ort-directml");
+
+    let configured_dir = attic_config
+        .semantic
+        .onnx_model_dir
+        .clone()
+        .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok());
+
+    let assets_present = configured_dir.as_ref().is_some_and(|d| {
+        let p = Path::new(d);
+        p.join("model_fp16.onnx").is_file() && p.join("tokenizer.json").is_file()
+    });
+
+    // Only DirectML has a real provider behind it today. The `CandleCuda`,
+    // `CandleMetal` and `OrtCoreMl` enum variants exist in
+    // `ExecutionBackend` but are never constructed by any code path, so
+    // claiming GPU support on Linux/macOS here would be a lie.
+    let platform_supported = cfg!(target_os = "windows");
+
+    let status = if !platform_supported {
+        "unsupported_platform"
+    } else if !compiled {
+        "not_compiled"
+    } else if configured_dir.is_none() {
+        "not_configured"
+    } else if !assets_present {
+        "assets_missing"
+    } else {
+        "available"
+    };
+
+    let explanation = match status {
+        "unsupported_platform" => format!(
+            "GPU acceleration is not implemented for this platform ({}); \
+             only the Windows ort-directml backend exists today, so embeddings run on CPU",
+            std::env::consts::OS
+        ),
+        "not_compiled" => "this binary was built without the 'ort-directml' feature, so no GPU \
+             provider exists in it; rebuild with --features ort-directml to enable GPU"
+            .to_string(),
+        "not_configured" => "GPU support is compiled in, but no ONNX model directory is set; \
+             set [semantic] onnx_model_dir in attic.toml (or ATTIC_ONNX_MODEL_DIR) to a \
+             directory containing model_fp16.onnx and tokenizer.json"
+            .to_string(),
+        "assets_missing" => format!(
+            "GPU support is compiled in and a model directory is set ({}), but it does not \
+             contain both model_fp16.onnx and tokenizer.json",
+            configured_dir.clone().unwrap_or_default()
+        ),
+        _ => "GPU acceleration is compiled in, configured, and its model assets are present"
+            .to_string(),
+    };
+
+    json!({
+        "status": status,
+        "explanation": explanation,
+        "compiled_with_gpu_support": compiled,
+        "platform_has_gpu_backend": platform_supported,
+        "onnx_model_dir": configured_dir,
+        "onnx_assets_present": assets_present,
+    })
+}
+
 /// Phase 9: decide which `SemanticProvider` to actually construct.
 ///
 /// Reconstructs the configured semantic provider for Attic.
@@ -300,6 +420,21 @@ fn resolve_semantic_provider(
             None,
         )
     };
+
+    // The PRIMARY candle provider honours `semantic.device` (auto/cpu/cuda/
+    // metal). Kept separate from `cpu_provider` above on purpose: that one is
+    // the DirectML fallback *target* and must stay strictly CPU, otherwise a
+    // GPU failure would "fall back" onto another GPU path.
+    let configured_backend = candle_backend_from_config(attic_config);
+    let candle_provider = |dir: &Path| {
+        supervised_provider(
+            configured_backend,
+            dir,
+            batch_size,
+            attic_config.semantic.dimension,
+            None,
+        )
+    };
     let cpu_dir = candidate_dirs.iter().find(|dir| {
         let mgr = attic_semantic::ModelAssetManager::new(
             dir,
@@ -313,10 +448,20 @@ fn resolve_semantic_provider(
 
     // Phase 4: prefer the ORT/DirectML GPU provider when a local ONNX model
     // directory is configured/present — measured ~195× faster than the candle
-    // CPU path on an RTX A500 (3,130 vs 16 tok/s). Set ATTIC_ONNX_MODEL_DIR
-    // to a directory containing model_fp16.onnx + tokenizer.json to enable.
+    // CPU path on an RTX A500 (3,130 vs 16 tok/s).
+    //
+    // Configuration precedence: `[semantic] onnx_model_dir` in attic.toml
+    // first, then the legacy `ATTIC_ONNX_MODEL_DIR` environment variable.
+    // The env var used to be the ONLY way to enable this and was documented
+    // nowhere, which is why real GPUs sat idle with no explanation. See
+    // `gpu_capability_report` for the status surfaced to users.
     #[cfg(feature = "ort-directml")]
-    if let Ok(onnx_dir) = std::env::var("ATTIC_ONNX_MODEL_DIR") {
+    if let Some(onnx_dir) = attic_config
+        .semantic
+        .onnx_model_dir
+        .clone()
+        .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok())
+    {
         let dir = PathBuf::from(onnx_dir);
         if dir.join("model_fp16.onnx").is_file() && dir.join("tokenizer.json").is_file() {
             let gpu = supervised_provider(
@@ -350,8 +495,11 @@ fn resolve_semantic_provider(
     }
 
     if let Some(dir) = cpu_dir {
-        tracing::info!("Qwen3 assets present; using supervised candle-cpu worker");
-        return cpu_provider(dir);
+        tracing::info!(
+            backend = configured_backend,
+            "Qwen3 assets present; using supervised candle worker"
+        );
+        return candle_provider(dir);
     }
 
     tracing::warn!(
@@ -365,6 +513,7 @@ fn resolve_semantic_provider(
         model_cache_dir.to_path_buf(),
         batch_size,
         attic_config.semantic.dimension,
+        configured_backend,
     );
     deferred
 }
@@ -410,6 +559,7 @@ fn spawn_model_download_task(
     cache_dir: PathBuf,
     batch_size: usize,
     dimension: Option<usize>,
+    backend: &'static str,
 ) {
     use attic_semantic::ModelLifecycle;
     let task_deferred = deferred.clone();
@@ -441,7 +591,7 @@ fn spawn_model_download_task(
                         match mgr.verify_active_snapshot() {
                             Ok(_) => {
                                 deferred.swap_in(supervised_provider(
-                                    "candle-cpu",
+                                    backend,
                                     &cache_dir,
                                     batch_size,
                                     dimension,
@@ -2525,6 +2675,10 @@ fn handle_status(
             // `fallback_reason`). `None` (never fabricated) when this
             // provider never fell back — see `attic_semantic::fallback`.
             "fallback_reason": stack.provider.fallback_reason(),
+            // Why this process can or cannot use a GPU. Always populated,
+            // so "backend": "candle-cpu" is never ambiguous about whether
+            // CPU was a deliberate choice or an unreported capability gap.
+            "gpu": gpu_capability_report(phase8.attic_config),
         });
     }
 

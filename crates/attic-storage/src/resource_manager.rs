@@ -1210,13 +1210,28 @@ pub enum ResourceAdvisory {
     Restricted,
 }
 
+impl ResourceAdvisory {
+    /// Map a [`ResourcePressure`] tier onto its advisory.
+    ///
+    /// Note that `Restricted` deliberately covers BOTH Critical and
+    /// Emergency, so it answers "should new expensive work be refused?" —
+    /// NOT "should all background work stop?". Those are different
+    /// questions: Critical still grants a reduced embedding budget (see
+    /// `adaptive_embedding_limit`/`adaptive_embedding_batch`), and gating
+    /// dispatch on this advisory instead of on the budget starves that work
+    /// completely. Use `ResourceMonitor::is_emergency` for a true stop.
+    pub fn from_pressure(pressure: ResourcePressure) -> Self {
+        match pressure {
+            ResourcePressure::Normal => Self::Ok,
+            ResourcePressure::Warning => Self::Degraded,
+            ResourcePressure::Critical | ResourcePressure::Emergency => Self::Restricted,
+        }
+    }
+}
+
 /// Compute the [`ResourceAdvisory`] for the given monitor.
 pub fn current_advisory(monitor: &ResourceMonitor) -> ResourceAdvisory {
-    match monitor.pressure() {
-        ResourcePressure::Normal => ResourceAdvisory::Ok,
-        ResourcePressure::Warning => ResourceAdvisory::Degraded,
-        ResourcePressure::Critical | ResourcePressure::Emergency => ResourceAdvisory::Restricted,
-    }
+    ResourceAdvisory::from_pressure(monitor.pressure())
 }
 
 // ── ResourceConfig ────────────────────────────────────────────────────────

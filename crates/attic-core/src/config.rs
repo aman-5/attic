@@ -79,6 +79,43 @@ pub struct SemanticConfig {
     /// 256 KiB.
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
+    /// Directory containing a local ONNX export (`model_fp16.onnx` +
+    /// `tokenizer.json`) used by the GPU execution backend.
+    ///
+    /// GPU acceleration requires BOTH of the following, and silently stays
+    /// on CPU if either is missing:
+    ///  1. a binary compiled with the `ort-directml` feature, and
+    ///  2. this directory (or the `ATTIC_ONNX_MODEL_DIR` environment
+    ///     variable, which this setting takes precedence over).
+    ///
+    /// This was previously env-var-only and completely undocumented, so a
+    /// machine with a perfectly good GPU reported `backend = "candle-cpu"`
+    /// with no indication of what was missing. `semantic_identity` now
+    /// always explains which of the two conditions failed.
+    #[serde(default)]
+    pub onnx_model_dir: Option<String>,
+
+    /// Which device to run embedding inference on.
+    ///
+    /// Accepted values: `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`.
+    /// An unrecognized value logs a warning and falls back to `"auto"`
+    /// rather than blocking startup.
+    ///
+    /// | Value    | Effect                                                    |
+    /// |----------|-----------------------------------------------------------|
+    /// | `auto`   | Metal on Apple Silicon, CUDA on Linux/Windows, else CPU   |
+    /// | `cpu`    | Force CPU even when a GPU is present                      |
+    /// | `cuda`   | Require NVIDIA; falls back to CPU with a logged reason    |
+    /// | `metal`  | Require Apple Silicon; falls back to CPU with a reason    |
+    ///
+    /// GPU backends must also be compiled in (`candle-cuda` / `candle-metal`
+    /// cargo features). When they are not, the selected device reports
+    /// exactly that instead of silently using CPU.
+    ///
+    /// Note: AMD GPUs are not supported by the Candle backend on Linux —
+    /// Candle has no ROCm device. AMD hosts run on CPU, and say so.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 impl Default for SemanticConfig {
@@ -89,6 +126,8 @@ impl Default for SemanticConfig {
             dimension: None,
             exclude_globs: Vec::new(),
             max_file_bytes: None,
+            onnx_model_dir: None,
+            device: None,
         }
     }
 }

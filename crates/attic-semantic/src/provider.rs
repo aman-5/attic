@@ -153,14 +153,23 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Execution backend that produced a vector — TELEMETRY ONLY (Final Master
 /// Plan identity split). Two backends may write to the same vector space only
 /// after measured parity; the backend itself never participates in identity.
+///
+/// Every variant here is reachable. `OrtCoreMl` was removed: nothing ever
+/// constructed it, and its presence implied macOS GPU support that did not
+/// exist. Intel Macs (Radeon/Iris) are intentionally not a GPU target — they
+/// resolve to `CandleCpu` like any other unsupported device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBackend {
+    /// CPU via Candle. Always available, on every platform.
     CandleCpu,
+    /// NVIDIA GPU via Candle CUDA — Linux and Windows, `candle-cuda` feature.
     CandleCuda,
+    /// Apple Silicon GPU via Candle Metal — macOS aarch64, `candle-metal`.
     CandleMetal,
+    /// Any DX12 GPU (NVIDIA/AMD/Intel) via ONNX Runtime DirectML — Windows,
+    /// `ort-directml` feature.
     OrtDirectMl,
-    OrtCoreMl,
     Hashing,
     #[default]
     Unknown,
@@ -173,10 +182,18 @@ impl ExecutionBackend {
             Self::CandleCuda => "candle-cuda",
             Self::CandleMetal => "candle-metal",
             Self::OrtDirectMl => "ort-directml",
-            Self::OrtCoreMl => "ort-coreml",
             Self::Hashing => "hashing",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// Whether this backend runs on a GPU. Used by status reporting to answer
+    /// "is my GPU being used?" without callers pattern-matching variants.
+    pub fn is_gpu(&self) -> bool {
+        matches!(
+            self,
+            Self::CandleCuda | Self::CandleMetal | Self::OrtDirectMl
+        )
     }
 }
 

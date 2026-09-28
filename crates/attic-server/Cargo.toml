@@ -38,7 +38,12 @@ tempfile.workspace = true
 
 
 [features]
-# GPU semantic backend via ONNX Runtime DirectML (Windows; no CUDA toolkit).
-# Build with: cargo build -p attic-server --features ort-directml
+# GPU semantic backends.
+#   ort-directml : any DX12 GPU on Windows (NVIDIA/AMD/Intel), no CUDA toolkit.
+#   candle-cuda  : NVIDIA on Linux and Windows (requires the CUDA toolkit).
+#   candle-metal : Apple Silicon macOS.
+# Build e.g.: cargo build -p attic-server --features candle-metal
 default = []
 ort-directml = ["attic-semantic/ort-directml"]
+candle-cuda = ["attic-semantic/candle-cuda"]
+candle-metal = ["attic-semantic/candle-metal"]

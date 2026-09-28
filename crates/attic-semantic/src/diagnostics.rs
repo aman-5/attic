@@ -29,6 +29,15 @@ pub struct SemanticProgressSnapshot {
     pub batch_latency_ms: f64,
     /// Estimated time to drain queue in seconds, if throughput > 0.
     pub eta_seconds: Option<u64>,
+    /// Why `eta_seconds` is `None`, in plain language.
+    ///
+    /// A null ETA with no explanation is the least useful thing a progress
+    /// API can report: during a long throttle the queue showed
+    /// `eta_seconds: null` for twelve straight minutes, which is
+    /// indistinguishable from "just started" or "hung". Whenever the ETA
+    /// cannot be computed this states the observable reason instead, and it
+    /// is `None` only when `eta_seconds` is actually populated.
+    pub eta_unavailable_reason: Option<String>,
     /// Currently active generation ID serving queries.
     pub active_generation_id: Option<i64>,
     /// Generation ID currently building in background, if any.
@@ -66,6 +75,23 @@ impl SemanticProgressSnapshot {
             None
         };
 
+        // Never report an unexplained null ETA — say what is actually
+        // observable instead.
+        let eta_unavailable_reason = if eta_seconds.is_some() {
+            None
+        } else if inflight > 0 {
+            Some(format!(
+                "{total_depth} item(s) queued and {inflight} in flight, but no batch has \
+                 completed yet, so there is no throughput to extrapolate from; \
+                 see why_slow for the current bottleneck"
+            ))
+        } else {
+            Some(format!(
+                "{total_depth} item(s) queued but no worker has been dispatched yet, so \
+                 throughput is zero; see why_slow for the current bottleneck"
+            ))
+        };
+
         Self {
             queue_pending: pending,
             queue_inflight: inflight,
@@ -76,6 +102,7 @@ impl SemanticProgressSnapshot {
             batches_per_sec,
             batch_latency_ms,
             eta_seconds,
+            eta_unavailable_reason,
             active_generation_id: active_gen,
             building_generation_id: building_gen,
             model_cache_state: model_cache_state.into(),
@@ -285,8 +312,48 @@ mod tests {
         assert!((snapshot.batches_per_sec - 5.0).abs() < 1e-3);
         // ETA: 520 / 50 = 10.4 -> ceil = 11 seconds
         assert_eq!(snapshot.eta_seconds, Some(11));
+        // A computable ETA needs no excuse.
+        assert_eq!(snapshot.eta_unavailable_reason, None);
         assert_eq!(snapshot.active_generation_id, Some(1));
         assert_eq!(snapshot.building_generation_id, Some(2));
+    }
+
+    /// Regression: a blocked queue must explain itself.
+    ///
+    /// During a long throttle the status output reported
+    /// `eta_seconds: null` for twelve consecutive minutes with nothing
+    /// beside it, which is indistinguishable from "just started" or "hung".
+    #[test]
+    fn blocked_queue_explains_why_it_has_no_eta() {
+        // 20 chunks queued, nothing dispatched, zero throughput — exactly
+        // the observed stall shape.
+        let stalled = SemanticProgressSnapshot::compute(20, 0, 0, 0, 0.0, 0.0, Some(1), None, "hot");
+        assert_eq!(stalled.eta_seconds, None);
+        let reason = stalled
+            .eta_unavailable_reason
+            .expect("a null ETA must always carry a reason");
+        assert!(reason.contains("20"), "reason should cite queue depth: {reason}");
+        assert!(
+            reason.contains("why_slow"),
+            "reason should point at the bottleneck diagnostic: {reason}"
+        );
+
+        // Same, but with work claimed and no completions yet.
+        let inflight =
+            SemanticProgressSnapshot::compute(12, 8, 0, 0, 0.0, 0.0, Some(1), None, "loading");
+        assert_eq!(inflight.eta_seconds, None);
+        assert!(
+            inflight
+                .eta_unavailable_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("in flight")),
+            "an inflight stall must be described differently from an undispatched one"
+        );
+
+        // A drained queue is a real answer, not a missing one.
+        let drained = SemanticProgressSnapshot::compute(0, 0, 45, 0, 0.0, 0.0, Some(1), None, "hot");
+        assert_eq!(drained.eta_seconds, Some(0));
+        assert_eq!(drained.eta_unavailable_reason, None);
     }
 
     #[test]

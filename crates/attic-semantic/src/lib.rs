@@ -17,6 +17,7 @@
 
 pub mod cpu_isolation;
 pub mod deferred_provider;
+pub mod device;
 pub mod diagnostics;
 pub mod enrich;
 pub mod error;
@@ -38,6 +39,7 @@ pub mod worker_supervisor;
 
 pub use cpu_isolation::CpuIsolationPlan;
 pub use deferred_provider::{DeferredProvider, ModelLifecycle};
+pub use device::{DevicePreference, ResolvedDevice, UNSUPPORTED_ROCM_REASON};
 pub use diagnostics::{
     DiagnosticContext, SemanticLatencyBreakdown, SemanticProgressSnapshot, WhySlowDiagnostic,
     diagnose_why_slow,

@@ -273,7 +273,15 @@ pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> Embeddin
         },
         _ => EmbeddingFingerprint {
             model_revision: crate::model_assets::ModelManifest::qwen3_default().pinned_revision,
-            execution_backend: ExecutionBackend::CandleCpu,
+            // Telemetry only (not identity-checked — see
+            // `verify_identity_capabilities`). Reported accurately for the
+            // requested device so status output is truthful, while still
+            // permitting a CPU fallback at load time.
+            execution_backend: match backend {
+                "candle-cuda" => ExecutionBackend::CandleCuda,
+                "candle-metal" => ExecutionBackend::CandleMetal,
+                _ => ExecutionBackend::CandleCpu,
+            },
             quantization: "fp32-safetensors".into(),
             ..base
         },
@@ -337,7 +345,22 @@ pub fn verify_identity_capabilities(
         "query_instruction_version",
         &expected.query_instruction_version,
     );
-    check("execution_backend", expected.execution_backend.as_str());
+    // `execution_backend` is deliberately NOT checked.
+    //
+    // It is telemetry (see `provider::ExecutionBackend`), and comparing it
+    // here actively breaks GPU fallback: a host configured for `candle-cuda`
+    // that legitimately degrades to CPU (no NVIDIA device, or a binary built
+    // without the `candle-cuda` feature) reports `candle-cpu`, which would be
+    // rejected as an identity mismatch — turning a graceful, intended
+    // fallback into a total semantic-embedding outage.
+    //
+    // Nothing is weakened by dropping it. The vector spaces that genuinely
+    // must not mix are already separated by fields that ARE checked:
+    //   - CPU/CUDA/Metal all run identical F32 safetensors  -> same space,
+    //     differing only by float non-determinism (a parity question).
+    //   - DirectML is fp16 ONNX                             -> already split
+    //     by `provider` (qwen3-ort), `quantization` (fp16-onnx) and
+    //     `model_revision` (onnx-community-fp16).
     check("quantization", &expected.quantization);
     if mismatches.is_empty() {
         Ok(())
@@ -425,6 +448,56 @@ mod expected_fingerprint_tests {
             !provider.available(),
             "a worker whose load attempt genuinely failed must report unavailable"
         );
+    }
+
+    #[test]
+    fn gpu_request_that_falls_back_to_cpu_is_still_accepted() {
+        // The exact shipping bug this guards: a host configured for CUDA
+        // that has no NVIDIA device (or a binary built without the feature)
+        // loads on CPU and reports `candle-cpu`. If identity verification
+        // compared execution_backend, this would be rejected and semantic
+        // embedding would fail completely rather than degrading.
+        let expected = expected_fingerprint("candle-cuda", Some(1024));
+        assert_eq!(
+            expected.execution_backend,
+            crate::provider::ExecutionBackend::CandleCuda,
+            "the request should still be reported accurately as telemetry"
+        );
+
+        // What the worker actually reports after falling back to CPU.
+        let actual_cpu = expected_fingerprint("candle-cpu", Some(1024));
+        let caps = fingerprint_capabilities(&actual_cpu);
+
+        verify_identity_capabilities(&expected, &caps).expect(
+            "a CUDA request that degrades to CPU must remain identity-compatible: \
+             same weights, same F32 dtype, same vector space",
+        );
+    }
+
+    #[test]
+    fn metal_fallback_to_cpu_is_also_accepted() {
+        let expected = expected_fingerprint("candle-metal", Some(1024));
+        assert_eq!(
+            expected.execution_backend,
+            crate::provider::ExecutionBackend::CandleMetal
+        );
+        let caps = fingerprint_capabilities(&expected_fingerprint("candle-cpu", Some(1024)));
+        verify_identity_capabilities(&expected, &caps)
+            .expect("an Apple Silicon request degrading to CPU must stay compatible");
+    }
+
+    #[test]
+    fn directml_is_still_rejected_against_a_candle_vector_space() {
+        // Dropping the execution_backend check must NOT let genuinely
+        // incompatible spaces mix. fp16 ONNX vectors and fp32 safetensors
+        // vectors are different spaces and are still separated by
+        // provider/quantization/model_revision.
+        let expected = expected_fingerprint("candle-cpu", Some(1024));
+        let caps = fingerprint_capabilities(&expected_fingerprint("ort-directml", Some(1024)));
+        let err = verify_identity_capabilities(&expected, &caps)
+            .expect_err("fp16 ONNX must never be accepted into an fp32 candle space");
+        assert!(err.contains("quantization"), "err: {err}");
+        assert!(err.contains("provider"), "err: {err}");
     }
 
     #[test]

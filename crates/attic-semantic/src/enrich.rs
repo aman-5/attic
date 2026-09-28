@@ -26,6 +26,13 @@ use crate::provider::{
 use crate::selection::{SEMANTIC_SELECTION_VERSION, SelectionConfig};
 use crate::store::SemanticStore;
 
+/// First backoff after the provider reports it is not ready; doubles per
+/// consecutive unready drive up to [`PROVIDER_UNREADY_MAX_SHIFT`].
+const PROVIDER_UNREADY_BASE_BACKOFF_MS: u64 = 250;
+/// Caps the doubling at `250ms << 6` = 16s, so a cold model is waited out
+/// patiently but a recovered one is picked back up promptly.
+const PROVIDER_UNREADY_MAX_SHIFT: u32 = 6;
+
 /// Ensure an active or building generation is ready to receive vectors for this fingerprint.
 /// Returns the generation ID to tag the batch with.
 fn ensure_generation_for_fingerprint(
@@ -115,6 +122,72 @@ pub struct EnrichStats {
     /// How many times an OOM (BudgetExhausted) forced a batch-cap halving
     /// this drive — the adaptive-batching signal (r07).
     pub oom_reductions: u64,
+    /// True when this drive stopped because the provider itself was not
+    /// ready (model loading / cold warm-up / worker restarting) rather than
+    /// because of anything wrong with the work. Every claimed item was
+    /// returned to PENDING WITHOUT burning an attempt; the caller should
+    /// back off and retry rather than treat the queue as failed.
+    pub provider_unready: bool,
+}
+
+/// Classify a provider error as transient infrastructure trouble (the
+/// provider/host is not ready) versus a genuine item-level failure.
+///
+/// This distinction is the difference between "wait for the model to finish
+/// its cold warm-up" and "quarantine this content forever". Treating the
+/// former as the latter is exactly how a whole queue gets burned down on the
+/// first dispatch after a slow model load: the supervisor's own message for
+/// a killed worker even says "it will restart on the next batch", yet the
+/// items it was carrying had already spent an attempt each.
+///
+/// Item-level (returns false) means the content itself is the problem and
+/// retrying it unchanged cannot help:
+/// * `InputTooLarge` / `InputTooManyTokens` — permanent for this body.
+/// * `DimensionMismatch` — the record cannot live in this vector space.
+///
+/// Transient (returns true) means the *provider or host* was not ready, and
+/// the items it was carrying are innocent:
+/// * `ProviderUnavailable` — model loading, assets missing, GPU init failed.
+/// * `EmbeddingFailed` **only** when the message identifies a worker
+///   lifecycle event (deadline exceeded, killed, died, restarting).
+///
+/// That last narrowing matters. An unconditional "all EmbeddingFailed is
+/// transient" rule would make a genuinely broken provider retry forever,
+/// because nothing would ever burn an attempt and the queue could never
+/// reach quarantine. Real inference failures — bad tensor shapes, a corrupt
+/// model, arithmetic faults — still count against the item's attempts and
+/// still quarantine, exactly as before.
+fn is_transient_provider_error(e: &SemanticError) -> bool {
+    match e {
+        SemanticError::InputTooLarge { .. }
+        | SemanticError::InputTooManyTokens { .. }
+        | SemanticError::DimensionMismatch { .. } => false,
+
+        // The provider itself is not up. Nothing about the work is wrong.
+        SemanticError::ProviderUnavailable { .. } => true,
+
+        // Worker lifecycle trouble is reported through this variant by
+        // `worker_supervisor`'s error mapping (WorkerTimeout / WorkerDied).
+        // Match on those markers rather than the whole variant so a real
+        // inference error still quarantines.
+        SemanticError::EmbeddingFailed(msg) => {
+            let m = msg.to_ascii_lowercase();
+            m.contains("deadline")
+                || m.contains("timed out")
+                || m.contains("timeout")
+                || m.contains("killed")
+                || m.contains("died")
+                || m.contains("restart")
+                || m.contains("not ready")
+                || m.contains("loading")
+                || m.contains("warm-up")
+                || m.contains("warmup")
+        }
+
+        // Anything else (store/IO trouble) is environmental, not the item's
+        // fault.
+        _ => true,
+    }
 }
 
 /// Drive the enrichment queue until empty or budget/cancellation bounds hit.
@@ -477,6 +550,20 @@ fn drive_leased(
                 }
             }
             Err(e) => {
+                if is_transient_provider_error(&e) {
+                    // Infrastructure, not content. Return the whole claimed
+                    // batch to PENDING WITHOUT incrementing attempts and stop
+                    // this drive — continuing would march the same cold/dead
+                    // provider through every remaining batch and quarantine
+                    // the entire queue in one pass.
+                    tracing::warn!(
+                        "embedding batch hit a transient provider error ({e}); \
+                         returning batch to PENDING without burning an attempt"
+                    );
+                    reset_all(store, &owner, &token_of);
+                    stats.provider_unready = true;
+                    break;
+                }
                 tracing::warn!("embedding batch failed: {e}");
                 fail_all(store, &owner, &token_of, cfg.max_attempts);
                 stats.failed_items += token_of.len() as u64;
@@ -711,10 +798,32 @@ impl BackgroundEnricher {
                         return;
                     }
                 };
+                // Consecutive transient-infrastructure failures (cold model,
+                // worker restart, store contention). Drives an exponential
+                // backoff so a not-yet-warm provider is waited out instead of
+                // being hammered, WITHOUT burning per-item attempts.
+                let mut infra_backoff_streak: u32 = 0;
                 while !stop2.is_cancelled() {
                     if let Some(monitor) = resource_monitor.as_ref() {
-                        use attic_storage::resource_manager::{ResourceAdvisory, current_advisory};
-                        if matches!(current_advisory(monitor), ResourceAdvisory::Restricted) {
+                        // Only a genuine Emergency halts enrichment outright.
+                        //
+                        // This previously blocked on `ResourceAdvisory::
+                        // Restricted`, which covers Critical AND Emergency —
+                        // directly contradicting `adaptive_embedding_limit`,
+                        // which deliberately grants 1 embedding slot (and a
+                        // quarter batch) at Critical precisely so background
+                        // embedding keeps making slow forward progress. The
+                        // result was total starvation: on any developer
+                        // machine sitting above SYSTEM_CRITICAL_PCT (82% of
+                        // system memory — routine with an IDE and a browser
+                        // open) the queue reported a granted slot yet never
+                        // dispatched a single batch, indefinitely.
+                        //
+                        // Critical now proceeds under the already-reduced
+                        // limit/batch; Emergency (limit 0, batch 0) still
+                        // parks, and `acquire_embedding_heavy_blocking`
+                        // remains the authoritative admission gate below.
+                        if monitor.is_emergency() {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
                         }
@@ -806,12 +915,32 @@ impl BackgroundEnricher {
                     };
 
                     match drive(&conn, &store, provider.as_ref(), drive_cfg, &stop2) {
+                        Ok(s) if s.provider_unready => {
+                            // The provider is not ready yet (model still
+                            // loading / cold warm-up / worker restarting).
+                            // Items were returned to PENDING untouched, so
+                            // back off with a cap and let it warm up.
+                            infra_backoff_streak = infra_backoff_streak.saturating_add(1);
+                            let delay_ms =
+                                PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
+                                    1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
+                                );
+                            tracing::info!(
+                                streak = infra_backoff_streak,
+                                delay_ms,
+                                "semantic provider not ready; queue held PENDING, backing off"
+                            );
+                            std::thread::sleep(jittered(Duration::from_millis(delay_ms)));
+                        }
                         Ok(s) if s.embedded == 0 && !s.cancelled => {
+                            infra_backoff_streak = 0;
                             // Queue drained; idle-poll so we stay responsive to
                             // new enqueues without spinning hot.
                             std::thread::sleep(jittered(Duration::from_millis(50)));
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            infra_backoff_streak = 0;
+                        }
                         Err(e) => {
                             tracing::warn!("background enrichment error: {e}");
                             std::thread::sleep(jittered(Duration::from_millis(200)));
@@ -846,6 +975,120 @@ impl BackgroundEnricher {
             }
         }
         all_joined
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::*;
+    use attic_core::ResourcePressure;
+    use attic_storage::resource_manager::{
+        ResourceAdvisory, adaptive_embedding_batch, adaptive_embedding_limit,
+    };
+
+    #[test]
+    fn a_genuinely_broken_provider_still_quarantines() {
+        // The other half of the contract. If every EmbeddingFailed were
+        // treated as transient, nothing would ever burn an attempt and a
+        // permanently broken provider would retry the same queue forever.
+        // Real inference errors must still count against the item.
+        assert!(!is_transient_provider_error(
+            &SemanticError::EmbeddingFailed("injected failure with 0 completed".into())
+        ));
+        assert!(!is_transient_provider_error(
+            &SemanticError::EmbeddingFailed("tensor shape mismatch in forward pass".into())
+        ));
+        assert!(!is_transient_provider_error(
+            &SemanticError::EmbeddingFailed("matryoshka truncation failed".into())
+        ));
+    }
+
+    /// Regression: a cold/restarting inference worker must NOT quarantine the
+    /// work it was carrying.
+    ///
+    /// Observed in production: after a long throttle the model was cold, the
+    /// first dispatched batch hit the worker deadline, and all 20 queued
+    /// chunks went straight to FAILED. The supervisor maps worker
+    /// timeout/death to `EmbeddingFailed`, which the drive loop's catch-all
+    /// sent to `fail_all`, burning an attempt per item for a problem that had
+    /// nothing to do with the items.
+    #[test]
+    fn worker_and_provider_trouble_is_transient_not_item_failure() {
+        assert!(is_transient_provider_error(&SemanticError::EmbeddingFailed(
+            "inference worker died mid-batch; it will restart on the next batch".into()
+        )));
+        assert!(is_transient_provider_error(&SemanticError::EmbeddingFailed(
+            "inference worker exceeded deadline and was killed".into()
+        )));
+        assert!(is_transient_provider_error(
+            &SemanticError::ProviderUnavailable {
+                provider: "inference-worker".into(),
+                reason: "model assets still loading".into(),
+            }
+        ));
+        assert!(is_transient_provider_error(
+            &SemanticError::StoreUnavailable("mutex poisoned".into())
+        ));
+        assert!(is_transient_provider_error(&SemanticError::Canonical(
+            "database is locked".into()
+        )));
+    }
+
+    /// The complement: content that cannot ever succeed must still be
+    /// quarantined, otherwise a poison item loops forever.
+    #[test]
+    fn content_level_problems_remain_item_failures() {
+        assert!(!is_transient_provider_error(&SemanticError::InputTooLarge {
+            len: 10_000,
+            max: 2_048,
+        }));
+        assert!(!is_transient_provider_error(
+            &SemanticError::InputTooManyTokens {
+                tokens: 900,
+                max: 512,
+            }
+        ));
+        assert!(!is_transient_provider_error(
+            &SemanticError::DimensionMismatch {
+                record: 768,
+                expected: 1024,
+            }
+        ));
+    }
+
+    /// Regression: Critical pressure must throttle embedding, never stop it.
+    ///
+    /// The enrichment loop used to skip its whole body whenever the advisory
+    /// was `Restricted`, which covers Critical AND Emergency. But the
+    /// resource manager deliberately grants a reduced-but-nonzero budget at
+    /// Critical. The two disagreed, so on any machine sitting above the
+    /// system-critical memory threshold the queue reported an available slot
+    /// and still never dispatched anything.
+    ///
+    /// This asserts the budget side of that contract: only Emergency is a
+    /// true stop.
+    #[test]
+    fn critical_pressure_still_grants_a_reduced_embedding_budget() {
+        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Critical), 1);
+        assert_eq!(adaptive_embedding_batch(16, ResourcePressure::Critical), 4);
+
+        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Emergency), 0);
+        assert_eq!(adaptive_embedding_batch(16, ResourcePressure::Emergency), 0);
+    }
+
+    /// Critical maps to the same advisory as Emergency, which is precisely
+    /// why gating enrichment on the advisory was wrong. Pinning this keeps
+    /// the old bug from being reintroduced as a "simplification".
+    #[test]
+    fn restricted_advisory_covers_critical_so_it_cannot_gate_dispatch() {
+        assert_eq!(
+            ResourceAdvisory::from_pressure(ResourcePressure::Critical),
+            ResourceAdvisory::Restricted
+        );
+        assert_eq!(
+            ResourceAdvisory::from_pressure(ResourcePressure::Emergency),
+            ResourceAdvisory::Restricted
+        );
     }
 }
 

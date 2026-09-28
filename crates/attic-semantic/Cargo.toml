@@ -39,6 +39,21 @@ ndarray = { version = "0.17", optional = true }
 default = []
 ort-directml = ["dep:ort", "dep:half", "dep:ndarray"]
 
+# Candle GPU backends. These enable real `Device::new_cuda` /
+# `Device::new_metal` support; without them Candle still compiles those calls
+# but returns `NotCompiledWith*Support` at runtime, which `device.rs` turns
+# into an actionable "rebuild with this feature" message rather than a silent
+# CPU fallback.
+#
+# candle-cuda  : NVIDIA on Linux and Windows (requires the CUDA toolkit).
+# candle-metal : Apple Silicon macOS (no extra SDK beyond Xcode tools).
+#
+# There is deliberately no AMD/ROCm feature: Candle has no ROCm backend, so
+# offering one here would be a label with nothing behind it — exactly the
+# problem the dead `OrtCoreMl`/`CandleCuda` enum variants used to create.
+candle-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+candle-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

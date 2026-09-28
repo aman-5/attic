@@ -53,7 +53,24 @@ impl WorkerEngine for NeuralEngine {
 
     fn load(&mut self, spec: &LoadSpec) -> Result<EngineInfo, WorkerFail> {
         let provider: Arc<dyn SemanticProvider> = match spec.backend.as_str() {
-            "candle-cpu" => {
+            // All Candle devices share one construction path: the device is
+            // chosen by the process-wide preference, which we set here from
+            // the backend the server requested. This is the only place the
+            // worker process learns which device to use — it never sees the
+            // server's config object.
+            //
+            // A GPU request that cannot be honoured degrades to CPU inside
+            // `Qwen3Embedder` and is reported back via the fingerprint; the
+            // supervisor deliberately does not treat that as an identity
+            // mismatch (see `verify_identity_capabilities`).
+            "candle-cpu" | "candle-cuda" | "candle-metal" => {
+                let pref = match spec.backend.as_str() {
+                    "candle-cuda" => attic_semantic::DevicePreference::Cuda,
+                    "candle-metal" => attic_semantic::DevicePreference::Metal,
+                    _ => attic_semantic::DevicePreference::Cpu,
+                };
+                attic_semantic::device::set_process_preference(pref);
+
                 let cache = std::path::PathBuf::from(&spec.cache_dir);
                 let embedder = attic_semantic::Qwen3Embedder::new(
                     &cache,
@@ -62,6 +79,14 @@ impl WorkerEngine for NeuralEngine {
                     attic_semantic::QwenPooling::LastToken,
                 )
                 .map_err(map_semantic_error)?;
+                if let Some(reason) = embedder.device_fallback_reason() {
+                    tracing::warn!(
+                        requested = %spec.backend,
+                        actual = embedder.execution_backend().as_str(),
+                        reason = %reason,
+                        "requested GPU backend unavailable; running on CPU"
+                    );
+                }
                 Arc::new(embedder)
             }
             #[cfg(feature = "ort-directml")]

@@ -110,6 +110,24 @@ case " $SUPPORTED_TARGETS " in
 esac
 
 cd "$REPO_ROOT"
+
+# GPU backend defaults ON for Windows release builds.
+#
+# `ort-directml` is the ONLY real GPU backend in the codebase, and
+# `attic-server`'s `default = []` meant every published Windows binary was
+# compiled without it. The provider code existed and CI even compile-checked
+# it, but the artifact users actually installed could never construct
+# anything except `ExecutionBackend::CandleCpu` — so real GPUs sat idle while
+# status reported a deliberate-looking "candle-cpu" with no fallback reason.
+#
+# Non-Windows targets keep the default feature set: there is no CUDA, Metal
+# or CoreML provider implemented, so enabling anything here would only
+# produce a build failure, not acceleration.
+if [[ -z "$FEATURES" && "$TARGET" == *windows* ]]; then
+  FEATURES="ort-directml"
+  echo "== enabling default Windows GPU backend feature: $FEATURES"
+fi
+
 echo "== building attic-server for $TARGET${FEATURES:+ (features: $FEATURES)}"
 if [[ -n "$FEATURES" ]]; then
   cargo build --release --package attic-server --target "$TARGET" --features "$FEATURES"

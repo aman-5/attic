@@ -122,12 +122,26 @@ pub struct Qwen3Embedder {
     max_tokens: usize,
     pooling: QwenPooling,
     fingerprint: EmbeddingFingerprint,
+    /// Why this embedder is on CPU despite a GPU being requested, if it is.
+    /// Surfaced in status output so a silent CPU fallback is impossible.
+    device_fallback_reason: Option<String>,
 }
 
 impl Qwen3Embedder {
     /// Native hidden dimensionality of the model before Matryoshka truncation.
     pub fn native_dims(&self) -> usize {
         self.native_dims
+    }
+
+    /// The execution backend this embedder actually resolved to.
+    pub fn execution_backend(&self) -> ExecutionBackend {
+        self.fingerprint.execution_backend
+    }
+
+    /// Why this embedder is running on CPU when a GPU was preferred, or
+    /// `None` when it is running on the requested device.
+    pub fn device_fallback_reason(&self) -> Option<&str> {
+        self.device_fallback_reason.as_deref()
     }
 
     /// Construct a `Qwen3Embedder` from a local cache directory or Hugging Face.
@@ -360,7 +374,32 @@ impl Qwen3Embedder {
 
         let max_tokens = qwen_config.max_position_embeddings.min(DEFAULT_MAX_TOKENS);
 
-        let device = Device::Cpu;
+        // Device is resolved from the process-wide preference (set at startup
+        // from `semantic.device` in attic.toml). This is the line that used to
+        // read `Device::Cpu` unconditionally, which is why Apple Silicon and
+        // NVIDIA Linux hosts always ran on CPU regardless of hardware.
+        //
+        // DTYPE stays F32 on every device on purpose: the weights are the
+        // official F32 safetensors, so `quantization` below remains
+        // "fp32-safetensors" and the vector space is unchanged by which
+        // device produced it.
+        let resolved = crate::device::resolve(crate::device::process_preference());
+        if let Some(reason) = &resolved.fallback_reason {
+            tracing::warn!(
+                backend = resolved.backend.as_str(),
+                reason = %reason,
+                "semantic embedding fell back to CPU"
+            );
+        } else {
+            tracing::info!(
+                backend = resolved.backend.as_str(),
+                "semantic embedding device selected"
+            );
+        }
+        let execution_backend = resolved.backend;
+        let device_fallback_reason = resolved.fallback_reason.clone();
+        let device = resolved.device;
+
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device) }
             .map_err(|e| SemanticError::ProviderUnavailable {
                 provider: QWEN_PROVIDER_ID.into(),
@@ -402,10 +441,12 @@ impl Qwen3Embedder {
             tokenizer_version: "qwen_bpe_v1".to_string(),
             chunking_version: attic_core::constants::CHUNKING_VERSION.to_string(),
             query_instruction_version: CODE_RETRIEVAL_V1_ID.to_string(),
-            execution_backend: ExecutionBackend::CandleCpu,
+            execution_backend,
             // Weights are the official safetensors upcast to F32 (DTYPE
             // above) — NOT a quantized artifact. Part of vector-space
             // identity (r04): these vectors must never mix with Q8/fp16.
+            // Unchanged across CPU/CUDA/Metal, which is what keeps an
+            // existing index valid after a device change.
             quantization: "fp32-safetensors".to_string(),
         };
 
@@ -420,6 +461,7 @@ impl Qwen3Embedder {
             max_tokens,
             pooling,
             fingerprint,
+            device_fallback_reason,
         })
     }
 
