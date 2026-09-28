@@ -360,7 +360,25 @@ where
                 // ── Skip files under detected submodule roots ──────────────
                 let repo_rel = match normalize_repo_relative(abs_path, root) {
                     Some(r) => r,
-                    None => continue,
+                    None => {
+                        // Every file counted in `files_seen` must reach a
+                        // terminal accounting bucket. A path that fails
+                        // normalization (non-UTF-8 component, traversal, or
+                        // an absolute-path escape) previously fell through
+                        // this `continue` with no counter/diagnostic at
+                        // all, silently breaking the
+                        // `files_indexed + files_skipped == files_seen`
+                        // completeness invariant callers rely on.
+                        if is_new_file {
+                            result.counters.security_exclusions += 1;
+                            result.diagnostics.push(Diagnostic {
+                                kind: DiagnosticKind::InvalidPath,
+                                path: abs_path.to_path_buf(),
+                                message: "path failed repo-relative normalization (non-UTF-8 component, traversal, or absolute-path escape); excluded".into(),
+                            });
+                        }
+                        continue;
+                    }
                 };
 
                 if submodule_prefixes

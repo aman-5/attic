@@ -79,9 +79,22 @@ fn corpus_from_env(var: &str) -> Option<std::path::PathBuf> {
 /// discovery began indexing FileVault `.content.xml` dot-files (4,779 AEM
 /// JCR content files that were previously skipped as hidden) and the AEM
 /// plugin added structure to them. Every repository's unit count stayed
-/// equal or grew. Note: on this machine the per-repo terminal-state gate
-/// already fails for `impact-analyser` on the pre-change commit (1409da65:
-/// 96 terminal of 105 seen), independent of this change.
+/// equal or grew.
+///
+/// 2026 cleanup: `impact-analyser` used to fail the per-repo terminal-state
+/// gate (9 of 105 files "vanished" with no counter or diagnostic at all).
+/// Root cause: `attic_discovery::walk` counted a file into `files_seen`
+/// before normalizing it to a repo-relative path, and the `None` branch of
+/// that normalization (`normalize_repo_relative` — non-UTF-8 path
+/// component, traversal, or absolute-path escape) `continue`d without
+/// incrementing any counter or emitting a diagnostic. Fixed by counting
+/// that branch as `security_exclusions` with a new
+/// `DiagnosticKind::InvalidPath` diagnostic. The gate below was also
+/// corrected to compare against `files_eligible` (files that actually
+/// became discovery entries) rather than raw `files_seen`, since
+/// walk-level policy exclusions never reach `index_repository`'s
+/// terminal-state loop in the first place — comparing against `files_seen`
+/// conflated two different failure classes.
 ///
 /// Every
 /// intended repository must appear with at least one indexed file — a repo
@@ -146,13 +159,27 @@ fn multi_repo_workspace_indexes_completely() {
             "ACCEPTANCE workspace repo={name} files={} units={}",
             r.files_indexed, r.units_inserted
         );
-        // Gate: no discovered file in this repo may be left in a retryable
-        // (non-terminal) state — every eligible file is either indexed or
-        // explicitly, permanently skipped.
+        // Gate: no *eligible* file in this repo may be left in a retryable
+        // (non-terminal) state — every file that survived walk-level policy
+        // filtering (`files_eligible`, i.e. `discovery.entries`) is either
+        // indexed or explicitly, permanently skipped by the indexing loop.
+        //
+        // This intentionally compares against `files_eligible`, not the raw
+        // `files_seen`: the gap between the two is walk-level policy
+        // exclusion (gitignore, tracked-file filtering, security exclusions,
+        // submodule boundaries) — files that never become discovery entries
+        // in the first place and so are never handed to `index_repository`.
+        // Those exclusions are accounted for separately in
+        // `discovery_counters` (`ignored_or_pruned`, `security_exclusions`,
+        // `symlinks_skipped`, `nested_repo_boundaries`), each paired with a
+        // diagnostic explaining why. Comparing against `files_seen` here
+        // would conflate "never became an eligible entry" with "became an
+        // eligible entry but never reached indexed/skipped", which are
+        // different failure classes with different fixes.
         assert_eq!(
             r.files_indexed as u64 + r.files_skipped as u64,
-            r.discovery_counters.files_seen,
-            "repo {name}: every discovered file must reach a terminal state"
+            r.discovery_counters.files_eligible,
+            "repo {name}: every eligible file must reach a terminal state"
         );
         // Gate: no intended repository may silently contribute zero files.
         assert!(

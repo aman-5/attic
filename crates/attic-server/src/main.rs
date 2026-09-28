@@ -1642,6 +1642,7 @@ fn diagnostic_kind_str(kind: &attic_discovery::DiagnosticKind) -> &'static str {
         IoError => "IO_ERROR",
         SubmoduleDetected => "SUBMODULE_DETECTED",
         ExemptionRejected => "EXEMPTION_REJECTED",
+        InvalidPath => "INVALID_PATH",
     }
 }
 
