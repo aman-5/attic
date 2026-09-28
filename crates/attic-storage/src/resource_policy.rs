@@ -262,6 +262,15 @@ impl ResourcePolicy {
             max_io_ops_per_sec: overrides
                 .max_io_ops_per_sec
                 .unwrap_or(self.max_io_ops_per_sec),
+            scheduler_workers: overrides
+                .scheduler_workers
+                .unwrap_or(self.scheduler_workers),
+            embedding_batch_size: overrides
+                .embedding_batch_size
+                .unwrap_or(self.embedding_batch_size),
+            embedding_worker_count: overrides
+                .embedding_worker_count
+                .unwrap_or(self.embedding_worker_count),
             ..self
         }
     }
@@ -474,44 +483,87 @@ impl EffectiveResourceConfig {
 }
 
 /// Read `ATTIC_RESOURCE_MODE` / the `ATTIC_*` resource env vars as a
-/// [`ResourceOverrides`] layer — the sole env-var reader for these names now
-/// that the pre-Phase-8 `ResourceConfig::load()` (a second, independent
-/// parser for the same names) has been removed as dead code.
-pub fn env_resource_overrides() -> ResourceOverrides {
-    // `None` here means "ATTIC_RESOURCE_MODE not set (or not recognized)",
-    // distinct from `Some(Auto)` ("explicitly set to auto") — see the field
-    // doc on `ResourceOverrides::mode` for why that distinction matters.
-    let mode = match std::env::var("ATTIC_RESOURCE_MODE").ok().as_deref() {
-        Some("low") => Some(ResourceModeSetting::Low),
-        Some("balanced") => Some(ResourceModeSetting::Balanced),
-        Some("performance") => Some(ResourceModeSetting::Performance),
-        Some("auto") => Some(ResourceModeSetting::Auto),
-        _ => None,
-    };
-    ResourceOverrides {
-        mode,
-        total_memory_budget_mib: std::env::var("ATTIC_TOTAL_MEMORY_BUDGET_MIB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        min_free_memory_mib: std::env::var("ATTIC_MIN_FREE_MEMORY_MIB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        max_foreground_queries: std::env::var("ATTIC_MAX_FOREGROUND_QUERIES")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_batch_size: std::env::var("ATTIC_WRITER_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_flush_interval_ms: std::env::var("ATTIC_WRITER_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_queue_capacity: std::env::var("ATTIC_WRITER_QUEUE_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        max_io_ops_per_sec: std::env::var("ATTIC_MAX_IO_OPS_PER_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+/// [`ResourceOverrides`] layer — the sole env-var reader for these names.
+///
+/// Fails closed: a variable that is set but cannot be parsed (e.g.
+/// `ATTIC_WRITER_BATCH_SIZE=abc`, `ATTIC_RESOURCE_MODE=fast`) is a startup
+/// error rather than being silently ignored, so an operator never believes an
+/// override is active when it is not. Unset (or empty) variables are `None`.
+pub fn env_resource_overrides() -> Result<ResourceOverrides, attic_core::config::ConfigError> {
+    env_resource_overrides_from(|key| std::env::var(key).ok())
+}
+
+/// [`env_resource_overrides`] over an injectable lookup, so parsing is
+/// testable without mutating the real process environment.
+pub fn env_resource_overrides_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ResourceOverrides, attic_core::config::ConfigError> {
+    use attic_core::config::ConfigError;
+
+    let get = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
+    fn parse<T: std::str::FromStr>(
+        key: &str,
+        raw: Option<String>,
+    ) -> Result<Option<T>, ConfigError> {
+        raw.map(|v| {
+            v.trim().parse::<T>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "environment variable {key}={v:?} is not a valid value"
+                ))
+            })
+        })
+        .transpose()
     }
+
+    // `None` here means "ATTIC_RESOURCE_MODE not set", distinct from
+    // `Some(Auto)` ("explicitly set to auto") — see the field doc on
+    // `ResourceOverrides::mode` for why that distinction matters.
+    let mode = match get("ATTIC_RESOURCE_MODE") {
+        None => None,
+        Some(v) => Some(match v.trim().to_ascii_lowercase().as_str() {
+            "low" => ResourceModeSetting::Low,
+            "balanced" => ResourceModeSetting::Balanced,
+            "performance" => ResourceModeSetting::Performance,
+            "auto" => ResourceModeSetting::Auto,
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "environment variable ATTIC_RESOURCE_MODE={v:?} must be one of \
+                     auto, low, balanced, performance"
+                )));
+            }
+        }),
+    };
+    Ok(ResourceOverrides {
+        mode,
+        total_memory_budget_mib: parse(
+            "ATTIC_TOTAL_MEMORY_BUDGET_MIB",
+            get("ATTIC_TOTAL_MEMORY_BUDGET_MIB"),
+        )?,
+        min_free_memory_mib: parse(
+            "ATTIC_MIN_FREE_MEMORY_MIB",
+            get("ATTIC_MIN_FREE_MEMORY_MIB"),
+        )?,
+        max_foreground_queries: parse(
+            "ATTIC_MAX_FOREGROUND_QUERIES",
+            get("ATTIC_MAX_FOREGROUND_QUERIES"),
+        )?,
+        writer_batch_size: parse("ATTIC_WRITER_BATCH_SIZE", get("ATTIC_WRITER_BATCH_SIZE"))?,
+        writer_flush_interval_ms: parse(
+            "ATTIC_WRITER_FLUSH_INTERVAL_MS",
+            get("ATTIC_WRITER_FLUSH_INTERVAL_MS"),
+        )?,
+        writer_queue_capacity: parse(
+            "ATTIC_WRITER_QUEUE_CAPACITY",
+            get("ATTIC_WRITER_QUEUE_CAPACITY"),
+        )?,
+        max_io_ops_per_sec: parse("ATTIC_MAX_IO_OPS_PER_SEC", get("ATTIC_MAX_IO_OPS_PER_SEC"))?,
+        scheduler_workers: parse("ATTIC_SCHEDULER_WORKERS", get("ATTIC_SCHEDULER_WORKERS"))?,
+        embedding_batch_size: parse(
+            "ATTIC_EMBEDDING_BATCH_SIZE",
+            get("ATTIC_EMBEDDING_BATCH_SIZE"),
+        )?,
+        embedding_worker_count: parse("ATTIC_EMBEDDING_WORKERS", get("ATTIC_EMBEDDING_WORKERS"))?,
+    })
 }
 
 /// Full resolution result: the clamped effective config, plus which
@@ -637,6 +689,81 @@ mod tests {
         let applied = p.apply_overrides(&overrides);
         assert_eq!(applied.memory_budget_mib, 1234);
         assert_eq!(applied.writer_batch_size, p.writer_batch_size);
+    }
+
+    #[test]
+    fn apply_overrides_sets_worker_and_embedding_tunables() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Balanced);
+        let applied = p.apply_overrides(&ResourceOverrides {
+            scheduler_workers: Some(5),
+            embedding_batch_size: Some(24),
+            embedding_worker_count: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(applied.scheduler_workers, 5);
+        assert_eq!(applied.embedding_batch_size, 24);
+        assert_eq!(applied.embedding_worker_count, 2);
+        assert_eq!(applied.writer_batch_size, p.writer_batch_size);
+    }
+
+    #[test]
+    fn zero_worker_override_is_rejected_by_validation() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Balanced).apply_overrides(
+            &ResourceOverrides {
+                scheduler_workers: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(p.validate().is_err());
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn env_overrides_parse_all_supported_variables() {
+        let o = env_resource_overrides_from(env_of(&[
+            ("ATTIC_RESOURCE_MODE", "Performance"),
+            ("ATTIC_SCHEDULER_WORKERS", "3"),
+            ("ATTIC_EMBEDDING_BATCH_SIZE", " 12 "),
+            ("ATTIC_EMBEDDING_WORKERS", "1"),
+            ("ATTIC_WRITER_BATCH_SIZE", "128"),
+        ]))
+        .unwrap();
+        assert_eq!(o.mode, Some(ResourceModeSetting::Performance));
+        assert_eq!(o.scheduler_workers, Some(3));
+        assert_eq!(o.embedding_batch_size, Some(12));
+        assert_eq!(o.embedding_worker_count, Some(1));
+        assert_eq!(o.writer_batch_size, Some(128));
+        assert_eq!(o.max_io_ops_per_sec, None);
+    }
+
+    #[test]
+    fn env_overrides_treat_empty_values_as_unset() {
+        let o = env_resource_overrides_from(env_of(&[
+            ("ATTIC_RESOURCE_MODE", ""),
+            ("ATTIC_SCHEDULER_WORKERS", "  "),
+        ]))
+        .unwrap();
+        assert_eq!(o.mode, None);
+        assert_eq!(o.scheduler_workers, None);
+    }
+
+    #[test]
+    fn env_overrides_fail_closed_on_unparsable_values() {
+        for (key, value) in [
+            ("ATTIC_WRITER_BATCH_SIZE", "abc"),
+            ("ATTIC_SCHEDULER_WORKERS", "-1"),
+            ("ATTIC_RESOURCE_MODE", "fast"),
+        ] {
+            let err = env_resource_overrides_from(env_of(&[(key, value)])).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value} → {err}");
+        }
     }
 
     #[test]

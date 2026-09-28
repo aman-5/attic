@@ -258,11 +258,11 @@ impl Default for SemanticConfig {
 
 /// User-tunable resource overrides (`[resources]` in `attic.toml`).
 ///
-/// Intentionally exposes only 7 of `ResourcePolicy`'s 12 controlled values.
-/// `scheduler_workers`, `sqlite_cache_pages`, `sqlite_mmap_bytes`,
-/// `embedding_batch_size`, and `embedding_worker_count` remain
-/// mode-derived/automatic in V1 by design — not parsed from this struct at
-/// all, so there is no parsed-and-ignored field for them.
+/// Every field is optional: `None` keeps the hardware-detected mode's
+/// baseline. Overrides are validated (`ResourcePolicy::validate`) and then
+/// hardware-clamped as the final step, so an override can never exceed what
+/// the machine can support. `sqlite_cache_pages`/`sqlite_mmap_bytes` remain
+/// mode-derived by design.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceOverrides {
@@ -289,6 +289,18 @@ pub struct ResourceOverrides {
     pub writer_queue_capacity: Option<usize>,
     /// Override for `ResourcePolicy::max_io_ops_per_sec`.
     pub max_io_ops_per_sec: Option<u32>,
+    /// Override for `ResourcePolicy::scheduler_workers` (concurrent
+    /// incremental reindex tasks and bootstrap repositories). Clamped to the
+    /// physical core count.
+    pub scheduler_workers: Option<usize>,
+    /// Override for `ResourcePolicy::embedding_batch_size` (items per
+    /// provider call). An explicit value bypasses the conservative default
+    /// cap applied to the neural provider, but is still bounded by the
+    /// provider's token budget.
+    pub embedding_batch_size: Option<usize>,
+    /// Override for `ResourcePolicy::embedding_worker_count`. Providers that
+    /// serialize inference still run one effective lane.
+    pub embedding_worker_count: Option<usize>,
 }
 
 impl ResourceOverrides {
@@ -310,9 +322,16 @@ impl ResourceOverrides {
                 .or(self.writer_flush_interval_ms),
             writer_queue_capacity: other.writer_queue_capacity.or(self.writer_queue_capacity),
             max_io_ops_per_sec: other.max_io_ops_per_sec.or(self.max_io_ops_per_sec),
+            scheduler_workers: other.scheduler_workers.or(self.scheduler_workers),
+            embedding_batch_size: other.embedding_batch_size.or(self.embedding_batch_size),
+            embedding_worker_count: other.embedding_worker_count.or(self.embedding_worker_count),
         }
     }
 }
+
+/// Upper bound accepted for `[indexing] analysis_threads`. Larger values are
+/// almost certainly typos and would only oversubscribe the machine.
+pub const MAX_ANALYSIS_THREADS: usize = 256;
 
 /// User-tunable indexing/discovery overrides (`[indexing]` in `attic.toml`).
 #[derive(Debug, Clone, Deserialize)]
@@ -344,6 +363,21 @@ pub struct IndexingOverride {
     /// failures surface earlier, never as a coverage fix.
     #[serde(default)]
     pub max_units_per_file: Option<usize>,
+    /// Worker threads for per-file analysis (maps to
+    /// `attic_indexing::IndexOptions::analysis_threads`). `None` or `0` =
+    /// automatic (logical processors minus two, reserved for the developer's
+    /// foreground work).
+    #[serde(default)]
+    pub analysis_threads: Option<usize>,
+    /// Analyzer plugins to enable, by plugin id (e.g. `"java"`, `"swift"`,
+    /// `"aem"`). Empty = every built-in plugin. Unknown ids fail startup.
+    #[serde(default)]
+    pub analyzers: Vec<String>,
+    /// Analyzer plugins to disable, applied after `analyzers`. Files those
+    /// plugins would handle stay fully searchable through the generic
+    /// lexical analyzer.
+    #[serde(default)]
+    pub disabled_analyzers: Vec<String>,
 }
 
 impl Default for IndexingOverride {
@@ -352,7 +386,55 @@ impl Default for IndexingOverride {
             exclude: Vec::new(),
             structural: true,
             max_units_per_file: None,
+            analysis_threads: None,
+            analyzers: Vec::new(),
+            disabled_analyzers: Vec::new(),
         }
+    }
+}
+
+impl IndexingOverride {
+    /// Range and consistency checks that do not need to know which analyzer
+    /// plugins exist (plugin ids are resolved by `attic-analyzers`).
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.exclude.iter().any(|p| p.trim().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "[indexing] exclude must not contain empty patterns".into(),
+            ));
+        }
+        if self.max_units_per_file == Some(0) {
+            return Err(ConfigError::Invalid(
+                "[indexing] max_units_per_file must be >= 1".into(),
+            ));
+        }
+        if let Some(threads) = self.analysis_threads
+            && threads > MAX_ANALYSIS_THREADS
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[indexing] analysis_threads must be <= {MAX_ANALYSIS_THREADS} (got {threads}); \
+                 use 0 for automatic"
+            )));
+        }
+        for (key, ids) in [
+            ("analyzers", &self.analyzers),
+            ("disabled_analyzers", &self.disabled_analyzers),
+        ] {
+            if ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "[indexing] {key} must not contain empty ids"
+                )));
+            }
+        }
+        if let Some(id) = self
+            .analyzers
+            .iter()
+            .find(|id| self.disabled_analyzers.contains(id))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[indexing] analyzer '{id}' is listed in both analyzers and disabled_analyzers"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -360,8 +442,11 @@ impl Default for IndexingOverride {
 ///
 /// Never contains workspace-membership (`[[repositories]]`); that stays on
 /// the existing, separate `<ATTIC_HOME>/config.toml` and its hand-rolled
-/// parser, completely untouched by this type.
+/// parser, completely untouched by this type. Unknown top-level tables are
+/// rejected, so a misspelled table (`[indexng]`) fails loudly instead of
+/// being silently ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AtticConfig {
     /// `[resources]` table.
     #[serde(default)]
@@ -376,8 +461,8 @@ pub struct AtticConfig {
 }
 
 impl AtticConfig {
-    /// Parse `attic.toml` contents. Pure — does no I/O; the caller
-    /// (`attic-server`) reads the file and hands the contents here.
+    /// Parse and validate `attic.toml` contents. Pure — does no I/O; the
+    /// caller (`attic-server`) reads the file and hands the contents here.
     pub fn parse_str(contents: &str) -> Result<Self, ConfigError> {
         if contents.contains("[embedding]") {
             return Err(ConfigError::Parse(
@@ -385,7 +470,43 @@ impl AtticConfig {
             ));
         }
         let cfg: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Range and consistency checks for values that deserialize fine but are
+    /// meaningless (zero sizes, empty patterns, contradictory analyzer
+    /// lists). Resource values are validated separately after mode
+    /// resolution (`ResourcePolicy::validate`), because their valid range
+    /// depends on the other layers they are merged with.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.indexing.validate()?;
+        if self.semantic.model.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "[semantic] model must not be empty".into(),
+            ));
+        }
+        if self.semantic.dimension == Some(0) {
+            return Err(ConfigError::Invalid(
+                "[semantic] dimension must be >= 1".into(),
+            ));
+        }
+        if self.semantic.max_file_bytes == Some(0) {
+            return Err(ConfigError::Invalid(
+                "[semantic] max_file_bytes must be >= 1".into(),
+            ));
+        }
+        if self
+            .semantic
+            .exclude_globs
+            .iter()
+            .any(|g| g.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "[semantic] exclude_globs must not contain empty patterns".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -396,12 +517,15 @@ impl AtticConfig {
 pub const ATTIC_TOML_TEMPLATE: &str = r#"# attic.toml — resource/embedding/indexing tunables.
 # Separate from <ATTIC_HOME>/config.toml, which continues to hold
 # [[repositories]] workspace membership exactly as it does today, untouched.
+# Unknown tables or keys are rejected at startup. Environment variables
+# (ATTIC_*) override values set here.
 
 [resources]
 # Automatically selects low/balanced/performance from available RAM and CPU.
 mode = "auto"
 
-# Optional overrides — uncomment to override automatic tuning.
+# Optional overrides — uncomment to override automatic tuning. Every value is
+# validated and then clamped to what this machine can support.
 # total_memory_budget_mib = 4096
 # min_free_memory_mib = 400
 # max_foreground_queries = 64
@@ -409,6 +533,11 @@ mode = "auto"
 # writer_flush_interval_ms = 50
 # writer_queue_capacity = 512
 # max_io_ops_per_sec = 200
+# Concurrent incremental reindex tasks / bootstrapped repositories.
+# scheduler_workers = 4
+# Items per embedding call and concurrent embedding workers.
+# embedding_batch_size = 16
+# embedding_worker_count = 1
 
 [semantic]
 # Production neural semantic model (Qwen3-Embedding-0.6B).
@@ -435,6 +564,16 @@ model = "qwen3-embedding-0.6b"
 # Hard per-file retrieval-unit ceiling. FAIL-CLOSED: exceeding it aborts the
 # indexing run instead of silently dropping content. Default 100000.
 # max_units_per_file = 100000
+
+# Per-file analysis worker threads. 0 = automatic (logical CPUs minus two).
+# analysis_threads = 0
+
+# Analyzer plugins. Empty = every built-in plugin. Files a disabled plugin
+# would handle remain fully searchable through the generic lexical analyzer.
+# Built-in ids: aem, java, python, go, javascript, typescript, json, c, cpp,
+# ruby, csharp, scala, php, swift, lua, rust, dockerfile.
+# analyzers = ["java", "typescript", "aem"]
+# disabled_analyzers = ["php"]
 "#;
 
 #[cfg(test)]
@@ -508,6 +647,67 @@ mod tests {
     fn invalid_mode_value_fails_to_parse() {
         let result = AtticConfig::parse_str("[resources]\nmode = \"performnace\"\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_top_level_table_is_rejected() {
+        let err = AtticConfig::parse_str("[indexng]\nstructural = false\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn worker_and_embedding_tunables_parse() {
+        let cfg = AtticConfig::parse_str(
+            "[resources]\nscheduler_workers = 6\nembedding_batch_size = 32\nembedding_worker_count = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.resources.scheduler_workers, Some(6));
+        assert_eq!(cfg.resources.embedding_batch_size, Some(32));
+        assert_eq!(cfg.resources.embedding_worker_count, Some(2));
+    }
+
+    #[test]
+    fn indexing_analysis_and_analyzer_keys_parse() {
+        let cfg = AtticConfig::parse_str(
+            "[indexing]\nanalysis_threads = 4\nanalyzers = [\"swift\", \"aem\"]\ndisabled_analyzers = [\"php\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.indexing.analysis_threads, Some(4));
+        assert_eq!(cfg.indexing.analyzers, ["swift", "aem"]);
+        assert_eq!(cfg.indexing.disabled_analyzers, ["php"]);
+    }
+
+    #[test]
+    fn invalid_indexing_values_fail_closed() {
+        for (toml, needle) in [
+            ("[indexing]\nmax_units_per_file = 0\n", "max_units_per_file"),
+            (
+                "[indexing]\nanalysis_threads = 100000\n",
+                "analysis_threads",
+            ),
+            ("[indexing]\nexclude = [\"\"]\n", "exclude"),
+            ("[indexing]\nanalyzers = [\" \"]\n", "analyzers"),
+            (
+                "[indexing]\nanalyzers = [\"swift\"]\ndisabled_analyzers = [\"swift\"]\n",
+                "both",
+            ),
+            ("[semantic]\ndimension = 0\n", "dimension"),
+            ("[semantic]\nmax_file_bytes = 0\n", "max_file_bytes"),
+            ("[semantic]\nmodel = \"\"\n", "model"),
+        ] {
+            match AtticConfig::parse_str(toml) {
+                Err(ConfigError::Invalid(msg)) => {
+                    assert!(msg.contains(needle), "{toml:?} → {msg}")
+                }
+                other => panic!("{toml:?} must be rejected as invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn analysis_threads_zero_means_automatic_and_is_accepted() {
+        let cfg = AtticConfig::parse_str("[indexing]\nanalysis_threads = 0\n").unwrap();
+        assert_eq!(cfg.indexing.analysis_threads, Some(0));
     }
 
     #[test]

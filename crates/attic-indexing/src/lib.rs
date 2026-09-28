@@ -76,6 +76,9 @@ pub enum IndexError {
     },
     #[error("policy hash failed: {0}")]
     PolicyHash(String),
+    /// The analyzer plugin selection names an unknown plugin.
+    #[error("invalid analyzer configuration: {0}")]
+    AnalyzerConfig(String),
     #[error("repository at {0} has not been bootstrapped; run a full index first")]
     RepositoryNotBootstrapped(String),
     /// Generation-completeness invariant (Phase 6.4): one or more discovered
@@ -180,6 +183,10 @@ pub struct IndexOptions {
     /// `0` disables flushing (single end-of-run write, the pre-bound
     /// behaviour).
     pub analysis_cache_flush_bytes: u64,
+    /// Structural analyzers to enable (plugin selection from `attic.toml
+    /// [indexing] analyzers / disabled_analyzers`). Ignored when
+    /// `structural` is `false`. Default: every built-in plugin.
+    pub analyzers: attic_analyzers::AnalyzerSelection,
     /// Maximum worker threads used for per-file analysis.
     ///
     /// `0` means "derive from [`std::thread::available_parallelism`]".
@@ -227,8 +234,60 @@ impl Default for IndexOptions {
             refresh_existing: true,
             structural: true,
             analysis_cache_flush_bytes: DEFAULT_ANALYSIS_CACHE_FLUSH_BYTES,
+            analyzers: attic_analyzers::AnalyzerSelection::all(),
             analysis_threads: 0,
         }
+    }
+}
+
+impl IndexOptions {
+    /// Options derived from `attic.toml [indexing]`. Every field the file
+    /// does not set keeps its library default.
+    pub fn from_config(cfg: &attic_core::config::IndexingOverride) -> Self {
+        let defaults = Self::default();
+        Self {
+            structural: cfg.structural,
+            max_units_per_file: cfg
+                .max_units_per_file
+                .unwrap_or(defaults.max_units_per_file),
+            analysis_threads: cfg.analysis_threads.unwrap_or(0),
+            analyzers: attic_analyzers::AnalyzerSelection::new(
+                &cfg.analyzers,
+                &cfg.disabled_analyzers,
+            ),
+            ..defaults
+        }
+    }
+
+    /// Fail-closed validation, for callers that want configuration errors at
+    /// startup rather than on the first indexing run.
+    pub fn validate(&self) -> Result<(), IndexError> {
+        if self.max_units_per_file == 0 {
+            return Err(IndexError::AnalyzerConfig(
+                "max_units_per_file must be >= 1".into(),
+            ));
+        }
+        attic_analyzers::PluginCatalog::builtin()
+            .validate(&self.analyzers)
+            .map_err(|e| IndexError::AnalyzerConfig(e.to_string()))
+    }
+
+    /// Version stamp for PR-7 analysis-cache rows: the registry version plus
+    /// the effective analyzer plugin set, so a retry after the analyzer
+    /// configuration changed never replays output produced by different
+    /// analyzers.
+    fn analysis_cache_version(&self) -> Result<String, IndexError> {
+        let plugins = if self.structural {
+            attic_analyzers::PluginCatalog::builtin()
+                .fingerprint(&self.analyzers)
+                .map_err(|e| IndexError::AnalyzerConfig(e.to_string()))?
+        } else {
+            "generic".to_owned()
+        };
+        Ok(format!(
+            "{}|{plugins}",
+            attic_core::constants::ANALYZER_REGISTRY_VERSION
+        ))
     }
 }
 
@@ -887,11 +946,8 @@ pub fn index_repository_with_cancellation(
         .map_err(IndexError::Storage)?;
     let mut cache_writes: Vec<attic_storage::CachedFileAnalysis> = Vec::new();
 
-    let registry = if opts.structural {
-        structural_pipeline::default_registry()
-    } else {
-        structural_pipeline::generic_only_registry()
-    };
+    let registry = structural_pipeline::shared_registry(opts)?;
+    let cache_version = opts.analysis_cache_version()?;
     let mut pending_units: Vec<PendingUnit> = Vec::new();
     let mut indexed_records: Vec<FileRecord> = Vec::new();
     // Phase 0: live byte counts for the two whole-repo text accumulators.
@@ -946,10 +1002,13 @@ pub fn index_repository_with_cancellation(
         }
         let prepped = analyze_files(
             stripe,
-            &analysis_cache,
+            &AnalysisCacheLookup {
+                entries: &analysis_cache,
+                policy_hash: &policy_hash,
+                version: &cache_version,
+            },
             &registry,
             opts,
-            &policy_hash,
             cancellation,
             analysis_threads,
         )?;
@@ -1034,8 +1093,7 @@ pub fn index_repository_with_cancellation(
                             security_state: security_state.as_str().to_owned(),
                             is_partial_scan,
                             secret_pattern_version: SECRET_PATTERN_VERSION,
-                            analyzer_registry_version:
-                                attic_core::constants::ANALYZER_REGISTRY_VERSION.to_owned(),
+                            analyzer_registry_version: cache_version.clone(),
                             discovery_policy_hash: policy_hash.clone(),
                             structural: opts.structural,
                             max_units_per_file: opts.max_units_per_file as u64,
@@ -1388,6 +1446,15 @@ struct AnalyzedFile {
     small_file_bytes_read: Option<u64>,
 }
 
+/// The PR-7 analysis cache as seen by one run: prior entries plus the keys an
+/// entry must match to be replayed.
+struct AnalysisCacheLookup<'a> {
+    entries: &'a HashMap<String, attic_storage::CachedFileAnalysis>,
+    policy_hash: &'a str,
+    /// See [`IndexOptions::analysis_cache_version`].
+    version: &'a str,
+}
+
 /// Analyze every file record, using `threads` workers, and return the results
 /// in the original (discovery) order.
 ///
@@ -1399,22 +1466,32 @@ struct AnalyzedFile {
 /// here goes near the coordinated writer, so the single-writer contract is
 /// untouched.
 ///
+/// # Scheduling
+///
+/// Workers pull files from one shared atomic cursor (dynamic scheduling)
+/// rather than owning a fixed contiguous slice. File cost is heavily skewed
+/// in real corpora — one multi-megabyte JSON export costs as much as
+/// thousands of small sources — so static partitioning left most workers
+/// idle while one ground through the slice that happened to hold the big
+/// files. The cursor walks a largest-first permutation (longest-processing-
+/// time-first), so the expensive files start immediately and the small ones
+/// fill in behind them.
+///
 /// # Why output is deterministic
 ///
-/// Work is partitioned by index into contiguous stripes; each worker owns a
-/// disjoint slice and fills only its own slots. The results vector is then
-/// reassembled in stripe order, so the sequence the caller observes is exactly
-/// the sequence a single-threaded run would produce. Thread count affects
-/// timing only — never ordering, never content.
+/// Each result is tagged with its record's original index and the results
+/// are reassembled in that order, so the sequence the caller observes is
+/// exactly the sequence a single-threaded run would produce. Thread count and
+/// scheduling affect timing only — never ordering, never content.
 ///
 /// Cancellation is checked per file inside each worker, so a cancelled run
-/// stops promptly rather than after the whole stripe.
+/// stops promptly rather than after the whole stripe. A worker panic is
+/// propagated to the caller unchanged.
 fn analyze_files(
     file_records: Vec<FileRecord>,
-    analysis_cache: &HashMap<String, attic_storage::CachedFileAnalysis>,
+    cache: &AnalysisCacheLookup<'_>,
     registry: &AnalyzerRegistry,
     opts: &IndexOptions,
-    policy_hash: &str,
     cancellation: &CancellationToken,
     threads: usize,
 ) -> Result<Vec<AnalyzedFile>, IndexError> {
@@ -1422,28 +1499,27 @@ fn analyze_files(
         return Ok(Vec::new());
     }
 
-    let analyze_one = |rec: FileRecord| -> AnalyzedFile {
+    let analyze_one = |rec: &FileRecord| -> FileAnalysis {
         // A cache hit requires the content hash AND the secret-detector /
         // analyzer-registry versions to match what's current: a retry that
         // spans a ruleset upgrade must never replay a verdict computed under
         // the old rules for unchanged content (e.g. a secret the upgraded
         // detector would now catch).
-        let cache_hit = analysis_cache
+        let cache_hit = cache
+            .entries
             .get(&rec.repo_relative)
             .filter(|cached| {
                 cached.content_hash == rec.content_hash
                     && cached.secret_pattern_version == SECRET_PATTERN_VERSION
-                    && cached.analyzer_registry_version
-                        == attic_core::constants::ANALYZER_REGISTRY_VERSION
-                    && cached.discovery_policy_hash == policy_hash
+                    && cached.analyzer_registry_version == cache.version
+                    && cached.discovery_policy_hash == cache.policy_hash
                     && cached.structural == opts.structural
                     && cached.max_units_per_file == opts.max_units_per_file as u64
             })
-            .and_then(|cached| reconstruct_file_prep_from_cache(cached, &rec));
+            .and_then(|cached| reconstruct_file_prep_from_cache(cached, rec));
 
         match cache_hit {
-            Some(prep) => AnalyzedFile {
-                rec,
+            Some(prep) => FileAnalysis {
                 prep: Ok(prep),
                 was_cache_hit: true,
                 small_file_bytes_read: None,
@@ -1452,9 +1528,8 @@ fn analyze_files(
                 let small_file_bytes_read = (rec.size_bytes >= 0
                     && (rec.size_bytes as u64) <= attic_discovery::MAX_FULL_LOAD_BYTES)
                     .then_some(rec.size_bytes as u64);
-                let prep = analyze_single_file(&rec, registry, opts, cancellation);
-                AnalyzedFile {
-                    rec,
+                let prep = analyze_single_file(rec, registry, opts, cancellation);
+                FileAnalysis {
                     prep,
                     was_cache_hit: false,
                     small_file_bytes_read,
@@ -1463,41 +1538,59 @@ fn analyze_files(
         }
     };
 
-    if threads <= 1 {
-        let mut out = Vec::with_capacity(file_records.len());
-        for rec in file_records {
+    let assemble = |records: Vec<FileRecord>, results: Vec<FileAnalysis>| -> Vec<AnalyzedFile> {
+        records
+            .into_iter()
+            .zip(results)
+            .map(|(rec, a)| AnalyzedFile {
+                rec,
+                prep: a.prep,
+                was_cache_hit: a.was_cache_hit,
+                small_file_bytes_read: a.small_file_bytes_read,
+            })
+            .collect()
+    };
+
+    let threads = threads.clamp(1, file_records.len());
+    if threads == 1 {
+        let mut results = Vec::with_capacity(file_records.len());
+        for rec in &file_records {
             if cancellation.is_cancelled() {
                 return Err(IndexError::Cancelled);
             }
-            out.push(analyze_one(rec));
+            results.push(analyze_one(rec));
         }
-        return Ok(out);
+        return Ok(assemble(file_records, results));
     }
 
-    // Contiguous stripes: `chunk_len` is a ceiling divide, so `threads` chunks
-    // cover every record and only the final chunk is short.
-    let chunk_len = file_records.len().div_ceil(threads);
-    let mut inputs: Vec<Vec<FileRecord>> = Vec::with_capacity(threads);
-    let mut remaining = file_records;
-    while !remaining.is_empty() {
-        let take = chunk_len.min(remaining.len());
-        let rest = remaining.split_off(take);
-        inputs.push(remaining);
-        remaining = rest;
-    }
+    // Largest-first permutation; the index tie-break keeps it deterministic.
+    let mut work_order: Vec<usize> = (0..file_records.len()).collect();
+    work_order.sort_by(|&a, &b| {
+        file_records[b]
+            .size_bytes
+            .cmp(&file_records[a].size_bytes)
+            .then(a.cmp(&b))
+    });
 
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let records = &file_records;
+    let work_order = &work_order;
+    let cursor = &cursor;
     let analyze_one = &analyze_one;
-    let mut outputs: Vec<Vec<AnalyzedFile>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = inputs
-            .into_iter()
-            .map(|chunk| {
+    let tagged: Vec<Vec<(usize, FileAnalysis)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
                 scope.spawn(move || {
-                    let mut local = Vec::with_capacity(chunk.len());
-                    for rec in chunk {
+                    let mut local = Vec::new();
+                    loop {
                         if cancellation.is_cancelled() {
                             break;
                         }
-                        local.push(analyze_one(rec));
+                        let next = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&idx) = work_order.get(next) else {
+                            break;
+                        };
+                        local.push((idx, analyze_one(&records[idx])));
                     }
                     // Hand the worker's analysis tally back with its results so
                     // the spawning thread can attribute it (test-only; see
@@ -1529,18 +1622,32 @@ fn analyze_files(
             .collect()
     });
 
-    // A worker that observed cancellation returns a short vector, so the
-    // reassembled result would silently omit files. Surface it as the
-    // cancellation it is rather than publishing an incomplete generation.
+    // A worker that observed cancellation stops early, so some slots stay
+    // empty. Surface it as the cancellation it is rather than publishing an
+    // incomplete generation.
     if cancellation.is_cancelled() {
         return Err(IndexError::Cancelled);
     }
 
-    let mut out = Vec::with_capacity(outputs.iter().map(Vec::len).sum());
-    for chunk in &mut outputs {
-        out.append(chunk);
+    let mut slots: Vec<Option<FileAnalysis>> = Vec::with_capacity(file_records.len());
+    slots.resize_with(file_records.len(), || None);
+    for (idx, analysis) in tagged.into_iter().flatten() {
+        slots[idx] = Some(analysis);
     }
-    Ok(out)
+    let results: Option<Vec<FileAnalysis>> = slots.into_iter().collect();
+    match results {
+        Some(results) => Ok(assemble(file_records, results)),
+        // Unreachable without cancellation (every index below `len` is
+        // claimed exactly once), but never publish a partial stripe.
+        None => Err(IndexError::Cancelled),
+    }
+}
+
+/// One file's analysis result before it is re-paired with its record.
+struct FileAnalysis {
+    prep: Result<FilePrep, IndexError>,
+    was_cache_hit: bool,
+    small_file_bytes_read: Option<u64>,
 }
 
 /// Reconstruct a cached analysis result for reuse (PR-7 cache hit).
@@ -1764,7 +1871,7 @@ fn analyze_single_file(
         path: rec.abs_path.clone(),
         content: analyzer_content,
         file_type: rec.file_type,
-        language_hint: infer_language_hint(&rec.abs_path).map(str::to_string),
+        language_hint: infer_language_hint(&rec.repo_relative).map(str::to_string),
         size_bytes,
         is_partial_scan,
         cancellation_token: cancellation.clone(),
@@ -1896,9 +2003,14 @@ fn classify_security_state(
     }
 }
 
-/// Infer the broad file type from path extension.
+/// Infer the broad file type from path extension (ASCII case-insensitive, so
+/// `Main.JAVA` on a case-insensitive filesystem is classified like `Main.java`).
 fn infer_file_type(path: &Path) -> FileType {
-    match path.extension().and_then(|e| e.to_str()) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
         Some("rs") => FileType::Rust,
         Some("ts") | Some("tsx") => FileType::TypeScript,
         Some("js") | Some("mjs") | Some("cjs") | Some("jsx") => FileType::JavaScript,
@@ -1917,43 +2029,16 @@ fn infer_file_type(path: &Path) -> FileType {
 /// language-hint lookup (`AnalyzerInput::language_hint`), additive to — and
 /// finer-grained than — `infer_file_type`'s broad `FileType` classification.
 ///
-/// This is the mechanism that lets `.tsx` route to the JSX-aware TypeScript
-/// grammar while `.ts` keeps the plain one (both share `FileType::TypeScript`,
-/// which cannot itself distinguish them), and lets tier-2 tags.scm-based
-/// languages (which have no `FileType` variant at all, e.g. Ruby/C#/Scala/
-/// PHP/Swift/Lua/Dockerfile) be selected without widening `attic-core`'s
-/// domain enum. Returns `None` for anything not handled by a registered
-/// language-specific analyzer; such files still get generic full-text
-/// coverage via `infer_file_type`'s existing fallback path.
-///
-/// Tag strings here MUST match the tags used to register analyzers in
-/// `attic_analyzers::structural::default_registry` exactly.
-fn infer_language_hint(path: &Path) -> Option<&'static str> {
-    // Filename-based match (checked before extension-based, same convention
-    // `infer_file_type` would use if it needed one): Dockerfiles are
-    // conventionally named `Dockerfile`/`dockerfile` with no extension.
-    if let Some(name) = path.file_name().and_then(|n| n.to_str())
-        && name.eq_ignore_ascii_case("dockerfile")
-    {
-        return Some("dockerfile");
-    }
-
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("tsx") => Some("tsx"),
-        Some("ts") => Some("typescript"),
-        Some("rs") => Some("rust"),
-        Some("c") | Some("h") => Some("c"),
-        Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") | Some("h++")
-        | Some("hxx") => Some("cpp"),
-        Some("rb") => Some("ruby"),
-        Some("cs") => Some("csharp"),
-        Some("scala") | Some("sc") => Some("scala"),
-        Some("php") => Some("php"),
-        Some("swift") => Some("swift"),
-        Some("lua") => Some("lua"),
-        Some("dockerfile") => Some("dockerfile"),
-        _ => None,
-    }
+/// Delegates to the analyzer plugin catalog (`attic_analyzers::language_hint`),
+/// the single source of truth for which plugin claims which path. That is
+/// what lets `.tsx` route to the JSX-aware grammar, tier-2 languages with no
+/// `FileType` variant (Swift, Ruby, …) be selected, and path-based platform
+/// plugins (AEM: `jcr_root/…/*.html`, `*.cfg.json`) claim files whose
+/// extension alone is ambiguous. `repo_relative` must be the
+/// repository-relative path so path-based rules never match directories
+/// outside the repository.
+fn infer_language_hint(repo_relative: &str) -> Option<&'static str> {
+    attic_analyzers::language_hint(repo_relative)
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,10 +2086,14 @@ mod tests {
             "x.swift",
             "x.lua",
             "x.dockerfile",
+            "ui.apps/src/main/content/jcr_root/apps/site/components/b/.content.xml",
+            "ui.apps/src/main/content/jcr_root/apps/site/components/b/b.html",
+            "ui.config/src/main/content/jcr_root/apps/site/osgiconfig/config/com.a.B.cfg.json",
+            "ui.apps/src/main/content/jcr_root/apps/site/clientlibs/base/css.txt",
         ];
         let produced: HashSet<&'static str> = samples
             .iter()
-            .filter_map(|s| infer_language_hint(Path::new(s)))
+            .filter_map(|s| infer_language_hint(s))
             .collect();
         assert!(
             !produced.is_empty(),

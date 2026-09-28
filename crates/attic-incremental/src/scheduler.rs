@@ -59,10 +59,11 @@ pub struct SchedulerConfig {
     pub max_pending: usize,
     /// Idle poll interval.
     pub poll_interval: Duration,
-    /// Mirrors `attic_core::config::IndexingOverride::structural` — an
-    /// operational kill-switch to fall back to lexical-only indexing.
-    /// Default `true` (current behavior unchanged).
-    pub structural_indexing: bool,
+    /// Indexing options every incremental task runs with — the same options
+    /// bootstrap uses (built from `attic.toml [indexing]`), so incremental
+    /// and full indexing can never disagree on structural analysis, the
+    /// analyzer plugin set, unit ceilings or analysis parallelism.
+    pub index_options: IndexOptions,
 }
 
 impl Default for SchedulerConfig {
@@ -71,7 +72,7 @@ impl Default for SchedulerConfig {
             workers: 2,
             max_pending: 4096,
             poll_interval: Duration::from_millis(200),
-            structural_indexing: true,
+            index_options: IndexOptions::default(),
         }
     }
 }
@@ -454,10 +455,7 @@ fn execute_task(
                 readers: pool,
                 writer,
             };
-            let opts = IndexOptions {
-                structural: config.structural_indexing,
-                ..IndexOptions::default()
-            };
+            let opts = config.index_options.clone();
             match attic_indexing::index_changes(&store, root, policy, &opts, &scoped) {
                 Ok(res) => {
                     debug!(

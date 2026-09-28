@@ -609,6 +609,13 @@ impl AtticServer {
             }
             attic_core::AtticConfig::default()
         };
+        // Fail closed at startup on analyzer settings (unknown plugin ids,
+        // zero unit ceiling) instead of on the first indexing run.
+        IndexOptions::from_config(&attic_config.indexing)
+            .validate()
+            .map_err(|e| {
+                ServerError::InvalidArg(format!("invalid '{}': {e}", attic_toml_path.display()))
+            })?;
 
         // Hardware detection failure never cascades into a crash — it only
         // affects ResourceMode/ResourcePolicy (falls back to Low's
@@ -619,7 +626,12 @@ impl AtticServer {
                 "hardware detection failed ({e}); falling back to a conservative resource baseline"
             );
         }
-        let env_overrides = attic_storage::env_resource_overrides();
+        let env_overrides = attic_storage::env_resource_overrides()
+            .map_err(|e| ServerError::InvalidArg(format!("invalid resource configuration: {e}")))?;
+        let explicit_embedding_batch = env_overrides
+            .embedding_batch_size
+            .or(attic_config.resources.embedding_batch_size)
+            .is_some();
         let resolution = attic_storage::resolve_effective_config(
             &attic_config.resources,
             &env_overrides,
@@ -627,10 +639,12 @@ impl AtticServer {
         )
         .map_err(|e| ServerError::InvalidArg(format!("invalid resource configuration: {e}")))?;
         let mut effective = resolution.effective;
-        if semantic_opt_in {
+        if semantic_opt_in && !explicit_embedding_batch {
             // Batch 64 pushed the F32 Qwen process above 5 GiB and magnified
             // padding/attention work. Sixteen keeps the observed working set
             // near the requested 3-3.5 GiB envelope while still vectorizing.
+            // An explicit `embedding_batch_size` is honoured as configured;
+            // the provider's token budget still bounds its memory.
             effective.embedding_batch_size = effective.embedding_batch_size.min(16);
         }
         info!(
@@ -689,10 +703,7 @@ impl AtticServer {
                         model = provider.model_id(),
                         "semantic layer ENABLED"
                     );
-                    let stack = attic_retrieval::semantic::SemanticStack {
-                        store,
-                        provider,
-                    };
+                    let stack = attic_retrieval::semantic::SemanticStack { store, provider };
                     Some(Arc::new(stack))
                 }
                 Err(e) => {
@@ -761,6 +772,12 @@ impl AtticServer {
         })
     }
 
+    /// Indexing options for every run this server performs (bootstrap and
+    /// incremental), derived once from `attic.toml [indexing]`.
+    fn index_options(&self) -> IndexOptions {
+        IndexOptions::from_config(&self.attic_config.indexing)
+    }
+
     /// Bootstrap (or reconcile) the repository at `root`.
     ///
     /// Always runs a full authoritative [`index_repository`] pass, even when
@@ -794,17 +811,7 @@ impl AtticServer {
             .iter()
             .map(|pattern| GlobRule::exclude(pattern.clone()))
             .collect();
-        let opts = IndexOptions {
-            structural: self.attic_config.indexing.structural,
-            // Configurable fail-closed unit ceiling ([indexing]
-            // max_units_per_file in attic.toml); absent → library default.
-            max_units_per_file: self
-                .attic_config
-                .indexing
-                .max_units_per_file
-                .unwrap_or_else(|| IndexOptions::default().max_units_per_file),
-            ..IndexOptions::default()
-        };
+        let opts = self.index_options();
         let result = attic_indexing::index_repository_with_cancellation(
             &store,
             root,
@@ -4183,7 +4190,7 @@ pub(crate) fn build_server_and_enricher(
             match attic_incremental::spawn_scheduler(
                 attic_incremental::SchedulerConfig {
                     workers: startup_server.effective_resources.scheduler_workers,
-                    structural_indexing: startup_server.attic_config.indexing.structural,
+                    index_options: startup_server.index_options(),
                     ..attic_incremental::SchedulerConfig::default()
                 },
                 startup_server.pool.clone(),
@@ -4647,6 +4654,47 @@ mod tests {
         assert!(written.contains("[semantic]"));
     }
 
+    /// A misspelled analyzer plugin id must stop startup with an actionable
+    /// error naming the valid ids, never silently index with the wrong set.
+    #[test]
+    fn unknown_analyzer_plugin_in_attic_toml_fails_startup() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("fresh.db");
+        std::fs::write(
+            tmp.path().join("attic.toml"),
+            "[indexing]\nanalyzers = [\"swfit\"]\n",
+        )
+        .unwrap();
+        let err = match AtticServer::new_with_semantic_opt(&db, false) {
+            Ok(_) => panic!("startup must fail on an unknown analyzer id"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("swfit"), "{err}");
+        assert!(
+            err.contains("swift"),
+            "error must list the valid ids: {err}"
+        );
+    }
+
+    /// Valid analyzer and parallelism settings flow into the options every
+    /// bootstrap and incremental run uses.
+    #[test]
+    fn indexing_settings_flow_into_index_options() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("fresh.db");
+        std::fs::write(
+            tmp.path().join("attic.toml"),
+            "[indexing]\nanalysis_threads = 3\nanalyzers = [\"aem\", \"java\"]\nmax_units_per_file = 5000\n",
+        )
+        .unwrap();
+        let server = AtticServer::new_with_semantic_opt(&db, false).expect("valid config starts");
+        let opts = server.index_options();
+        assert_eq!(opts.analysis_threads, 3);
+        assert_eq!(opts.max_units_per_file, 5000);
+        assert_eq!(opts.analyzers.enabled(), ["aem", "java"]);
+        assert!(opts.structural);
+    }
+
     // ΓöÇΓöÇ Multi-root workspace configuration: parsing + validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
@@ -4776,6 +4824,7 @@ mod tests {
                 IndexError::Storage(_) => {}
                 IndexError::Io { .. } => {}
                 IndexError::PolicyHash(_) => {}
+                IndexError::AnalyzerConfig(_) => {}
                 IndexError::RepositoryNotBootstrapped(_) => {}
                 IndexError::TransientFailures { .. } => {}
                 IndexError::IncompleteAnalysis { .. } => {}

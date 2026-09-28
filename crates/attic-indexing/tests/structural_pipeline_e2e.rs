@@ -620,3 +620,115 @@ fn rename_removes_old_artifacts_and_keeps_new() {
         fx.query_i64(|c| c.query_row("SELECT COUNT(*) FROM core_identity_links", [], |r| r.get(0)));
     assert!(links >= 1, "rename identity link expected");
 }
+
+// ── AEM platform plugin end-to-end ──────────────────────────────────────────
+
+const AEM_COMPONENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" xmlns:sling="http://sling.apache.org/jcr/sling/1.0"
+    jcr:primaryType="cq:Component"
+    jcr:title="Hero Banner"
+    sling:resourceSuperType="core/wcm/components/teaser/v2/teaser"/>
+"#;
+const AEM_HTL: &str = r#"<div class="hero" data-sly-use.hero="com.acme.core.models.HeroBanner">
+  <template data-sly-template.cta="${@ link}"><a href="${link}">heroBannerCallToAction</a></template>
+</div>
+"#;
+const AEM_OSGI: &str = "{\n  \"endpoint\": \"https://api.example.com\",\n  \"timeout\": 30\n}\n";
+
+#[test]
+fn aem_layout_is_indexed_structurally_and_stays_searchable() {
+    let base = "ui.apps/src/main/content/jcr_root/apps/acme/components/hero";
+    let fx = Fixture::bootstrap(&[
+        (&format!("{base}/.content.xml"), AEM_COMPONENT),
+        (&format!("{base}/hero.html"), AEM_HTL),
+        (
+            "ui.config/src/main/content/jcr_root/apps/acme/osgiconfig/config.prod/com.acme.core.ApiClient.cfg.json",
+            AEM_OSGI,
+        ),
+        // Plain HTML outside an AEM layout must not be claimed.
+        (
+            "site/index.html",
+            "<html><body>plainLandingPage</body></html>\n",
+        ),
+    ]);
+
+    let aem_symbols: BTreeSet<String> = fx
+        .pool
+        .with_reader(|c| {
+            let mut stmt = c.prepare(
+                "SELECT qualified_name FROM core_symbol_identities WHERE language = 'aem'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<BTreeSet<_>, _>>()?)
+        })
+        .unwrap();
+    for expected in [
+        "/apps/acme/components/hero",
+        "hero.html#hero",
+        "hero.html#cta",
+        "com.acme.core.ApiClient",
+        "com.acme.core.ApiClient#endpoint",
+        "com.acme.core.ApiClient#timeout",
+    ] {
+        assert!(
+            aem_symbols.contains(expected),
+            "missing AEM symbol {expected}; got {aem_symbols:?}"
+        );
+    }
+
+    let super_type_edges = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_relationships
+              WHERE provenance_json LIKE '%core/wcm/components/teaser/v2/teaser%'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        super_type_edges, 1,
+        "resourceSuperType must be recorded as an import edge"
+    );
+
+    let sling_model_edges = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_relationships
+              WHERE provenance_json LIKE '%com.acme.core.models.HeroBanner%'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        sling_model_edges, 1,
+        "data-sly-use must be recorded as an import edge"
+    );
+
+    let plain_html_symbols = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_symbol_occurrences so
+               JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
+              WHERE fo.path = 'site/index.html'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(plain_html_symbols, 0, "plain HTML is not an AEM artifact");
+
+    for token in ["heroBannerCallToAction", "plainLandingPage"] {
+        let hits = fx
+            .pool
+            .with_reader(|c| {
+                attic_storage::fts_search(
+                    c,
+                    &attic_storage::FtsSearchParams {
+                        query: token,
+                        repository_id: None,
+                        file_type: None,
+                        language: None,
+                        max_results: 10,
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{token} must stay lexically searchable");
+    }
+}
