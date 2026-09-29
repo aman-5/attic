@@ -39,7 +39,8 @@ tempfile.workspace = true
 
 [features]
 # GPU semantic backends.
-#   ort-directml : any DX12 GPU on Windows (NVIDIA/AMD/Intel), no CUDA toolkit.
+#   ort-directml : no-op alias. DirectML (any DX12 GPU) is built in
+#                  automatically on Windows MSVC; nothing to enable.
 #   candle-cuda  : NVIDIA on Linux and Windows (requires the CUDA toolkit).
 #   candle-metal : Apple Silicon macOS.
 # Build e.g.: cargo build -p attic-server --features candle-metal

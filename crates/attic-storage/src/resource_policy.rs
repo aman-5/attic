@@ -38,7 +38,13 @@ impl HardwareSnapshot {
         let mut sys = System::new();
         sys.refresh_memory();
         let total_memory_mib = sys.total_memory() / (1024 * 1024);
-        let cpu_cores = sys.physical_core_count().unwrap_or(0);
+        // Fault-injection hook (like ATTIC_FORCE_RESOURCE_PRESSURE): pin the
+        // core count so resource tests don't depend on the CI runner's size.
+        let cpu_cores = std::env::var("ATTIC_FORCE_CPU_CORES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| sys.physical_core_count().unwrap_or(0));
         if total_memory_mib == 0 || cpu_cores == 0 {
             return Err(ResourceDetectionError(format!(
                 "implausible hardware snapshot (total_memory_mib={total_memory_mib}, cpu_cores={cpu_cores})"

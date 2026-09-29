@@ -149,7 +149,7 @@ embedded:
 
 | Goal | Change |
 |---|---|
-| Faster embeddings on Windows | Build with `--features ort-directml --target x86_64-pc-windows-msvc`. The fp16 ONNX export downloads automatically on first run; `ATTIC_ONNX_MODEL_DIR` is only needed to point at your own export |
+| Faster embeddings on Windows | Nothing to do on MSVC: DirectML is built in by default. The fp16 ONNX export downloads automatically on first run; `ATTIC_ONNX_MODEL_DIR` is only needed to point at your own export |
 | Faster embeddings on Apple Silicon | Build with `--features candle-metal` (the default for `aarch64-apple-darwin` release builds) |
 | Faster embeddings on Linux + NVIDIA | Build with `--features candle-cuda` on a machine with the CUDA toolkit installed |
 | Less embedding work | `[semantic] exclude_globs` for generated, vendored or snapshot data; lower `max_file_bytes`; raise `min_score` (default 0.30) |

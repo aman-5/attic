@@ -559,7 +559,7 @@ pub fn expected_fingerprint(backend: &str, dimension: Option<usize>) -> Embeddin
     match backend {
         "ort-directml" => EmbeddingFingerprint {
             // Must match `ort_directml::ORT_PROVIDER_ID`; kept as a literal
-            // here because that module is `#[cfg(feature = "ort-directml")]`
+            // here because that module is `#[cfg(all(windows, target_env = "msvc"))]`
             // and this function must resolve regardless of feature flags.
             provider: "qwen3-ort".into(),
             model_revision: "onnx-community-fp16".into(),

@@ -18,12 +18,8 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: windows-latest
-          # Pinned to macos-14 (Apple Silicon/arm64) rather than macos-latest so
-          # this stays real native-arm64 compile+test evidence regardless of
-          # future macos-latest default changes. There is no GPU/Metal on this
-          # hosted runner and no Metal backend implemented in this codebase, so
-          # this is CPU-only compile+test evidence, not GPU runtime evidence.
-          - os: macos-14
+          # Apple Silicon runner, matching release.yml.
+          - os: macos-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -44,23 +40,6 @@ jobs:
 
       - name: Unit + integration tests
         run: cargo test --workspace
-
-  windows-directml-compile-only:
-    # No GPU is present on GitHub-hosted windows-latest runners, so this job
-    # only proves the ort-directml feature compiles cleanly on Windows MSVC.
-    # It is NOT a GPU/DirectML runtime test.
-    name: windows-directml-compile-only
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@1.98.0
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build with ort-directml feature (compile-only, no GPU on hosted runner)
-        run: cargo build --workspace --features attic-server/ort-directml
 
   package:
     name: packaging layout verification

@@ -98,7 +98,7 @@ impl WorkerEngine for NeuralEngine {
                 }
                 Arc::new(embedder)
             }
-            #[cfg(feature = "ort-directml")]
+            #[cfg(all(windows, target_env = "msvc"))]
             "ort-directml" => {
                 let dir = spec
                     .onnx_model_dir
@@ -113,7 +113,7 @@ impl WorkerEngine for NeuralEngine {
                 .map_err(map_semantic_error)?;
                 Arc::new(p)
             }
-            #[cfg(not(feature = "ort-directml"))]
+            #[cfg(not(all(windows, target_env = "msvc")))]
             "ort-directml" => {
                 return Err(WorkerFail::artifact(
                     "ort-directml backend not compiled into this binary",

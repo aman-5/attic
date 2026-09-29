@@ -14,26 +14,20 @@
 # The archive NEVER contains: target/, Cargo build artifacts, developer
 # scripts, local configuration, test databases, logs, or hidden files.
 #
-# Usage:
 #   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
+#                   [--features "<cargo-features>"] [--stage-only]
 #
-#   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
-#                   [--features "ort-directml"] [--stage-only]
-#
-# Backend variants (r14):
-#   default build                 CPU-safe; semantic runs via the supervised
-#                                 worker with the Candle Qwen3 provider.
-#   --features ort-directml       Windows GPU build (NVIDIA validated on RTX
-#                                 A500; AMD/Intel untested). Requires the MSVC
-#                                 toolchain — never the GNU target — because
-#                                 ONNX Runtime ships MSVC-only binaries. The
+# Backend variants:
+#   default build                 Target default; Windows MSVC includes
+#                                 DirectML automatically.
+#   Windows DirectML              Built automatically for the MSVC target; no
+#                                 feature flag is needed. The
 #                                 `inference-worker` subcommand is part of the
 #                                 same binary; no extra artifact is packaged.
 #
 # Cross-compilation targets:
 #   x86_64-pc-windows-msvc      Windows x86_64
 #   x86_64-unknown-linux-gnu    Linux x86_64
-#   x86_64-apple-darwin         macOS x86_64
 #   aarch64-apple-darwin        macOS ARM64
 set -euo pipefail
 
@@ -42,8 +36,8 @@ usage() { echo "usage: $0 --target <triple> [--out <dir>] [--stage-only] | --ver
 MODE=build
 STAGE_ONLY=false
 TARGET=
-# r14: optional Cargo feature set for backend variants (e.g. "ort-directml"
-# for the Windows GPU build). Empty = default CPU-safe build.
+# Optional Cargo feature set for explicit backend variants. Empty = default
+# release build for the target.
 FEATURES=
 OUT=dist
 while [[ $# -gt 0 ]]; do
@@ -60,7 +54,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${ATTIC_RELEASE_VERSION:-$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')}"
 
-SUPPORTED_TARGETS="x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin"
+SUPPORTED_TARGETS="x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin"
 
 if [[ "$MODE" == verify ]]; then
   DIR="${VERIFY_DIR:?--verify requires a directory}"
@@ -113,27 +107,13 @@ cd "$REPO_ROOT"
 
 # Per-target GPU backend defaults.
 #
-# `attic-server`'s `default = []` meant every published binary was compiled
-# without any GPU backend. The provider code existed and CI even
-# compile-checked it, but the artifact users actually installed could never
-# construct anything except `ExecutionBackend::CandleCpu` — so real GPUs sat
-# idle while status reported a deliberate-looking "candle-cpu" with no
-# fallback reason. A backend that is not compiled in is not a backend.
-#
-# Windows      -> ort-directml. Vendor-agnostic across NVIDIA/AMD/Intel
-#                 because DirectML targets DX12 rather than a vendor SDK,
-#                 and the `ort` crate pulls its own runtime binaries and
-#                 copies them beside the executable, so nothing extra has to
-#                 be staged by hand.
+# Windows      -> DirectML is compiled automatically for the MSVC target by
+#                 attic-semantic, so no feature flag is required.
 #
 # macOS arm64  -> candle-metal. Metal ships with the OS and needs no SDK
 #                 beyond the Xcode command line tools, so this cannot fail
 #                 to build on any machine that can already build the target,
 #                 and every Apple Silicon Mac can actually use it.
-#
-# macOS x86_64 -> nothing. Intel Macs are deliberately CPU-only; Metal on
-#                 those machines would target GPUs this project does not
-#                 support.
 #
 # Linux        -> nothing, DESPITE candle-cuda existing and working. It is a
 #                 deliberate omission, not an oversight: linking it requires
@@ -152,7 +132,6 @@ cd "$REPO_ROOT"
 # still runs correctly on a machine that has no such device.
 if [[ -z "$FEATURES" ]]; then
   case "$TARGET" in
-    *windows*)          FEATURES="ort-directml" ;;
     aarch64-apple-darwin) FEATURES="candle-metal" ;;
   esac
   [[ -n "$FEATURES" ]] && echo "== enabling default GPU backend for $TARGET: $FEATURES"

@@ -359,7 +359,7 @@ Attic works with zero configuration. Everything below is optional.
 ### Where things live
 
 Everything is under `ATTIC_HOME` (default `~/.attic`) — never inside your
-repositories:
+repositories and never in Hugging Face's global `~/.cache/huggingface` cache:
 
 | Path | Contents |
 |---|---|
@@ -367,9 +367,9 @@ repositories:
 | `semantic.db` | Embeddings — disposable |
 | `config.toml` | Workspace membership (`[[repositories]]`) |
 | `attic.toml` | Tunables (below); a commented template is written on first run |
-| `models/` | Embedding model cache (`ATTIC_MODEL_CACHE_DIR` overrides) |
-| `logs/` | Daily file log — off by default, toggled live with the `logging` tool |
-| `backups/`, `tmp/` | Crash-recovery backups (last 3) and scratch space |
+| `models/` | Embedding model cache (`ATTIC_MODEL_CACHE_DIR` overrides); created only when model assets are downloaded |
+| `logs/` | Daily file log — off by default, created only after `logging {"action":"on"}` |
+| `backups/` | Crash-recovery backups (last 3), created only when the shutdown backup first runs |
 | `attic.lock`, `attic.ipc` | Daemon election and relay address |
 
 ### `attic.toml`
@@ -539,8 +539,8 @@ cargo build --release --package attic-server
 Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (`rustup show`
 installs it) and a C compiler for the bundled tree-sitter grammars —
 Build Tools for Visual Studio (or MinGW) on Windows, `build-essential` on
-Linux, `xcode-select --install` on macOS. The optional GPU build
-(`--features ort-directml`) is Windows/MSVC-only.
+Linux, `xcode-select --install` on macOS. On Windows with MSVC the DirectML
+GPU backend is built in automatically; no feature flag is needed.
 
 ```sh
 cargo test --workspace

@@ -32,7 +32,7 @@ pub mod model_assets;
 // every build means a CPU-only binary can still report honestly on ONNX
 // asset state instead of pretending the concept does not exist.
 pub mod onnx_assets;
-#[cfg(feature = "ort-directml")]
+#[cfg(all(windows, target_env = "msvc"))]
 pub mod ort_directml;
 pub mod provider;
 pub mod qwen3_model;
@@ -59,7 +59,7 @@ pub use invalidate::{ReconcileReport, reconcile};
 pub use model_assets::{
     ModelAssetError, ModelAssetManager, ModelAssetStatus, ModelFileSpec, ModelManifest,
 };
-#[cfg(feature = "ort-directml")]
+#[cfg(all(windows, target_env = "msvc"))]
 pub use ort_directml::{ORT_PROVIDER_ID, OrtDirectMlProvider};
 pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,

@@ -28,16 +28,20 @@ attic-inference-worker = { path = "../attic-inference-worker" }
 rayon = "1.10"
 hnsw_rs = "0.3.4"
 
-# Phase 4: ORT/DirectML GPU provider (Windows-first; no CUDA toolkit needed).
-# Optional so default builds stay lean and platform-specific backends compile
-# only where they ship.
-ort = { version = "2.0.0-rc.10", features = ["directml", "ndarray", "half"], optional = true }
-half = { version = "2.1", features = ["num-traits"], optional = true }
-ndarray = { version = "0.17", optional = true }
+# ORT/DirectML GPU provider: any DX12 GPU (NVIDIA/AMD/Intel), no CUDA toolkit.
+# Always built on Windows MSVC (ONNX Runtime ships MSVC-only binaries), so a
+# plain `cargo build` / `cargo test` includes the GPU path with no flags.
+# Other platforms and windows-gnu never compile it.
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+ort = { version = "2.0.0-rc.10", features = ["directml", "ndarray", "half"] }
+half = { version = "2.1", features = ["num-traits"] }
+ndarray = "0.17"
 
 [features]
 default = []
-ort-directml = ["dep:ort", "dep:half", "dep:ndarray"]
+# No-op, kept so existing `--features ort-directml` scripts keep working;
+# DirectML is enabled automatically on Windows MSVC.
+ort-directml = []
 
 # Candle GPU backends. These enable real `Device::new_cuda` /
 # `Device::new_metal` support; without them Candle still compiles those calls

@@ -127,6 +127,16 @@ Canonical (lexical/structural) retrieval never depends on it. Embedding
 workers scale with the resource mode (1 / 3 / 8 for low / balanced /
 performance). See [`PERFORMANCE.md`](PERFORMANCE.md) for expected throughput.
 
+### Attic home layout
+
+`ATTIC_HOME` defaults to `~/.attic`. Startup creates the home directory, the
+main `attic.db*` files, and `attic.toml` when missing. Other directories are
+lazy: `models/` is created only for model downloads (or an explicit
+`ATTIC_MODEL_CACHE_DIR` elsewhere), `logs/` only after the `logging` tool is
+turned on, and `backups/` only after the shutdown backup first succeeds.
+Attic does not read from or write to `~/.cache/huggingface`; model assets live
+under the Attic model cache.
+
 ## Troubleshooting
 
 | Problem | What to check |
@@ -141,7 +151,7 @@ performance). See [`PERFORMANCE.md`](PERFORMANCE.md) for expected throughput.
 | Cross-repo answers withheld | Startup cross-repo sync not finished or failed (stderr `cross-repo workspace sync failed`); single-repo retrieval unaffected |
 | No semantic results | `status.semantic_progress`; stderr `semantic layer unavailable` means lexical-only by design |
 | "server busy" / memory | `status.resource_pressure`; raise `total_memory_budget_mib` / `max_foreground_queries`, or index fewer repositories at once |
-| Disk usage | `attic.db*`, `semantic.db`, `backups/` under `ATTIC_HOME` — not Cargo's `target/` |
+| Disk usage | `attic.db*`, `semantic.db`, lazy `models/` / `backups/` under `ATTIC_HOME` — not Cargo's `target/` or `~/.cache/huggingface` |
 
 <details>
 <summary><strong>Details</strong></summary>
@@ -302,19 +312,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 <summary><b>Toolchains per platform</b></summary>
 
 - **Windows (recommended):** rustup's default `x86_64-pc-windows-msvc` plus
-  "Build Tools for Visual Studio" with the C++ workload. The GPU build
-  (`--features ort-directml`) requires MSVC.
+  "Build Tools for Visual Studio" with the C++ workload. The DirectML GPU
+  backend is built in automatically with MSVC — plain `cargo build` /
+  `cargo test` include it, no feature flag.
 
   > **The GNU override below silently disables the GPU build.** ONNX Runtime
   > publishes no `x86_64-pc-windows-gnu` binaries, so a `[build] target`
-  > override in `%USERPROFILE%\.cargo\config.toml` makes
-  > `--features ort-directml` fail with
-  > `no prebuilt binaries available for target x86_64-pc-windows-gnu` —
-  > not a GPU that merely goes unused, but a build that cannot happen at
-  > all. If you have that override set, pass the target explicitly:
+  > override in `%USERPROFILE%\.cargo\config.toml` produces a CPU-only
+  > binary. If you have that override set but also have MSVC installed,
+  > either delete the override or pass the target explicitly:
   >
   > ```
-  > cargo build --release --features ort-directml --target x86_64-pc-windows-msvc
+  > cargo build --release --target x86_64-pc-windows-msvc
   > ```
   >
   > and install from `target/x86_64-pc-windows-msvc/release/`, copying the
@@ -344,10 +353,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 |---|---|
 | `ATTIC_BENCH_INDEX=1` (+ `ATTIC_BENCH_ROOT`, …) | Indexing benchmark — see [`PERFORMANCE.md`](PERFORMANCE.md) |
 | `ATTIC_BENCH_QWEN=1` (+ `ATTIC_BENCH_QWEN_CORPUS`, …) | Real-model embedding benchmark |
-| `ATTIC_RUN_MODEL_E2E=1` | End-to-end test with the real embedding model |
+| `ATTIC_RUN_MODEL_E2E=0/1` | Real-model e2e: runs automatically on Windows MSVC when `~/.attic/models/onnx-fp16` exists; `0` skips, `1` forces (CPU if no GPU assets) |
 | `ATTIC_ACCEPTANCE_DUMP=<dir>` | Frozen-count acceptance run over the reference JSON-export corpus |
 | `ATTIC_ACCEPTANCE_WORKSPACE=<dir>` | Frozen-count acceptance run over the reference 20-repository workspace |
 | `ATTIC_FORCE_RESOURCE_PRESSURE` | Fault injection: start at a fixed pressure tier |
+| `ATTIC_FORCE_CPU_CORES=<n>` | Test hook: pin the detected physical core count so resource tests don't depend on the machine |
 | `ATTIC_PRESSURE_OVERRIDE_FILE` | Fault injection: a file whose content (`normal`…`emergency`) forces the tier while it exists |
 | `ATTIC_FAST_RECOVERY_MS` | Fault injection: shorten graduated-recovery dwell times |
 | `ATTIC_MOCK_WORKER` | Inference-worker test double: `echo` / `hang` / `corrupt` / `crash` |

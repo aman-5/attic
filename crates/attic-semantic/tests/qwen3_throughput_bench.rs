@@ -33,16 +33,18 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn resolve_cache_dir() -> PathBuf {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        return PathBuf::from(hf_home).join("hub");
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".cache")
-        .join("huggingface")
-        .join("hub")
+    // Attic's own model cache (`$ATTIC_HOME/models`, default `~/.attic/models`).
+    let home = std::env::var("ATTIC_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| ".".into()),
+            )
+            .join(".attic")
+        });
+    home.join("models")
 }
 
 /// Deterministic, representative corpus split on line boundaries into

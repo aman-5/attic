@@ -40,22 +40,18 @@ struct TestCase {
 }
 
 fn resolve_cache_dir() -> PathBuf {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        let p = PathBuf::from(hf_home).join("hub");
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let p = PathBuf::from(home)
-            .join(".cache")
-            .join("huggingface")
-            .join("hub");
-        if p.exists() {
-            return p;
-        }
-    }
-    PathBuf::from(".cache/huggingface/hub")
+    // Attic's own model cache (`$ATTIC_HOME/models`, default `~/.attic/models`).
+    let home = std::env::var("ATTIC_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| ".".into()),
+            )
+            .join(".attic")
+        });
+    home.join("models")
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

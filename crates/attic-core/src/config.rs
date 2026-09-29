@@ -103,7 +103,7 @@ pub struct SemanticConfig {
     ///
     /// GPU acceleration requires BOTH of the following, and silently stays
     /// on CPU if either is missing:
-    ///  1. a binary compiled with the `ort-directml` feature, and
+    ///  1. a Windows MSVC build (DirectML is compiled in automatically), and
     ///  2. this directory (or the `ATTIC_ONNX_MODEL_DIR` environment
     ///     variable, which this setting takes precedence over).
     ///

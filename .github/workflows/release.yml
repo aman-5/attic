@@ -14,10 +14,6 @@ name: Release
 #   ALL required builds pass
 #           ↓
 #   Create tag + GitHub Release
-#           ↓
-#   macOS Intel continues independently
-#           ↓
-#   If Intel succeeds later, attach its binary to the SAME release.
 #
 # Example:
 #
@@ -247,16 +243,6 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-
-      # -----------------------------------------------------------------------
-      # Tests
-      # -----------------------------------------------------------------------
-
-      - name: Run tests
-        run: |
-          cargo test --workspace
-
-
       # -----------------------------------------------------------------------
       # Package
       # -----------------------------------------------------------------------
@@ -386,108 +372,6 @@ jobs:
 
           if-no-files-found: error
 
-
-  # ===========================================================================
-  # OPTIONAL INTEL macOS BUILD
-  #
-  # IMPORTANT:
-  #
-  # publish DOES NOT depend on this job.
-  #
-  # Therefore if GitHub has no Intel Mac runner available, this job can remain
-  # queued without blocking Windows/Linux/Apple-Silicon release publication.
-  # ===========================================================================
-
-  build-intel-macos:
-    name: build x86_64-apple-darwin
-
-    needs:
-      - prepare
-
-    if: needs.prepare.outputs.already_released != 'true'
-
-    runs-on: macos-15-intel
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
-
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          targets: x86_64-apple-darwin
-
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-
-      # -----------------------------------------------------------------------
-      # Tests
-      # -----------------------------------------------------------------------
-
-      - name: Run tests
-        run: |
-          cargo test --workspace
-
-
-      # -----------------------------------------------------------------------
-      # Package
-      # -----------------------------------------------------------------------
-
-      - name: Package release
-        shell: bash
-        env:
-          ATTIC_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          export ATTIC_RELEASE_VERSION="${ATTIC_RELEASE_VERSION#v}"
-
-          bash tools/package.sh \
-            --target "x86_64-apple-darwin" \
-            --out dist
-
-
-      - name: Verify packaged artifact contract
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          ARCHIVE="dist/attic-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz"
-          test -f "$ARCHIVE"
-          test -f "${ARCHIVE}.sha256"
-          echo "verified release artifact: $ARCHIVE"
-          echo "verified checksum: ${ARCHIVE}.sha256"
-
-
-      - name: Show packaged files
-        shell: bash
-        run: |
-          find dist -maxdepth 2 -type f -print
-
-
-      # -----------------------------------------------------------------------
-      # Store Intel artifact
-      # -----------------------------------------------------------------------
-
-      - name: Upload Intel macOS artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: attic-x86_64-apple-darwin
-
-          path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-
-          if-no-files-found: error
-
-
   # ===========================================================================
   # PUBLISH REQUIRED RELEASE
   #
@@ -495,8 +379,6 @@ jobs:
   #
   #   prepare
   #   required 3-platform build matrix
-  #
-  # It deliberately DOES NOT depend on build-intel-macos.
   # ===========================================================================
 
   publish:
@@ -520,10 +402,7 @@ jobs:
 
 
       # -----------------------------------------------------------------------
-      # Download ONLY the required platform artifacts.
-      #
-      # We intentionally do not wildcard-download Intel here because whether
-      # Intel happened to finish early must not affect initial release contents.
+      # Download required platform artifacts.
       # -----------------------------------------------------------------------
 
       - name: Download Windows artifact
@@ -600,7 +479,6 @@ jobs:
       #   Linux x64
       #   macOS Apple Silicon
       #
-      # Intel Mac may be attached later.
       # -----------------------------------------------------------------------
 
       - name: Publish GitHub Release
@@ -618,77 +496,3 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-
-
-  # ===========================================================================
-  # ATTACH INTEL MACOS LATER
-  #
-  # This runs only when BOTH:
-  #
-  #   initial release has been published
-  #   Intel macOS build succeeded
-  #
-  # If Intel waits three hours for a runner, this job simply waits for Intel.
-  #
-  # It does NOT create another version.
-  #
-  # Example:
-  #
-  #   v0.1.0 initially:
-  #
-  #       Windows
-  #       Linux
-  #       Apple Silicon
-  #
-  #   later:
-  #
-  #       Intel finishes
-  #             ↓
-  #       Intel artifact attached to SAME v0.1.0
-  # ===========================================================================
-
-  attach-intel-macos:
-    name: attach Intel macOS binary
-
-    needs:
-      - prepare
-      - publish
-      - build-intel-macos
-
-    if: >
-      always() &&
-      needs.prepare.result == 'success' &&
-      needs.publish.result == 'success' &&
-      needs.build-intel-macos.result == 'success' &&
-      needs.prepare.outputs.already_released != 'true'
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Download Intel macOS artifact
-        uses: actions/download-artifact@v6
-        with:
-          name: attic-x86_64-apple-darwin
-          path: dist
-
-
-      - name: Show Intel release files
-        shell: bash
-        run: |
-          find dist -maxdepth 1 -type f -print
-
-
-      # -----------------------------------------------------------------------
-      # softprops/action-gh-release updates the EXISTING release associated
-      # with this tag and uploads the additional files.
-      # -----------------------------------------------------------------------
-
-      - name: Attach Intel macOS files to existing release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256

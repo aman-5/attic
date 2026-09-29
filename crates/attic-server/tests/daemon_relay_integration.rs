@@ -105,6 +105,8 @@ async fn connect_daemon_with_env(
     cmd.env("ATTIC_HOME", home)
         .env("ATTIC_DB_PATH", db)
         .env("ATTIC_SEMANTIC", "0")
+        // Pin hardware so resource assertions don't depend on the runner size.
+        .env("ATTIC_FORCE_CPU_CORES", "16")
         .env_remove("ATTIC_CONFIG")
         .env_remove("ATTIC_WORKSPACE_ROOT")
         .stdin(Stdio::piped())

@@ -2,9 +2,11 @@
 //! no process at construction, loads on first embed, the process exits after
 //! the idle window, and the next embed reloads and returns the same vector.
 //!
-//! Gated on ATTIC_RUN_MODEL_E2E=1 (loads the real model). Uses the ONNX
-//! DirectML export when ATTIC_ONNX_MODEL_DIR is set and the binary was built
-//! with `ort-directml`; otherwise the Candle CPU weights in the HF cache.
+//! Runs automatically on Windows MSVC when the DirectML ONNX assets are on
+//! disk (`ATTIC_ONNX_MODEL_DIR`, else `~/.attic/models/onnx-fp16`); skips
+//! with a printed reason otherwise. `ATTIC_RUN_MODEL_E2E=0` forces a skip,
+//! `=1` forces a run (falling back to the Candle CPU weights in Attic's model cache
+//! when no GPU assets exist).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,14 +15,25 @@ use attic_inference_protocol::supervisor::{LoadParams, WorkerLaunch};
 use attic_semantic::{CancelFlag, EmbeddingInput, ResourceUsage, SemanticProvider};
 
 fn hf_hub() -> String {
-    std::env::var("HF_HOME")
-        .map(|h| format!("{h}/hub"))
-        .or_else(|_| {
-            std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .map(|h| format!("{h}/.cache/huggingface/hub"))
+    attic_model_cache_dir().display().to_string()
+}
+
+fn attic_model_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("ATTIC_MODEL_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| attic_home().join("models"))
+}
+
+fn attic_home() -> std::path::PathBuf {
+    std::env::var_os("ATTIC_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from)
+                .expect("need ATTIC_HOME or a user home directory")
+                .join(".attic")
         })
-        .expect("need a Hugging Face cache location")
 }
 
 fn embed(p: &dyn SemanticProvider, text: &str) -> (Vec<f32>, ResourceUsage) {
@@ -39,14 +52,32 @@ fn embed(p: &dyn SemanticProvider, text: &str) -> (Vec<f32>, ResourceUsage) {
     (out.into_iter().next().unwrap().vector, usage)
 }
 
+/// The local DirectML model directory, if its assets are present.
+fn local_onnx_dir() -> Option<String> {
+    let dir = std::env::var_os("ATTIC_ONNX_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            attic_model_cache_dir().join(attic_semantic::onnx_assets::ONNX_DIR_NAME)
+        });
+    attic_semantic::onnx_assets::assets_present(&dir).then(|| dir.display().to_string())
+}
+
 #[test]
 fn idle_worker_exits_and_the_next_query_reloads_it() {
-    if std::env::var("ATTIC_RUN_MODEL_E2E").ok().as_deref() != Some("1") {
-        eprintln!("ATTIC_RUN_MODEL_E2E!=1; skipping idle-unload e2e");
+    let forced = std::env::var("ATTIC_RUN_MODEL_E2E").ok();
+    if forced.as_deref() == Some("0") {
+        eprintln!("ATTIC_RUN_MODEL_E2E=0; skipping idle-unload e2e");
         return;
     }
-    let onnx = std::env::var("ATTIC_ONNX_MODEL_DIR").ok();
-    let backend = if onnx.is_some() && cfg!(feature = "ort-directml") {
+    let onnx = local_onnx_dir().filter(|_| cfg!(all(windows, target_env = "msvc")));
+    if onnx.is_none() && forced.as_deref() != Some("1") {
+        eprintln!(
+            "no local DirectML model (Windows MSVC + ~/.attic/models/onnx-fp16); \
+             skipping idle-unload e2e (set ATTIC_RUN_MODEL_E2E=1 to run on CPU)"
+        );
+        return;
+    }
+    let backend = if onnx.is_some() {
         "ort-directml"
     } else {
         "candle-cpu"

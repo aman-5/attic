@@ -2,12 +2,29 @@
 //! real Candle Qwen3 model → embedding vectors, over the wire protocol.
 //!
 //! Gated on ATTIC_RUN_MODEL_E2E=1 because it loads the real model (~1.2 GB).
-//! Uses the already-provisioned Hugging Face cache; performs no network I/O
+//! Uses Attic's already-provisioned model cache; performs no network I/O
 //! when the pinned snapshot is present.
 
 use attic_inference_protocol::EmbedItem;
 use attic_inference_protocol::supervisor::{LoadParams, WorkerLaunch, WorkerSupervisor};
 use std::time::Duration;
+
+fn attic_model_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("ATTIC_MODEL_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("ATTIC_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::var_os("USERPROFILE")
+                        .or_else(|| std::env::var_os("HOME"))
+                        .map(std::path::PathBuf::from)
+                        .expect("need ATTIC_HOME or a user home directory")
+                        .join(".attic")
+                })
+                .join("models")
+        })
+}
 
 #[test]
 fn candle_worker_end_to_end_with_real_model() {
@@ -15,14 +32,7 @@ fn candle_worker_end_to_end_with_real_model() {
         eprintln!("ATTIC_RUN_MODEL_E2E!=1; skipping real-model worker e2e");
         return;
     }
-    let hub = std::env::var("HF_HOME")
-        .map(|h| format!("{h}/hub"))
-        .or_else(|_| {
-            std::env::var("USERPROFILE")
-                .map(|h| format!("{h}/.cache/huggingface/hub"))
-                .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.cache/huggingface/hub")))
-        })
-        .expect("need a Hugging Face cache location");
+    let hub = attic_model_cache_dir().display().to_string();
 
     let sup = WorkerSupervisor::new(WorkerLaunch {
         program: std::path::PathBuf::from(env!("CARGO_BIN_EXE_attic")),

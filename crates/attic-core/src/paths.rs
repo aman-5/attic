@@ -21,10 +21,12 @@
 //! ```text
 //! ~/.attic/
 //! ├── config.toml   — persistent multi-root workspace configuration
+//! ├── attic.toml     — resource, semantic and indexing tunables
 //! ├── attic.db      — main SQLite database
 //! ├── semantic.db   — semantic layer (only when ATTIC_SEMANTIC=1)
-//! ├── backups/      — crash-recovery backups
-//! └── tmp/          — process scratch space (safe to delete while Attic is not running)
+//! ├── models/       — model cache, created lazily when models are downloaded
+//! ├── logs/         — file logs, created lazily when file logging is enabled
+//! └── backups/      — crash-recovery backups, created lazily on shutdown backup
 //! ```
 
 use std::fmt;
@@ -70,16 +72,13 @@ pub struct AtticPaths {
     pub runtime_config: PathBuf,
     /// Semantic layer database (`<home>/semantic.db`).
     pub semantic_db: PathBuf,
-    /// Crash-recovery backup directory (`<home>/backups/`).
-    pub backups_dir: PathBuf,
-    /// Process scratch directory (`<home>/tmp/`).
-    pub temp_dir: PathBuf,
 }
 
 impl AtticPaths {
     /// Resolve Attic's home directory according to the policy described in the
-    /// module documentation, create required directories, and return the
-    /// populated `AtticPaths`.
+    /// module documentation, create the home directory itself, and return the
+    /// populated `AtticPaths`. Optional subdirectories are created lazily by
+    /// the subsystems that first write to them.
     ///
     /// Reads `ATTIC_HOME` from the real environment; delegates to
     /// [`resolve_data_root_from`] for the pure resolution logic.
@@ -90,8 +89,8 @@ impl AtticPaths {
 
         // ATTIC_DB_PATH is the legacy explicit database override documented by
         // the public configuration contract. When ATTIC_HOME is absent, its
-        // parent also becomes the Attic home so config/backups/tmp remain
-        // colocated with the explicitly selected database.
+        // parent also becomes the Attic home so config and lazily-created
+        // subdirectories remain colocated with the explicitly selected database.
         let derived_home = db_override
             .as_deref()
             .map(str::trim)
@@ -125,19 +124,6 @@ impl AtticPaths {
             ))
         })?;
 
-        let backups = home.join("backups");
-        std::fs::create_dir_all(&backups).map_err(|e| {
-            PathResolutionError::new(format!(
-                "failed to create backups directory {:?}: {}",
-                backups, e
-            ))
-        })?;
-
-        let tmp = home.join("tmp");
-        std::fs::create_dir_all(&tmp).map_err(|e| {
-            PathResolutionError::new(format!("failed to create tmp directory {:?}: {}", tmp, e))
-        })?;
-
         let database = match db_override {
             Some(raw) => PathBuf::from(raw),
             None => home.join("attic.db"),
@@ -148,8 +134,6 @@ impl AtticPaths {
             config_file: home.join("config.toml"),
             runtime_config: home.join("attic.toml"),
             semantic_db: home.join("semantic.db"),
-            backups_dir: backups,
-            temp_dir: tmp,
             home,
         })
     }

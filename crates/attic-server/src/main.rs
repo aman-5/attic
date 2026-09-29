@@ -35,7 +35,7 @@ use std::{
     io,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -49,6 +49,68 @@ use tracing_subscriber::{
 /// happens before the server ever accepts a tool call.
 static LOG_RELOAD_HANDLE: OnceLock<reload::Handle<LevelFilter, tracing_subscriber::Registry>> =
     OnceLock::new();
+
+#[derive(Clone)]
+struct LazyFileLogWriter {
+    log_dir: PathBuf,
+    state: Arc<Mutex<LazyFileLogWriterState>>,
+}
+
+struct LazyFileLogWriterState {
+    writer: Option<tracing_appender::non_blocking::NonBlocking>,
+    _guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    error_reported: bool,
+}
+
+impl LazyFileLogWriter {
+    fn new(log_dir: PathBuf) -> Self {
+        Self {
+            log_dir,
+            state: Arc::new(Mutex::new(LazyFileLogWriterState {
+                writer: None,
+                _guard: None,
+                error_reported: false,
+            })),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LazyFileLogWriter {
+    type Writer = Box<dyn io::Write + Send + 'static>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let Ok(mut state) = self.state.lock() else {
+            return Box::new(io::sink());
+        };
+
+        if let Some(writer) = &state.writer {
+            return Box::new(writer.clone());
+        }
+
+        match tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("attic.log")
+            .build(&self.log_dir)
+        {
+            Ok(file_appender) => {
+                let (writer, guard) = tracing_appender::non_blocking(file_appender);
+                state.writer = Some(writer.clone());
+                state._guard = Some(guard);
+                Box::new(writer)
+            }
+            Err(e) => {
+                if !state.error_reported {
+                    eprintln!(
+                        "failed to initialize Attic file log in '{}': {e}",
+                        self.log_dir.display()
+                    );
+                    state.error_reported = true;
+                }
+                Box::new(io::sink())
+            }
+        }
+    }
+}
 
 /// Map a poisoned RwLock/Mutex to [`ServerError::Retrieval`] in handler
 /// functions that return `Result<_, ServerError>`.
@@ -299,7 +361,7 @@ static GPU_DECISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Decide whether the DirectML adapter may be used. `Ok` carries the GPU
 /// description, `Err` the reason embedding runs on CPU instead.
-#[cfg_attr(not(feature = "ort-directml"), allow(dead_code))]
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 fn gpu_gate(
     semantic: &attic_core::config::SemanticConfig,
     adapter: Option<&attic_storage::gpu_telemetry::GpuAdapterInfo>,
@@ -353,7 +415,7 @@ fn device_line(fallback_reason: Option<String>, gpu_report: &serde_json::Value) 
 /// GPU acceleration needs BOTH conditions; this reports exactly which one
 /// is unmet so the answer is never ambiguous again.
 fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::Value {
-    let compiled = cfg!(feature = "ort-directml");
+    let compiled = cfg!(all(windows, target_env = "msvc"));
 
     // Precedence mirrors `resolve_semantic_provider`: an explicitly configured
     // directory wins, otherwise the directory the provider actually opened.
@@ -392,8 +454,9 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
              only the Windows ort-directml backend exists today, so embeddings run on CPU",
             std::env::consts::OS
         ),
-        "not_compiled" => "this binary was built without the 'ort-directml' feature, so no GPU \
-             provider exists in it; rebuild with --features ort-directml to enable GPU"
+        "not_compiled" => "this binary was built with the Windows GNU toolchain, which has no \
+             DirectML support; rebuild with the MSVC toolchain (x86_64-pc-windows-msvc) \
+             to enable GPU"
             .to_string(),
         "not_configured" => "GPU support is compiled in, but no ONNX model directory is set; \
              set [semantic] onnx_model_dir in attic.toml (or ATTIC_ONNX_MODEL_DIR) to a \
@@ -471,7 +534,7 @@ fn thermal_guard_report(pause_c: u32, resume_c: u32, temp_c: Option<u32>) -> ser
 /// `Qwen3Embedder` is the sole production neural provider. If unavailable
 /// (e.g. offline with no cached weights), it degrades to `UnavailableProvider`,
 /// never corrupting the vector space and never falling back to a hashing embedder.
-#[cfg_attr(not(feature = "ort-directml"), allow(unused_variables))]
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(unused_variables))]
 fn resolve_semantic_provider(
     attic_config: &attic_core::AtticConfig,
     batch_size: usize,
@@ -501,19 +564,10 @@ fn resolve_semantic_provider(
         });
     }
 
-    // Candidate directories to search for local cached weights:
-    let mut candidate_dirs = vec![model_cache_dir.to_path_buf()];
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        candidate_dirs.push(PathBuf::from(hf_home).join("hub"));
-    }
-    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        candidate_dirs.push(
-            PathBuf::from(home)
-                .join(".cache")
-                .join("huggingface")
-                .join("hub"),
-        );
-    }
+    // Only Attic's configured model cache is authoritative. Downloads are
+    // directed here too, so startup never probes or reuses Hugging Face's
+    // global `~/.cache/huggingface` cache.
+    let candidate_dirs = [model_cache_dir.to_path_buf()];
 
     // r06/r07: neural inference runs in the supervised worker process. The
     // parent never loads model tensors at startup — it probes asset presence
@@ -579,7 +633,7 @@ fn resolve_semantic_provider(
     // an undocumented environment variable at it; if they had not, GPU
     // acceleration was skipped in silence. Meanwhile the safetensors path
     // downloaded its own weights automatically. Attic now acquires both.
-    #[cfg(feature = "ort-directml")]
+    #[cfg(all(windows, target_env = "msvc"))]
     'gpu: {
         let adapter = attic_storage::gpu_telemetry::query_adapter_info();
         let gpu_desc = match gpu_gate(&attic_config.semantic, adapter.as_ref()) {
@@ -705,37 +759,42 @@ fn resolve_semantic_provider(
 /// mid-session would change `execution_backend` underneath in-flight batches
 /// for a purely optional speedup, so the GPU backend is picked up on the next
 /// start instead. Indexing is never blocked either way.
-#[cfg(feature = "ort-directml")]
+#[cfg(all(windows, target_env = "msvc"))]
 fn spawn_onnx_download_task(cache_dir: PathBuf) {
-    tokio::task::spawn_blocking(move || {
-        const ATTEMPTS: u32 = 3;
-        for attempt in 1..=ATTEMPTS {
-            match attic_semantic::onnx_assets::ensure_onnx_assets(&cache_dir, None) {
-                Ok(dir) => {
-                    tracing::info!(
-                        dir = %dir.display(),
-                        "ONNX GPU assets ready; the GPU backend is selected on the next start"
-                    );
-                    return;
-                }
-                Err(e) if attempt < ATTEMPTS => {
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "ONNX GPU asset download failed; retrying in 5s"
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ONNX GPU asset download failed after {ATTEMPTS} attempts; \
-                         semantic embedding continues on the CPU backend"
-                    );
+    if let Err(e) = std::thread::Builder::new()
+        .name("attic-onnx-download".into())
+        .spawn(move || {
+            const ATTEMPTS: u32 = 3;
+            for attempt in 1..=ATTEMPTS {
+                match attic_semantic::onnx_assets::ensure_onnx_assets(&cache_dir, None) {
+                    Ok(dir) => {
+                        tracing::info!(
+                            dir = %dir.display(),
+                            "ONNX GPU assets ready; the GPU backend is selected on the next start"
+                        );
+                        return;
+                    }
+                    Err(e) if attempt < ATTEMPTS => {
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "ONNX GPU asset download failed; retrying in 5s"
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ONNX GPU asset download failed after {ATTEMPTS} attempts; \
+                             semantic embedding continues on the CPU backend"
+                        );
+                    }
                 }
             }
-        }
-    });
+        })
+    {
+        tracing::warn!(error = %e, "failed to spawn ONNX GPU asset download thread");
+    }
 }
 
 /// r06/r07: build the supervised worker-backed provider for a neural backend.
@@ -4288,18 +4347,10 @@ async fn run() -> anyhow::Result<()> {
     // Wrapped in a `reload` handle so file logging can be switched on/off at
     // runtime via the `logging` MCP tool, without restarting the process —
     // an env var would only take effect on the next restart, which isn't a
-    // real "instant kill switch." `_log_appender_guard` must be kept alive
-    // for the process's lifetime (same pattern as `_lock_guard` below) or
-    // the non-blocking writer stops flushing.
-    let log_dir = db_path.with_file_name("logs");
-    std::fs::create_dir_all(&log_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to create log directory '{}': {e}",
-            log_dir.display()
-        )
-    })?;
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "attic.log");
-    let (non_blocking, _log_appender_guard) = tracing_appender::non_blocking(file_appender);
+    // real "instant kill switch." The writer initializes the rolling file
+    // appender lazily, so the `logs/` directory is not created while file
+    // logging is OFF.
+    let file_log_writer = LazyFileLogWriter::new(db_path.with_file_name("logs"));
     let (file_level, log_reload_handle) =
         tracing_subscriber::reload::Layer::new(tracing_subscriber::filter::LevelFilter::OFF);
     LOG_RELOAD_HANDLE
@@ -4316,7 +4367,7 @@ async fn run() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking)
+                .with_writer(file_log_writer)
                 .with_ansi(false)
                 .with_filter(file_level),
         )
