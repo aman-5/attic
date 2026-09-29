@@ -1375,6 +1375,18 @@ async fn combined_pressure_and_daemon_failure_recovers() {
     let override_file = home.join("pressure_override");
     let override_env = override_file.to_str().expect("utf-8 temp path").to_owned();
 
+    // Pin pressure to `normal` BEFORE the daemons start.
+    //
+    // The initial assertion below expects the full Performance capacity of 8
+    // indexing workers, which only holds when the host is not itself under
+    // memory or CPU pressure. Without this the test silently measures the
+    // *developer's machine*: running it alongside a build (or the rest of the
+    // suite) lowers the effective limit and fails an assertion that has
+    // nothing to do with the behaviour under test. Step 6 already drives this
+    // same override to `normal` to assert recovery, so seeding it here matches
+    // the test's own semantics rather than weakening them.
+    std::fs::write(&override_file, "normal").expect("seed normal pressure override");
+
     // 1. Start primary daemon in Performance mode
     let mut srv1 = connect_daemon_with_env(
         &bin,
