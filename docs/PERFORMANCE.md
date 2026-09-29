@@ -93,6 +93,16 @@ SHA-256 hashes; it is never counted in indexing time.
   the load time, so a cold query never times out. `status` →
   `semantic_identity.worker` shows `not loaded` / `loading` / `loaded (load
   took …)` / `unloaded (idle 15m)` and the last-use time.
+- **GPU eligibility, decided once at startup.** The adapter DirectML will
+  use (high-performance order, so the discrete GPU on hybrid laptops) is
+  checked before any model download: less dedicated VRAM than
+  `gpu_min_vram_mb` (default 4096; a nominal 4 GB card reporting ≈3.9 GB
+  qualifies) or an integrated GPU (unless `allow_integrated_gpu = true`)
+  means CPU from the start. `status` → `semantic_identity.device` says which
+  and why, e.g. `GPU: NVIDIA RTX A500 Laptop GPU (3965 MB)` or
+  `CPU: GPU … has 2048 MB VRAM < gpu_min_vram_mb=4096`. If the model then
+  fails to load on an eligible GPU, the CPU fallback takes over and the line
+  reads `CPU: GPU failed at runtime: …`.
 
 ## Sizing your own workspace
 
@@ -125,6 +135,7 @@ embedded:
 | Bigger GPU passes on a larger card | Raise `[semantic] gpu_batch_tokens` (default 4096, sized for a 4 GB card) |
 | GPU running hot | Lower `[semantic] gpu_temp_pause_c` / `gpu_temp_resume_c` (defaults 90 / 85 °C) |
 | Free GPU memory sooner / never | `[semantic] gpu_idle_unload_secs` (default 900; 0 keeps the model resident) |
+| Force CPU, or try a small / integrated GPU | `[semantic] gpu_min_vram_mb` (default 4096; set above your VRAM to force CPU, 0 to always try) and `allow_integrated_gpu` (default false) |
 | Faster GPU embeddings, less coverage | `[semantic] onnx_seq_len = 512`. Halves the padded window, but also halves the largest unit that can be embedded — units above the new ceiling are excluded from selection and counted as `exceeds_max_input_bytes`, not embedded. Leave unset (1024) unless you have measured the trade |
 | Keep the laptop responsive | `[resources] mode = "low"`, or lower `[indexing] analysis_threads` |
 | Index many repositories faster | `[resources] mode = "performance"` or a higher `scheduler_workers` |

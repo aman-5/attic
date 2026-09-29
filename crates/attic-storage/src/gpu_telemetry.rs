@@ -67,7 +67,7 @@ mod dxgi {
     //! adapters, matching DirectML's own adapter-neutral design.
     use super::VramSnapshot;
 
-    /// Query adapter 0's local-segment memory budget. Returns `None` on any
+    /// Query the DirectML adapter's local-segment memory budget. Returns `None` on any
     /// failure (no adapter, API error, unsupported OS) — the caller treats
     /// `None` as `VramSnapshot::UNKNOWN`, never as zero VRAM.
     pub fn query() -> Option<VramSnapshot> {
@@ -98,6 +98,40 @@ mod dxgi {
 /// callers — never coerced into a fabricated number.
 pub fn query_vram_snapshot() -> VramSnapshot {
     dxgi::query().unwrap_or(VramSnapshot::UNKNOWN)
+}
+
+/// The adapter DirectML will run on (high-performance preference).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuAdapterInfo {
+    /// Driver-reported adapter name.
+    pub name: String,
+    /// PCI vendor id (0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel).
+    pub vendor_id: u32,
+    /// Dedicated VRAM in MiB.
+    pub dedicated_mib: u64,
+    /// Heuristic: shared-memory carve-out rather than a discrete card.
+    pub integrated: bool,
+    /// Basic Render Driver / WARP.
+    pub software: bool,
+}
+
+/// Describe the DirectML adapter. `None` off Windows or when no adapter is
+/// found.
+pub fn query_adapter_info() -> Option<GpuAdapterInfo> {
+    #[cfg(windows)]
+    {
+        attic_gpu_telemetry_win::query_adapter_info().map(|a| GpuAdapterInfo {
+            integrated: a.is_integrated(),
+            name: a.name,
+            vendor_id: a.vendor_id,
+            dedicated_mib: a.dedicated_mib,
+            software: a.software,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 // ── Cached/throttled sampler ────────────────────────────────────────────────

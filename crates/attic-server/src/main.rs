@@ -291,6 +291,60 @@ fn candle_backend_from_config(attic_config: &attic_core::AtticConfig) -> &'stati
 /// describes what the process is doing rather than re-deciding it.
 static ACTIVE_ONNX_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The startup device decision in one line, e.g. `GPU: NVIDIA RTX A500
+/// (3965 MB)` or `CPU: GPU has 2048 MB VRAM < gpu_min_vram_mb=4096`. Set
+/// once by `resolve_semantic_provider`; a later runtime fallback is reported
+/// by `device_line` on top of it.
+static GPU_DECISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Decide whether the DirectML adapter may be used. `Ok` carries the GPU
+/// description, `Err` the reason embedding runs on CPU instead.
+#[cfg_attr(not(feature = "ort-directml"), allow(dead_code))]
+fn gpu_gate(
+    semantic: &attic_core::config::SemanticConfig,
+    adapter: Option<&attic_storage::gpu_telemetry::GpuAdapterInfo>,
+) -> Result<String, String> {
+    use attic_core::config::GpuEligibility;
+    let Some(a) = adapter else {
+        // No adapter could be described. Only an explicit "always try"
+        // (gpu_min_vram_mb = 0) still attempts DirectML.
+        return if semantic.min_vram_mb() == 0 {
+            Ok("GPU: unidentified DirectML adapter (gpu_min_vram_mb=0)".into())
+        } else {
+            Err("CPU: no DirectX 12 GPU adapter found".into())
+        };
+    };
+    if a.software {
+        return Err(format!("CPU: only a software adapter is present ({})", a.name));
+    }
+    match semantic.gpu_eligibility(a.dedicated_mib, a.integrated) {
+        GpuEligibility::Eligible => Ok(format!("GPU: {} ({} MB)", a.name, a.dedicated_mib)),
+        GpuEligibility::Integrated => Err(format!(
+            "CPU: integrated GPU {} (allow_integrated_gpu=false)",
+            a.name
+        )),
+        GpuEligibility::TooLittleVram { have_mb, min_mb } => Err(format!(
+            "CPU: GPU {} has {have_mb} MB VRAM < gpu_min_vram_mb={min_mb}",
+            a.name
+        )),
+    }
+}
+
+/// What `status` shows as the device line: a runtime GPU→CPU fallback wins
+/// over the startup decision, which wins over the capability explanation.
+fn device_line(fallback_reason: Option<String>, gpu_report: &serde_json::Value) -> String {
+    if let Some(r) = fallback_reason {
+        return format!("CPU: GPU failed at runtime: {r}");
+    }
+    if let Some(d) = GPU_DECISION.get() {
+        return d.clone();
+    }
+    format!(
+        "CPU: {}",
+        gpu_report["explanation"].as_str().unwrap_or("no GPU backend")
+    )
+}
+
 /// GPU acceleration needs BOTH conditions; this reports exactly which one
 /// is unmet so the answer is never ambiguous again.
 fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::Value {
@@ -353,6 +407,16 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
             .to_string(),
     };
 
+    let adapter = attic_storage::gpu_telemetry::query_adapter_info().map(|a| {
+        json!({
+            "name": a.name,
+            "vendor_id": format!("{:#06x}", a.vendor_id),
+            "dedicated_vram_mb": a.dedicated_mib,
+            "integrated": a.integrated,
+            "software": a.software,
+        })
+    });
+
     json!({
         "status": status,
         "explanation": explanation,
@@ -360,6 +424,10 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
         "platform_has_gpu_backend": platform_supported,
         "onnx_model_dir": configured_dir,
         "onnx_assets_present": assets_present,
+        "adapter": adapter,
+        "min_vram_mb": attic_config.semantic.min_vram_mb(),
+        "allow_integrated_gpu": attic_config.semantic.allow_integrated_gpu.unwrap_or(false),
+        "startup_decision": GPU_DECISION.get(),
     })
 }
 
@@ -479,7 +547,18 @@ fn resolve_semantic_provider(
     // acceleration was skipped in silence. Meanwhile the safetensors path
     // downloaded its own weights automatically. Attic now acquires both.
     #[cfg(feature = "ort-directml")]
-    {
+    'gpu: {
+        let adapter = attic_storage::gpu_telemetry::query_adapter_info();
+        let gpu_desc = match gpu_gate(&attic_config.semantic, adapter.as_ref()) {
+            Ok(desc) => desc,
+            Err(reason) => {
+                // Decided once, before any 1.2 GB ONNX download: an
+                // ineligible GPU would only thrash and then demote anyway.
+                tracing::warn!(%reason, "GPU not eligible; embedding runs on CPU");
+                let _ = GPU_DECISION.set(reason);
+                break 'gpu;
+            }
+        };
         let configured = attic_config
             .semantic
             .onnx_model_dir
@@ -497,6 +576,8 @@ fn resolve_semantic_provider(
             // Record what we actually opened so status reports the real state
             // instead of re-deriving it from config that may not mention it.
             let _ = ACTIVE_ONNX_DIR.set(dir.clone());
+            tracing::info!(device = %gpu_desc, "GPU eligible");
+            let _ = GPU_DECISION.set(gpu_desc);
             let gpu = supervised_provider_with_env(
                 "ort-directml",
                 model_cache_dir,
@@ -539,6 +620,10 @@ fn resolve_semantic_provider(
                 "[semantic] onnx_model_dir is set but does not contain both model_fp16.onnx and tokenizer.json; \
                  GPU acceleration is disabled this run. Unset it to let Attic download and manage the export itself"
             );
+            let _ = GPU_DECISION.set(format!(
+                "CPU: onnx_model_dir {} lacks model_fp16.onnx/tokenizer.json",
+                explicit.display()
+            ));
         } else {
             tracing::info!(
                 dir = %managed.display(),
@@ -546,6 +631,10 @@ fn resolve_semantic_provider(
                  Semantic embedding runs on the CPU backend until it completes, \
                  and the GPU backend is selected automatically on the next start"
             );
+            let _ = GPU_DECISION.set(format!(
+                "CPU: {} is eligible; its ONNX model is downloading and is used from the next start",
+                gpu_desc.trim_start_matches("GPU: ")
+            ));
             spawn_onnx_download_task(model_cache_dir.to_path_buf());
         }
     }
@@ -871,6 +960,47 @@ mod resolve_provider_tests {
 
     fn test_store() -> Arc<attic_semantic::SemanticStore> {
         Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap())
+    }
+
+    fn adapter(mb: u64, integrated: bool, software: bool) -> attic_storage::gpu_telemetry::GpuAdapterInfo {
+        attic_storage::gpu_telemetry::GpuAdapterInfo {
+            name: "Test GPU".into(),
+            vendor_id: 0x10de,
+            dedicated_mib: mb,
+            integrated,
+            software,
+        }
+    }
+
+    #[test]
+    fn gpu_gate_reasons() {
+        let s = attic_core::config::SemanticConfig::default();
+        assert_eq!(
+            super::gpu_gate(&s, Some(&adapter(3965, false, false))).unwrap(),
+            "GPU: Test GPU (3965 MB)"
+        );
+        assert_eq!(
+            super::gpu_gate(&s, Some(&adapter(1024, false, false))).unwrap_err(),
+            "CPU: GPU Test GPU has 1024 MB VRAM < gpu_min_vram_mb=4096"
+        );
+        assert!(super::gpu_gate(&s, Some(&adapter(128, true, false)))
+            .unwrap_err()
+            .contains("allow_integrated_gpu=false"));
+        assert!(super::gpu_gate(&s, Some(&adapter(0, false, true))).is_err());
+        assert!(super::gpu_gate(&s, None).is_err());
+        let open = attic_core::config::SemanticConfig {
+            gpu_min_vram_mb: Some(0),
+            allow_integrated_gpu: Some(true),
+            ..Default::default()
+        };
+        assert!(super::gpu_gate(&open, Some(&adapter(128, true, false))).is_ok());
+        assert!(super::gpu_gate(&open, None).is_ok());
+    }
+
+    #[test]
+    fn device_line_prefers_runtime_fallback() {
+        let report = serde_json::json!({ "explanation": "not compiled" });
+        assert!(super::device_line(Some("oom".into()), &report).starts_with("CPU: GPU failed at runtime"));
     }
 
     #[test]
@@ -2863,8 +2993,12 @@ fn handle_status(
         // GPU or CPU, fp16 or fp32, and is inference isolated?" without
         // reading logs.
         let fp = stack.provider.fingerprint();
+        let gpu_report = gpu_capability_report(phase8.attic_config);
+        let fallback_reason = stack.provider.fallback_reason();
         payload["semantic_identity"] = json!({
             "provider_id": stack.provider.id(),
+            // One line: which device embeds and why.
+            "device": device_line(fallback_reason.clone(), &gpu_report),
             "backend": fp
                 .as_ref()
                 .map(|f| f.execution_backend.as_str())
@@ -2880,11 +3014,11 @@ fn handle_status(
             // `FallbackCoordinator` (or any provider that overrides
             // `fallback_reason`). `None` (never fabricated) when this
             // provider never fell back — see `attic_semantic::fallback`.
-            "fallback_reason": stack.provider.fallback_reason(),
+            "fallback_reason": fallback_reason,
             // Why this process can or cannot use a GPU. Always populated,
             // so "backend": "candle-cpu" is never ambiguous about whether
             // CPU was a deliberate choice or an unreported capability gap.
-            "gpu": gpu_capability_report(phase8.attic_config),
+            "gpu": gpu_report,
             // Model worker lifecycle: not_loaded / loading / loaded /
             // unloaded (idle unload), last use, and last load time.
             "worker": stack.provider.worker_status(),

@@ -159,6 +159,19 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub gpu_idle_unload_secs: Option<u64>,
 
+    /// Minimum dedicated VRAM (MiB) for the GPU to be used at all. Below it
+    /// embedding runs on CPU from startup, with the reason in `status`.
+    /// Default 4096 (a nominal 4 GB card qualifies — drivers report ~3.9 GB,
+    /// so a 1/16 slack is applied). 0 = always try the GPU.
+    #[serde(default)]
+    pub gpu_min_vram_mb: Option<u64>,
+
+    /// Allow an integrated GPU (shared-memory carve-out). Default false:
+    /// it competes with the desktop for the same RAM and is usually slower
+    /// than the CPU path for this model.
+    #[serde(default)]
+    pub allow_integrated_gpu: Option<bool>,
+
     /// Which device to run embedding inference on.
     ///
     /// Accepted values: `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`.
@@ -200,6 +213,8 @@ impl Default for SemanticConfig {
             gpu_temp_pause_c: None,
             gpu_temp_resume_c: None,
             gpu_idle_unload_secs: None,
+            gpu_min_vram_mb: None,
+            allow_integrated_gpu: None,
             device: None,
         }
     }
@@ -211,11 +226,55 @@ pub const DEFAULT_GPU_IDLE_UNLOAD_SECS: u64 = 900;
 /// Upper bound for `[semantic] gpu_idle_unload_secs` (one week).
 pub const MAX_GPU_IDLE_UNLOAD_SECS: u64 = 7 * 24 * 3600;
 
+/// Default for `[semantic] gpu_min_vram_mb`.
+pub const DEFAULT_GPU_MIN_VRAM_MB: u64 = 4096;
+
+/// Upper bound for `[semantic] gpu_min_vram_mb` (1 TiB).
+pub const MAX_GPU_MIN_VRAM_MB: u64 = 1 << 20;
+
+/// Why the GPU was (not) chosen at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuEligibility {
+    /// The GPU may be used.
+    Eligible,
+    /// Dedicated VRAM is below `gpu_min_vram_mb` (after slack).
+    TooLittleVram {
+        /// Reported dedicated VRAM.
+        have_mb: u64,
+        /// Configured floor.
+        min_mb: u64,
+    },
+    /// Integrated GPU and `allow_integrated_gpu` is false.
+    Integrated,
+}
+
 impl SemanticConfig {
     /// Effective idle-unload delay in seconds; 0 means never unload.
     pub fn idle_unload_secs(&self) -> u64 {
         self.gpu_idle_unload_secs
             .unwrap_or(DEFAULT_GPU_IDLE_UNLOAD_SECS)
+    }
+
+    /// Effective minimum dedicated VRAM in MiB; 0 means always try the GPU.
+    pub fn min_vram_mb(&self) -> u64 {
+        self.gpu_min_vram_mb.unwrap_or(DEFAULT_GPU_MIN_VRAM_MB)
+    }
+
+    /// Decide whether an adapter with `dedicated_mb` of VRAM may be used.
+    /// Cards are sold by nominal size but drivers reserve a slice (a 4 GB
+    /// A500 reports 3965 MiB), so the floor has a 1/16 slack.
+    pub fn gpu_eligibility(&self, dedicated_mb: u64, integrated: bool) -> GpuEligibility {
+        if integrated && !self.allow_integrated_gpu.unwrap_or(false) {
+            return GpuEligibility::Integrated;
+        }
+        let min_mb = self.min_vram_mb();
+        if dedicated_mb < min_mb - min_mb / 16 {
+            return GpuEligibility::TooLittleVram {
+                have_mb: dedicated_mb,
+                min_mb,
+            };
+        }
+        GpuEligibility::Eligible
     }
 }
 
@@ -496,6 +555,13 @@ impl AtticConfig {
                 "[semantic] gpu_idle_unload_secs must be within 0..={MAX_GPU_IDLE_UNLOAD_SECS} (0 = never unload)"
             )));
         }
+        if let Some(v) = self.semantic.gpu_min_vram_mb
+            && v > MAX_GPU_MIN_VRAM_MB
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[semantic] gpu_min_vram_mb must be within 0..={MAX_GPU_MIN_VRAM_MB} (0 = always try the GPU)"
+            )));
+        }
         if self
             .semantic
             .exclude_globs
@@ -577,6 +643,13 @@ model = "qwen3-embedding-0.6b"
 # (or CPU) memory is released; the next chunk or query reloads it.
 # 0 keeps the model resident.
 # gpu_idle_unload_secs = 900
+# GPU eligibility, decided once at startup (see `status` for the reason).
+# A GPU with less dedicated VRAM than this runs embedding on CPU instead;
+# a nominal 4 GB card qualifies. 0 = always try the GPU.
+# gpu_min_vram_mb = 4096
+# Integrated GPUs share system RAM with the desktop and are skipped unless
+# allowed here.
+# allow_integrated_gpu = false
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
@@ -727,6 +800,10 @@ mod tests {
                 "[semantic]\ngpu_idle_unload_secs = 99999999\n",
                 "gpu_idle_unload_secs",
             ),
+            (
+                "[semantic]\ngpu_min_vram_mb = 99999999999\n",
+                "gpu_min_vram_mb",
+            ),
             ("[semantic]\nmodel = \"\"\n", "model"),
         ] {
             match AtticConfig::parse_str(toml) {
@@ -736,6 +813,24 @@ mod tests {
                 other => panic!("{toml:?} must be rejected as invalid, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn gpu_eligibility_gate() {
+        let cfg = SemanticConfig::default();
+        // A nominal 4 GB card reports ~3965 MiB and must qualify.
+        assert_eq!(cfg.gpu_eligibility(3965, false), GpuEligibility::Eligible);
+        assert_eq!(
+            cfg.gpu_eligibility(2048, false),
+            GpuEligibility::TooLittleVram { have_mb: 2048, min_mb: 4096 }
+        );
+        assert_eq!(cfg.gpu_eligibility(8192, true), GpuEligibility::Integrated);
+        let open = SemanticConfig {
+            gpu_min_vram_mb: Some(0),
+            allow_integrated_gpu: Some(true),
+            ..SemanticConfig::default()
+        };
+        assert_eq!(open.gpu_eligibility(0, true), GpuEligibility::Eligible);
     }
 
     #[test]
