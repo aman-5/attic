@@ -100,6 +100,8 @@ struct Cache {
     at: Option<Instant>,
     value: Option<u32>,
     nvidia_smi_ok: bool,
+    /// When a background refresh was started; `None` when none is running.
+    refreshing_since: Option<Instant>,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -109,33 +111,70 @@ fn cache() -> &'static Mutex<Cache> {
             at: None,
             value: None,
             nvidia_smi_ok: true,
+            refreshing_since: None,
         })
     })
 }
 
+/// A refresh stuck this long (hung `nvidia-smi`) no longer blocks new ones.
+const REFRESH_STUCK: Duration = Duration::from_secs(30);
+
 /// Hottest GPU core temperature in °C, cached for [`SAMPLE_INTERVAL`].
 /// `None` means no supported sensor on this machine.
+///
+/// Only the very first call blocks on a sensor read. After that a stale
+/// reading is refreshed on a background thread and the last value is
+/// returned immediately: `nvidia-smi` takes ~300 ms to start on Windows, and
+/// the embedding loop calls this between every GPU pass, so a blocking read
+/// cost ~11% of GPU time on a 4 GB laptop card.
 pub fn gpu_temperature_c() -> Option<u32> {
     let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(at) = c.at
-        && at.elapsed() < SAMPLE_INTERVAL
-    {
-        return c.value;
+    let Some(at) = c.at else {
+        let (value, smi_ok) = read_sensor(c.nvidia_smi_ok);
+        c.nvidia_smi_ok = smi_ok;
+        c.at = Some(Instant::now());
+        c.value = value;
+        return value;
+    };
+    let refresh_running = c
+        .refreshing_since
+        .is_some_and(|since| since.elapsed() < REFRESH_STUCK);
+    if at.elapsed() >= SAMPLE_INTERVAL && !refresh_running {
+        c.refreshing_since = Some(Instant::now());
+        let smi_ok = c.nvidia_smi_ok;
+        let spawned = std::thread::Builder::new()
+            .name("attic-gpu-temp".into())
+            .spawn(move || {
+                let (value, smi_ok) = read_sensor(smi_ok);
+                let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+                c.nvidia_smi_ok = smi_ok;
+                c.at = Some(Instant::now());
+                c.value = value;
+                c.refreshing_since = None;
+            });
+        if spawned.is_err() {
+            c.refreshing_since = None;
+        }
     }
+    c.value
+}
+
+/// One blocking sensor read. Returns the value and whether `nvidia-smi`
+/// should still be tried next time.
+fn read_sensor(nvidia_smi_ok: bool) -> (Option<u32>, bool) {
+    let mut smi_ok = nvidia_smi_ok;
     let mut value = None;
-    if c.nvidia_smi_ok {
+    if smi_ok {
         value = read_nvidia_smi();
         if value.is_none() {
-            c.nvidia_smi_ok = false;
+            smi_ok = false;
             tracing::debug!("nvidia-smi temperature unavailable; disabling that source");
         }
     }
     if value.is_none() {
         value = read_hwmon();
     }
-    c.at = Some(Instant::now());
-    c.value = value;
-    value
+    (value, smi_ok)
 }
 
 fn read_nvidia_smi() -> Option<u32> {

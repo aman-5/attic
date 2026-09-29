@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use half::f16;
 use ndarray::{Array2, Array4};
 use ort::ep::DirectML;
-use ort::session::Session;
+use ort::session::{OutputSelector, RunOptions, Session};
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
@@ -119,11 +119,18 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// Length buckets for a read window: 32, 64, … doubling, capped by (and
 /// always ending at) `seq_len`.
 pub(crate) fn length_buckets(seq_len: usize) -> Vec<usize> {
+    // Powers of two plus the 1.5x midpoint between each pair: measured on
+    // real corpora with the Qwen3 tokenizer, midpoints cut padded GPU work by
+    // 7% (source code) to 20% (JSON exports) for a handful of extra shapes.
     let seq_len = seq_len.max(1);
     let mut out = Vec::new();
     let mut b = MIN_BUCKET;
     while b < seq_len {
         out.push(b);
+        let mid = b + b / 2;
+        if mid < seq_len {
+            out.push(mid);
+        }
         b *= 2;
     }
     out.push(seq_len);
@@ -434,7 +441,13 @@ impl OrtDirectMlProvider {
                 n /= 2;
             }
             if cancel.is_cancelled() || waited.elapsed() >= PRESSURE_WAIT_MAX {
-                tracing::debug!(bucket, "no VRAM headroom for a new shape; running 1 item");
+                tracing::info!(
+                    bucket,
+                    want = items,
+                    available_mib = ?snap.available_mib,
+                    cost_mib = new_shape_cost_mib(items, bucket),
+                    "no VRAM headroom for a new shape; running 1 item"
+                );
                 return 1;
             }
             let _paused = PauseGuard::enter();
@@ -496,12 +509,22 @@ impl OrtDirectMlProvider {
             }
         }
 
+        // Request ONLY `last_hidden_state`. The export is a decoder that also
+        // returns 56 `present.*` KV-cache tensors (28 layers x key/value), and
+        // a plain `run()` copied every one of them from VRAM to host RAM:
+        // ~112 KiB per padded token, ~448 MiB per 4096-token pass, all unused.
+        // That copy left the GPU idle between passes (the saw-tooth in Task
+        // Manager) and held hundreds of MiB of VRAM per pass.
+        let run_options = RunOptions::new()
+            .map_err(|e| SemanticError::EmbeddingFailed(format!("run options: {e}")))?
+            .with_outputs(OutputSelector::no_default().with("last_hidden_state"));
         let outputs = session
-            .run(
+            .run_with_options(
                 inputs
                     .iter()
                     .map(|(n, t)| (n.as_str(), t))
                     .collect::<Vec<_>>(),
+                &run_options,
             )
             .map_err(|e| {
                 let msg = format!("DirectML run: {e}");
@@ -627,6 +650,8 @@ impl SemanticProvider for OrtDirectMlProvider {
 
         let mut outputs: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
         let mut done = 0usize;
+        let (mut passes, mut forward_ms, mut wait_ms, mut shrunk) = (0u32, 0u128, 0u128, 0u32);
+        let tokenize_ms = t0.elapsed().as_millis();
         for (bucket, members) in by_bucket.into_iter().filter(|(_, m)| !m.is_empty()) {
             // Per-call cap for this bucket; halves when a pass fails so the
             // failing input is isolated in at most log2(cap) extra passes.
@@ -643,16 +668,23 @@ impl SemanticProvider for OrtDirectMlProvider {
                 let budget_cap = (full_pass_items(self.batch_token_budget, bucket) >> shift).max(1);
                 let want = pow2_passes(members.len() - start, cap.min(budget_cap))[0];
                 let items = self.admit_items(want, bucket, cancel);
+                if items < want {
+                    shrunk += 1;
+                }
+                wait_ms += waits.elapsed().as_millis();
                 deadline = deadline.map(|d| d + waits.elapsed());
                 let chunk = &members[start..start + items];
                 let rows: Vec<&[u32]> = chunk.iter().map(|&i| token_ids[i]).collect();
 
+                let forward_started = Instant::now();
                 let result = {
                     let mut guard = self.session.lock().map_err(|_| {
                         SemanticError::EmbeddingFailed("session mutex poisoned".into())
                     })?;
                     Self::run_forward(&mut guard, self.kv_dtype, &rows, bucket)
                 };
+                forward_ms += forward_started.elapsed().as_millis();
+                passes += 1;
                 progress::tick();
                 match result {
                     Ok((pooled, native_hidden)) => {
@@ -683,6 +715,16 @@ impl SemanticProvider for OrtDirectMlProvider {
         }
 
         usage.elapsed_ms += t0.elapsed().as_millis() as u64;
+        tracing::info!(
+            items = inputs.len(),
+            passes,
+            shrunk_by_vram = shrunk,
+            tokenize_ms,
+            forward_ms,
+            wait_ms,
+            total_ms = t0.elapsed().as_millis(),
+            "DirectML embed batch"
+        );
         outputs
             .into_iter()
             .zip(inputs)
@@ -703,9 +745,19 @@ mod shape_tests {
 
     #[test]
     fn buckets_double_and_end_at_window() {
-        assert_eq!(length_buckets(512), vec![32, 64, 128, 256, 512]);
-        assert_eq!(length_buckets(1024), vec![32, 64, 128, 256, 512, 1024]);
-        assert_eq!(length_buckets(300), vec![32, 64, 128, 256, 300]);
+        assert_eq!(
+            length_buckets(512),
+            vec![32, 48, 64, 96, 128, 192, 256, 384, 512]
+        );
+        assert_eq!(
+            length_buckets(1024),
+            vec![32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+        );
+        assert_eq!(
+            length_buckets(300),
+            vec![32, 48, 64, 96, 128, 192, 256, 300]
+        );
+        assert_eq!(length_buckets(40), vec![32, 40]);
         assert_eq!(length_buckets(32), vec![32]);
         assert_eq!(length_buckets(20), vec![20]);
     }

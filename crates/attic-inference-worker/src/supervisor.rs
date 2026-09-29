@@ -168,7 +168,9 @@ impl WorkerSupervisor {
         cmd.args(&self.launch.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // Worker diagnostics (stderr) reach the parent's stderr/log
+            // instead of being discarded.
+            .stderr(Stdio::inherit());
         for (k, v) in &self.launch.env {
             cmd.env(k, v);
         }

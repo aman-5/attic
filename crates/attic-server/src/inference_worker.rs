@@ -173,6 +173,17 @@ impl WorkerEngine for NeuralEngine {
 /// tokio runtime exists; exits the process when the supervisor closes the
 /// channel or sends Shutdown.
 pub fn run_inference_worker() -> i32 {
+    // stdout is the protocol channel; diagnostics go to stderr, which the
+    // supervisor forwards to the parent's stderr. Without a subscriber every
+    // worker-side warning (DirectML pass failures, thermal pauses, VRAM
+    // admission) was silently discarded.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("ATTIC_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
     let engine = NeuralEngine {
         provider: None,
         backend: "unloaded".to_string(),

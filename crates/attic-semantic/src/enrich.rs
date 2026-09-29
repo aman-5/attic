@@ -360,6 +360,7 @@ fn drive_leased(
         if batch_size == 0 {
             break;
         }
+        let batch_started = Instant::now();
         let claims = store.queue_claim_batch(&owner, LEASE_MS, batch_size)?;
         if claims.is_empty() {
             break;
@@ -532,6 +533,7 @@ fn drive_leased(
         // which the loop head already does.
         let batch_deadline =
             Instant::now() + Duration::from_millis(cfg.batch_inference_timeout_ms.max(1));
+        let embed_started = Instant::now();
         let embed_res = if to_embed.is_empty() {
             // Every claimed unit was satisfied by content reuse — no
             // inference to run. Per §11 nothing about cancellation semantics
@@ -685,10 +687,21 @@ fn drive_leased(
                     .iter()
                     .map(|e| e.occurrence_id.clone())
                     .collect();
+                let embed_ms = embed_started.elapsed().as_millis() as u64;
+                let commit_started = Instant::now();
                 match store.commit_batch(&commit_entries, target_gen_id, SEMANTIC_SELECTION_VERSION)
                 {
                     Ok(committed) => {
                         stats.embedded += committed.len() as u64;
+                        tracing::info!(
+                            claimed = claims.len(),
+                            embedded = committed.len(),
+                            input_bytes = to_embed.iter().map(|i| i.text.len()).sum::<usize>(),
+                            prep_ms = (embed_started - batch_started).as_millis() as u64,
+                            embed_ms,
+                            commit_ms = commit_started.elapsed().as_millis() as u64,
+                            "semantic batch"
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("failed to commit embedding batch: {e}");

@@ -66,7 +66,7 @@ SHA-256 hashes; it is never counted in indexing time.
 ### GPU batching (ONNX / DirectML)
 
 - **Length buckets.** Inputs are grouped by token length into buckets of
-  32/64/128/256/… (up to `onnx_seq_len`) and padded only to their bucket, not
+  32/48/64/96/128/192/256/384/… (powers of two plus 1.5× midpoints, up to `onnx_seq_len`) and padded only to their bucket, not
   to the full window. Code chunks are mostly short, so this removes most
   padding work. Vectors are unchanged (cosine ≥ 0.9999 vs fixed-512 padding).
 - **Token budget per pass.** Each forward pass carries

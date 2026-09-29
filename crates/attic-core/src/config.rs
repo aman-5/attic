@@ -132,7 +132,7 @@ pub struct SemanticConfig {
     pub onnx_seq_len: Option<usize>,
 
     /// Padded tokens per GPU forward pass (ONNX/DirectML). Inputs are grouped
-    /// into length buckets (64/128/256/…) and each pass carries
+    /// into length buckets (32/48/64/96/…) and each pass carries
     /// `gpu_batch_tokens / bucket` items. Default 4096 — measured best on a
     /// 4 GB card (8192 was 3% faster but left < 0.2 GiB free). Raise it on
     /// cards with more VRAM.
