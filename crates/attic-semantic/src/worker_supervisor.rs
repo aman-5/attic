@@ -57,7 +57,23 @@ pub struct SupervisedWorkerProvider {
     /// worker would report unavailable forever and never get the one real
     /// attempt that would actually set `ready = true`.
     load_failed: AtomicBool,
+    /// Queue items per `embed_batch` for backends that bucket internally.
+    claim_items: Option<usize>,
 }
+
+/// Items claimed per GPU batch call. The DirectML provider packs these into
+/// length buckets under a token budget (up to 64 short items per forward
+/// pass), so it needs a claim wide enough to fill several full passes.
+/// Host cost is only the claimed texts; device memory is bounded by the
+/// provider's token budget, not by this number.
+pub const GPU_CLAIM_ITEMS: usize = 128;
+
+/// Worker env: padded tokens per GPU forward pass (`[semantic] gpu_batch_tokens`).
+pub const ENV_GPU_BATCH_TOKENS: &str = "ATTIC_GPU_BATCH_TOKENS";
+/// Worker env: GPU pause temperature in °C (`[semantic] gpu_temp_pause_c`).
+pub const ENV_GPU_TEMP_PAUSE_C: &str = "ATTIC_GPU_TEMP_PAUSE_C";
+/// Worker env: GPU resume temperature in °C (`[semantic] gpu_temp_resume_c`).
+pub const ENV_GPU_TEMP_RESUME_C: &str = "ATTIC_GPU_TEMP_RESUME_C";
 
 impl SupervisedWorkerProvider {
     /// Create the provider; spawns nothing yet (lazy start on first embed so
@@ -68,6 +84,7 @@ impl SupervisedWorkerProvider {
         fingerprint: EmbeddingFingerprint,
         max_input_bytes: usize,
     ) -> Self {
+        let claim_items = (load.backend == "ort-directml").then_some(GPU_CLAIM_ITEMS);
         let supervisor = WorkerSupervisor::new(launch);
         // Remember load params immediately so lazy restart works.
         supervisor.load_model_params_only(load);
@@ -85,6 +102,7 @@ impl SupervisedWorkerProvider {
             max_input_bytes,
             ready: AtomicBool::new(false),
             load_failed: AtomicBool::new(false),
+            claim_items,
         }
     }
 
@@ -174,6 +192,10 @@ impl SemanticProvider for SupervisedWorkerProvider {
 
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
         Some(self.fingerprint.clone())
+    }
+
+    fn preferred_claim_items(&self) -> Option<usize> {
+        self.claim_items
     }
 
     fn embed_batch(

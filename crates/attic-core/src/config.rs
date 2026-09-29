@@ -55,7 +55,7 @@ fn default_semantic_model() -> String {
 }
 
 /// Modern semantic engine configuration (`[semantic]` in `attic.toml`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticConfig {
     /// Whether semantic embedding and search are enabled.
@@ -79,6 +79,19 @@ pub struct SemanticConfig {
     /// 256 KiB.
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
+    /// Minimum selection score (0.0–1.0) a unit needs to be embedded.
+    /// Lower = more coverage, more GPU/CPU work. `None` uses the built-in
+    /// default (0.30).
+    #[serde(default)]
+    pub min_score: Option<f64>,
+    /// Maximum units embedded per repository. `None` uses the built-in
+    /// default (2560). Raise it on a GPU build to embed whole large repos.
+    #[serde(default)]
+    pub max_units_per_repo: Option<usize>,
+    /// Maximum units embedded across the whole workspace (bounds queue and
+    /// vector storage). `None` uses the built-in default (100000).
+    #[serde(default)]
+    pub max_units_total: Option<usize>,
     /// Wall-clock budget for ONE background enrichment drive slice (ms).
     ///
     /// Bounds how long a slice keeps starting new batches; it is NOT a
@@ -118,6 +131,26 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub onnx_seq_len: Option<usize>,
 
+    /// Padded tokens per GPU forward pass (ONNX/DirectML). Inputs are grouped
+    /// into length buckets (64/128/256/…) and each pass carries
+    /// `gpu_batch_tokens / bucket` items. Default 4096 — measured best on a
+    /// 4 GB card (8192 was 3% faster but left < 0.2 GiB free). Raise it on
+    /// cards with more VRAM.
+    #[serde(default)]
+    pub gpu_batch_tokens: Option<usize>,
+
+    /// GPU core temperature (°C) at which embedding pauses. Default 90.
+    /// Read via `nvidia-smi` (NVIDIA, Windows/Linux) or hwmon (Linux
+    /// AMD/Intel); where no sensor exists (macOS, other Windows adapters)
+    /// the guard is inactive and the OS's own thermal management applies.
+    #[serde(default)]
+    pub gpu_temp_pause_c: Option<u32>,
+
+    /// GPU core temperature (°C) at or below which paused embedding
+    /// resumes. Default 85; always clamped below `gpu_temp_pause_c`.
+    #[serde(default)]
+    pub gpu_temp_resume_c: Option<u32>,
+
     /// Which device to run embedding inference on.
     ///
     /// Accepted values: `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`.
@@ -149,9 +182,15 @@ impl Default for SemanticConfig {
             dimension: None,
             exclude_globs: Vec::new(),
             max_file_bytes: None,
+            min_score: None,
+            max_units_per_repo: None,
+            max_units_total: None,
             drive_budget_ms: None,
             onnx_model_dir: None,
             onnx_seq_len: None,
+            gpu_batch_tokens: None,
+            gpu_temp_pause_c: None,
+            gpu_temp_resume_c: None,
             device: None,
         }
     }
@@ -402,6 +441,31 @@ impl AtticConfig {
                 "[semantic] drive_budget_ms must be >= 1".into(),
             ));
         }
+        if let Some(s) = self.semantic.min_score
+            && !(0.0..=1.0).contains(&s)
+        {
+            return Err(ConfigError::Invalid(
+                "[semantic] min_score must be within 0.0..=1.0".into(),
+            ));
+        }
+        if self.semantic.max_units_per_repo == Some(0) || self.semantic.max_units_total == Some(0)
+        {
+            return Err(ConfigError::Invalid(
+                "[semantic] max_units_per_repo and max_units_total must be >= 1".into(),
+            ));
+        }
+        if self.semantic.gpu_batch_tokens == Some(0) {
+            return Err(ConfigError::Invalid(
+                "[semantic] gpu_batch_tokens must be >= 1".into(),
+            ));
+        }
+        if let Some(p) = self.semantic.gpu_temp_pause_c
+            && !(40..=110).contains(&p)
+        {
+            return Err(ConfigError::Invalid(
+                "[semantic] gpu_temp_pause_c must be within 40..=110".into(),
+            ));
+        }
         if self
             .semantic
             .exclude_globs
@@ -462,6 +526,22 @@ model = "qwen3-embedding-0.6b"
 # (default: 60000 = 60s). This is NOT a per-batch inference deadline; a
 # claimed batch always runs to completion under its own hang timeout.
 # drive_budget_ms = 60000
+# Minimum selection score a unit needs to be embedded (default 0.30).
+# Lower it for more semantic coverage at the cost of more embedding work.
+# min_score = 0.30
+# Embedding caps: per repository (default 2560) and workspace-wide
+# (default 100000). Raise both on a GPU build to embed large repos fully.
+# max_units_per_repo = 2560
+# max_units_total = 100000
+
+# GPU (ONNX/DirectML) tunables. Inputs are grouped into length buckets
+# (64/128/256/…) and each forward pass carries gpu_batch_tokens / bucket
+# items. Default 4096 fits a 4 GB card; raise it on larger cards.
+# gpu_batch_tokens = 4096
+# Thermal guard: throttle at pause-1, pause at pause_c, resume at resume_c.
+# Inactive where no sensor exists (macOS, non-NVIDIA Windows adapters).
+# gpu_temp_pause_c = 90
+# gpu_temp_resume_c = 85
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
@@ -604,6 +684,10 @@ mod tests {
             ),
             ("[semantic]\ndimension = 0\n", "dimension"),
             ("[semantic]\nmax_file_bytes = 0\n", "max_file_bytes"),
+            ("[semantic]\nmin_score = 1.5\n", "min_score"),
+            ("[semantic]\nmax_units_per_repo = 0\n", "max_units_per_repo"),
+            ("[semantic]\ngpu_batch_tokens = 0\n", "gpu_batch_tokens"),
+            ("[semantic]\ngpu_temp_pause_c = 200\n", "gpu_temp_pause_c"),
             ("[semantic]\nmodel = \"\"\n", "model"),
         ] {
             match AtticConfig::parse_str(toml) {

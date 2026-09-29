@@ -75,6 +75,7 @@ pub use selection::{
 };
 pub use store::{EmbeddingRecord, KnnResult, NearestHit, QueueCounts, ScanBudget, SemanticStore};
 pub use worker_supervisor::{
+    ENV_GPU_BATCH_TOKENS, ENV_GPU_TEMP_PAUSE_C, ENV_GPU_TEMP_RESUME_C, GPU_CLAIM_ITEMS,
     SupervisedWorkerProvider, expected_fingerprint, expected_max_input_bytes,
     fingerprint_capabilities, verify_identity_capabilities,
 };

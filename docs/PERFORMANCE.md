@@ -63,6 +63,27 @@ attention mask, and the benchmark asserts batched and single-item vectors
 match. The model is a one-time ~1.2 GB download, verified against pinned
 SHA-256 hashes; it is never counted in indexing time.
 
+### GPU batching (ONNX / DirectML)
+
+- **Length buckets.** Inputs are grouped by token length into buckets of
+  64/128/256/… (up to `onnx_seq_len`) and padded only to their bucket, not
+  to the full window. Code chunks are mostly short, so this removes most
+  padding work. Vectors are unchanged (cosine ≥ 0.9999 vs fixed-512 padding).
+- **Token budget per pass.** Each forward pass carries
+  `gpu_batch_tokens / bucket` items (power-of-two sizes, so DirectML sees a
+  small fixed set of shapes and its memory arena stops growing).
+- **Stays on the GPU.** Shapes that already ran are always admitted; a new
+  shape runs only if free VRAM covers it, otherwise the pass shrinks. An
+  out-of-memory pass is retried at half size — never demoted to CPU.
+- **Thermal guard.** At `gpu_temp_pause_c − 1` the token budget halves; at
+  `gpu_temp_pause_c` (default 90 °C) embedding pauses until the GPU cools to
+  `gpu_temp_resume_c` (default 85 °C). Sensor: `nvidia-smi` (NVIDIA on
+  Windows/Linux) or Linux hwmon; macOS and other Windows adapters have no
+  readable sensor, so the OS's own thermal management applies.
+- **Poison isolation.** If a multi-item batch fails on content, each item is
+  retried alone: good items commit, only the offender is marked failed, so
+  one bad chunk never stalls the queue.
+
 ## Sizing your own workspace
 
 **Estimate** the semantic workload from the text that will actually be
@@ -89,7 +110,10 @@ embedded:
 | Faster embeddings on Windows | Build with `--features ort-directml --target x86_64-pc-windows-msvc`. The fp16 ONNX export downloads automatically on first run; `ATTIC_ONNX_MODEL_DIR` is only needed to point at your own export |
 | Faster embeddings on Apple Silicon | Build with `--features candle-metal` (the default for `aarch64-apple-darwin` release builds) |
 | Faster embeddings on Linux + NVIDIA | Build with `--features candle-cuda` on a machine with the CUDA toolkit installed |
-| Less embedding work | `[semantic] exclude_globs` for generated, vendored or snapshot data; lower `max_file_bytes` |
+| Less embedding work | `[semantic] exclude_globs` for generated, vendored or snapshot data; lower `max_file_bytes`; raise `min_score` (default 0.30) |
+| More semantic coverage | Lower `[semantic] min_score` (0.0 embeds every eligible unit) and raise `max_units_per_repo` (default 2560) / `max_units_total` (default 100000) |
+| Bigger GPU passes on a larger card | Raise `[semantic] gpu_batch_tokens` (default 4096, sized for a 4 GB card) |
+| GPU running hot | Lower `[semantic] gpu_temp_pause_c` / `gpu_temp_resume_c` (defaults 90 / 85 °C) |
 | Faster GPU embeddings, less coverage | `[semantic] onnx_seq_len = 512`. Halves the padded window, but also halves the largest unit that can be embedded — units above the new ceiling are excluded from selection and counted as `exceeds_max_input_bytes`, not embedded. Leave unset (1024) unless you have measured the trade |
 | Keep the laptop responsive | `[resources] mode = "low"`, or lower `[indexing] analysis_threads` |
 | Index many repositories faster | `[resources] mode = "performance"` or a higher `scheduler_workers` |

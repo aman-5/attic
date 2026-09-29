@@ -1565,18 +1565,32 @@ impl SemanticStore {
     /// ever holds currently-selected work. INFLIGHT rows are never deleted: a
     /// concurrent worker owns them and completes or releases them itself.
     pub fn queue_retain_only(&self, keep: &[String]) -> Result<usize, SemanticError> {
-        use rusqlite::ToSql;
-        let n = if keep.is_empty() {
-            self.guard()?
-                .execute("DELETE FROM sem_queue_v2 WHERE state != 'INFLIGHT'", [])?
-        } else {
-            let paramslice: Vec<&dyn ToSql> = keep.iter().map(|s| s as &dyn ToSql).collect();
-            let placeholders = vec!["?"; keep.len()].join(",");
-            let sql = format!(
-                "DELETE FROM sem_queue_v2 WHERE occurrence_id NOT IN ({placeholders}) AND state != 'INFLIGHT'"
-            );
-            self.guard()?.execute(&sql, paramslice.as_slice())?
-        };
+        let conn = self.guard()?;
+        if keep.is_empty() {
+            return Ok(conn.execute("DELETE FROM sem_queue_v2 WHERE state != 'INFLIGHT'", [])?);
+        }
+        // A `NOT IN (?, ?, …)` list binds one variable per kept unit and fails
+        // past SQLite's variable limit (32,766) — i.e. on any repo with more
+        // than ~32K selected units. Stage the keep-set in a temp table instead.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS sem_keep_ids (id TEXT PRIMARY KEY);
+             DELETE FROM temp.sem_keep_ids;",
+        )?;
+        {
+            let mut ins = tx.prepare("INSERT OR IGNORE INTO temp.sem_keep_ids (id) VALUES (?1)")?;
+            for id in keep {
+                ins.execute(params![id])?;
+            }
+        }
+        let n = tx.execute(
+            "DELETE FROM sem_queue_v2
+              WHERE state != 'INFLIGHT'
+                AND occurrence_id NOT IN (SELECT id FROM temp.sem_keep_ids)",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.sem_keep_ids", [])?;
+        tx.commit()?;
         Ok(n)
     }
 

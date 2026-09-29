@@ -63,7 +63,7 @@ enum GpuFailureClass {
     Ignored,
 }
 
-fn classify(err: &SemanticError) -> GpuFailureClass {
+fn classify(err: &SemanticError, batch_items: usize) -> GpuFailureClass {
     match err {
         // Worker load/handshake failure or reported model-artifact problem —
         // this is exactly "GPU execution remains unavailable or unsafe".
@@ -76,12 +76,26 @@ fn classify(err: &SemanticError) -> GpuFailureClass {
         // OOM is per-batch adaptive-sizing territory (r07); repeated OOM
         // alone must never trigger fallback (see module tests).
         SemanticError::BudgetExhausted(_) => GpuFailureClass::Ignored,
-        // Worker died/timed out mid-batch or an internal engine error:
-        // possibly transient (the supervisor already restarts the child),
-        // but repeated occurrences stand in for "device loss" since real
-        // device loss cannot be synthesized in this environment.
-        SemanticError::EmbeddingFailed(_) => GpuFailureClass::TransientCountable,
-        SemanticError::Cancelled { .. } => GpuFailureClass::TransientCountable,
+        // Cancellation (shutdown, a thermal pause outlasting the deadline) is
+        // not a device defect. Counting it demoted a healthy-but-hot GPU.
+        SemanticError::Cancelled { .. } => GpuFailureClass::Ignored,
+        // Worker crash/hang or device loss. On a multi-item batch it may be
+        // one poisoned input, which enrichment bisects down to single items —
+        // so only single-item failures are evidence the DEVICE is broken. A
+        // dead GPU still escalates fast: bisection reaches singles in
+        // log2(batch) steps. Plain content errors never count at all.
+        SemanticError::EmbeddingFailed(msg) => {
+            let m = msg.to_ascii_lowercase();
+            let device_trouble = ["died", "killed", "deadline", "timed out", "timeout"]
+                .iter()
+                .chain(["887a0005", "887a0006", "device removed", "device lost", "device hung"].iter())
+                .any(|k| m.contains(k));
+            if device_trouble && batch_items <= 1 {
+                GpuFailureClass::TransientCountable
+            } else {
+                GpuFailureClass::Ignored
+            }
+        }
         _ => GpuFailureClass::TransientCountable,
     }
 }
@@ -96,9 +110,31 @@ mod device_pressure_tests {
     #[test]
     fn device_pressure_is_never_permanent() {
         assert!(matches!(
-            classify(&SemanticError::DevicePressure("vram".into())),
+            classify(&SemanticError::DevicePressure("vram".into()), 1),
             GpuFailureClass::TransientCountable
         ));
+    }
+
+    /// A thermal pause outlasting the deadline (Cancelled) or a poisoned
+    /// input in a wide batch must never push a healthy GPU toward CPU.
+    #[test]
+    fn cancellation_and_batch_content_errors_never_count() {
+        assert_eq!(
+            classify(&SemanticError::Cancelled { completed: 0, total: 64 }, 64),
+            GpuFailureClass::Ignored
+        );
+        assert_eq!(
+            classify(&SemanticError::EmbeddingFailed("inference worker died mid-batch".into()), 64),
+            GpuFailureClass::Ignored
+        );
+        assert_eq!(
+            classify(&SemanticError::EmbeddingFailed("bad token id".into()), 1),
+            GpuFailureClass::Ignored
+        );
+        assert_eq!(
+            classify(&SemanticError::EmbeddingFailed("inference worker died mid-batch".into()), 1),
+            GpuFailureClass::TransientCountable
+        );
     }
 
     /// A genuinely broken provider must still be permanent — the fix above
@@ -109,7 +145,7 @@ mod device_pressure_tests {
             classify(&SemanticError::ProviderUnavailable {
                 provider: "x".into(),
                 reason: "model artifact corrupt".into(),
-            }),
+            }, 1),
             GpuFailureClass::Permanent
         ));
     }
@@ -195,8 +231,8 @@ impl FallbackCoordinator {
         self.promoted.store(false, Ordering::Relaxed);
     }
 
-    fn handle_gpu_failure(&self, err: &SemanticError) {
-        match classify(err) {
+    fn handle_gpu_failure(&self, err: &SemanticError, batch_items: usize) {
+        match classify(err, batch_items) {
             GpuFailureClass::Permanent => {
                 self.switch_to_cpu(format!("gpu provider reported a permanent failure: {err}"));
             }
@@ -307,6 +343,10 @@ impl SemanticProvider for FallbackCoordinator {
         self.fallback_reason_snapshot()
     }
 
+    fn preferred_claim_items(&self) -> Option<usize> {
+        self.current().preferred_claim_items()
+    }
+
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
@@ -323,7 +363,7 @@ impl SemanticProvider for FallbackCoordinator {
         match (&result, backend) {
             (Ok(_), ActiveBackend::Gpu) => self.handle_gpu_success(),
             (Ok(_), ActiveBackend::Cpu) => self.try_promote_cpu_generation(),
-            (Err(e), ActiveBackend::Gpu) => self.handle_gpu_failure(e),
+            (Err(e), ActiveBackend::Gpu) => self.handle_gpu_failure(e, inputs.len()),
             (Err(_), ActiveBackend::Cpu) => {} // CPU failing has no further fallback tier
         }
         result

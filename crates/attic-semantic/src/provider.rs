@@ -117,6 +117,15 @@ pub trait SemanticProvider: Send + Sync {
         None
     }
 
+    /// How many queue items one `embed_batch` call should receive, when the
+    /// provider packs work internally better than the host's generic batch
+    /// size. A GPU provider that groups inputs into length buckets needs a
+    /// wide claim to fill its batches; a claim capped at the CPU-sized batch
+    /// leaves the device mostly idle. `None` keeps the caller's batch size.
+    fn preferred_claim_items(&self) -> Option<usize> {
+        None
+    }
+
     /// Embed a batch under an ENFORCEABLE time contract (§20): `deadline`
     /// (when set) bounds the whole call — implementations must check it
     /// cooperatively between items/slices and return

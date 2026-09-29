@@ -494,13 +494,14 @@ fn resolve_semantic_provider(
             // Record what we actually opened so status reports the real state
             // instead of re-deriving it from config that may not mention it.
             let _ = ACTIVE_ONNX_DIR.set(dir.clone());
-            let gpu = supervised_provider(
+            let gpu = supervised_provider_with_env(
                 "ort-directml",
                 model_cache_dir,
                 batch_size,
                 attic_config.semantic.dimension,
                 Some(dir),
                 onnx_seq_len(attic_config),
+                gpu_worker_env(attic_config),
             );
             return match cpu_dir {
                 Some(cpu_dir) => {
@@ -619,11 +620,40 @@ fn supervised_provider(
     onnx_dir: Option<PathBuf>,
     seq_len: usize,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
+    supervised_provider_with_env(backend, cache_dir, batch_size, dimension, onnx_dir, seq_len, vec![])
+}
+
+/// GPU tunables from `attic.toml` `[semantic]`, forwarded to the inference
+/// worker as environment (the worker never reads `attic.toml` itself).
+fn gpu_worker_env(attic_config: &attic_core::AtticConfig) -> Vec<(String, String)> {
+    let s = &attic_config.semantic;
+    let mut env = Vec::new();
+    if let Some(n) = s.gpu_batch_tokens.filter(|n| *n > 0) {
+        env.push((attic_semantic::ENV_GPU_BATCH_TOKENS.to_string(), n.to_string()));
+    }
+    if let Some(c) = s.gpu_temp_pause_c {
+        env.push((attic_semantic::ENV_GPU_TEMP_PAUSE_C.to_string(), c.to_string()));
+    }
+    if let Some(c) = s.gpu_temp_resume_c {
+        env.push((attic_semantic::ENV_GPU_TEMP_RESUME_C.to_string(), c.to_string()));
+    }
+    env
+}
+
+fn supervised_provider_with_env(
+    backend: &str,
+    cache_dir: &Path,
+    batch_size: usize,
+    dimension: Option<usize>,
+    onnx_dir: Option<PathBuf>,
+    seq_len: usize,
+    env: Vec<(String, String)>,
+) -> Arc<dyn attic_semantic::SemanticProvider> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("attic"));
     let launch = attic_inference_protocol::supervisor::WorkerLaunch {
         program: exe,
         args: vec!["inference-worker".to_string()],
-        env: vec![],
+        env,
     };
     let load = attic_inference_protocol::supervisor::LoadParams {
         cache_dir: cache_dir.to_string_lossy().into_owned(),
@@ -4229,6 +4259,21 @@ pub(crate) fn build_server_and_enricher(
                         .semantic
                         .max_file_bytes
                         .unwrap_or(defaults.max_file_bytes),
+                    min_score: server
+                        .attic_config
+                        .semantic
+                        .min_score
+                        .unwrap_or(defaults.min_score),
+                    max_units_per_repo: server
+                        .attic_config
+                        .semantic
+                        .max_units_per_repo
+                        .unwrap_or(defaults.max_units_per_repo),
+                    max_units_total: server
+                        .attic_config
+                        .semantic
+                        .max_units_total
+                        .unwrap_or(defaults.max_units_total),
                     ..defaults
                 }
             },

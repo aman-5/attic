@@ -218,6 +218,44 @@ fn is_transient_provider_error(e: &SemanticError) -> bool {
     }
 }
 
+/// The inference worker crashed or hung while carrying a batch (the
+/// supervisor killed/lost it). The worker restarts on the next call, so
+/// this is not "provider not ready" — but the batch may contain the input
+/// that caused it, so it must be isolated rather than blindly requeued.
+fn is_worker_crash(e: &SemanticError) -> bool {
+    let SemanticError::EmbeddingFailed(msg) = e else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    m.contains("deadline")
+        || m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("killed")
+        || m.contains("died")
+}
+
+/// Failures that bisection can attribute to specific content: a content
+/// error, or a worker crash/hang. Cancellation, OOM (owned by the batch-cap
+/// halving) and provider-not-ready are never the content's fault.
+fn is_isolatable_failure(e: &SemanticError) -> bool {
+    if matches!(
+        e,
+        SemanticError::Cancelled { .. } | SemanticError::BudgetExhausted(_)
+    ) {
+        return false;
+    }
+    is_worker_crash(e) || !is_transient_provider_error(e)
+}
+
+/// Hang-detection budget for a bisected sub-batch: proportional to its share
+/// of the original batch, floored at 60 s, so isolating a hanging item costs
+/// ~2-3x one batch timeout rather than one full timeout per bisection level.
+fn sub_batch_timeout(cfg: &EnrichmentConfig, part: usize, total: usize) -> Duration {
+    let full = cfg.batch_inference_timeout_ms.max(1);
+    let share = full.saturating_mul(part as u64) / (total.max(1) as u64);
+    Duration::from_millis(share.max(60_000.min(full)))
+}
+
 /// Drive the enrichment queue until empty or budget/cancellation bounds hit.
 ///
 /// `conn` is a CANONICAL READ-ONLY connection; nothing here writes to the
@@ -306,6 +344,13 @@ fn drive_leased(
             break;
         }
         let mut batch_size = cfg.batch_size;
+        // A bucketing GPU provider needs a wide claim to fill its forward
+        // passes. Emergency (0) still parks: never widen a zero.
+        if batch_size > 0
+            && let Some(wide) = provider.preferred_claim_items()
+        {
+            batch_size = batch_size.max(wide);
+        }
         if let Some(cap) = oom_batch_cap {
             batch_size = batch_size.min(cap);
         }
@@ -495,6 +540,102 @@ fn drive_leased(
                 provider.embed_batch(&to_embed, cancel, &mut usage, Some(batch_deadline))
             })
         };
+        // One bad chunk must not fail — or block — every other chunk it shares
+        // a forward pass with. On a content failure OR a worker crash/hang
+        // while carrying this batch, bisect: good halves commit now, and only
+        // the single offending item is charged an attempt (quarantined after
+        // `max_attempts`). Without this, a chunk that deterministically
+        // crashes the worker was returned to PENDING with its whole batch
+        // (worker trouble never burns an attempt) and — claims being oldest
+        // first — re-claimed forever: a silent zero-throughput livelock.
+        let mut stop_unready = false;
+        let embed_res = match embed_res {
+            Err(e) if is_isolatable_failure(&e) && (to_embed.len() > 1 || is_worker_crash(&e)) => {
+                tracing::warn!(
+                    items = to_embed.len(),
+                    "embedding batch failed ({e}); bisecting to isolate the offending item(s)"
+                );
+                let total = to_embed.len();
+                let mut ok = Vec::with_capacity(total);
+                let mut stack: Vec<&[EmbeddingInput]> = Vec::new();
+                if total > 1 {
+                    let (a, b) = to_embed.split_at(total / 2);
+                    stack.push(b);
+                    stack.push(a);
+                } else {
+                    // A lone item that crashed the worker: charge it now.
+                    for input in &to_embed {
+                        if let Some(token) = token_of.get(&input.unit_key).copied() {
+                            tracing::warn!(unit = %input.unit_key, "embedding item failed: {e}");
+                            let _ = store.queue_mark_failed(
+                                &input.unit_key,
+                                &owner,
+                                token,
+                                cfg.max_attempts,
+                                &e.to_string(),
+                            );
+                            handled.insert(input.unit_key.clone());
+                            stats.failed_items += 1;
+                        }
+                    }
+                }
+                while let Some(part) = stack.pop() {
+                    let release = |handled: &mut std::collections::HashSet<String>| {
+                        for input in part {
+                            if let Some(token) = token_of.get(&input.unit_key).copied() {
+                                let _ = store.queue_reset(&input.unit_key, &owner, token);
+                                handled.insert(input.unit_key.clone());
+                            }
+                        }
+                    };
+                    if cancel.is_cancelled() || stop_unready {
+                        release(&mut handled);
+                        continue;
+                    }
+                    let res = plan.execute_isolated(|| {
+                        provider.embed_batch(
+                            part,
+                            cancel,
+                            &mut usage,
+                            Some(Instant::now() + sub_batch_timeout(cfg, part.len(), total)),
+                        )
+                    });
+                    match res {
+                        Ok(mut v) => ok.append(&mut v),
+                        Err(err) if is_isolatable_failure(&err) && part.len() > 1 => {
+                            let (a, b) = part.split_at(part.len() / 2);
+                            stack.push(b);
+                            stack.push(a);
+                        }
+                        Err(err) if is_isolatable_failure(&err) => {
+                            let input = &part[0];
+                            if let Some(token) = token_of.get(&input.unit_key).copied() {
+                                tracing::warn!(unit = %input.unit_key, "embedding item failed: {err}");
+                                let _ = store.queue_mark_failed(
+                                    &input.unit_key,
+                                    &owner,
+                                    token,
+                                    cfg.max_attempts,
+                                    &err.to_string(),
+                                );
+                                handled.insert(input.unit_key.clone());
+                                stats.failed_items += 1;
+                            }
+                        }
+                        Err(err) => {
+                            // Cancelled / OOM / provider not ready: not the
+                            // content's fault — release without an attempt.
+                            if is_transient_provider_error(&err) {
+                                stop_unready = true;
+                            }
+                            release(&mut handled);
+                        }
+                    }
+                }
+                Ok(ok)
+            }
+            other => other,
+        };
         match embed_res {
             Ok(outputs) => {
                 for out in outputs {
@@ -554,6 +695,10 @@ fn drive_leased(
                             }
                         }
                     }
+                }
+                if stop_unready {
+                    stats.provider_unready = true;
+                    break;
                 }
             }
             Err(SemanticError::Cancelled { .. }) => {
@@ -1473,5 +1618,249 @@ mod generation_driven_enrichment_tests {
         assert_eq!(stats.oom_reductions, 1, "exactly one halving event");
         assert_eq!(stats.failed_items, 0);
         assert_eq!(stats.queue_remaining, 0);
+    }
+}
+
+/// Queue robustness at scale (run explicitly: it inserts 200K units).
+///
+/// `cargo test --release -p attic-semantic --lib queue_scale -- --ignored --nocapture`
+/// (`ATTIC_SCALE_UNITS` overrides the unit count.)
+#[cfg(test)]
+mod queue_scale_tests {
+    use super::*;
+    use crate::provider::EmbeddingOutput;
+    use std::sync::atomic::AtomicU64;
+
+    /// GPU-shaped provider (wide claims) with injected faults:
+    /// POISON = content error, CRASH = worker dies, HANG = worker hangs until
+    /// the deadline and is killed, plus a periodic "model loading" outage.
+    struct ChaosProvider {
+        calls: AtomicU64,
+    }
+
+    impl SemanticProvider for ChaosProvider {
+        fn id(&self) -> &'static str {
+            "chaos"
+        }
+        fn model_id(&self) -> &str {
+            "chaos-v1"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn max_input_bytes(&self) -> usize {
+            4096
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
+            Some(crate::testing::test_fingerprint(self))
+        }
+        fn preferred_claim_items(&self) -> Option<usize> {
+            Some(128)
+        }
+        fn embed_batch(
+            &self,
+            inputs: &[EmbeddingInput],
+            _cancel: &CancelFlag,
+            usage: &mut ResourceUsage,
+            deadline: Option<Instant>,
+        ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(997) {
+                return Err(SemanticError::ProviderUnavailable {
+                    provider: "chaos".into(),
+                    reason: "model loading".into(),
+                });
+            }
+            if inputs.iter().any(|i| i.text.contains("HANG")) {
+                if let Some(d) = deadline {
+                    std::thread::sleep(d.saturating_duration_since(Instant::now()));
+                }
+                return Err(SemanticError::EmbeddingFailed(
+                    "inference worker exceeded deadline and was killed".into(),
+                ));
+            }
+            if inputs.iter().any(|i| i.text.contains("CRASH")) {
+                return Err(SemanticError::EmbeddingFailed(
+                    "inference worker died mid-batch".into(),
+                ));
+            }
+            if inputs.iter().any(|i| i.text.contains("POISON")) {
+                return Err(SemanticError::EmbeddingFailed("mock bad tensor".into()));
+            }
+            usage.items_embedded += inputs.len() as u64;
+            Ok(inputs
+                .iter()
+                .map(|i| EmbeddingOutput {
+                    unit_key: i.unit_key.clone(),
+                    vector: vec![0.5; 4],
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    #[ignore = "scale test: run explicitly with --ignored --release"]
+    fn queue_scale_never_stalls_on_bad_items() {
+        use attic_core::{
+            DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
+            IndexGenerationId, RepositoryId, SecurityState, SourceRevisionId, SourceType,
+            SubsystemVersions,
+        };
+        let units: usize = std::env::var("ATTIC_SCALE_UNITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let bad = |i: usize| -> Option<&'static str> {
+            if i % 20_000 == 7 {
+                Some("POISON")
+            } else if i % 50_000 == 11 {
+                Some("CRASH")
+            } else if i % 100_000 == 13 {
+                Some("HANG")
+            } else {
+                None
+            }
+        };
+        let n_bad = (0..units).filter(|&i| bad(i).is_some()).count();
+
+        let t_setup = Instant::now();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        attic_storage::run_migrations(&conn).unwrap();
+        let repo_id = RepositoryId::new_v4();
+        attic_storage::upsert_repository(&conn, &repo_id, "/repo/scale", "scale").unwrap();
+        let rev_id = SourceRevisionId::new_v4();
+        attic_storage::insert_source_revision(
+            &conn, &rev_id, &repo_id, "abc", "2026-01-01T00:00:00Z", SourceType::Git,
+        )
+        .unwrap();
+        let gen_id = IndexGenerationId::new_v4();
+        attic_storage::insert_index_generation(
+            &conn, &gen_id, &repo_id, &rev_id, 1, &SubsystemVersions::new(),
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        let per_file = 1_000;
+        let mut occ = FileOccurrenceId::new_v4();
+        for i in 0..units {
+            if i % per_file == 0 {
+                let fid = FileIdentityId::new_v4();
+                let path = format!("src/f{}.rs", i / per_file);
+                attic_storage::upsert_file_identity(&conn, &fid, &repo_id, &path).unwrap();
+                occ = FileOccurrenceId::new_v4();
+                attic_storage::insert_file_occurrence(
+                    &conn,
+                    &attic_storage::NewFileOccurrence {
+                        id: &occ,
+                        file_identity_id: &fid,
+                        source_revision_id: &rev_id,
+                        index_generation_id: Some(&gen_id),
+                        path: &path,
+                        content_hash: &format!("blake3:{i}"),
+                        size_bytes: 4096,
+                        language: Some("rust"),
+                        file_type: FileType::Rust,
+                        discovery_class: DiscoveryClass::Vcs,
+                        security_state: SecurityState::Clean,
+                        existence_state: ExistenceState::Present,
+                    },
+                )
+                .unwrap();
+            }
+            let text = format!(
+                "fn unit_{i}() {{ let value_{i} = {i}; {} }}",
+                bad(i).unwrap_or("")
+            );
+            let unit_id = attic_core::RetrievalUnitId::new_v4().to_string_repr();
+            attic_storage::insert_retrieval_unit_with_fts(
+                &conn,
+                &attic_storage::NewRetrievalUnit {
+                    id: &unit_id,
+                    file_occurrence_id: &occ.to_string_repr(),
+                    index_generation_id: &gen_id.to_string_repr(),
+                    repository_id: &repo_id.to_string_repr(),
+                    retrieval_text: &text,
+                    analyzer_id: "generic",
+                    analyzer_version: "test",
+                    start_line: Some(i as u32),
+                    end_line: Some(i as u32),
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+
+        let store = SemanticStore::open_in_memory().unwrap();
+        let provider = ChaosProvider {
+            calls: AtomicU64::new(0),
+        };
+        let selection = crate::selection::SelectionConfig {
+            min_score: 0.0,
+            max_units_per_repo: units * 2,
+            max_units_total: units * 2,
+            ..Default::default()
+        };
+        let report = crate::invalidate::reconcile(&conn, &store, &provider, &selection).unwrap();
+        assert_eq!(report.enqueued, units, "{report:?}");
+        let setup_s = t_setup.elapsed().as_secs_f64();
+
+        let cfg = EnrichmentConfig {
+            batch_size: 16,
+            budget_ms: 2_000,
+            max_attempts: 3,
+            // Stand-in for the 300 s production hang deadline.
+            batch_inference_timeout_ms: 400,
+            ..EnrichmentConfig::default()
+        };
+        let t0 = Instant::now();
+        let mut embedded = 0u64;
+        let mut rates: Vec<f64> = Vec::new();
+        let mut drives = 0u32;
+        let mut unready = 0u32;
+        let mut first_chunk_ms: Option<u128> = None;
+        loop {
+            drives += 1;
+            assert!(drives < 20_000, "queue did not drain: livelock");
+            let s = drive(&conn, &store, &provider, &cfg, &CancelFlag::new()).unwrap();
+            if s.embedded > 0 && first_chunk_ms.is_none() {
+                first_chunk_ms = Some(t0.elapsed().as_millis());
+            }
+            if s.provider_unready {
+                unready += 1;
+            }
+            embedded += s.embedded;
+            if s.elapsed_ms > 500 && s.embedded > 0 {
+                rates.push(s.embedded as f64 * 1000.0 / s.elapsed_ms as f64);
+            }
+            let c = store.queue_counts().unwrap();
+            if c.pending == 0 && c.inflight == 0 {
+                break;
+            }
+        }
+        let total_s = t0.elapsed().as_secs_f64();
+        let c = store.queue_counts().unwrap();
+        let head = rates.iter().take(3).sum::<f64>() / rates.len().clamp(1, 3) as f64;
+        let tail = rates.iter().rev().take(3).sum::<f64>() / rates.len().clamp(1, 3) as f64;
+        println!(
+            "SCALE units={units} bad={n_bad} setup={setup_s:.1}s drain={total_s:.1}s \
+             embedded={embedded} done={} failed={} pending={} inflight={} drives={drives} \
+             unready_drives={unready} first_chunk_ms={first_chunk_ms:?} \
+             rate_head={head:.0}/s rate_tail={tail:.0}/s overall={:.0}/s",
+            c.done,
+            c.failed,
+            c.pending,
+            c.inflight,
+            embedded as f64 / total_s
+        );
+        assert_eq!(c.pending + c.inflight, 0);
+        assert_eq!(c.failed as usize, n_bad, "only the injected bad items quarantine");
+        assert_eq!(embedded as usize, units - n_bad, "every good item embeds");
+        assert!(
+            tail >= head * 0.5,
+            "throughput must not degrade with queue depth: head {head:.0}/s tail {tail:.0}/s"
+        );
     }
 }
