@@ -79,7 +79,9 @@ SHA-256 hashes; it is never counted in indexing time.
   `gpu_temp_pause_c` (default 90 °C) embedding pauses until the GPU cools to
   `gpu_temp_resume_c` (default 85 °C). Sensor: `nvidia-smi` (NVIDIA on
   Windows/Linux) or Linux hwmon; macOS and other Windows adapters have no
-  readable sensor, so the OS's own thermal management applies.
+  readable sensor, so the OS's own thermal management applies. `status` →
+  `semantic_identity.gpu.thermal_guard` shows `active` with the current temperature, or
+  `inactive` when no sensor is readable.
 - **Poison isolation.** If a multi-item batch fails on content or crashes
   the worker, it is split in halves until the offender is found: good items
   commit, only the offender is marked failed, so one bad chunk never stalls

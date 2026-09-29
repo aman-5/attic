@@ -428,7 +428,39 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
         "min_vram_mb": attic_config.semantic.min_vram_mb(),
         "allow_integrated_gpu": attic_config.semantic.allow_integrated_gpu.unwrap_or(false),
         "startup_decision": GPU_DECISION.get(),
+        "thermal_guard": thermal_guard_report(
+            attic_config
+                .semantic
+                .gpu_temp_pause_c
+                .unwrap_or(attic_storage::gpu_thermal::DEFAULT_PAUSE_C),
+            attic_config
+                .semantic
+                .gpu_temp_resume_c
+                .unwrap_or(attic_storage::gpu_thermal::DEFAULT_RESUME_C),
+            attic_storage::gpu_thermal::gpu_temperature_c(),
+        ),
     })
+}
+
+/// The thermal guard only acts on a readable sensor; say plainly when there
+/// is none rather than implying the GPU is protected.
+fn thermal_guard_report(pause_c: u32, resume_c: u32, temp_c: Option<u32>) -> serde_json::Value {
+    match temp_c {
+        Some(t) => json!({
+            "active": true,
+            "current_c": t,
+            "pause_c": pause_c,
+            "resume_c": resume_c,
+            "detail": format!("active: GPU at {t} °C; embedding pauses at {pause_c} °C and resumes at {resume_c} °C"),
+        }),
+        None => json!({
+            "active": false,
+            "current_c": null,
+            "pause_c": pause_c,
+            "resume_c": resume_c,
+            "detail": "inactive: no readable GPU temperature sensor (needs nvidia-smi on NVIDIA, or Linux hwmon); the OS's own thermal throttling applies",
+        }),
+    }
 }
 
 /// Phase 9: decide which `SemanticProvider` to actually construct.
@@ -1001,6 +1033,16 @@ mod resolve_provider_tests {
     fn device_line_prefers_runtime_fallback() {
         let report = serde_json::json!({ "explanation": "not compiled" });
         assert!(super::device_line(Some("oom".into()), &report).starts_with("CPU: GPU failed at runtime"));
+    }
+
+    #[test]
+    fn thermal_guard_reports_inactive_without_a_sensor() {
+        let none = super::thermal_guard_report(90, 85, None);
+        assert_eq!(none["active"], false);
+        assert!(none["detail"].as_str().unwrap().starts_with("inactive"));
+        let hot = super::thermal_guard_report(90, 85, Some(71));
+        assert_eq!(hot["active"], true);
+        assert_eq!(hot["current_c"], 71);
     }
 
     #[test]
