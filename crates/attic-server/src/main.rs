@@ -833,6 +833,7 @@ struct WorkerTuning {
 
 /// GPU tunables from `attic.toml` `[semantic]`, forwarded to the inference
 /// worker as environment (the worker never reads `attic.toml` itself).
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 fn gpu_worker_env(attic_config: &attic_core::AtticConfig) -> Vec<(String, String)> {
     let s = &attic_config.semantic;
     let mut env = Vec::new();
@@ -900,6 +901,7 @@ fn supervised_provider_with_env(
 /// throughput trade (padding waste scales with the window) but it shrinks
 /// coverage, so it must be chosen deliberately via config rather than
 /// hardcoded.
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 fn onnx_seq_len(attic_config: &attic_core::AtticConfig) -> usize {
     attic_config
         .semantic
@@ -918,6 +920,7 @@ fn onnx_seq_len(attic_config: &attic_core::AtticConfig) -> usize {
 /// provider accepts (`SelectionConfig::for_provider_capacity`), so a
 /// narrower window costs coverage but can never resurrect the
 /// "input too large" dead band.
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 fn default_onnx_seq_len() -> usize {
     match attic_storage::gpu_telemetry::query_vram_snapshot().total_mib {
         Some(total) if total < SMALL_VRAM_THRESHOLD_MIB => NARROW_ONNX_SEQ_LEN,
@@ -926,9 +929,11 @@ fn default_onnx_seq_len() -> usize {
 }
 
 /// Below this much dedicated VRAM, use the narrower sequence window.
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 const SMALL_VRAM_THRESHOLD_MIB: u64 = 6144;
 
 /// Sequence window for VRAM-constrained devices.
+#[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
 const NARROW_ONNX_SEQ_LEN: usize = 512;
 
 /// Matches `qwen3_provider::DEFAULT_MAX_TOKENS`, which is what the selection
