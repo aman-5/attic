@@ -8,7 +8,7 @@
 //! against a freshly restarted worker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use attic_inference_protocol::supervisor::{
     LoadParams, SupervisorError, WorkerLaunch, WorkerSupervisor,
@@ -188,7 +188,9 @@ impl SemanticProvider for SupervisedWorkerProvider {
                 total: inputs.len(),
             });
         }
+        let warmup_started = Instant::now();
         self.ensure_ready()?;
+        let warmup_cost = warmup_started.elapsed();
 
         let items: Vec<EmbedItem> = inputs
             .iter()
@@ -201,14 +203,36 @@ impl SemanticProvider for SupervisedWorkerProvider {
 
         let effective_deadline = match deadline {
             Some(d) => {
+                // Refund whatever a COLD MODEL LOAD just consumed.
+                //
+                // The caller's deadline starts before `ensure_ready()`, which
+                // is where a cold worker loads the model — for a 1.1 GB fp16
+                // ONNX export on DirectML that can take minutes. The remaining
+                // budget then reached zero before a single item was embedded,
+                // so the batch returned `Cancelled { completed: 0 }`. Three of
+                // those trip the fallback coordinator's consecutive-failure
+                // threshold and the GPU is abandoned for CPU permanently —
+                // observed as "gpu provider failed 3 consecutive times:
+                // embedding batch cancelled after 0 of 4 items" on a machine
+                // whose GPU was working perfectly.
+                //
+                // This deadline exists to catch a HUNG INFERENCE CALL. Warm-up
+                // is a legitimate one-time cost with its own separate budget
+                // (the supervisor's load roundtrip), so charging it here
+                // punished the GPU for being cold rather than for being stuck.
+                // Refunding it leaves the hang detection intact — the budget
+                // is still capped at EMBED_DEADLINE and a warm worker is
+                // completely unaffected, since `warmup_cost` is then ~zero.
                 let remaining = d.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(SemanticError::Cancelled {
-                        completed: 0,
-                        total: inputs.len(),
-                    });
+                match inference_budget(remaining, warmup_cost) {
+                    Some(b) => b,
+                    None => {
+                        return Err(SemanticError::Cancelled {
+                            completed: 0,
+                            total: inputs.len(),
+                        });
+                    }
                 }
-                remaining.min(EMBED_DEADLINE)
             }
             None => EMBED_DEADLINE,
         };
@@ -386,6 +410,22 @@ pub fn verify_identity_capabilities(
     }
 }
 
+/// How long this batch may spend in *inference*, given the caller's remaining
+/// budget and what a cold model load just cost.
+///
+/// `warmup_cost` is refunded. The caller's deadline starts before the worker
+/// loads its model, so a cold load can consume the entire budget and leave a
+/// batch cancelled having embedded nothing — which the fallback coordinator
+/// counts as a provider failure and, after three, abandons the GPU for good.
+/// This deadline is a hang detector for inference; warm-up is a legitimate
+/// one-time cost with its own budget, so it must not be charged here.
+///
+/// Returns `None` when the budget is genuinely exhausted.
+fn inference_budget(remaining: Duration, warmup_cost: Duration) -> Option<Duration> {
+    let budget = remaining.saturating_add(warmup_cost).min(EMBED_DEADLINE);
+    (!budget.is_zero()).then_some(budget)
+}
+
 /// The max_input_bytes the worker's provider will enforce, without loading
 /// the model (mirrors each provider's contract).
 pub fn expected_max_input_bytes(backend: &str, seq_len: usize) -> usize {
@@ -465,6 +505,41 @@ mod expected_fingerprint_tests {
             !provider.available(),
             "a worker whose load attempt genuinely failed must report unavailable"
         );
+    }
+
+    /// The shipping bug this guards: a cold DirectML load ate the caller's
+    /// whole embed deadline, so the batch was cancelled having embedded 0 of
+    /// 4 items. Three of those tripped the fallback coordinator and the GPU
+    /// was abandoned for CPU permanently — on a machine whose GPU was fine.
+    #[test]
+    fn a_cold_model_load_does_not_consume_the_inference_budget() {
+        // Caller's budget fully consumed by warm-up.
+        let budget = inference_budget(Duration::ZERO, Duration::from_secs(280))
+            .expect("a cold load must not leave zero inference budget");
+        assert_eq!(budget, Duration::from_secs(280));
+    }
+
+    #[test]
+    fn a_warm_worker_is_unaffected_by_the_refund() {
+        let remaining = Duration::from_secs(120);
+        assert_eq!(
+            inference_budget(remaining, Duration::ZERO),
+            Some(remaining),
+            "a warm worker pays no warm-up, so its budget must be unchanged"
+        );
+    }
+
+    #[test]
+    fn the_refund_is_still_capped_at_the_embed_deadline() {
+        // The refund must not become an unbounded budget: a genuinely hung
+        // inference call still has to be caught.
+        let budget = inference_budget(EMBED_DEADLINE, EMBED_DEADLINE).unwrap();
+        assert_eq!(budget, EMBED_DEADLINE);
+    }
+
+    #[test]
+    fn an_exhausted_budget_with_no_warmup_is_still_exhausted() {
+        assert_eq!(inference_budget(Duration::ZERO, Duration::ZERO), None);
     }
 
     #[test]
