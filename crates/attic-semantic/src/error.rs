@@ -34,6 +34,17 @@ pub enum SemanticError {
     #[error("resource budget exhausted: {0}")]
     BudgetExhausted(String),
 
+    /// The device is under sustained resource pressure right now.
+    ///
+    /// Distinct from [`Self::ProviderUnavailable`], which means the provider
+    /// itself is broken or unsafe and is therefore classified permanent. A
+    /// desktop GPU is shared hardware: VRAM pressure is a transient
+    /// condition that clears when other applications release memory, so
+    /// treating it as permanent retired a perfectly healthy GPU for the rest
+    /// of the process lifetime after a single spike.
+    #[error("device under sustained resource pressure: {0}")]
+    DevicePressure(String),
+
     #[error("canonical index read failed: {0}")]
     Canonical(String),
 

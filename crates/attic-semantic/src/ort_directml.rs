@@ -39,13 +39,28 @@ use crate::provider::{
     ProviderConcurrencyContract, ResourceUsage, SemanticProvider,
 };
 
-/// Conservative default dedicated-VRAM ceiling admission enforces against —
-/// deliberately below the smallest GPU this provider has actually been
-/// validated on (RTX A500, 4096 MiB) so admission leaves headroom for the
-/// OS/driver/other processes rather than assuming this process owns the
-/// whole device. Override with `ATTIC_VRAM_CEILING_MIB` for a known-larger
-/// (or smaller) dedicated GPU.
+/// Fraction of a device's dedicated VRAM this process will admit against,
+/// leaving the remainder for the OS/compositor/other apps. A desktop GPU is
+/// shared hardware; assuming we own it is how admission ends up thrashing.
+const VRAM_CEILING_FRACTION_PCT: u64 = 75;
+
+/// Fallback ceiling when the device reports no usable VRAM telemetry —
+/// deliberately below the smallest GPU this provider has been validated on
+/// (RTX A500, 4096 MiB). Override with `ATTIC_VRAM_CEILING_MIB`.
 const DEFAULT_VRAM_CEILING_MIB: u64 = 3072;
+
+/// Ceiling admission enforces against.
+///
+/// Previously a flat 3072 MiB regardless of hardware, which silently
+/// under-used large cards and mis-sized small ones. Derive it from what the
+/// device actually reports, and only fall back to the constant when
+/// telemetry is unavailable.
+fn default_vram_ceiling_mib() -> u64 {
+    match attic_storage::gpu_telemetry::query_vram_snapshot().total_mib {
+        Some(total) if total > 0 => (total.saturating_mul(VRAM_CEILING_FRACTION_PCT) / 100).max(1),
+        _ => DEFAULT_VRAM_CEILING_MIB,
+    }
+}
 
 fn vram_telemetry() -> &'static GpuTelemetry {
     static TELEMETRY: OnceLock<GpuTelemetry> = OnceLock::new();
@@ -58,7 +73,7 @@ fn vram_admission() -> &'static GpuAdmissionController {
         let ceiling = std::env::var("ATTIC_VRAM_CEILING_MIB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_VRAM_CEILING_MIB);
+            .unwrap_or_else(default_vram_ceiling_mib);
         GpuAdmissionController::new(ceiling)
     })
 }
@@ -398,10 +413,9 @@ impl SemanticProvider for OrtDirectMlProvider {
                 ));
             }
             AdmissionDecision::FallbackToCpu => {
-                return Err(SemanticError::ProviderUnavailable {
-                    provider: ORT_PROVIDER_ID.into(),
-                    reason: "sustained critical VRAM pressure; falling back to CPU".into(),
-                });
+                return Err(SemanticError::DevicePressure(
+                    "sustained critical VRAM pressure".into(),
+                ));
             }
         }
 

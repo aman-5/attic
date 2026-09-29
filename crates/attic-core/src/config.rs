@@ -79,6 +79,12 @@ pub struct SemanticConfig {
     /// 256 KiB.
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
+    /// Wall-clock budget for ONE background enrichment drive slice (ms).
+    ///
+    /// Bounds how long a slice keeps starting new batches; it is NOT a
+    /// per-batch inference deadline. `None` uses the built-in default.
+    #[serde(default)]
+    pub drive_budget_ms: Option<u64>,
     /// Directory containing a local ONNX export (`model_fp16.onnx` +
     /// `tokenizer.json`) used by the GPU execution backend.
     ///
@@ -143,6 +149,7 @@ impl Default for SemanticConfig {
             dimension: None,
             exclude_globs: Vec::new(),
             max_file_bytes: None,
+            drive_budget_ms: None,
             onnx_model_dir: None,
             onnx_seq_len: None,
             device: None,
@@ -390,6 +397,11 @@ impl AtticConfig {
                 "[semantic] max_file_bytes must be >= 1".into(),
             ));
         }
+        if self.semantic.drive_budget_ms == Some(0) {
+            return Err(ConfigError::Invalid(
+                "[semantic] drive_budget_ms must be >= 1".into(),
+            ));
+        }
         if self
             .semantic
             .exclude_globs
@@ -445,6 +457,11 @@ model = "qwen3-embedding-0.6b"
 # max_file_bytes = 262144
 # Additional paths to keep out of the embedding queue.
 # exclude_globs = ["**/*.min.js", "testdata/"]
+
+# How long one background enrichment slice keeps starting new batches
+# (default: 60000 = 60s). This is NOT a per-batch inference deadline; a
+# claimed batch always runs to completion under its own hang timeout.
+# drive_budget_ms = 60000
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and

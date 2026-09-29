@@ -653,14 +653,43 @@ fn onnx_seq_len(attic_config: &attic_core::AtticConfig) -> usize {
         .semantic
         .onnx_seq_len
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_ONNX_SEQ_LEN)
+        .unwrap_or_else(default_onnx_seq_len)
 }
+
+/// Widest sequence this machine's GPU can carry without thrashing admission.
+///
+/// Activation VRAM scales linearly with sequence length, so a flat 1024
+/// default doubled per-item VRAM versus 512 and pushed a 4 GiB card into
+/// sustained critical pressure — admission then reported the GPU
+/// unavailable and the whole run fell back to CPU. Small cards get the
+/// narrower window; the selection gate clamps itself to whatever the live
+/// provider accepts (`SelectionConfig::for_provider_capacity`), so a
+/// narrower window costs coverage but can never resurrect the
+/// "input too large" dead band.
+fn default_onnx_seq_len() -> usize {
+    match attic_storage::gpu_telemetry::query_vram_snapshot().total_mib {
+        Some(total) if total < SMALL_VRAM_THRESHOLD_MIB => NARROW_ONNX_SEQ_LEN,
+        _ => DEFAULT_ONNX_SEQ_LEN,
+    }
+}
+
+/// Below this much dedicated VRAM, use the narrower sequence window.
+const SMALL_VRAM_THRESHOLD_MIB: u64 = 6144;
+
+/// Sequence window for VRAM-constrained devices.
+const NARROW_ONNX_SEQ_LEN: usize = 512;
 
 /// Matches `qwen3_provider::DEFAULT_MAX_TOKENS`, which is what the selection
 /// gate is derived from. Previously 512, which silently halved the accepted
 /// input size on the GPU path relative to the gate and made every unit in
 /// between fail permanently.
 const DEFAULT_ONNX_SEQ_LEN: usize = 1024;
+
+/// Drive-slice budget for the background enricher.
+///
+/// Bounds how long one slice keeps starting new batches — not how long any
+/// single batch may run (see `EnrichmentConfig::batch_inference_timeout_ms`).
+const DEFAULT_ENRICH_DRIVE_BUDGET_MS: u64 = 60_000;
 
 /// Phase 2: background model acquisition. Downloads weights OFF the startup
 /// path (canonical/lexical indexing never waits), with the agreed failure
@@ -4179,6 +4208,15 @@ pub(crate) fn build_server_and_enricher(
         let enrichment_cfg = attic_semantic::EnrichmentConfig {
             batch_size: server.effective_resources.embedding_batch_size,
             embedding_worker_count: server.effective_resources.embedding_worker_count,
+            // The 2s default belongs to standalone/test drives. This enricher
+            // runs on its own background thread behind a resource permit, so a
+            // slice that can only ever fit part of one batch just churns the
+            // queue. Long slices let a warm provider keep embedding.
+            budget_ms: server
+                .attic_config
+                .semantic
+                .drive_budget_ms
+                .unwrap_or(DEFAULT_ENRICH_DRIVE_BUDGET_MS),
             cpu_threads: semantic_cpu_thread_budget(
                 std::thread::available_parallelism().map_or(1, usize::from),
             ),

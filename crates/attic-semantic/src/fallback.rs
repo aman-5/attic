@@ -68,6 +68,11 @@ fn classify(err: &SemanticError) -> GpuFailureClass {
         // Worker load/handshake failure or reported model-artifact problem —
         // this is exactly "GPU execution remains unavailable or unsafe".
         SemanticError::ProviderUnavailable { .. } => GpuFailureClass::Permanent,
+        // Device pressure is a condition, not a defect. It clears when other
+        // processes release VRAM, so it must be able to recover — but if it
+        // never clears, the consecutive-failure threshold still escalates to
+        // CPU rather than starving the queue forever.
+        SemanticError::DevicePressure(_) => GpuFailureClass::TransientCountable,
         // OOM is per-batch adaptive-sizing territory (r07); repeated OOM
         // alone must never trigger fallback (see module tests).
         SemanticError::BudgetExhausted(_) => GpuFailureClass::Ignored,
@@ -78,6 +83,35 @@ fn classify(err: &SemanticError) -> GpuFailureClass {
         SemanticError::EmbeddingFailed(_) => GpuFailureClass::TransientCountable,
         SemanticError::Cancelled { .. } => GpuFailureClass::TransientCountable,
         _ => GpuFailureClass::TransientCountable,
+    }
+}
+
+#[cfg(test)]
+mod device_pressure_tests {
+    use super::*;
+
+    /// VRAM pressure used to arrive as `ProviderUnavailable`, which is
+    /// classified permanent — so one spike on a shared desktop GPU retired
+    /// the device for the whole process. It must be recoverable.
+    #[test]
+    fn device_pressure_is_never_permanent() {
+        assert!(matches!(
+            classify(&SemanticError::DevicePressure("vram".into())),
+            GpuFailureClass::TransientCountable
+        ));
+    }
+
+    /// A genuinely broken provider must still be permanent — the fix above
+    /// must not soften real provider defects.
+    #[test]
+    fn a_broken_provider_is_still_permanent() {
+        assert!(matches!(
+            classify(&SemanticError::ProviderUnavailable {
+                provider: "x".into(),
+                reason: "model artifact corrupt".into(),
+            }),
+            GpuFailureClass::Permanent
+        ));
     }
 }
 

@@ -125,6 +125,7 @@ fn map_supervisor_error(e: SupervisorError) -> SemanticError {
         ),
         SupervisorError::Engine { class, message } => match class {
             WorkerErrorClass::OutOfMemory => SemanticError::BudgetExhausted(message),
+            WorkerErrorClass::ResourcePressure => SemanticError::DevicePressure(message),
             WorkerErrorClass::InvalidInput => SemanticError::EmbeddingFailed(message),
             WorkerErrorClass::Artifact => SemanticError::ProviderUnavailable {
                 provider: "inference-worker".into(),
@@ -440,6 +441,23 @@ pub fn expected_max_input_bytes(backend: &str, seq_len: usize) -> usize {
 #[cfg(test)]
 mod expected_fingerprint_tests {
     use super::*;
+
+    /// A recoverable device condition must survive the IPC boundary as a
+    /// recoverable condition. It previously arrived as `Internal` ->
+    /// `EmbeddingFailed`, whose transient check is substring-based and did
+    /// not match "resource pressure", so every occurrence burned a retry and
+    /// four units were permanently quarantined by a passing VRAM spike.
+    #[test]
+    fn device_pressure_survives_the_worker_boundary() {
+        let mapped = map_supervisor_error(SupervisorError::Engine {
+            class: WorkerErrorClass::ResourcePressure,
+            message: "sustained critical VRAM pressure".into(),
+        });
+        assert!(
+            matches!(mapped, SemanticError::DevicePressure(_)),
+            "resource pressure must stay typed, got {mapped:?}"
+        );
+    }
 
     #[test]
     fn candle_cpu_provider_matches_qwen3_provider_id() {

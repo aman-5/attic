@@ -101,6 +101,12 @@ pub enum WorkerResponse {
 pub enum WorkerErrorClass {
     /// GPU/VRAM or native allocation failure — retry with smaller batch.
     OutOfMemory,
+    /// Device is under sustained resource pressure (e.g. VRAM contention
+    /// from other processes). Distinct from `OutOfMemory`: the batch was
+    /// never attempted, and distinct from `Artifact`/`Internal`: nothing is
+    /// broken. Recoverable once pressure clears, so callers must NOT burn a
+    /// retry attempt or permanently retire the device.
+    ResourcePressure,
     /// Worker-side deadline exceeded (it cooperatively aborted).
     Timeout,
     /// Over-token or otherwise permanently invalid input.

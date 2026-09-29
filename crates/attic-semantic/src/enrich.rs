@@ -56,6 +56,12 @@ fn ensure_generation_for_fingerprint(
     Ok(new_gen.generation_id)
 }
 
+/// Default hang-detection deadline for one `embed_batch` call.
+///
+/// Sized for a cold GPU model load plus a full batch of inference, not for a
+/// tight interactive slice. A batch that genuinely exceeds this is stuck.
+pub const DEFAULT_BATCH_INFERENCE_TIMEOUT_MS: u64 = 300_000;
+
 /// Inspectable enrichment knobs.
 #[derive(Debug, Clone)]
 pub struct EnrichmentConfig {
@@ -64,7 +70,21 @@ pub struct EnrichmentConfig {
     /// Attempts before an item is quarantined as FAILED.
     pub max_attempts: u32,
     /// Wall-clock budget for ONE drive() call (ms).
+    ///
+    /// This bounds how long a drive slice keeps *starting new batches*. It is
+    /// deliberately NOT the deadline handed to the provider — see
+    /// [`Self::batch_inference_timeout_ms`].
     pub budget_ms: u64,
+    /// Hang-detection deadline for a single `embed_batch` call (ms).
+    ///
+    /// Once a batch is claimed it must be allowed to finish. Truncating it
+    /// with the remaining drive-slice budget produced a livelock: the batch
+    /// returned `Cancelled`, cancellation by contract commits nothing and is
+    /// not an attempt, so the same items were reclaimed and re-cancelled
+    /// forever at zero throughput with `attempts` pinned at 0 and no error
+    /// ever recorded. This deadline exists only to catch a genuinely hung
+    /// backend.
+    pub batch_inference_timeout_ms: u64,
     /// Number of concurrent background embedding worker threads
     /// `BackgroundEnricher::spawn` spins up (mirrors
     /// `attic_storage::ResourcePolicy::embedding_worker_count`).
@@ -90,6 +110,7 @@ impl EnrichmentConfig {
             batch_size,
             max_attempts,
             budget_ms,
+            batch_inference_timeout_ms: DEFAULT_BATCH_INFERENCE_TIMEOUT_MS,
             embedding_worker_count,
             cpu_threads: 2,
             selection: SelectionConfig::baseline(),
@@ -103,6 +124,7 @@ impl Default for EnrichmentConfig {
             batch_size: 16,
             max_attempts: 3,
             budget_ms: 2_000,
+            batch_inference_timeout_ms: DEFAULT_BATCH_INFERENCE_TIMEOUT_MS,
             embedding_worker_count: 1,
             cpu_threads: 2,
             selection: SelectionConfig::default(),
@@ -165,6 +187,12 @@ fn is_transient_provider_error(e: &SemanticError) -> bool {
 
         // The provider itself is not up. Nothing about the work is wrong.
         SemanticError::ProviderUnavailable { .. } => true,
+
+        // The device is busy, not broken, and the content is fine. Returning
+        // the batch to PENDING without burning an attempt lets it embed once
+        // pressure clears; quarantining here would discard good work for a
+        // condition that resolves on its own.
+        SemanticError::DevicePressure(_) => true,
 
         // Worker lifecycle trouble is reported through this variant by
         // `worker_supervisor`'s error mapping (WorkerTimeout / WorkerDied).
@@ -443,9 +471,19 @@ fn drive_leased(
             }
         }
 
-        // Enrichment's own wall-clock budget is the provider deadline: a
-        // slow/hung backend must never hold the drive loop past it.
         // Isolation plan ensures Qwen CPU execution respects orchestrator thread limits.
+        // A claimed batch runs to completion under its OWN hang-detection
+        // deadline. It must NOT inherit the remaining drive-slice budget:
+        // cancellation commits nothing and is not an attempt, so a batch
+        // truncated by an exhausted slice returns every item to PENDING
+        // untouched and the next drive reclaims exactly the same items and
+        // truncates them again — a silent, permanent livelock at zero
+        // throughput (`attempts` stuck at 0, `last_error` NULL, and three
+        // consecutive cancellations demoting a perfectly healthy GPU to CPU).
+        // The slice budget's job is to decide whether to start ANOTHER batch,
+        // which the loop head already does.
+        let batch_deadline =
+            Instant::now() + Duration::from_millis(cfg.batch_inference_timeout_ms.max(1));
         let embed_res = if to_embed.is_empty() {
             // Every claimed unit was satisfied by content reuse — no
             // inference to run. Per §11 nothing about cancellation semantics
@@ -454,7 +492,7 @@ fn drive_leased(
             Ok(Vec::new())
         } else {
             plan.execute_isolated(|| {
-                provider.embed_batch(&to_embed, cancel, &mut usage, Some(deadline))
+                provider.embed_batch(&to_embed, cancel, &mut usage, Some(batch_deadline))
             })
         };
         match embed_res {
@@ -948,6 +986,26 @@ impl BackgroundEnricher {
                             // new enqueues without spinning hot.
                             std::thread::sleep(jittered(Duration::from_millis(50)));
                         }
+                        Ok(s) if s.embedded == 0 && s.cancelled => {
+                            // A drive that cancelled having embedded NOTHING
+                            // made no progress and left the queue exactly as
+                            // it found it. Re-driving immediately reclaims the
+                            // same items and reproduces the same outcome, so
+                            // treating this as normal (the previous `Ok(_)`
+                            // arm did) hot-spins forever at zero throughput
+                            // and says nothing. Back off and make it visible.
+                            infra_backoff_streak = infra_backoff_streak.saturating_add(1);
+                            let delay_ms = PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
+                                1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
+                            );
+                            tracing::warn!(
+                                streak = infra_backoff_streak,
+                                delay_ms,
+                                "semantic drive cancelled with zero progress; \
+                                 queue returned to PENDING, backing off"
+                            );
+                            std::thread::sleep(jittered(Duration::from_millis(delay_ms)));
+                        }
                         Ok(_) => {
                             infra_backoff_streak = 0;
                         }
@@ -1185,6 +1243,123 @@ mod generation_driven_enrichment_tests {
         let building = store.get_building_generation().unwrap().unwrap();
         assert_eq!(building.generation_id, 2);
         assert_eq!(building.fingerprint, fp2);
+    }
+
+    /// A drive slice whose budget expires must still make progress.
+    ///
+    /// The slice budget used to be handed to the provider as its inference
+    /// deadline, so a batch claimed near the end of a slice was cancelled
+    /// mid-flight. Cancellation commits nothing and is not an attempt, so the
+    /// next drive reclaimed the identical items and cancelled them again —
+    /// forever, at zero throughput, with `attempts` pinned at 0 and no error
+    /// recorded anywhere. This pins the fix: a claimed batch completes under
+    /// its own hang timeout regardless of how little slice budget is left.
+    #[test]
+    fn an_expired_slice_budget_never_livelocks_a_claimed_batch() {
+        use attic_core::{
+            DiscoveryClass, ExistenceState, FileIdentityId, FileOccurrenceId, FileType,
+            IndexGenerationId, RepositoryId, SecurityState, SourceRevisionId, SourceType,
+            SubsystemVersions,
+        };
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        attic_storage::run_migrations(&conn).unwrap();
+        let repo_id = RepositoryId::new_v4();
+        attic_storage::upsert_repository(&conn, &repo_id, "/repo/slice", "slice-repo").unwrap();
+        let rev_id = SourceRevisionId::new_v4();
+        attic_storage::insert_source_revision(
+            &conn,
+            &rev_id,
+            &repo_id,
+            "abc123",
+            "2026-01-01T00:00:00Z",
+            SourceType::Git,
+        )
+        .unwrap();
+        let gen_id = IndexGenerationId::new_v4();
+        attic_storage::insert_index_generation(
+            &conn,
+            &gen_id,
+            &repo_id,
+            &rev_id,
+            1,
+            &SubsystemVersions::new(),
+        )
+        .unwrap();
+        let fid = FileIdentityId::new_v4();
+        attic_storage::upsert_file_identity(&conn, &fid, &repo_id, "basis").unwrap();
+        let occ_id = FileOccurrenceId::new_v4();
+        attic_storage::insert_file_occurrence(
+            &conn,
+            &attic_storage::NewFileOccurrence {
+                id: &occ_id,
+                file_identity_id: &fid,
+                source_revision_id: &rev_id,
+                index_generation_id: Some(&gen_id),
+                path: "src/lib.rs",
+                content_hash: "blake3:aa",
+                size_bytes: 128,
+                language: Some("rust"),
+                file_type: FileType::Rust,
+                discovery_class: DiscoveryClass::Vcs,
+                security_state: SecurityState::Clean,
+                existence_state: ExistenceState::Present,
+            },
+        )
+        .unwrap();
+
+        let store = SemanticStore::open_in_memory().unwrap();
+        for i in 0..2 {
+            let unit_id = attic_core::RetrievalUnitId::new_v4().to_string_repr();
+            attic_storage::insert_retrieval_unit_with_fts(
+                &conn,
+                &attic_storage::NewRetrievalUnit {
+                    id: &unit_id,
+                    file_occurrence_id: &occ_id.to_string_repr(),
+                    index_generation_id: &gen_id.to_string_repr(),
+                    repository_id: &repo_id.to_string_repr(),
+                    retrieval_text: if i == 0 {
+                        "fn slice_token_alpha() {}"
+                    } else {
+                        "fn slice_token_beta() {}"
+                    },
+                    analyzer_id: "generic",
+                    analyzer_version: "test",
+                    start_line: Some(i as u32),
+                    end_line: Some(i as u32),
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+        }
+
+        // Budget is large enough to enter the loop and claim a batch, but far
+        // too small to cover the batch itself (2 items x 80ms). That is the
+        // production shape: the slice expires DURING inference, not before it.
+        let provider = crate::testing::SlowProvider { delay_ms: 80 };
+        let report = crate::invalidate::reconcile(
+            &conn,
+            &store,
+            &provider,
+            &crate::selection::SelectionConfig {
+                min_score: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.enqueued, 2, "{report:?}");
+
+        let cfg = EnrichmentConfig {
+            batch_size: 2,
+            budget_ms: 50,
+            batch_inference_timeout_ms: 30_000,
+            ..EnrichmentConfig::default()
+        };
+        let stats = drive(&conn, &store, &provider, &cfg, &CancelFlag::new()).unwrap();
+        assert_eq!(
+            stats.embedded, 2,
+            "a claimed batch must finish even with no slice budget left: {stats:?}"
+        );
     }
 
     /// r07: an OOM (BudgetExhausted) batch must NOT fail items — the drive

@@ -42,6 +42,15 @@ fn map_semantic_error(e: attic_semantic::SemanticError) -> WorkerFail {
             class: WorkerErrorClass::Artifact,
             message: reason,
         },
+        // Must stay typed across the IPC boundary. Flattening it into
+        // `internal` erased the fact that it is recoverable, so the caller's
+        // substring-based transient check missed it, burned a retry attempt
+        // per occurrence, and permanently quarantined good units after three
+        // — for a condition that clears on its own.
+        S::DevicePressure(m) => WorkerFail {
+            class: WorkerErrorClass::ResourcePressure,
+            message: m,
+        },
         other => WorkerFail::internal(other.to_string()),
     }
 }
