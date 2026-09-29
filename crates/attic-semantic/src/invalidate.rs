@@ -59,6 +59,7 @@ pub fn reconcile(
     let max_units = sel_cfg.max_units_total.min(200_000) as u32;
     let rows = attic_storage::semantic_unit_rows(conn, max_units)?;
     let (selected, duplicates, sel_report) = selection::select_units(&rows, &demand, sel_cfg);
+    selection::publish_selection_report(&sel_report);
     report.selection = sel_report;
 
     // Expected per-unit state under the active model.

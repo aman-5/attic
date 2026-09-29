@@ -70,7 +70,8 @@ pub use qwen3_provider::{QWEN_MODEL_ID, QWEN_PROVIDER_ID, Qwen3Embedder, QwenPoo
 pub use selection::{
     EX_BELOW_THRESHOLD, EX_CAP_REPO, EX_CAP_TOTAL, EX_DUPLICATE, EX_EXCLUDED_GLOB, EX_FILE_TOO_BIG,
     EX_GENERATED_PATH, EX_GENERATED_TYPE, EX_TOO_LARGE, SEMANTIC_SELECTION_VERSION, SelectedUnit,
-    SelectionConfig, SelectionReport, SelectionSignals, select_units,
+    SelectionConfig, SelectionReport, SelectionSignals, last_selection_report,
+    publish_selection_report, select_units,
 };
 pub use store::{EmbeddingRecord, KnnResult, NearestHit, QueueCounts, ScanBudget, SemanticStore};
 pub use worker_supervisor::{

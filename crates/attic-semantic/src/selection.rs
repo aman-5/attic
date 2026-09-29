@@ -194,6 +194,40 @@ impl SelectionReport {
     }
 }
 
+/// The most recent selection outcome, published for `status`.
+///
+/// Selection decides how much of the index is eligible for embedding at all,
+/// and it can legitimately reject the overwhelming majority of units — a
+/// JSON-heavy corpus was observed producing 45,110 units of which only 20
+/// were selected. That may be correct (duplicates, low signal, caps) or a
+/// misconfiguration, and previously there was no way to tell the two apart:
+/// the report was computed on every reconcile, logged only when something
+/// was enqueued, and then dropped. An operator saw "45,110 units indexed,
+/// 20 embedded" with no reason attached.
+///
+/// Publishing the last report makes the gap self-explaining, which is the
+/// same standard applied to the backend, the stall verdict and the GPU
+/// capability report.
+static LAST_SELECTION: std::sync::OnceLock<std::sync::Mutex<Option<SelectionReport>>> =
+    std::sync::OnceLock::new();
+
+fn last_selection_cell() -> &'static std::sync::Mutex<Option<SelectionReport>> {
+    LAST_SELECTION.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record the outcome of a selection pass. Never panics on a poisoned lock:
+/// losing an observability snapshot must not take down enrichment.
+pub fn publish_selection_report(report: &SelectionReport) {
+    if let Ok(mut slot) = last_selection_cell().lock() {
+        *slot = Some(report.clone());
+    }
+}
+
+/// The last published selection outcome, if any pass has run.
+pub fn last_selection_report() -> Option<SelectionReport> {
+    last_selection_cell().lock().ok().and_then(|s| s.clone())
+}
+
 pub const EX_GENERATED_PATH: &str = "generated_path";
 pub const EX_GENERATED_TYPE: &str = "generated_file_type";
 pub const EX_TOO_LARGE: &str = "exceeds_max_input_bytes";
@@ -735,6 +769,23 @@ mod tests {
     /// (=> 1024 bytes). Units in the 1025..=2048 band passed selection, were
     /// enqueued, and then failed *permanently* with "input too large".
     /// A real corpus lost 18 of 20 chunks (1227..=1769 bytes) this way.
+    /// A selection pass that rejects almost everything must still be
+    /// explainable — publishing is what turns "45,110 units, 20 embedded"
+    /// from a mystery into a breakdown.
+    #[test]
+    fn the_last_selection_outcome_is_observable() {
+        let rows = vec![
+            row("r-1", "src/a.rs", "SOURCE", "distinct alpha body one"),
+            row("r-2", "src/b.rs", "SOURCE", "distinct beta body two"),
+        ];
+        let (_sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
+        publish_selection_report(&rep);
+
+        let seen = last_selection_report().expect("a published report must be readable");
+        assert_eq!(seen.scanned, rep.scanned);
+        assert_eq!(seen.selected, rep.selected);
+    }
+
     #[test]
     fn gate_never_admits_more_than_the_live_provider_reads() {
         const NARROW_PROVIDER_BYTES: usize = 512 * 2;

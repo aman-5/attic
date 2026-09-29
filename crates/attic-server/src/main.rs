@@ -2894,6 +2894,26 @@ fn handle_status(
                 "verdict": stall.verdict,
                 "secs_since_last_completed_batch": secs_since_advance,
             });
+
+            // Why the embedded count is what it is. Selection can reject the
+            // vast majority of an index for entirely legitimate reasons
+            // (duplicates, low signal, caps) — without the breakdown an
+            // operator cannot distinguish that from a misconfiguration.
+            if let Some(sel) = attic_semantic::last_selection_report() {
+                let mut excluded: Vec<(&str, usize)> =
+                    sel.excluded.iter().map(|(k, v)| (*k, *v)).collect();
+                excluded.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                let breakdown: serde_json::Map<String, serde_json::Value> = excluded
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), json!(v)))
+                    .collect();
+                payload["semantic_selection"] = json!({
+                    "scanned": sel.scanned,
+                    "selected": sel.selected,
+                    "excluded": breakdown,
+                    "top_exclusion_reason": excluded.first().map(|(k, _)| *k),
+                });
+            }
         }
 
         let diag_ctx = attic_semantic::DiagnosticContext {
