@@ -140,9 +140,12 @@ pub fn gpu_temperature_c() -> Option<u32> {
 
 fn read_nvidia_smi() -> Option<u32> {
     let mut cmd = std::process::Command::new("nvidia-smi");
-    cmd.args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.args([
+        "--query-gpu=temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

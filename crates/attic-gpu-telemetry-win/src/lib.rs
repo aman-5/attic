@@ -69,9 +69,10 @@ unsafe fn preferred_adapter() -> Option<windows::Win32::Graphics::Dxgi::IDXGIAda
         };
         if let Ok(f6) = factory.cast::<IDXGIFactory6>() {
             for i in 0..16 {
-                let Ok(a) = f6
-                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
-                else {
+                let Ok(a) = f6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    i,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                ) else {
                     break;
                 };
                 if is_hw(&a) {
@@ -94,9 +95,15 @@ pub fn query_adapter_info() -> Option<RawAdapterInfo> {
     unsafe {
         let adapter = preferred_adapter()?;
         let desc = adapter.GetDesc1().ok()?;
-        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
         Some(RawAdapterInfo {
-            name: String::from_utf16_lossy(&desc.Description[..len]).trim().to_string(),
+            name: String::from_utf16_lossy(&desc.Description[..len])
+                .trim()
+                .to_string(),
             vendor_id: desc.VendorId,
             dedicated_mib: (desc.DedicatedVideoMemory as u64) / (1024 * 1024),
             shared_mib: (desc.SharedSystemMemory as u64) / (1024 * 1024),

@@ -220,8 +220,7 @@ fn try_metal() -> Result<ResolvedDevice, String> {
 pub fn compiled_gpu_preference() -> DevicePreference {
     if cfg!(feature = "candle-metal") && is_apple_silicon() {
         DevicePreference::Metal
-    } else if cfg!(feature = "candle-cuda")
-        && cfg!(any(target_os = "linux", target_os = "windows"))
+    } else if cfg!(feature = "candle-cuda") && cfg!(any(target_os = "linux", target_os = "windows"))
     {
         DevicePreference::Cuda
     } else {
@@ -311,14 +310,16 @@ mod tests {
         let pref = compiled_gpu_preference();
 
         match pref {
-            DevicePreference::Cuda => assert!(
-                cfg!(feature = "candle-cuda"),
-                "claimed CUDA without the candle-cuda feature compiled in"
-            ),
-            DevicePreference::Metal => assert!(
-                cfg!(feature = "candle-metal"),
-                "claimed Metal without the candle-metal feature compiled in"
-            ),
+            DevicePreference::Cuda => {
+                if !cfg!(feature = "candle-cuda") {
+                    panic!("claimed CUDA without the candle-cuda feature compiled in");
+                }
+            }
+            DevicePreference::Metal => {
+                if !cfg!(feature = "candle-metal") {
+                    panic!("claimed Metal without the candle-metal feature compiled in");
+                }
+            }
             DevicePreference::Cpu => {}
             DevicePreference::Auto => {
                 panic!("auto must resolve to a concrete device, never back to auto")
@@ -426,7 +427,10 @@ mod tests {
 
     #[test]
     fn preference_parsing_accepts_documented_aliases() {
-        assert_eq!(DevicePreference::parse("auto"), Some(DevicePreference::Auto));
+        assert_eq!(
+            DevicePreference::parse("auto"),
+            Some(DevicePreference::Auto)
+        );
         assert_eq!(DevicePreference::parse(""), Some(DevicePreference::Auto));
         assert_eq!(DevicePreference::parse("CPU"), Some(DevicePreference::Cpu));
         assert_eq!(
@@ -458,7 +462,10 @@ mod tests {
         );
         let warning = warning.expect("an unrecognized value must be surfaced, not swallowed");
         assert!(warning.contains("gpu-please"), "warning: {warning}");
-        assert!(warning.contains("auto|cpu|cuda|metal"), "warning: {warning}");
+        assert!(
+            warning.contains("auto|cpu|cuda|metal"),
+            "warning: {warning}"
+        );
 
         let (pref, warning) = DevicePreference::parse_with_warning("cuda");
         assert_eq!(pref, DevicePreference::Cuda);
@@ -470,13 +477,13 @@ mod tests {
         // Guards the Intel-Mac / Linux case: Auto must not report a Metal
         // failure on a platform where Metal was never a candidate.
         let r = resolve(DevicePreference::Auto);
-        if let Some(reason) = &r.fallback_reason {
-            if !is_apple_silicon() {
-                assert!(
-                    !reason.contains("Metal"),
-                    "Auto should not surface Metal errors off Apple Silicon: {reason}"
-                );
-            }
+        if let Some(reason) = &r.fallback_reason
+            && !is_apple_silicon()
+        {
+            assert!(
+                !reason.contains("Metal"),
+                "Auto should not surface Metal errors off Apple Silicon: {reason}"
+            );
         }
     }
 }

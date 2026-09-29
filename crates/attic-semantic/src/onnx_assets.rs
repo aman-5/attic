@@ -105,7 +105,10 @@ pub fn onnx_dir(cache_dir: &Path) -> PathBuf {
 /// never be called on the startup path — callers run it on the same
 /// background-download task the safetensors path uses, so canonical and
 /// lexical indexing are never blocked waiting for a GPU model.
-pub fn ensure_onnx_assets(cache_dir: &Path, revision: Option<&str>) -> Result<PathBuf, SemanticError> {
+pub fn ensure_onnx_assets(
+    cache_dir: &Path,
+    revision: Option<&str>,
+) -> Result<PathBuf, SemanticError> {
     let target = onnx_dir(cache_dir);
     if assets_present(&target) {
         return Ok(target);
@@ -275,7 +278,13 @@ mod tests {
         write(&src.join(TOKENIZER_FILE), "tok");
 
         let target = onnx_dir(&tmp.path().join("cache"));
-        materialise(&target, &src.join(MODEL_FILE), None, &src.join(TOKENIZER_FILE)).unwrap();
+        materialise(
+            &target,
+            &src.join(MODEL_FILE),
+            None,
+            &src.join(TOKENIZER_FILE),
+        )
+        .unwrap();
 
         assert!(assets_present(&target));
         assert!(
@@ -299,10 +308,19 @@ mod tests {
         write(&src.join(TOKENIZER_FILE), "tok");
 
         let target = onnx_dir(&cache);
-        materialise(&target, &src.join(MODEL_FILE), None, &src.join(TOKENIZER_FILE)).unwrap();
+        materialise(
+            &target,
+            &src.join(MODEL_FILE),
+            None,
+            &src.join(TOKENIZER_FILE),
+        )
+        .unwrap();
 
         assert!(assets_present(&target));
-        assert!(!target.join("partial.bin").exists(), "stale junk must not survive");
+        assert!(
+            !target.join("partial.bin").exists(),
+            "stale junk must not survive"
+        );
         assert!(!staging.exists(), "staging must not be left behind");
     }
 

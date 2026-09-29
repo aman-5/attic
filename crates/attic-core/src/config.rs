@@ -530,8 +530,7 @@ impl AtticConfig {
                 "[semantic] min_score must be within 0.0..=1.0".into(),
             ));
         }
-        if self.semantic.max_units_per_repo == Some(0) || self.semantic.max_units_total == Some(0)
-        {
+        if self.semantic.max_units_per_repo == Some(0) || self.semantic.max_units_total == Some(0) {
             return Err(ConfigError::Invalid(
                 "[semantic] max_units_per_repo and max_units_total must be >= 1".into(),
             ));
@@ -822,7 +821,10 @@ mod tests {
         assert_eq!(cfg.gpu_eligibility(3965, false), GpuEligibility::Eligible);
         assert_eq!(
             cfg.gpu_eligibility(2048, false),
-            GpuEligibility::TooLittleVram { have_mb: 2048, min_mb: 4096 }
+            GpuEligibility::TooLittleVram {
+                have_mb: 2048,
+                min_mb: 4096
+            }
         );
         assert_eq!(cfg.gpu_eligibility(8192, true), GpuEligibility::Integrated);
         let open = SemanticConfig {

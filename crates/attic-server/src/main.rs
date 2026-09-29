@@ -315,7 +315,10 @@ fn gpu_gate(
         };
     };
     if a.software {
-        return Err(format!("CPU: only a software adapter is present ({})", a.name));
+        return Err(format!(
+            "CPU: only a software adapter is present ({})",
+            a.name
+        ));
     }
     match semantic.gpu_eligibility(a.dedicated_mib, a.integrated) {
         GpuEligibility::Eligible => Ok(format!("GPU: {} ({} MB)", a.name, a.dedicated_mib)),
@@ -341,7 +344,9 @@ fn device_line(fallback_reason: Option<String>, gpu_report: &serde_json::Value) 
     }
     format!(
         "CPU: {}",
-        gpu_report["explanation"].as_str().unwrap_or("no GPU backend")
+        gpu_report["explanation"]
+            .as_str()
+            .unwrap_or("no GPU backend")
     )
 }
 
@@ -357,11 +362,7 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
         .onnx_model_dir
         .clone()
         .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok())
-        .or_else(|| {
-            ACTIVE_ONNX_DIR
-                .get()
-                .map(|p| p.display().to_string())
-        });
+        .or_else(|| ACTIVE_ONNX_DIR.get().map(|p| p.display().to_string()));
 
     let assets_present = configured_dir
         .as_ref()
@@ -777,13 +778,22 @@ fn gpu_worker_env(attic_config: &attic_core::AtticConfig) -> Vec<(String, String
     let s = &attic_config.semantic;
     let mut env = Vec::new();
     if let Some(n) = s.gpu_batch_tokens.filter(|n| *n > 0) {
-        env.push((attic_semantic::ENV_GPU_BATCH_TOKENS.to_string(), n.to_string()));
+        env.push((
+            attic_semantic::ENV_GPU_BATCH_TOKENS.to_string(),
+            n.to_string(),
+        ));
     }
     if let Some(c) = s.gpu_temp_pause_c {
-        env.push((attic_semantic::ENV_GPU_TEMP_PAUSE_C.to_string(), c.to_string()));
+        env.push((
+            attic_semantic::ENV_GPU_TEMP_PAUSE_C.to_string(),
+            c.to_string(),
+        ));
     }
     if let Some(c) = s.gpu_temp_resume_c {
-        env.push((attic_semantic::ENV_GPU_TEMP_RESUME_C.to_string(), c.to_string()));
+        env.push((
+            attic_semantic::ENV_GPU_TEMP_RESUME_C.to_string(),
+            c.to_string(),
+        ));
     }
     env
 }
@@ -994,7 +1004,11 @@ mod resolve_provider_tests {
         Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap())
     }
 
-    fn adapter(mb: u64, integrated: bool, software: bool) -> attic_storage::gpu_telemetry::GpuAdapterInfo {
+    fn adapter(
+        mb: u64,
+        integrated: bool,
+        software: bool,
+    ) -> attic_storage::gpu_telemetry::GpuAdapterInfo {
         attic_storage::gpu_telemetry::GpuAdapterInfo {
             name: "Test GPU".into(),
             vendor_id: 0x10de,
@@ -1015,9 +1029,11 @@ mod resolve_provider_tests {
             super::gpu_gate(&s, Some(&adapter(1024, false, false))).unwrap_err(),
             "CPU: GPU Test GPU has 1024 MB VRAM < gpu_min_vram_mb=4096"
         );
-        assert!(super::gpu_gate(&s, Some(&adapter(128, true, false)))
-            .unwrap_err()
-            .contains("allow_integrated_gpu=false"));
+        assert!(
+            super::gpu_gate(&s, Some(&adapter(128, true, false)))
+                .unwrap_err()
+                .contains("allow_integrated_gpu=false")
+        );
         assert!(super::gpu_gate(&s, Some(&adapter(0, false, true))).is_err());
         assert!(super::gpu_gate(&s, None).is_err());
         let open = attic_core::config::SemanticConfig {
@@ -1032,7 +1048,10 @@ mod resolve_provider_tests {
     #[test]
     fn device_line_prefers_runtime_fallback() {
         let report = serde_json::json!({ "explanation": "not compiled" });
-        assert!(super::device_line(Some("oom".into()), &report).starts_with("CPU: GPU failed at runtime"));
+        assert!(
+            super::device_line(Some("oom".into()), &report)
+                .starts_with("CPU: GPU failed at runtime")
+        );
     }
 
     #[test]

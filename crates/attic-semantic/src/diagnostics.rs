@@ -354,12 +354,16 @@ mod tests {
     fn blocked_queue_explains_why_it_has_no_eta() {
         // 20 chunks queued, nothing dispatched, zero throughput — exactly
         // the observed stall shape.
-        let stalled = SemanticProgressSnapshot::compute(20, 0, 0, 0, 0.0, 0.0, Some(1), None, "hot");
+        let stalled =
+            SemanticProgressSnapshot::compute(20, 0, 0, 0, 0.0, 0.0, Some(1), None, "hot");
         assert_eq!(stalled.eta_seconds, None);
         let reason = stalled
             .eta_unavailable_reason
             .expect("a null ETA must always carry a reason");
-        assert!(reason.contains("20"), "reason should cite queue depth: {reason}");
+        assert!(
+            reason.contains("20"),
+            "reason should cite queue depth: {reason}"
+        );
         assert!(
             reason.contains("why_slow"),
             "reason should point at the bottleneck diagnostic: {reason}"
@@ -378,7 +382,8 @@ mod tests {
         );
 
         // A drained queue is a real answer, not a missing one.
-        let drained = SemanticProgressSnapshot::compute(0, 0, 45, 0, 0.0, 0.0, Some(1), None, "hot");
+        let drained =
+            SemanticProgressSnapshot::compute(0, 0, 45, 0, 0.0, 0.0, Some(1), None, "hot");
         assert_eq!(drained.eta_seconds, Some(0));
         assert_eq!(drained.eta_unavailable_reason, None);
     }

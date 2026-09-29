@@ -825,7 +825,8 @@ mod tests {
             let ids = enc.get_ids();
             let bucket = p.bucket_for(ids.len());
             let mut s = p.session.lock().unwrap();
-            let (a, _) = OrtDirectMlProvider::run_forward(&mut s, p.kv_dtype, &[ids], bucket).unwrap();
+            let (a, _) =
+                OrtDirectMlProvider::run_forward(&mut s, p.kv_dtype, &[ids], bucket).unwrap();
             let (b, _) = OrtDirectMlProvider::run_forward(&mut s, p.kv_dtype, &[ids], 512).unwrap();
             let sim = cosine(&a, &b);
             assert!(sim > 0.999, "bucket {bucket} vs 512 cosine {sim}");

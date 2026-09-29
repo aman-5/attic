@@ -1776,7 +1776,8 @@ mod tests {
         let cgid = fp.content_generation_id("sel");
         for id in ["bad", "good"] {
             let hash = crate::identity::content_hash(id);
-            s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0]).unwrap();
+            s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0])
+                .unwrap();
             s.add_occurrence(id, id, &vsid, &hash, "repo", "rev", "gen", &cgid, "{}")
                 .unwrap();
         }
@@ -1787,7 +1788,10 @@ mod tests {
         let first = s.queue_claim_batch("w", 60_000, 1).unwrap();
         assert_eq!(first[0].0, "bad", "oldest first");
         std::thread::sleep(std::time::Duration::from_millis(3));
-        assert!(s.queue_mark_failed("bad", "w", first[0].1, 3, "boom").unwrap());
+        assert!(
+            s.queue_mark_failed("bad", "w", first[0].1, 3, "boom")
+                .unwrap()
+        );
 
         let next = s.queue_claim_batch("w", 60_000, 2).unwrap();
         let order: Vec<&str> = next.iter().map(|(id, _)| id.as_str()).collect();

@@ -88,7 +88,16 @@ fn classify(err: &SemanticError, batch_items: usize) -> GpuFailureClass {
             let m = msg.to_ascii_lowercase();
             let device_trouble = ["died", "killed", "deadline", "timed out", "timeout"]
                 .iter()
-                .chain(["887a0005", "887a0006", "device removed", "device lost", "device hung"].iter())
+                .chain(
+                    [
+                        "887a0005",
+                        "887a0006",
+                        "device removed",
+                        "device lost",
+                        "device hung",
+                    ]
+                    .iter(),
+                )
                 .any(|k| m.contains(k));
             if device_trouble && batch_items <= 1 {
                 GpuFailureClass::TransientCountable
@@ -120,11 +129,20 @@ mod device_pressure_tests {
     #[test]
     fn cancellation_and_batch_content_errors_never_count() {
         assert_eq!(
-            classify(&SemanticError::Cancelled { completed: 0, total: 64 }, 64),
+            classify(
+                &SemanticError::Cancelled {
+                    completed: 0,
+                    total: 64
+                },
+                64
+            ),
             GpuFailureClass::Ignored
         );
         assert_eq!(
-            classify(&SemanticError::EmbeddingFailed("inference worker died mid-batch".into()), 64),
+            classify(
+                &SemanticError::EmbeddingFailed("inference worker died mid-batch".into()),
+                64
+            ),
             GpuFailureClass::Ignored
         );
         assert_eq!(
@@ -132,7 +150,10 @@ mod device_pressure_tests {
             GpuFailureClass::Ignored
         );
         assert_eq!(
-            classify(&SemanticError::EmbeddingFailed("inference worker died mid-batch".into()), 1),
+            classify(
+                &SemanticError::EmbeddingFailed("inference worker died mid-batch".into()),
+                1
+            ),
             GpuFailureClass::TransientCountable
         );
     }
@@ -142,10 +163,13 @@ mod device_pressure_tests {
     #[test]
     fn a_broken_provider_is_still_permanent() {
         assert!(matches!(
-            classify(&SemanticError::ProviderUnavailable {
-                provider: "x".into(),
-                reason: "model artifact corrupt".into(),
-            }, 1),
+            classify(
+                &SemanticError::ProviderUnavailable {
+                    provider: "x".into(),
+                    reason: "model artifact corrupt".into(),
+                },
+                1
+            ),
             GpuFailureClass::Permanent
         ));
     }

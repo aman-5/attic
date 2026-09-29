@@ -24,7 +24,10 @@ pub fn set_paused(paused: bool) {
 
 /// `(ticks, paused)` right now.
 pub fn snapshot() -> (u64, bool) {
-    (TICKS.load(Ordering::Relaxed), PAUSED.load(Ordering::Relaxed))
+    (
+        TICKS.load(Ordering::Relaxed),
+        PAUSED.load(Ordering::Relaxed),
+    )
 }
 
 /// Clears `paused` on drop, so an early return or panic inside a wait can

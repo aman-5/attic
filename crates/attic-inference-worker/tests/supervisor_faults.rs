@@ -249,7 +249,11 @@ fn silent_worker_is_killed_by_stall_watchdog_fast() {
         matches!(err, SupervisorError::WorkerStalled(_)),
         "expected WorkerStalled, got {err:?}"
     );
-    assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
     let (kills, last) = sup.stall_stats();
     assert_eq!(kills, 1);
     assert!(last.is_some());

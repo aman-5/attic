@@ -40,6 +40,7 @@ const EMBED_DEADLINE: std::time::Duration =
 /// Exposed so diagnostics can assert that the number quoted to operators is
 /// the number that governs the kill, rather than trusting two constants to
 /// stay in sync by convention.
+#[cfg(test)]
 pub(crate) fn embed_deadline() -> std::time::Duration {
     EMBED_DEADLINE
 }
@@ -480,41 +481,42 @@ impl SupervisedWorkerProvider {
         // work budget, so a slow-but-alive batch is bounded by its own size
         // rather than the generic 300 s ceiling.
         let effective_deadline = match self.stall_limit {
-            Some(_) => effective_deadline
-                .min(gpu_work_budget(inputs.iter().map(|i| i.text.len()).sum())),
+            Some(_) => {
+                effective_deadline.min(gpu_work_budget(inputs.iter().map(|i| i.text.len()).sum()))
+            }
             None => effective_deadline,
         };
 
-        let vectors = match self.supervisor.embed_batch_watched(
-            items,
-            effective_deadline,
-            self.stall_limit,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                // `ready` only reflects the state as of the last successful
-                // `ensure_ready()` and is otherwise never touched — without
-                // this, one successful load at startup would make
-                // `available()` report healthy forever, even through a
-                // later worker crash/identity-mismatch-on-restart that
-                // keeps failing every subsequent call. An OOM is a
-                // per-batch resource signal the adaptive batch-cap halving
-                // in `enrich.rs` already owns, not evidence the worker
-                // itself is broken, so it alone does not flip readiness.
-                if !matches!(
-                    e,
-                    SupervisorError::Engine {
-                        class: WorkerErrorClass::OutOfMemory,
-                        ..
+        let vectors =
+            match self
+                .supervisor
+                .embed_batch_watched(items, effective_deadline, self.stall_limit)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // `ready` only reflects the state as of the last successful
+                    // `ensure_ready()` and is otherwise never touched — without
+                    // this, one successful load at startup would make
+                    // `available()` report healthy forever, even through a
+                    // later worker crash/identity-mismatch-on-restart that
+                    // keeps failing every subsequent call. An OOM is a
+                    // per-batch resource signal the adaptive batch-cap halving
+                    // in `enrich.rs` already owns, not evidence the worker
+                    // itself is broken, so it alone does not flip readiness.
+                    if !matches!(
+                        e,
+                        SupervisorError::Engine {
+                            class: WorkerErrorClass::OutOfMemory,
+                            ..
+                        }
+                    ) {
+                        self.load_failed.store(true, Ordering::Release);
+                        self.ready.store(false, Ordering::Release);
+                        self.set_phase(Phase::NotLoaded);
                     }
-                ) {
-                    self.load_failed.store(true, Ordering::Release);
-                    self.ready.store(false, Ordering::Release);
-                    self.set_phase(Phase::NotLoaded);
+                    return Err(map_supervisor_error(e));
                 }
-                return Err(map_supervisor_error(e));
-            }
-        };
+            };
 
         if vectors.len() != keys.len() {
             return Err(SemanticError::EmbeddingFailed(format!(
@@ -863,7 +865,10 @@ mod expected_fingerprint_tests {
         assert_eq!(s.state, "not_loaded");
         assert_eq!(s.idle_unload_secs, 900);
         assert!(s.last_used_unix_ms.is_none());
-        assert!(p.worker_pid().is_none(), "construction must not start a worker");
+        assert!(
+            p.worker_pid().is_none(),
+            "construction must not start a worker"
+        );
     }
 
     #[test]
@@ -873,7 +878,10 @@ mod expected_fingerprint_tests {
         mark_loaded(&p, t0);
         assert_eq!(p.worker_status().unwrap().detail, "loaded (load took 8s)");
 
-        assert!(!p.unload_if_idle(t0 + Duration::from_secs(899)), "not idle yet");
+        assert!(
+            !p.unload_if_idle(t0 + Duration::from_secs(899)),
+            "not idle yet"
+        );
         assert_eq!(p.worker_status().unwrap().state, "loaded");
 
         assert!(p.unload_if_idle(t0 + Duration::from_secs(900)));
@@ -883,7 +891,10 @@ mod expected_fingerprint_tests {
         assert!(!p.ready.load(Ordering::Acquire), "next use must reload");
         assert!(p.worker_pid().is_none());
         assert!(s.last_used_unix_ms.is_some(), "last use survives unload");
-        assert!(!p.unload_if_idle(t0 + Duration::from_secs(5_000)), "already unloaded");
+        assert!(
+            !p.unload_if_idle(t0 + Duration::from_secs(5_000)),
+            "already unloaded"
+        );
     }
 
     #[test]
@@ -913,7 +924,10 @@ mod expected_fingerprint_tests {
         p.spawn_idle_reaper();
         let deadline = Instant::now() + Duration::from_secs(5);
         while p.worker_status().unwrap().state != "unloaded" {
-            assert!(Instant::now() < deadline, "reaper never unloaded the idle worker");
+            assert!(
+                Instant::now() < deadline,
+                "reaper never unloaded the idle worker"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         let weak = Arc::downgrade(&p);
@@ -921,7 +935,10 @@ mod expected_fingerprint_tests {
         // The reaper holds a strong ref only for the instant of a check.
         let deadline = Instant::now() + Duration::from_secs(2);
         while weak.upgrade().is_some() {
-            assert!(Instant::now() < deadline, "the reaper must not keep the provider alive");
+            assert!(
+                Instant::now() < deadline,
+                "the reaper must not keep the provider alive"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -934,7 +951,10 @@ mod expected_fingerprint_tests {
             unit_key: "u1".into(),
             text: "hello".into(),
         }];
-        assert!(p.embed_batch(&inputs, &CancelFlag::new(), &mut usage, None).is_err());
+        assert!(
+            p.embed_batch(&inputs, &CancelFlag::new(), &mut usage, None)
+                .is_err()
+        );
         let s = p.worker_status().unwrap();
         assert_eq!(s.state, "not_loaded");
         assert!(s.last_used_unix_ms.is_some());

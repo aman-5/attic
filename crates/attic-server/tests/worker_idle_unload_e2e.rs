@@ -74,14 +74,22 @@ fn idle_worker_exits_and_the_next_query_reloads_it() {
     );
     provider.spawn_idle_reaper();
 
-    assert!(provider.worker_pid().is_none(), "no worker before first use");
+    assert!(
+        provider.worker_pid().is_none(),
+        "no worker before first use"
+    );
     assert_eq!(provider.worker_status().unwrap().state, "not_loaded");
 
     // A 2 s query deadline is far shorter than a cold load; the load is
     // refunded, so the cold query must still succeed.
-    let (v1, u1) = embed(provider.as_ref(), "fn authenticate_user(token: &str) -> bool");
+    let (v1, u1) = embed(
+        provider.as_ref(),
+        "fn authenticate_user(token: &str) -> bool",
+    );
     assert!(u1.warmup_ms > 0, "first use pays the load");
-    let pid1 = provider.worker_pid().expect("worker running after first use");
+    let pid1 = provider
+        .worker_pid()
+        .expect("worker running after first use");
     let s = provider.worker_status().unwrap();
     assert_eq!(s.state, "loaded");
     eprintln!("backend={backend} first load: {}", s.detail);
@@ -94,12 +102,18 @@ fn idle_worker_exits_and_the_next_query_reloads_it() {
     assert!(provider.worker_pid().is_none(), "worker process stopped");
     eprintln!("after idle: {}", provider.worker_status().unwrap().detail);
 
-    let (v2, u2) = embed(provider.as_ref(), "fn authenticate_user(token: &str) -> bool");
+    let (v2, u2) = embed(
+        provider.as_ref(),
+        "fn authenticate_user(token: &str) -> bool",
+    );
     assert!(u2.warmup_ms > 0, "reload after unload is a cold start");
     let pid2 = provider.worker_pid().expect("worker restarted");
     assert_ne!(pid1, pid2, "a new worker process serves after unload");
     let dot: f32 = v1.iter().zip(&v2).map(|(a, b)| a * b).sum();
-    assert!(dot > 0.999, "reloaded model must produce the same vector, cos={dot}");
+    assert!(
+        dot > 0.999,
+        "reloaded model must produce the same vector, cos={dot}"
+    );
     eprintln!(
         "reload: {} (warmup {} ms)",
         provider.worker_status().unwrap().detail,

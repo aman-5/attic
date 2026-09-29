@@ -283,7 +283,9 @@ impl WorkerSupervisor {
                 return Err(SupervisorError::WorkerDied);
             };
             match live.responses.recv_timeout(wait) {
-                Ok(Ok(Some(WorkerResponse::Progress { id: pid, paused, .. }))) => {
+                Ok(Ok(Some(WorkerResponse::Progress {
+                    id: pid, paused, ..
+                }))) => {
                     if pid == id {
                         let now = Instant::now();
                         last_beat = now;

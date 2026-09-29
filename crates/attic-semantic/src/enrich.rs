@@ -1114,10 +1114,9 @@ impl BackgroundEnricher {
                             // Items were returned to PENDING untouched, so
                             // back off with a cap and let it warm up.
                             infra_backoff_streak = infra_backoff_streak.saturating_add(1);
-                            let delay_ms =
-                                PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
-                                    1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
-                                );
+                            let delay_ms = PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
+                                1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
+                            );
                             tracing::info!(
                                 streak = infra_backoff_streak,
                                 delay_ms,
@@ -1227,12 +1226,16 @@ mod failure_classification_tests {
     /// nothing to do with the items.
     #[test]
     fn worker_and_provider_trouble_is_transient_not_item_failure() {
-        assert!(is_transient_provider_error(&SemanticError::EmbeddingFailed(
-            "inference worker died mid-batch; it will restart on the next batch".into()
-        )));
-        assert!(is_transient_provider_error(&SemanticError::EmbeddingFailed(
-            "inference worker exceeded deadline and was killed".into()
-        )));
+        assert!(is_transient_provider_error(
+            &SemanticError::EmbeddingFailed(
+                "inference worker died mid-batch; it will restart on the next batch".into()
+            )
+        ));
+        assert!(is_transient_provider_error(
+            &SemanticError::EmbeddingFailed(
+                "inference worker exceeded deadline and was killed".into()
+            )
+        ));
         assert!(is_transient_provider_error(
             &SemanticError::ProviderUnavailable {
                 provider: "inference-worker".into(),
@@ -1251,10 +1254,12 @@ mod failure_classification_tests {
     /// quarantined, otherwise a poison item loops forever.
     #[test]
     fn content_level_problems_remain_item_failures() {
-        assert!(!is_transient_provider_error(&SemanticError::InputTooLarge {
-            len: 10_000,
-            max: 2_048,
-        }));
+        assert!(!is_transient_provider_error(
+            &SemanticError::InputTooLarge {
+                len: 10_000,
+                max: 2_048,
+            }
+        ));
         assert!(!is_transient_provider_error(
             &SemanticError::InputTooManyTokens {
                 tokens: 900,
@@ -1733,12 +1738,22 @@ mod queue_scale_tests {
         attic_storage::upsert_repository(&conn, &repo_id, "/repo/scale", "scale").unwrap();
         let rev_id = SourceRevisionId::new_v4();
         attic_storage::insert_source_revision(
-            &conn, &rev_id, &repo_id, "abc", "2026-01-01T00:00:00Z", SourceType::Git,
+            &conn,
+            &rev_id,
+            &repo_id,
+            "abc",
+            "2026-01-01T00:00:00Z",
+            SourceType::Git,
         )
         .unwrap();
         let gen_id = IndexGenerationId::new_v4();
         attic_storage::insert_index_generation(
-            &conn, &gen_id, &repo_id, &rev_id, 1, &SubsystemVersions::new(),
+            &conn,
+            &gen_id,
+            &repo_id,
+            &rev_id,
+            1,
+            &SubsystemVersions::new(),
         )
         .unwrap();
         conn.execute_batch("BEGIN").unwrap();
@@ -1856,7 +1871,10 @@ mod queue_scale_tests {
             embedded as f64 / total_s
         );
         assert_eq!(c.pending + c.inflight, 0);
-        assert_eq!(c.failed as usize, n_bad, "only the injected bad items quarantine");
+        assert_eq!(
+            c.failed as usize, n_bad,
+            "only the injected bad items quarantine"
+        );
         assert_eq!(embedded as usize, units - n_bad, "every good item embeds");
         assert!(
             tail >= head * 0.5,
