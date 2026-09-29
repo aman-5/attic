@@ -8,7 +8,8 @@
 //! against a freshly restarted worker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock, TryLockError, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use attic_inference_protocol::supervisor::{
     LoadParams, SupervisorError, WorkerLaunch, WorkerSupervisor,
@@ -18,7 +19,7 @@ use attic_inference_protocol::{EmbedItem, WorkerErrorClass};
 use crate::error::SemanticError;
 use crate::provider::{
     CancelFlag, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput, ProviderConcurrencyContract,
-    ResourceUsage, SemanticProvider,
+    ResourceUsage, SemanticProvider, WorkerStatus,
 };
 
 /// How long a single embedding batch may run inside the worker before the
@@ -59,6 +60,28 @@ pub struct SupervisedWorkerProvider {
     load_failed: AtomicBool,
     /// Queue items per `embed_batch` for backends that bucket internally.
     claim_items: Option<usize>,
+    /// Held shared by every embed call and exclusively by the idle reaper,
+    /// so a worker can never be unloaded underneath a running batch.
+    gate: RwLock<()>,
+    life: Mutex<LifeState>,
+    /// Stop the worker after this long without an embed call (zero = never).
+    idle_unload: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    NotLoaded,
+    Loading { since: Instant },
+    Loaded,
+    Unloaded { idle: Duration },
+}
+
+#[derive(Debug)]
+struct LifeState {
+    phase: Phase,
+    last_used_at: Option<Instant>,
+    last_used_wall: Option<SystemTime>,
+    last_load: Option<Duration>,
 }
 
 /// Items claimed per GPU batch call. The DirectML provider packs these into
@@ -103,13 +126,108 @@ impl SupervisedWorkerProvider {
             ready: AtomicBool::new(false),
             load_failed: AtomicBool::new(false),
             claim_items,
+            gate: RwLock::new(()),
+            life: Mutex::new(LifeState {
+                phase: Phase::NotLoaded,
+                last_used_at: None,
+                last_used_wall: None,
+                last_load: None,
+            }),
+            idle_unload: Duration::ZERO,
         }
     }
 
-    fn ensure_ready(&self) -> Result<(), SemanticError> {
-        if self.ready.load(Ordering::Acquire) {
-            return Ok(());
+    /// Stop the worker process (freeing all model memory, including the
+    /// GPU driver's pool) after `idle` without any embed call. Zero keeps
+    /// the worker resident. Takes effect once [`Self::spawn_idle_reaper`]
+    /// runs.
+    pub fn with_idle_unload(mut self, idle: Duration) -> Self {
+        self.idle_unload = idle;
+        self
+    }
+
+    /// Start the background thread that unloads an idle worker. Holds only
+    /// a weak reference and exits when the provider is dropped. No-op when
+    /// idle unload is disabled.
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        if self.idle_unload.is_zero() {
+            return;
         }
+        let tick = (self.idle_unload / 4).clamp(Duration::from_millis(50), Duration::from_secs(30));
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("attic-worker-idle-reaper".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(tick);
+                    let Some(provider) = weak.upgrade() else {
+                        return;
+                    };
+                    provider.unload_if_idle(Instant::now());
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("idle-unload reaper not started; the worker stays resident: {e}");
+        }
+    }
+
+    /// Stop the worker if it is loaded, no embed call is running, and the
+    /// last call finished at least `idle_unload` before `now`. Returns
+    /// whether it unloaded. The next embed call restarts it.
+    pub fn unload_if_idle(&self, now: Instant) -> bool {
+        if self.idle_unload.is_zero() {
+            return false;
+        }
+        let _exclusive = match self.gate.try_write() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        let mut life = self.life.lock().unwrap_or_else(|e| e.into_inner());
+        if life.phase != Phase::Loaded {
+            return false;
+        }
+        let Some(last) = life.last_used_at else {
+            return false;
+        };
+        if now.saturating_duration_since(last) < self.idle_unload {
+            return false;
+        }
+        self.supervisor.shutdown();
+        self.ready.store(false, Ordering::Release);
+        life.phase = Phase::Unloaded {
+            idle: self.idle_unload,
+        };
+        tracing::info!(
+            idle_secs = self.idle_unload.as_secs(),
+            "semantic worker idle; stopped it to free model memory (restarts on next use)"
+        );
+        true
+    }
+
+    /// Process id of the running worker, if any.
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.supervisor.worker_pid()
+    }
+
+    fn set_phase(&self, phase: Phase) {
+        self.life.lock().unwrap_or_else(|e| e.into_inner()).phase = phase;
+    }
+
+    fn touch(&self) {
+        let mut life = self.life.lock().unwrap_or_else(|e| e.into_inner());
+        life.last_used_at = Some(Instant::now());
+        life.last_used_wall = Some(SystemTime::now());
+    }
+
+    /// Handshake and load if needed. Returns how long a load took, or zero
+    /// when the worker was already ready.
+    fn ensure_ready(&self) -> Result<Duration, SemanticError> {
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(Duration::ZERO);
+        }
+        let started = Instant::now();
+        self.set_phase(Phase::Loading { since: started });
         let result = self
             .supervisor
             .handshake()
@@ -121,15 +239,36 @@ impl SupervisedWorkerProvider {
             });
         match result {
             Ok(()) => {
+                let took = started.elapsed();
+                {
+                    let mut life = self.life.lock().unwrap_or_else(|e| e.into_inner());
+                    life.phase = Phase::Loaded;
+                    life.last_load = Some(took);
+                }
+                tracing::info!(load_ms = took.as_millis() as u64, "semantic worker loaded");
                 self.load_failed.store(false, Ordering::Release);
                 self.ready.store(true, Ordering::Release);
-                Ok(())
+                Ok(took)
             }
             Err(e) => {
+                self.set_phase(Phase::NotLoaded);
                 self.load_failed.store(true, Ordering::Release);
                 Err(e)
             }
         }
+    }
+}
+
+fn fmt_span(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 && s.is_multiple_of(3600) {
+        format!("{}h", s / 3600)
+    } else if s >= 60 && s.is_multiple_of(60) {
+        format!("{}m", s / 60)
+    } else if s >= 1 {
+        format!("{s}s")
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -198,6 +337,36 @@ impl SemanticProvider for SupervisedWorkerProvider {
         self.claim_items
     }
 
+    fn worker_status(&self) -> Option<WorkerStatus> {
+        let life = self.life.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, detail) = match life.phase {
+            Phase::NotLoaded => ("not_loaded", "not loaded".to_string()),
+            Phase::Loading { since } => (
+                "loading",
+                format!("loading ({} so far)", fmt_span(since.elapsed())),
+            ),
+            Phase::Loaded => (
+                "loaded",
+                match life.last_load {
+                    Some(t) => format!("loaded (load took {})", fmt_span(t)),
+                    None => "loaded".to_string(),
+                },
+            ),
+            Phase::Unloaded { idle } => ("unloaded", format!("unloaded (idle {})", fmt_span(idle))),
+        };
+        Some(WorkerStatus {
+            state: state.to_string(),
+            detail,
+            last_used_unix_ms: life
+                .last_used_wall
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64),
+            idle_secs: life.last_used_at.map(|t| t.elapsed().as_secs()),
+            last_load_ms: life.last_load.map(|d| d.as_millis() as u64),
+            idle_unload_secs: self.idle_unload.as_secs(),
+        })
+    }
+
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],
@@ -211,9 +380,23 @@ impl SemanticProvider for SupervisedWorkerProvider {
                 total: inputs.len(),
             });
         }
-        let warmup_started = Instant::now();
-        self.ensure_ready()?;
-        let warmup_cost = warmup_started.elapsed();
+        let _shared = self.gate.read().unwrap_or_else(|e| e.into_inner());
+        self.touch();
+        let result = self.embed_batch_gated(inputs, usage, deadline);
+        self.touch();
+        result
+    }
+}
+
+impl SupervisedWorkerProvider {
+    fn embed_batch_gated(
+        &self,
+        inputs: &[EmbeddingInput],
+        usage: &mut ResourceUsage,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<EmbeddingOutput>, SemanticError> {
+        let warmup_cost = self.ensure_ready()?;
+        usage.warmup_ms += warmup_cost.as_millis() as u64;
 
         let items: Vec<EmbedItem> = inputs
             .iter()
@@ -281,6 +464,7 @@ impl SemanticProvider for SupervisedWorkerProvider {
                 ) {
                     self.load_failed.store(true, Ordering::Release);
                     self.ready.store(false, Ordering::Release);
+                    self.set_phase(Phase::NotLoaded);
                 }
                 return Err(map_supervisor_error(e));
             }
@@ -580,6 +764,117 @@ mod expected_fingerprint_tests {
     #[test]
     fn an_exhausted_budget_with_no_warmup_is_still_exhausted() {
         assert_eq!(inference_budget(Duration::ZERO, Duration::ZERO), None);
+    }
+
+    fn idle_test_provider(idle: Duration) -> SupervisedWorkerProvider {
+        let launch = WorkerLaunch {
+            program: std::path::PathBuf::from("attic-inference-worker-does-not-exist"),
+            args: vec![],
+            env: vec![],
+        };
+        let load = LoadParams {
+            cache_dir: "unused".into(),
+            batch_size: 1,
+            dimension: Some(4),
+            backend: "candle-cpu".into(),
+            onnx_model_dir: None,
+            seq_len: None,
+        };
+        let fp = expected_fingerprint("candle-cpu", Some(4));
+        SupervisedWorkerProvider::new(launch, load, fp, 4096).with_idle_unload(idle)
+    }
+
+    fn mark_loaded(p: &SupervisedWorkerProvider, last_used: Instant) {
+        let mut life = p.life.lock().unwrap();
+        life.phase = Phase::Loaded;
+        life.last_used_at = Some(last_used);
+        life.last_used_wall = Some(SystemTime::now());
+        life.last_load = Some(Duration::from_millis(8_400));
+        p.ready.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_fresh_provider_reports_not_loaded_and_spawns_nothing() {
+        let p = idle_test_provider(Duration::from_secs(900));
+        let s = p.worker_status().unwrap();
+        assert_eq!(s.state, "not_loaded");
+        assert_eq!(s.idle_unload_secs, 900);
+        assert!(s.last_used_unix_ms.is_none());
+        assert!(p.worker_pid().is_none(), "construction must not start a worker");
+    }
+
+    #[test]
+    fn an_idle_worker_is_unloaded_and_reports_why() {
+        let p = idle_test_provider(Duration::from_secs(900));
+        let t0 = Instant::now();
+        mark_loaded(&p, t0);
+        assert_eq!(p.worker_status().unwrap().detail, "loaded (load took 8s)");
+
+        assert!(!p.unload_if_idle(t0 + Duration::from_secs(899)), "not idle yet");
+        assert_eq!(p.worker_status().unwrap().state, "loaded");
+
+        assert!(p.unload_if_idle(t0 + Duration::from_secs(900)));
+        let s = p.worker_status().unwrap();
+        assert_eq!(s.state, "unloaded");
+        assert_eq!(s.detail, "unloaded (idle 15m)");
+        assert!(!p.ready.load(Ordering::Acquire), "next use must reload");
+        assert!(p.worker_pid().is_none());
+        assert!(s.last_used_unix_ms.is_some(), "last use survives unload");
+        assert!(!p.unload_if_idle(t0 + Duration::from_secs(5_000)), "already unloaded");
+    }
+
+    #[test]
+    fn a_running_batch_blocks_unload() {
+        let p = idle_test_provider(Duration::from_secs(1));
+        let t0 = Instant::now();
+        mark_loaded(&p, t0);
+        let batch = p.gate.read().unwrap();
+        assert!(!p.unload_if_idle(t0 + Duration::from_secs(60)));
+        drop(batch);
+        assert!(p.unload_if_idle(t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn zero_idle_keeps_the_worker_resident() {
+        let p = idle_test_provider(Duration::ZERO);
+        let t0 = Instant::now();
+        mark_loaded(&p, t0);
+        assert!(!p.unload_if_idle(t0 + Duration::from_secs(1_000_000)));
+        assert_eq!(p.worker_status().unwrap().state, "loaded");
+    }
+
+    #[test]
+    fn the_reaper_unloads_on_its_own_and_exits_with_the_provider() {
+        let p = Arc::new(idle_test_provider(Duration::from_millis(200)));
+        mark_loaded(&p, Instant::now());
+        p.spawn_idle_reaper();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.worker_status().unwrap().state != "unloaded" {
+            assert!(Instant::now() < deadline, "reaper never unloaded the idle worker");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let weak = Arc::downgrade(&p);
+        drop(p);
+        // The reaper holds a strong ref only for the instant of a check.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the reaper must not keep the provider alive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_failed_load_attempt_records_use_and_not_loaded() {
+        let p = idle_test_provider(Duration::from_secs(900));
+        let mut usage = ResourceUsage::default();
+        let inputs = [EmbeddingInput {
+            unit_key: "u1".into(),
+            text: "hello".into(),
+        }];
+        assert!(p.embed_batch(&inputs, &CancelFlag::new(), &mut usage, None).is_err());
+        let s = p.worker_status().unwrap();
+        assert_eq!(s.state, "not_loaded");
+        assert!(s.last_used_unix_ms.is_some());
     }
 
     #[test]

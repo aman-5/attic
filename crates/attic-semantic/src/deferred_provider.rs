@@ -129,6 +129,12 @@ impl SemanticProvider for DeferredProvider {
     fn fingerprint(&self) -> Option<EmbeddingFingerprint> {
         self.current().fingerprint()
     }
+    fn preferred_claim_items(&self) -> Option<usize> {
+        self.current().preferred_claim_items()
+    }
+    fn worker_status(&self) -> Option<crate::provider::WorkerStatus> {
+        self.current().worker_status()
+    }
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],

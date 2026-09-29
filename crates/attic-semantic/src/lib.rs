@@ -64,7 +64,7 @@ pub use ort_directml::{ORT_PROVIDER_ID, OrtDirectMlProvider};
 pub use provider::{
     CancelFlag, EmbeddingExecutionBudget, EmbeddingFingerprint, EmbeddingInput, EmbeddingOutput,
     EmbeddingProvider, ExecutionBackend, ProviderConcurrencyContract, ResourceUsage,
-    SemanticProvider, UnavailableProvider, cosine,
+    SemanticProvider, UnavailableProvider, WorkerStatus, cosine,
 };
 pub use qwen3_provider::{QWEN_MODEL_ID, QWEN_PROVIDER_ID, Qwen3Embedder, QwenPooling};
 pub use selection::{

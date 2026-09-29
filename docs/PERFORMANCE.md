@@ -80,9 +80,19 @@ SHA-256 hashes; it is never counted in indexing time.
   `gpu_temp_resume_c` (default 85 °C). Sensor: `nvidia-smi` (NVIDIA on
   Windows/Linux) or Linux hwmon; macOS and other Windows adapters have no
   readable sensor, so the OS's own thermal management applies.
-- **Poison isolation.** If a multi-item batch fails on content, each item is
-  retried alone: good items commit, only the offender is marked failed, so
-  one bad chunk never stalls the queue.
+- **Poison isolation.** If a multi-item batch fails on content or crashes
+  the worker, it is split in halves until the offender is found: good items
+  commit, only the offender is marked failed, so one bad chunk never stalls
+  the queue.
+- **Lazy load, idle unload.** The model worker starts only when chunks are
+  pending or a semantic query arrives — never at server startup, and never
+  when `[semantic] enabled = false`. After `gpu_idle_unload_secs` (default
+  900) with no embedding work the worker process exits, so the OS reclaims
+  all of its VRAM (including the driver's pool). The next chunk or query
+  reloads it (≈2–7 s on an RTX A500); a query's time budget is extended by
+  the load time, so a cold query never times out. `status` →
+  `semantic_identity.worker` shows `not loaded` / `loading` / `loaded (load
+  took …)` / `unloaded (idle 15m)` and the last-use time.
 
 ## Sizing your own workspace
 
@@ -114,6 +124,7 @@ embedded:
 | More semantic coverage | Lower `[semantic] min_score` (0.0 embeds every eligible unit) and raise `max_units_per_repo` (default 2560) / `max_units_total` (default 100000) |
 | Bigger GPU passes on a larger card | Raise `[semantic] gpu_batch_tokens` (default 4096, sized for a 4 GB card) |
 | GPU running hot | Lower `[semantic] gpu_temp_pause_c` / `gpu_temp_resume_c` (defaults 90 / 85 °C) |
+| Free GPU memory sooner / never | `[semantic] gpu_idle_unload_secs` (default 900; 0 keeps the model resident) |
 | Faster GPU embeddings, less coverage | `[semantic] onnx_seq_len = 512`. Halves the padded window, but also halves the largest unit that can be embedded — units above the new ceiling are excluded from selection and counted as `exceeds_max_input_bytes`, not embedded. Leave unset (1024) unless you have measured the trade |
 | Keep the laptop responsive | `[resources] mode = "low"`, or lower `[indexing] analysis_threads` |
 | Index many repositories faster | `[resources] mode = "performance"` or a higher `scheduler_workers` |

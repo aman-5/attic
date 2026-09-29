@@ -55,6 +55,10 @@ pub struct ResourceUsage {
     pub items_embedded: u64,
     pub input_bytes: u64,
     pub elapsed_ms: u64,
+    /// Time spent starting the worker / loading the model before this call
+    /// could embed anything (cold start). Query paths credit it back to
+    /// their time budget so a reload after idle unload never times out.
+    pub warmup_ms: u64,
 }
 
 impl ResourceUsage {
@@ -62,7 +66,25 @@ impl ResourceUsage {
         self.items_embedded += o.items_embedded;
         self.input_bytes += o.input_bytes;
         self.elapsed_ms += o.elapsed_ms;
+        self.warmup_ms += o.warmup_ms;
     }
+}
+
+/// Lifecycle of an out-of-process model worker (status reporting).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    /// `not_loaded` | `loading` | `loaded` | `unloaded`.
+    pub state: String,
+    /// Human-readable state, e.g. `unloaded (idle 15m)`.
+    pub detail: String,
+    /// Unix ms of the last embed call (enrichment or query).
+    pub last_used_unix_ms: Option<u64>,
+    /// Seconds since the last embed call.
+    pub idle_secs: Option<u64>,
+    /// Duration of the most recent model load.
+    pub last_load_ms: Option<u64>,
+    /// Idle time after which the worker is stopped (0 = never).
+    pub idle_unload_secs: u64,
 }
 
 /// Provider-neutral embedding contract (ADR-013). Object-safe so any
@@ -123,6 +145,11 @@ pub trait SemanticProvider: Send + Sync {
     /// wide claim to fill its batches; a claim capped at the CPU-sized batch
     /// leaves the device mostly idle. `None` keeps the caller's batch size.
     fn preferred_claim_items(&self) -> Option<usize> {
+        None
+    }
+
+    /// Model-worker lifecycle for status, when the provider runs one.
+    fn worker_status(&self) -> Option<WorkerStatus> {
         None
     }
 

@@ -49,6 +49,12 @@ impl BudgetAccountant {
         self.started.elapsed() >= self.max_time
     }
 
+    /// Extend the time budget by a one-time cost that is not retrieval work
+    /// (e.g. starting the embedding worker after it was unloaded).
+    pub fn credit_time(&mut self, d: Duration) {
+        self.max_time = self.max_time.saturating_add(d);
+    }
+
     fn note_limit(&mut self, field: &'static str) {
         if !self.limits_hit.iter().any(|f| f == field) {
             self.limits_hit.push(field.to_owned());

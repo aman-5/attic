@@ -347,6 +347,10 @@ impl SemanticProvider for FallbackCoordinator {
         self.current().preferred_claim_items()
     }
 
+    fn worker_status(&self) -> Option<crate::provider::WorkerStatus> {
+        self.current().worker_status()
+    }
+
     fn embed_batch(
         &self,
         inputs: &[EmbeddingInput],

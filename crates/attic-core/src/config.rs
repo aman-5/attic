@@ -151,6 +151,14 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub gpu_temp_resume_c: Option<u32>,
 
+    /// Seconds without pending chunks or semantic queries after which the
+    /// model worker process is stopped, returning all of its memory (GPU
+    /// VRAM, including the driver's pool, or CPU RAM) to the OS. The next
+    /// chunk or query restarts it. Default 900 (15 minutes); 0 keeps the
+    /// model resident for the life of the server.
+    #[serde(default)]
+    pub gpu_idle_unload_secs: Option<u64>,
+
     /// Which device to run embedding inference on.
     ///
     /// Accepted values: `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`.
@@ -191,8 +199,23 @@ impl Default for SemanticConfig {
             gpu_batch_tokens: None,
             gpu_temp_pause_c: None,
             gpu_temp_resume_c: None,
+            gpu_idle_unload_secs: None,
             device: None,
         }
+    }
+}
+
+/// Default for `[semantic] gpu_idle_unload_secs`.
+pub const DEFAULT_GPU_IDLE_UNLOAD_SECS: u64 = 900;
+
+/// Upper bound for `[semantic] gpu_idle_unload_secs` (one week).
+pub const MAX_GPU_IDLE_UNLOAD_SECS: u64 = 7 * 24 * 3600;
+
+impl SemanticConfig {
+    /// Effective idle-unload delay in seconds; 0 means never unload.
+    pub fn idle_unload_secs(&self) -> u64 {
+        self.gpu_idle_unload_secs
+            .unwrap_or(DEFAULT_GPU_IDLE_UNLOAD_SECS)
     }
 }
 
@@ -466,6 +489,13 @@ impl AtticConfig {
                 "[semantic] gpu_temp_pause_c must be within 40..=110".into(),
             ));
         }
+        if let Some(s) = self.semantic.gpu_idle_unload_secs
+            && s > MAX_GPU_IDLE_UNLOAD_SECS
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[semantic] gpu_idle_unload_secs must be within 0..={MAX_GPU_IDLE_UNLOAD_SECS} (0 = never unload)"
+            )));
+        }
         if self
             .semantic
             .exclude_globs
@@ -542,6 +572,11 @@ model = "qwen3-embedding-0.6b"
 # Inactive where no sensor exists (macOS, non-NVIDIA Windows adapters).
 # gpu_temp_pause_c = 90
 # gpu_temp_resume_c = 85
+# The model worker starts only when chunks are pending or a semantic query
+# arrives. After this many idle seconds it is stopped and all of its GPU
+# (or CPU) memory is released; the next chunk or query reloads it.
+# 0 keeps the model resident.
+# gpu_idle_unload_secs = 900
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
@@ -688,6 +723,10 @@ mod tests {
             ("[semantic]\nmax_units_per_repo = 0\n", "max_units_per_repo"),
             ("[semantic]\ngpu_batch_tokens = 0\n", "gpu_batch_tokens"),
             ("[semantic]\ngpu_temp_pause_c = 200\n", "gpu_temp_pause_c"),
+            (
+                "[semantic]\ngpu_idle_unload_secs = 99999999\n",
+                "gpu_idle_unload_secs",
+            ),
             ("[semantic]\nmodel = \"\"\n", "model"),
         ] {
             match AtticConfig::parse_str(toml) {

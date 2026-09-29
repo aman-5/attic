@@ -425,6 +425,7 @@ fn resolve_semantic_provider(
     // exists before it can wire `FallbackCoordinator` (Phase 3 escalation
     // gap: a permanent GPU failure must have somewhere real to fall back
     // to, not just a coordinator that always answers from a dead GPU path).
+    let idle_unload = std::time::Duration::from_secs(attic_config.semantic.idle_unload_secs());
     let cpu_provider = |dir: &Path| {
         supervised_provider(
             "candle-cpu",
@@ -433,6 +434,7 @@ fn resolve_semantic_provider(
             attic_config.semantic.dimension,
             None,
             DEFAULT_ONNX_SEQ_LEN,
+            idle_unload,
         )
     };
 
@@ -449,6 +451,7 @@ fn resolve_semantic_provider(
             attic_config.semantic.dimension,
             None,
             DEFAULT_ONNX_SEQ_LEN,
+            idle_unload,
         )
     };
     let cpu_dir = candidate_dirs.iter().find(|dir| {
@@ -501,7 +504,10 @@ fn resolve_semantic_provider(
                 attic_config.semantic.dimension,
                 Some(dir),
                 onnx_seq_len(attic_config),
-                gpu_worker_env(attic_config),
+                WorkerTuning {
+                    env: gpu_worker_env(attic_config),
+                    idle_unload,
+                },
             );
             return match cpu_dir {
                 Some(cpu_dir) => {
@@ -564,6 +570,7 @@ fn resolve_semantic_provider(
         batch_size,
         attic_config.semantic.dimension,
         configured_backend,
+        idle_unload,
     );
     deferred
 }
@@ -619,8 +626,28 @@ fn supervised_provider(
     dimension: Option<usize>,
     onnx_dir: Option<PathBuf>,
     seq_len: usize,
+    idle_unload: std::time::Duration,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
-    supervised_provider_with_env(backend, cache_dir, batch_size, dimension, onnx_dir, seq_len, vec![])
+    supervised_provider_with_env(
+        backend,
+        cache_dir,
+        batch_size,
+        dimension,
+        onnx_dir,
+        seq_len,
+        WorkerTuning {
+            env: vec![],
+            idle_unload,
+        },
+    )
+}
+
+/// Per-worker process tuning that is not part of the model load spec.
+struct WorkerTuning {
+    /// Environment forwarded to the worker (GPU tunables).
+    env: Vec<(String, String)>,
+    /// Stop the worker after this long unused (zero = keep resident).
+    idle_unload: std::time::Duration,
 }
 
 /// GPU tunables from `attic.toml` `[semantic]`, forwarded to the inference
@@ -647,13 +674,13 @@ fn supervised_provider_with_env(
     dimension: Option<usize>,
     onnx_dir: Option<PathBuf>,
     seq_len: usize,
-    env: Vec<(String, String)>,
+    tuning: WorkerTuning,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("attic"));
     let launch = attic_inference_protocol::supervisor::WorkerLaunch {
         program: exe,
         args: vec!["inference-worker".to_string()],
-        env,
+        env: tuning.env,
     };
     let load = attic_inference_protocol::supervisor::LoadParams {
         cache_dir: cache_dir.to_string_lossy().into_owned(),
@@ -663,12 +690,17 @@ fn supervised_provider_with_env(
         onnx_model_dir: onnx_dir.map(|p| p.to_string_lossy().into_owned()),
         seq_len: Some(seq_len),
     };
-    Arc::new(attic_semantic::SupervisedWorkerProvider::new(
-        launch,
-        load,
-        attic_semantic::expected_fingerprint(backend, dimension),
-        attic_semantic::expected_max_input_bytes(backend, seq_len),
-    ))
+    let provider = Arc::new(
+        attic_semantic::SupervisedWorkerProvider::new(
+            launch,
+            load,
+            attic_semantic::expected_fingerprint(backend, dimension),
+            attic_semantic::expected_max_input_bytes(backend, seq_len),
+        )
+        .with_idle_unload(tuning.idle_unload),
+    );
+    provider.spawn_idle_reaper();
+    provider
 }
 
 /// The ONNX/DirectML padded sequence length.
@@ -731,6 +763,7 @@ fn spawn_model_download_task(
     batch_size: usize,
     dimension: Option<usize>,
     backend: &'static str,
+    idle_unload: std::time::Duration,
 ) {
     use attic_semantic::ModelLifecycle;
     let task_deferred = deferred.clone();
@@ -768,6 +801,7 @@ fn spawn_model_download_task(
                                     dimension,
                                     None,
                                     DEFAULT_ONNX_SEQ_LEN,
+                                    idle_unload,
                                 ));
                                 tracing::info!(
                                     "Qwen3 model verified against pinned manifest; supervised worker provider swapped in — semantic retrieval is now live"
@@ -2851,6 +2885,9 @@ fn handle_status(
             // so "backend": "candle-cpu" is never ambiguous about whether
             // CPU was a deliberate choice or an unreported capability gap.
             "gpu": gpu_capability_report(phase8.attic_config),
+            // Model worker lifecycle: not_loaded / loading / loaded /
+            // unloaded (idle unload), last use, and last load time.
+            "worker": stack.provider.worker_status(),
         });
     }
 

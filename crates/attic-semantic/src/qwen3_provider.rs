@@ -742,6 +742,7 @@ impl SemanticProvider for Qwen3Embedder {
             items_embedded: outputs.len() as u64,
             input_bytes: total_bytes as u64,
             elapsed_ms: elapsed.as_millis().max(1) as u64,
+            warmup_ms: 0,
         });
 
         Ok(outputs)

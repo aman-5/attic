@@ -218,6 +218,12 @@ impl SemanticCandidateGenerator {
                 },
             ));
         };
+        // A cold worker start (first query, or after idle unload) is a
+        // one-time load cost, not slow retrieval: credit it back so the
+        // search that follows still gets its full budget.
+        let warmup = std::time::Duration::from_millis(usage.warmup_ms);
+        let deadline = deadline + warmup;
+        env.budget.credit_time(warmup);
 
         // ── Active Generation Check ───
         let active_gen = match stack.store.get_active_generation() {
