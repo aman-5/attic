@@ -19,9 +19,10 @@ use crate::{
 };
 use std::io::{BufReader, BufWriter};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -31,6 +32,8 @@ pub enum SupervisorError {
     Spawn(String),
     #[error("worker timed out after {0:?} and was killed")]
     WorkerTimeout(Duration),
+    #[error("worker stalled (no progress for {0:?}) and was killed")]
+    WorkerStalled(Duration),
     #[error("worker died mid-request (EOF)")]
     WorkerDied,
     #[error("worker reported {class:?}: {message}")]
@@ -89,6 +92,9 @@ pub struct WorkerSupervisor {
     load: Mutex<Option<LoadParams>>,
     state: Mutex<State>,
     identity_verifier: Mutex<Option<Arc<IdentityVerifier>>>,
+    /// Workers killed by the stall watchdog, and when the last one was.
+    stall_kills: AtomicU64,
+    last_stall: Mutex<Option<SystemTime>>,
 }
 
 impl WorkerSupervisor {
@@ -102,7 +108,17 @@ impl WorkerSupervisor {
                 next_id: 1,
             }),
             identity_verifier: Mutex::new(None),
+            stall_kills: AtomicU64::new(0),
+            last_stall: Mutex::new(None),
         }
+    }
+
+    /// `(workers killed by the stall watchdog, time of the last kill)`.
+    pub fn stall_stats(&self) -> (u64, Option<SystemTime>) {
+        (
+            self.stall_kills.load(Ordering::Relaxed),
+            *self.last_stall.lock().unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// Install the identity check run against every LoadModel response
@@ -208,11 +224,17 @@ impl WorkerSupervisor {
     /// Send a request and wait for its response with a hard deadline.
     /// On timeout the child is killed — the native stack cannot be trusted
     /// to honor anything once it hangs.
+    ///
+    /// `deadline` bounds WORK time: intervals the worker reports as paused
+    /// (thermal, VRAM headroom) are not charged. `stall`, when set, kills a
+    /// worker that sends no heartbeat for that long — a hang is caught in
+    /// seconds instead of at the end of the whole batch budget.
     fn roundtrip(
         &self,
         state: &mut State,
         req: WorkerRequest,
         deadline: Duration,
+        stall: Option<Duration>,
     ) -> Result<WorkerResponse, SupervisorError> {
         let id = match &req {
             WorkerRequest::Hello { id }
@@ -232,23 +254,57 @@ impl WorkerSupervisor {
 
         write_request(&mut live.stdin, &req)?;
 
-        let wait_started = Instant::now();
+        let started = Instant::now();
+        let mut last_beat = started;
+        let mut paused_total = Duration::ZERO;
+        let mut paused_since: Option<Instant> = None;
         loop {
-            let remaining = deadline.saturating_sub(wait_started.elapsed());
+            let now = Instant::now();
+            let paused_now = paused_since.map_or(Duration::ZERO, |p| now - p);
+            let worked = (now - started).saturating_sub(paused_total + paused_now);
+            let remaining = deadline.saturating_sub(worked);
             if remaining.is_zero() {
                 Self::kill_child(state);
                 return Err(SupervisorError::WorkerTimeout(deadline));
             }
-            match live
-                .responses
-                .recv_timeout(remaining.min(Duration::from_millis(100)))
-            {
+            let mut wait = remaining.min(Duration::from_millis(100));
+            if let Some(limit) = stall {
+                let silent = now - last_beat;
+                if silent >= limit {
+                    Self::kill_child(state);
+                    self.stall_kills.fetch_add(1, Ordering::Relaxed);
+                    *self.last_stall.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(SystemTime::now());
+                    return Err(SupervisorError::WorkerStalled(limit));
+                }
+                wait = wait.min(limit - silent);
+            }
+            let Some(live) = state.live.as_mut() else {
+                return Err(SupervisorError::WorkerDied);
+            };
+            match live.responses.recv_timeout(wait) {
+                Ok(Ok(Some(WorkerResponse::Progress { id: pid, paused, .. }))) => {
+                    if pid == id {
+                        let now = Instant::now();
+                        last_beat = now;
+                        match (paused, paused_since) {
+                            (true, None) => paused_since = Some(now),
+                            (false, Some(p)) => {
+                                paused_total += now - p;
+                                paused_since = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 Ok(Ok(Some(resp))) => {
                     let resp_id = match &resp {
                         WorkerResponse::HelloOk { id, .. }
                         | WorkerResponse::ModelReady { id, .. }
                         | WorkerResponse::Embeddings { id, .. }
                         | WorkerResponse::Ok { id }
+                        | WorkerResponse::Progress { id, .. }
                         | WorkerResponse::Error { id, .. } => *id,
                     };
                     if resp_id != id {
@@ -288,6 +344,7 @@ impl WorkerSupervisor {
             &mut state,
             WorkerRequest::Hello { id },
             Duration::from_secs(10),
+            None,
         )? {
             WorkerResponse::HelloOk {
                 protocol,
@@ -321,7 +378,7 @@ impl WorkerSupervisor {
             onnx_model_dir: params.onnx_model_dir.clone(),
             seq_len: params.seq_len,
         };
-        match self.roundtrip(&mut state, req, Duration::from_secs(600))? {
+        match self.roundtrip(&mut state, req, Duration::from_secs(600), None)? {
             WorkerResponse::HelloOk { capabilities, .. } => {
                 self.verify_capabilities(&mut state, &capabilities)?;
                 state.model_loaded = true;
@@ -368,6 +425,18 @@ impl WorkerSupervisor {
         items: Vec<EmbedItem>,
         deadline: Duration,
     ) -> Result<Vec<Vec<f32>>, SupervisorError> {
+        self.embed_batch_watched(items, deadline, None)
+    }
+
+    /// [`Self::embed_batch`] plus a stall watchdog: the worker is killed if
+    /// it sends no progress heartbeat for `stall`. Use only with engines
+    /// that report progress (see [`crate::progress`]).
+    pub fn embed_batch_watched(
+        &self,
+        items: Vec<EmbedItem>,
+        deadline: Duration,
+        stall: Option<Duration>,
+    ) -> Result<Vec<Vec<f32>>, SupervisorError> {
         let mut state = self.state.lock().map_err(|_| {
             SupervisorError::Protocol(ProtocolError::Malformed("state lock poisoned".into()))
         })?;
@@ -393,7 +462,7 @@ impl WorkerSupervisor {
                 onnx_model_dir: params.onnx_model_dir,
                 seq_len: params.seq_len,
             };
-            match self.roundtrip(&mut state, req, Duration::from_secs(600))? {
+            match self.roundtrip(&mut state, req, Duration::from_secs(600), None)? {
                 WorkerResponse::HelloOk { capabilities, .. } => {
                     self.verify_capabilities(&mut state, &capabilities)?;
                     state.model_loaded = true;
@@ -419,6 +488,7 @@ impl WorkerSupervisor {
                 deadline_ms: deadline.as_millis() as u64,
             },
             deadline,
+            stall,
         )? {
             WorkerResponse::Embeddings { vectors, .. } => Ok(vectors),
             WorkerResponse::Error { class, message, .. } => {
@@ -439,6 +509,7 @@ impl WorkerSupervisor {
                     &mut state,
                     WorkerRequest::Shutdown { id },
                     Duration::from_secs(5),
+                    None,
                 );
             }
             Self::kill_child(&mut state);

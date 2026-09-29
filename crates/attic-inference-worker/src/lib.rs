@@ -21,9 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 pub mod engine;
+pub mod progress;
 pub mod supervisor;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 adds [`WorkerResponse::Progress`] heartbeats during a batch.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Hard frame cap — a batch of embedding texts is bounded well below this;
 /// anything larger indicates corruption or a hostile peer.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
@@ -87,6 +89,17 @@ pub enum WorkerResponse {
     },
     Ok {
         id: u64,
+    },
+    /// Heartbeat sent while an `EmbedBatch` is running, whenever the engine
+    /// has made progress (a forward pass finished) or is deliberately
+    /// waiting (thermal pause, VRAM headroom). Silence means stuck.
+    Progress {
+        id: u64,
+        /// Engine progress ticks since the worker started.
+        ticks: u64,
+        /// The engine is deliberately waiting; time spent here does not
+        /// count against the batch's work budget.
+        paused: bool,
     },
     Error {
         id: u64,

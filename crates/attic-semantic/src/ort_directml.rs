@@ -53,6 +53,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
+use attic_inference_protocol::progress::{self, PauseGuard};
 use attic_storage::gpu_telemetry::GpuTelemetry;
 use attic_storage::gpu_thermal::{self, ThermalAction, ThermalGuard};
 
@@ -78,7 +79,9 @@ pub use crate::worker_supervisor::ENV_GPU_TEMP_PAUSE_C as ENV_TEMP_PAUSE_C;
 pub use crate::worker_supervisor::ENV_GPU_TEMP_RESUME_C as ENV_TEMP_RESUME_C;
 
 /// Smallest length bucket; every input pads to at least this many tokens.
-const MIN_BUCKET: usize = 64;
+/// 32 lets very short units (signatures, constants) fill 128-item passes
+/// under the default 4096-token budget instead of padding to 64.
+const MIN_BUCKET: usize = 32;
 
 /// Free VRAM (MiB) kept untouched for the desktop/compositor when growing
 /// DirectML's arena for a new shape.
@@ -90,6 +93,9 @@ const VRAM_RESERVE_MIB: u64 = 256;
 const PRESSURE_WAIT_MAX: Duration = Duration::from_secs(2);
 const PRESSURE_POLL: Duration = Duration::from_millis(250);
 const THERMAL_POLL: Duration = Duration::from_millis(500);
+/// Longest a single batch waits for the GPU to cool before giving its items
+/// back to the queue (a stuck sensor must not park the worker forever).
+const MAX_THERMAL_PAUSE: Duration = Duration::from_secs(600);
 
 /// Qwen3-Embedding-0.6B: 28 layers, 16 query heads, 8 KV heads, head_dim 128.
 const NUM_LAYERS: usize = 28;
@@ -110,7 +116,7 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
-/// Length buckets for a read window: 64, 128, … doubling, capped by (and
+/// Length buckets for a read window: 32, 64, … doubling, capped by (and
 /// always ending at) `seq_len`.
 pub(crate) fn length_buckets(seq_len: usize) -> Vec<usize> {
     let seq_len = seq_len.max(1);
@@ -362,12 +368,13 @@ impl OrtDirectMlProvider {
 
     /// Block while the GPU is at or above the pause temperature. Returns the
     /// budget shift to apply (1 = halve while one degree below pause).
-    fn wait_thermal(
-        &self,
-        cancel: &CancelFlag,
-        deadline: Option<Instant>,
-    ) -> Result<u32, ()> {
+    ///
+    /// The wait is reported to the supervisor as paused, so it is not charged
+    /// to the batch's work budget; the caller extends its own deadline by the
+    /// time spent here. Gives up on cancel or after [`MAX_THERMAL_PAUSE`].
+    fn wait_thermal(&self, cancel: &CancelFlag) -> Result<u32, ()> {
         let mut logged = false;
+        let mut pause: Option<(Instant, PauseGuard)> = None;
         loop {
             let temp = gpu_thermal::gpu_temperature_c();
             match self.thermal.decide(temp) {
@@ -388,7 +395,10 @@ impl OrtDirectMlProvider {
                         );
                         logged = true;
                     }
-                    if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
+                    let since = pause
+                        .get_or_insert_with(|| (Instant::now(), PauseGuard::enter()))
+                        .0;
+                    if cancel.is_cancelled() || since.elapsed() >= MAX_THERMAL_PAUSE {
                         return Err(());
                     }
                     std::thread::sleep(THERMAL_POLL);
@@ -427,6 +437,7 @@ impl OrtDirectMlProvider {
                 tracing::debug!(bucket, "no VRAM headroom for a new shape; running 1 item");
                 return 1;
             }
+            let _paused = PauseGuard::enter();
             std::thread::sleep(PRESSURE_POLL);
         }
     }
@@ -589,6 +600,7 @@ impl SemanticProvider for OrtDirectMlProvider {
             return Err(cancelled(0));
         }
         let t0 = Instant::now();
+        let mut deadline = deadline;
 
         let texts: Vec<&str> = inputs.iter().map(|i| i.text.as_str()).collect();
         let encodings = self
@@ -624,12 +636,14 @@ impl SemanticProvider for OrtDirectMlProvider {
                 if cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(cancelled(done));
                 }
-                let shift = self
-                    .wait_thermal(cancel, deadline)
-                    .map_err(|_| cancelled(done))?;
+                // Waits below are paused (not charged by the supervisor), so
+                // they must not eat into this batch's own deadline either.
+                let waits = Instant::now();
+                let shift = self.wait_thermal(cancel).map_err(|_| cancelled(done))?;
                 let budget_cap = (full_pass_items(self.batch_token_budget, bucket) >> shift).max(1);
                 let want = pow2_passes(members.len() - start, cap.min(budget_cap))[0];
                 let items = self.admit_items(want, bucket, cancel);
+                deadline = deadline.map(|d| d + waits.elapsed());
                 let chunk = &members[start..start + items];
                 let rows: Vec<&[u32]> = chunk.iter().map(|&i| token_ids[i]).collect();
 
@@ -639,6 +653,7 @@ impl SemanticProvider for OrtDirectMlProvider {
                     })?;
                     Self::run_forward(&mut guard, self.kv_dtype, &rows, bucket)
                 };
+                progress::tick();
                 match result {
                     Ok((pooled, native_hidden)) => {
                         self.remember_shape(items, bucket);
@@ -688,14 +703,16 @@ mod shape_tests {
 
     #[test]
     fn buckets_double_and_end_at_window() {
-        assert_eq!(length_buckets(512), vec![64, 128, 256, 512]);
-        assert_eq!(length_buckets(1024), vec![64, 128, 256, 512, 1024]);
-        assert_eq!(length_buckets(300), vec![64, 128, 256, 300]);
+        assert_eq!(length_buckets(512), vec![32, 64, 128, 256, 512]);
+        assert_eq!(length_buckets(1024), vec![32, 64, 128, 256, 512, 1024]);
+        assert_eq!(length_buckets(300), vec![32, 64, 128, 256, 300]);
         assert_eq!(length_buckets(32), vec![32]);
+        assert_eq!(length_buckets(20), vec![20]);
     }
 
     #[test]
     fn full_pass_is_power_of_two_within_budget() {
+        assert_eq!(full_pass_items(4096, 32), 128);
         assert_eq!(full_pass_items(4096, 64), 64);
         assert_eq!(full_pass_items(4096, 512), 8);
         assert_eq!(full_pass_items(4096, 300), 8);

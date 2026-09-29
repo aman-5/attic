@@ -704,8 +704,11 @@ impl SemanticStore {
     }
 
     /// Record a failed attempt; quarantines as FAILED once `max_attempts` is
-    /// reached, otherwise returns to PENDING for retry. Rejected on a stale
-    /// fencing token so a superseded worker can never affect queue state.
+    /// reached, otherwise returns to PENDING for retry at the BACK of its
+    /// priority band (`enqueued_at_ms = now`), so a repeatedly failing item
+    /// can never sit at the head of the queue and be re-claimed ahead of
+    /// healthy work. Rejected on a stale fencing token so a superseded
+    /// worker can never affect queue state.
     pub fn queue_mark_failed(
         &self,
         occurrence_id: &str,
@@ -719,7 +722,7 @@ impl SemanticStore {
                 SET attempts = attempts + 1,
                     state = CASE WHEN attempts + 1 >= ?4 THEN 'FAILED' ELSE 'PENDING' END,
                     lease_owner = NULL, lease_expires_at_ms = NULL,
-                    last_error = ?5
+                    last_error = ?5, enqueued_at_ms = ?6
               WHERE occurrence_id = ?1 AND lease_owner = ?2
                 AND fencing_token = ?3 AND state = 'INFLIGHT'",
             params![
@@ -727,7 +730,8 @@ impl SemanticStore {
                 owner,
                 fencing_token,
                 max_attempts as i64,
-                error
+                error,
+                Self::now_ms()
             ],
         )?;
         Ok(changed > 0)
@@ -1748,6 +1752,46 @@ mod tests {
         assert_eq!(s.occurrence_count_for_canonical(&vsid, &hash).unwrap(), 2);
         let vec = s.embedding_for_canonical(&vsid, &hash).unwrap().unwrap();
         assert_eq!(vec, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// A failed attempt must go to the back of its priority band: the next
+    /// claim takes healthy work first, not the item that just failed.
+    #[test]
+    fn v2_queue_failed_item_retries_behind_healthy_work() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let fp = EmbeddingFingerprint {
+            provider: "qwen3".into(),
+            model_id: "m".into(),
+            model_revision: "r".into(),
+            dimension: 2,
+            pooling_version: "p".into(),
+            normalization_version: "n".into(),
+            tokenizer_version: "t".into(),
+            chunking_version: "c".into(),
+            query_instruction_version: "q".into(),
+            execution_backend: ExecutionBackend::CandleCpu,
+            quantization: "test-none".to_string(),
+        };
+        let vsid = fp.vector_space_id();
+        let cgid = fp.content_generation_id("sel");
+        for id in ["bad", "good"] {
+            let hash = crate::identity::content_hash(id);
+            s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0]).unwrap();
+            s.add_occurrence(id, id, &vsid, &hash, "repo", "rev", "gen", &cgid, "{}")
+                .unwrap();
+        }
+        s.queue_enqueue("bad", 0.5).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        s.queue_enqueue("good", 0.5).unwrap();
+
+        let first = s.queue_claim_batch("w", 60_000, 1).unwrap();
+        assert_eq!(first[0].0, "bad", "oldest first");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(s.queue_mark_failed("bad", "w", first[0].1, 3, "boom").unwrap());
+
+        let next = s.queue_claim_batch("w", 60_000, 2).unwrap();
+        let order: Vec<&str> = next.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["good", "bad"]);
     }
 
     /// r02: lease + fencing — a reclaimed row's old owner must be unable to

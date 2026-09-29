@@ -85,6 +85,12 @@ pub struct WorkerStatus {
     pub last_load_ms: Option<u64>,
     /// Idle time after which the worker is stopped (0 = never).
     pub idle_unload_secs: u64,
+    /// Workers killed by the stall watchdog (no progress heartbeat).
+    #[serde(default)]
+    pub stall_kills: u64,
+    /// Unix ms of the most recent stall kill.
+    #[serde(default)]
+    pub last_stall_unix_ms: Option<u64>,
 }
 
 /// Provider-neutral embedding contract (ADR-013). Object-safe so any

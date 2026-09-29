@@ -195,3 +195,62 @@ fn shutdown_then_embed_recovers_via_lazy_restart() {
     assert_eq!(out[0][2], "after-shutdown".len() as f32);
     sup.shutdown();
 }
+
+#[test]
+fn slow_but_progressing_worker_survives_stall_watchdog() {
+    // 3 s of work, heartbeat every ~1 s: a 2 s stall limit must not fire.
+    let sup = WorkerSupervisor::new(launch("slow"));
+    sup.handshake().unwrap();
+    sup.load_model(params()).unwrap();
+    let out = sup
+        .embed_batch_watched(
+            items(&["a", "b"]),
+            Duration::from_secs(20),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(sup.stall_stats().0, 0);
+    sup.shutdown();
+}
+
+#[test]
+fn paused_time_is_not_charged_to_the_work_budget() {
+    // Worker is paused (thermal/VRAM wait) for 3 s; a 1.5 s work budget
+    // must still succeed because paused time is excluded.
+    let sup = WorkerSupervisor::new(launch("paused"));
+    sup.handshake().unwrap();
+    sup.load_model(params()).unwrap();
+    let out = sup
+        .embed_batch_watched(
+            items(&["a"]),
+            Duration::from_millis(1500),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    sup.shutdown();
+}
+
+#[test]
+fn silent_worker_is_killed_by_stall_watchdog_fast() {
+    let sup = WorkerSupervisor::new(launch("hang"));
+    sup.handshake().unwrap();
+    sup.load_model(params()).unwrap();
+    let t = std::time::Instant::now();
+    let err = sup
+        .embed_batch_watched(
+            items(&["stuck"]),
+            Duration::from_secs(300),
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SupervisorError::WorkerStalled(_)),
+        "expected WorkerStalled, got {err:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+    let (kills, last) = sup.stall_stats();
+    assert_eq!(kills, 1);
+    assert!(last.is_some());
+}

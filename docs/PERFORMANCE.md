@@ -66,7 +66,7 @@ SHA-256 hashes; it is never counted in indexing time.
 ### GPU batching (ONNX / DirectML)
 
 - **Length buckets.** Inputs are grouped by token length into buckets of
-  64/128/256/… (up to `onnx_seq_len`) and padded only to their bucket, not
+  32/64/128/256/… (up to `onnx_seq_len`) and padded only to their bucket, not
   to the full window. Code chunks are mostly short, so this removes most
   padding work. Vectors are unchanged (cosine ≥ 0.9999 vs fixed-512 padding).
 - **Token budget per pass.** Each forward pass carries
@@ -103,6 +103,26 @@ SHA-256 hashes; it is never counted in indexing time.
   `CPU: GPU … has 2048 MB VRAM < gpu_min_vram_mb=4096`. If the model then
   fails to load on an eligible GPU, the CPU fallback takes over and the line
   reads `CPU: GPU failed at runtime: …`.
+- **Stall watchdog, not a flat timeout.** The GPU worker sends a heartbeat
+  after every forward pass. A worker silent for 60 s is killed and
+  restarted (`status` → `semantic_identity.worker.stall_kills`), and the
+  batch is bisected like any other crash. Each batch also has a work budget
+  of 60 s + ~1 s per 500 estimated tokens (at most 300 s). Thermal pauses
+  and VRAM-headroom waits are reported as paused and are not charged to
+  either limit, so a hot GPU is never mistaken for a hung one; a single
+  thermal pause is capped at 10 minutes, after which the batch returns to
+  the queue. CPU (Candle) keeps the flat 300 s limit.
+- **Failed items retry at the back of the queue.** A failed attempt
+  re-queues the item behind healthy work of the same priority; after
+  `max_attempts` (3) it is quarantined. Worker crashes and cancellations
+  release items without charging an attempt.
+
+Measured on an RTX A500 (4 GB, 3,965 MiB reported), attic repository,
+11,142 selected chunks, `min_score = 0.0`: **76–89 chunks/s steady**
+(previously 38–51), drained in 160 s including indexing and model load,
+first 1,000 chunks at ≈33 s, peak 85 °C, peak VRAM 3,486 MiB, 0 failures,
+no CPU fallback. A 200,000-chunk queue with 16 poison items (mock engine)
+drains completely: 16 quarantined, 0 left pending or in flight.
 
 ## Sizing your own workspace
 

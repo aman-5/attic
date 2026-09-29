@@ -60,6 +60,8 @@ pub struct SupervisedWorkerProvider {
     load_failed: AtomicBool,
     /// Queue items per `embed_batch` for backends that bucket internally.
     claim_items: Option<usize>,
+    /// Stall watchdog; set only for backends whose engine reports progress.
+    stall_limit: Option<Duration>,
     /// Held shared by every embed call and exclusively by the idle reaper,
     /// so a worker can never be unloaded underneath a running batch.
     gate: RwLock<()>,
@@ -91,6 +93,28 @@ struct LifeState {
 /// provider's token budget, not by this number.
 pub const GPU_CLAIM_ITEMS: usize = 128;
 
+/// GPU worker is killed after this long without a progress heartbeat. The
+/// DirectML engine ticks after every forward pass (well under a second on a
+/// warm device) and reports thermal/VRAM waits as paused, so silence this
+/// long means a hung driver call, not slow work.
+pub const GPU_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// Fixed allowance in every GPU batch budget (new-shape compiles, first pass).
+const GPU_BUDGET_BASE: Duration = Duration::from_secs(60);
+/// Conservative GPU throughput floor used to size a batch's work budget.
+/// Measured ~3000 tok/s on a 4 GB RTX A500; 500 leaves 6x headroom.
+const GPU_BUDGET_TOKENS_PER_SEC: u64 = 500;
+
+/// Work budget for one GPU batch: a fixed base plus time proportional to
+/// its estimated tokens (~2 bytes/token for code), capped at
+/// [`EMBED_DEADLINE`]. Paused time (thermal, VRAM) is not charged, and a
+/// hang is caught earlier by [`GPU_STALL_LIMIT`].
+pub(crate) fn gpu_work_budget(input_bytes: usize) -> Duration {
+    let tokens = (input_bytes as u64).div_ceil(2);
+    let secs = tokens.div_ceil(GPU_BUDGET_TOKENS_PER_SEC);
+    (GPU_BUDGET_BASE + Duration::from_secs(secs)).min(EMBED_DEADLINE)
+}
+
 /// Worker env: padded tokens per GPU forward pass (`[semantic] gpu_batch_tokens`).
 pub const ENV_GPU_BATCH_TOKENS: &str = "ATTIC_GPU_BATCH_TOKENS";
 /// Worker env: GPU pause temperature in °C (`[semantic] gpu_temp_pause_c`).
@@ -108,6 +132,7 @@ impl SupervisedWorkerProvider {
         max_input_bytes: usize,
     ) -> Self {
         let claim_items = (load.backend == "ort-directml").then_some(GPU_CLAIM_ITEMS);
+        let stall_limit = (load.backend == "ort-directml").then_some(GPU_STALL_LIMIT);
         let supervisor = WorkerSupervisor::new(launch);
         // Remember load params immediately so lazy restart works.
         supervisor.load_model_params_only(load);
@@ -126,6 +151,7 @@ impl SupervisedWorkerProvider {
             ready: AtomicBool::new(false),
             load_failed: AtomicBool::new(false),
             claim_items,
+            stall_limit,
             gate: RwLock::new(()),
             life: Mutex::new(LifeState {
                 phase: Phase::NotLoaded,
@@ -277,6 +303,9 @@ fn map_supervisor_error(e: SupervisorError) -> SemanticError {
         SupervisorError::WorkerTimeout(d) => SemanticError::EmbeddingFailed(format!(
             "inference worker exceeded {d:?} deadline and was killed; it will restart on the next batch"
         )),
+        SupervisorError::WorkerStalled(d) => SemanticError::EmbeddingFailed(format!(
+            "inference worker made no progress for {d:?} and was killed; it will restart on the next batch"
+        )),
         SupervisorError::WorkerDied => SemanticError::EmbeddingFailed(
             "inference worker died mid-batch; it will restart on the next batch".into(),
         ),
@@ -338,6 +367,7 @@ impl SemanticProvider for SupervisedWorkerProvider {
     }
 
     fn worker_status(&self) -> Option<WorkerStatus> {
+        let (stall_kills, last_stall) = self.supervisor.stall_stats();
         let life = self.life.lock().unwrap_or_else(|e| e.into_inner());
         let (state, detail) = match life.phase {
             Phase::NotLoaded => ("not_loaded", "not loaded".to_string()),
@@ -364,6 +394,10 @@ impl SemanticProvider for SupervisedWorkerProvider {
             idle_secs: life.last_used_at.map(|t| t.elapsed().as_secs()),
             last_load_ms: life.last_load.map(|d| d.as_millis() as u64),
             idle_unload_secs: self.idle_unload.as_secs(),
+            stall_kills,
+            last_stall_unix_ms: last_stall
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64),
         })
     }
 
@@ -442,8 +476,20 @@ impl SupervisedWorkerProvider {
             }
             None => EMBED_DEADLINE,
         };
+        // A progress-reporting (GPU) engine also gets a size-proportional
+        // work budget, so a slow-but-alive batch is bounded by its own size
+        // rather than the generic 300 s ceiling.
+        let effective_deadline = match self.stall_limit {
+            Some(_) => effective_deadline
+                .min(gpu_work_budget(inputs.iter().map(|i| i.text.len()).sum())),
+            None => effective_deadline,
+        };
 
-        let vectors = match self.supervisor.embed_batch(items, effective_deadline) {
+        let vectors = match self.supervisor.embed_batch_watched(
+            items,
+            effective_deadline,
+            self.stall_limit,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 // `ready` only reflects the state as of the last successful
@@ -653,6 +699,23 @@ mod expected_fingerprint_tests {
     /// `EmbeddingFailed`, whose transient check is substring-based and did
     /// not match "resource pressure", so every occurrence burned a retry and
     /// four units were permanently quarantined by a passing VRAM spike.
+    #[test]
+    fn stall_kill_maps_to_a_worker_killed_failure() {
+        let mapped = map_supervisor_error(SupervisorError::WorkerStalled(GPU_STALL_LIMIT));
+        let SemanticError::EmbeddingFailed(msg) = mapped else {
+            panic!("expected EmbeddingFailed, got {mapped:?}");
+        };
+        assert!(msg.contains("killed"), "{msg}");
+    }
+
+    #[test]
+    fn gpu_work_budget_scales_with_tokens_and_caps() {
+        assert_eq!(gpu_work_budget(0), Duration::from_secs(60));
+        // 64 items x 2 KB ~= 64K tokens -> 60 s + 132 s.
+        assert_eq!(gpu_work_budget(64 * 2048), Duration::from_secs(60 + 132));
+        assert_eq!(gpu_work_budget(usize::MAX / 4), EMBED_DEADLINE);
+    }
+
     #[test]
     fn device_pressure_survives_the_worker_boundary() {
         let mapped = map_supervisor_error(SupervisorError::Engine {
