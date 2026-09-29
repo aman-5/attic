@@ -3,3 +3,6 @@
 # This file does NOT contain machine-specific paths or platform targets.
 # Platform-specific linker setup (e.g. Windows GNU toolchain) belongs in
 # a developer's local, untracked override — see docs/PLAYBOOK.md (Development).
+
+[alias]
+xtask = "run --quiet -p xtask --"

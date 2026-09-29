@@ -314,39 +314,31 @@ The same commands on every OS; no feature flags or `--target` needed (the
 DirectML GPU backend is built in automatically on Windows MSVC).
 
 ```sh
-cargo fmt --all
-cargo fmt --all --check
-cargo check  --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test   --workspace
-cargo build  --release -p attic-server
+cargo xtask check
+cargo xtask install
 ```
+
+`cargo xtask check` runs the same pre-commit checks as plain Cargo commands,
+stopping at the first failure:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+`cargo xtask install` runs `cargo build --release -p attic-server`, stops any
+running local `attic-server` / `attic` process, then installs the binary and
+adjacent runtime libraries into `ATTIC_HOME` or `~/.attic`.
 
 The real-GPU end-to-end test runs automatically inside `cargo test` when
 `~/.attic/models/onnx-fp16` exists; `ATTIC_RUN_MODEL_E2E=0` skips it.
 
-Install the release build as the local server — Windows (PowerShell):
-
-```powershell
-$out = if ($env:CARGO_BUILD_TARGET) { ".\target\$env:CARGO_BUILD_TARGET\release" } else { ".\target\release" }
-Get-Item "$out\attic.exe"                                   # confirm it linked
-Get-Process attic* -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
-Start-Sleep -Seconds 2                                      # let Windows release file locks
-Copy-Item "$out\attic.exe" "$env:USERPROFILE\.attic\attic-server.exe" -Force
-Copy-Item "$out\*.dll"     "$env:USERPROFILE\.attic\" -Force   # DirectML/ONNX Runtime DLLs
-```
-
-Linux / macOS:
-
-```sh
-pkill -x attic-server || true
-install -m 755 target/release/attic ~/.attic/attic-server
-```
-
 If `%USERPROFILE%\.cargo\config.toml` forces `target = "x86_64-pc-windows-gnu"`
 (see below), delete that line when MSVC is installed, or run
 `$env:CARGO_BUILD_TARGET='x86_64-pc-windows-msvc'` once per shell before the
-commands above.
+commands above. `cargo xtask install` will then build and install from
+`target/x86_64-pc-windows-msvc/release/` automatically.
 
 <details>
 <summary><b>Toolchains per platform</b></summary>

@@ -39,7 +39,8 @@ pub struct SelectionConfig {
     /// Hard global cap (queue + storage bound, §20).
     pub max_units_total: usize,
     /// Units whose text exceeds this are NEVER embedded (LARGE safety §19);
-    /// enrichment truncates nothing silently.
+    /// enrichment truncates nothing silently. Units between one provider
+    /// window and this cap are embedded window-by-window and pooled.
     pub max_input_bytes: usize,
     /// Units from FILES larger than this are never embedded, however good
     /// their score (see [`DEFAULT_SEMANTIC_MAX_FILE_BYTES`]). This is the
@@ -77,9 +78,11 @@ impl SelectionConfig {
     /// Observed on a real corpus as 18 of 20 chunks dead (1227..=1769 bytes)
     /// while only the two units under 1024 bytes embedded.
     ///
-    /// Calling this with the live provider's `max_input_bytes()` closes the
-    /// band: oversized units are excluded at selection as [`EX_TOO_LARGE`] —
-    /// visible and counted — instead of becoming permanent queue failures.
+    /// Calling this with the live provider's windowed capacity
+    /// ([`crate::windowed::windowed_capacity`]) closes the band: units beyond
+    /// what enrichment can window are excluded at selection as
+    /// [`EX_TOO_LARGE`] — visible and counted — instead of becoming permanent
+    /// queue failures.
     pub fn for_provider_capacity(mut self, provider_max_input_bytes: usize) -> Self {
         if provider_max_input_bytes > 0 {
             self.max_input_bytes = self.max_input_bytes.min(provider_max_input_bytes);
@@ -106,7 +109,10 @@ impl SelectionConfig {
             // actually reads — so units between the provider ceiling and this
             // gate passed the check documented as "enrichment truncates
             // nothing silently" and were then truncated by the tokenizer.
-            max_input_bytes: Self::MAX_INPUT_BYTES_DEFAULT,
+            // Units above one provider window are embedded in windows and
+            // mean-pooled (see `crate::windowed`), so the gate admits up to
+            // the windowed capacity instead of a single window.
+            max_input_bytes: crate::windowed::windowed_capacity(Self::MAX_INPUT_BYTES_DEFAULT),
             max_file_bytes: DEFAULT_SEMANTIC_MAX_FILE_BYTES,
             exclude_globs: Vec::new(),
         }
@@ -677,7 +683,8 @@ mod tests {
 
     #[test]
     fn oversized_units_never_embed() {
-        let big = "x".repeat(20_000);
+        // Beyond the windowed capacity (16 windows x 2 KiB): excluded, counted.
+        let big = "x".repeat(40_000);
         let rows = vec![row("big", "src/big.rs", "SOURCE", &big)];
         let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &SelectionConfig::default());
         assert_eq!(sel.len(), 0);
@@ -790,7 +797,11 @@ mod tests {
     fn gate_never_admits_more_than_the_live_provider_reads() {
         const NARROW_PROVIDER_BYTES: usize = 512 * 2;
 
-        let cfg = SelectionConfig::default().for_provider_capacity(NARROW_PROVIDER_BYTES);
+        let cfg = SelectionConfig {
+            max_input_bytes: SelectionConfig::MAX_INPUT_BYTES_DEFAULT,
+            ..Default::default()
+        }
+        .for_provider_capacity(NARROW_PROVIDER_BYTES);
         assert!(
             cfg.max_input_bytes <= NARROW_PROVIDER_BYTES,
             "gate {} must not exceed provider capacity {NARROW_PROVIDER_BYTES}",
@@ -804,6 +815,25 @@ mod tests {
         let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
         assert!(sel.is_empty(), "oversized unit must not be selected");
         assert_eq!(rep.excluded.get(EX_TOO_LARGE), Some(&1));
+    }
+
+    /// A provider wider than the default must not *raise* the gate — the
+    /// default encodes other limits too, so the clamp is one-directional.
+    #[test]
+    fn units_above_one_window_are_selected_for_windowed_embedding() {
+        // The Dump regression: DirectML at seq_len 512 reads 1024 bytes, and
+        // every 1025..=2048-byte chunk was excluded. They now fit the
+        // windowed capacity and are selected.
+        let cfg = SelectionConfig::default()
+            .for_provider_capacity(crate::windowed::windowed_capacity(512 * 2));
+        let rows = vec![row(
+            "r-mid",
+            "docs/guide.md",
+            "DOCUMENT",
+            &"word ".repeat(340),
+        )];
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
+        assert_eq!(sel.len(), 1, "report: {rep:?}");
     }
 
     /// A provider wider than the default must not *raise* the gate — the

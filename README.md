@@ -534,6 +534,8 @@ git clone https://github.com/aman-5/attic
 cd attic
 cargo build --release --package attic-server
 # → target/release/attic   (target\release\attic.exe on Windows)
+cargo xtask install
+# → installs the local server to ~/.attic (or %USERPROFILE%\.attic on Windows)
 ```
 
 Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (`rustup show`
@@ -547,8 +549,8 @@ cargo test --workspace
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#development) for the full developer
-workflow, benchmarks and the release process.
+See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#development) for `cargo xtask check`,
+the full developer workflow, benchmarks and the release process.
 
 ## Documentation
 

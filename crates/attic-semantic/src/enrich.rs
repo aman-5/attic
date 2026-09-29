@@ -284,7 +284,10 @@ pub fn drive(
     if provider.fingerprint().is_none() {
         return Ok(EnrichStats::default());
     }
-    drive_leased(conn, store, provider, cfg, cancel)
+    // Units longer than one model window are embedded window-by-window and
+    // pooled into one vector instead of being failed as "input too large".
+    let windowed = crate::windowed::WindowedProvider::new(provider);
+    drive_leased(conn, store, &windowed, cfg, cancel)
 }
 
 fn drive_leased(
@@ -1044,10 +1047,11 @@ impl BackgroundEnricher {
                         // provider (ONNX/DirectML at seq_len 512) turns every
                         // unit in the gap into a permanent "input too large"
                         // queue failure instead of a counted exclusion.
-                        let sel_cfg = cfg
-                            .selection
-                            .clone()
-                            .for_provider_capacity(provider.max_input_bytes());
+                        // Enrichment windows oversized units, so the gate is
+                        // the provider's windowed capacity, not one window.
+                        let sel_cfg = cfg.selection.clone().for_provider_capacity(
+                            crate::windowed::windowed_capacity(provider.max_input_bytes()),
+                        );
                         match reconcile(&conn, &store, provider.as_ref(), &sel_cfg) {
                             Ok(report) if report.enqueued > 0 => {
                                 tracing::info!(

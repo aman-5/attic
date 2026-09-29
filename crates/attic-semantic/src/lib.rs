@@ -40,6 +40,7 @@ pub mod qwen3_provider;
 pub mod selection;
 pub mod store;
 pub mod testing;
+pub mod windowed;
 pub mod worker_supervisor;
 
 pub use cpu_isolation::CpuIsolationPlan;

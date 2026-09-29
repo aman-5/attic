@@ -14,6 +14,7 @@ members = [
     "crates/attic-inference-worker",
     "crates/attic-server",
     "crates/attic-gpu-telemetry-win",
+    "xtask",
 ]
 
 # Phase 7: production release profile.  Conservative, well-supported options
