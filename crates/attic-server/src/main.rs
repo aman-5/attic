@@ -279,21 +279,39 @@ fn candle_backend_from_config(attic_config: &attic_core::AtticConfig) -> &'stati
 /// running ~195x slower than it could, with nothing in the status output
 /// pointing at the cause.
 ///
+/// The ONNX model directory the DirectML provider was actually constructed
+/// with, recorded at provider-resolution time.
+///
+/// `gpu_capability_report` previously re-derived this from config and the
+/// `ATTIC_ONNX_MODEL_DIR` env var alone. Once assets could be auto-downloaded
+/// into the managed cache, that derivation went stale: a server genuinely
+/// running on DirectML reported `status = "not_configured"` and
+/// `onnx_assets_present = false`, telling the operator to set a config key
+/// that was not needed. Recording the resolved path means the report
+/// describes what the process is doing rather than re-deciding it.
+static ACTIVE_ONNX_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// GPU acceleration needs BOTH conditions; this reports exactly which one
 /// is unmet so the answer is never ambiguous again.
 fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::Value {
     let compiled = cfg!(feature = "ort-directml");
 
+    // Precedence mirrors `resolve_semantic_provider`: an explicitly configured
+    // directory wins, otherwise the directory the provider actually opened.
     let configured_dir = attic_config
         .semantic
         .onnx_model_dir
         .clone()
-        .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok());
+        .or_else(|| std::env::var("ATTIC_ONNX_MODEL_DIR").ok())
+        .or_else(|| {
+            ACTIVE_ONNX_DIR
+                .get()
+                .map(|p| p.display().to_string())
+        });
 
-    let assets_present = configured_dir.as_ref().is_some_and(|d| {
-        let p = Path::new(d);
-        p.join("model_fp16.onnx").is_file() && p.join("tokenizer.json").is_file()
-    });
+    let assets_present = configured_dir
+        .as_ref()
+        .is_some_and(|d| attic_semantic::onnx_assets::assets_present(Path::new(d)));
 
     // Only DirectML has a real provider behind it today. The `CandleCuda`,
     // `CandleMetal` and `OrtCoreMl` enum variants exist in
@@ -414,6 +432,7 @@ fn resolve_semantic_provider(
             batch_size,
             attic_config.semantic.dimension,
             None,
+            DEFAULT_ONNX_SEQ_LEN,
         )
     };
 
@@ -429,6 +448,7 @@ fn resolve_semantic_provider(
             batch_size,
             attic_config.semantic.dimension,
             None,
+            DEFAULT_ONNX_SEQ_LEN,
         )
     };
     let cpu_dir = candidate_dirs.iter().find(|dir| {
@@ -471,12 +491,16 @@ fn resolve_semantic_provider(
         let dir = configured.clone().unwrap_or_else(|| managed.clone());
 
         if attic_semantic::onnx_assets::assets_present(&dir) {
+            // Record what we actually opened so status reports the real state
+            // instead of re-deriving it from config that may not mention it.
+            let _ = ACTIVE_ONNX_DIR.set(dir.clone());
             let gpu = supervised_provider(
                 "ort-directml",
                 model_cache_dir,
                 batch_size,
                 attic_config.semantic.dimension,
                 Some(dir),
+                onnx_seq_len(attic_config),
             );
             return match cpu_dir {
                 Some(cpu_dir) => {
@@ -593,6 +617,7 @@ fn supervised_provider(
     batch_size: usize,
     dimension: Option<usize>,
     onnx_dir: Option<PathBuf>,
+    seq_len: usize,
 ) -> Arc<dyn attic_semantic::SemanticProvider> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("attic"));
     let launch = attic_inference_protocol::supervisor::WorkerLaunch {
@@ -606,15 +631,36 @@ fn supervised_provider(
         dimension,
         backend: backend.to_string(),
         onnx_model_dir: onnx_dir.map(|p| p.to_string_lossy().into_owned()),
-        seq_len: Some(512),
+        seq_len: Some(seq_len),
     };
     Arc::new(attic_semantic::SupervisedWorkerProvider::new(
         launch,
         load,
         attic_semantic::expected_fingerprint(backend, dimension),
-        attic_semantic::expected_max_input_bytes(backend, 512),
+        attic_semantic::expected_max_input_bytes(backend, seq_len),
     ))
 }
+
+/// The ONNX/DirectML padded sequence length.
+///
+/// Defaults to [`DEFAULT_ONNX_SEQ_LEN`] so the ONNX read window matches the
+/// Candle one and therefore the selection gate. A smaller window is a valid
+/// throughput trade (padding waste scales with the window) but it shrinks
+/// coverage, so it must be chosen deliberately via config rather than
+/// hardcoded.
+fn onnx_seq_len(attic_config: &attic_core::AtticConfig) -> usize {
+    attic_config
+        .semantic
+        .onnx_seq_len
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_ONNX_SEQ_LEN)
+}
+
+/// Matches `qwen3_provider::DEFAULT_MAX_TOKENS`, which is what the selection
+/// gate is derived from. Previously 512, which silently halved the accepted
+/// input size on the GPU path relative to the gate and made every unit in
+/// between fail permanently.
+const DEFAULT_ONNX_SEQ_LEN: usize = 1024;
 
 /// Phase 2: background model acquisition. Downloads weights OFF the startup
 /// path (canonical/lexical indexing never waits), with the agreed failure
@@ -662,6 +708,7 @@ fn spawn_model_download_task(
                                     batch_size,
                                     dimension,
                                     None,
+                                    DEFAULT_ONNX_SEQ_LEN,
                                 ));
                                 tracing::info!(
                                     "Qwen3 model verified against pinned manifest; supervised worker provider swapped in — semantic retrieval is now live"

@@ -95,6 +95,23 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub onnx_model_dir: Option<String>,
 
+    /// Fixed padded sequence length for the ONNX/DirectML provider.
+    ///
+    /// This is the model's read window, and it anchors the whole size chain:
+    /// the selection gate admits at most `onnx_seq_len * MIN_BYTES_PER_TOKEN`
+    /// bytes, so a unit that passes selection is always one the provider can
+    /// actually read.
+    ///
+    /// Defaults to 1024 so the ONNX window matches the Candle window. It was
+    /// previously pinned to 512 for throughput (padding waste grows with the
+    /// window), but a 512-token window accepts only 1024 bytes while selection
+    /// admitted 2048 — so every unit in between passed the gate and then failed
+    /// permanently with "input too large". Lowering this trades coverage for
+    /// speed and re-opens that gap unless the selection gate moves with it,
+    /// which `SelectionConfig::for_provider_capacity` now guarantees.
+    #[serde(default)]
+    pub onnx_seq_len: Option<usize>,
+
     /// Which device to run embedding inference on.
     ///
     /// Accepted values: `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`.
@@ -127,6 +144,7 @@ impl Default for SemanticConfig {
             exclude_globs: Vec::new(),
             max_file_bytes: None,
             onnx_model_dir: None,
+            onnx_seq_len: None,
             device: None,
         }
     }

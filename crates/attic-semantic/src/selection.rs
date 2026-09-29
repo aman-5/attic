@@ -64,6 +64,29 @@ impl SelectionConfig {
     pub const MAX_INPUT_BYTES_DEFAULT: usize =
         crate::qwen3_provider::DEFAULT_MAX_TOKENS * crate::qwen3_provider::MIN_BYTES_PER_TOKEN;
 
+    /// Re-anchor the selection gate to the capacity of the provider that will
+    /// actually embed these units.
+    ///
+    /// [`MAX_INPUT_BYTES_DEFAULT`](Self::MAX_INPUT_BYTES_DEFAULT) is a
+    /// *compile-time* constant derived from the Candle provider. That made the
+    /// documented `selection gate <= provider capacity` chain hold only for
+    /// Candle. When the ONNX/DirectML provider ran with a smaller window
+    /// (seq_len 512 => 1024 bytes) while the gate still admitted 2048, every
+    /// unit in the 1025..=2048 band passed selection, was enqueued, and then
+    /// failed *permanently* at the enrichment pre-check with "input too large".
+    /// Observed on a real corpus as 18 of 20 chunks dead (1227..=1769 bytes)
+    /// while only the two units under 1024 bytes embedded.
+    ///
+    /// Calling this with the live provider's `max_input_bytes()` closes the
+    /// band: oversized units are excluded at selection as [`EX_TOO_LARGE`] —
+    /// visible and counted — instead of becoming permanent queue failures.
+    pub fn for_provider_capacity(mut self, provider_max_input_bytes: usize) -> Self {
+        if provider_max_input_bytes > 0 {
+            self.max_input_bytes = self.max_input_bytes.min(provider_max_input_bytes);
+        }
+        self
+    }
+
     /// The default configuration as a const expression — the single source of
     /// truth for the defaults, so `EnrichmentConfig::standalone` can stay a
     /// `const fn` (its callers use it in const contexts). `Default::default()`
@@ -704,5 +727,53 @@ mod tests {
         let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
         assert_eq!(sel.len(), 3); // repo cap binds before global cap
         assert_eq!(rep.excluded.get(EX_CAP_REPO), Some(&7));
+    }
+
+    /// The regression this guards: the selection gate was a compile-time
+    /// constant derived from the Candle provider (1024 tokens => 2048 bytes),
+    /// while the live ONNX/DirectML provider ran a 512-token window
+    /// (=> 1024 bytes). Units in the 1025..=2048 band passed selection, were
+    /// enqueued, and then failed *permanently* with "input too large".
+    /// A real corpus lost 18 of 20 chunks (1227..=1769 bytes) this way.
+    #[test]
+    fn gate_never_admits_more_than_the_live_provider_reads() {
+        const NARROW_PROVIDER_BYTES: usize = 512 * 2;
+
+        let cfg = SelectionConfig::default().for_provider_capacity(NARROW_PROVIDER_BYTES);
+        assert!(
+            cfg.max_input_bytes <= NARROW_PROVIDER_BYTES,
+            "gate {} must not exceed provider capacity {NARROW_PROVIDER_BYTES}",
+            cfg.max_input_bytes
+        );
+
+        // A unit inside the old dead band must now be excluded and COUNTED,
+        // never silently admitted for a permanent downstream failure.
+        let big = "x".repeat(1_600);
+        let rows = vec![row("r-big", "src/big.rs", "SOURCE", &big)];
+        let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
+        assert!(sel.is_empty(), "oversized unit must not be selected");
+        assert_eq!(rep.excluded.get(EX_TOO_LARGE), Some(&1));
+    }
+
+    /// A provider wider than the default must not *raise* the gate — the
+    /// default encodes other limits too, so the clamp is one-directional.
+    #[test]
+    fn a_wider_provider_does_not_loosen_the_gate() {
+        let base = SelectionConfig::default().max_input_bytes;
+        let cfg = SelectionConfig::default().for_provider_capacity(base * 4);
+        assert_eq!(cfg.max_input_bytes, base);
+    }
+
+    /// A provider reporting zero capacity is nonsense; keep the default
+    /// rather than clamping the gate to zero and excluding everything.
+    #[test]
+    fn a_zero_capacity_provider_is_ignored() {
+        let base = SelectionConfig::default().max_input_bytes;
+        assert_eq!(
+            SelectionConfig::default()
+                .for_provider_capacity(0)
+                .max_input_bytes,
+            base
+        );
     }
 }

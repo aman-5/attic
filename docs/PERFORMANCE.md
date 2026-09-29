@@ -90,6 +90,7 @@ embedded:
 | Faster embeddings on Apple Silicon | Build with `--features candle-metal` (the default for `aarch64-apple-darwin` release builds) |
 | Faster embeddings on Linux + NVIDIA | Build with `--features candle-cuda` on a machine with the CUDA toolkit installed |
 | Less embedding work | `[semantic] exclude_globs` for generated, vendored or snapshot data; lower `max_file_bytes` |
+| Faster GPU embeddings, less coverage | `[semantic] onnx_seq_len = 512`. Halves the padded window, but also halves the largest unit that can be embedded — units above the new ceiling are excluded from selection and counted as `exceeds_max_input_bytes`, not embedded. Leave unset (1024) unless you have measured the trade |
 | Keep the laptop responsive | `[resources] mode = "low"`, or lower `[indexing] analysis_threads` |
 | Index many repositories faster | `[resources] mode = "performance"` or a higher `scheduler_workers` |
 | Smaller semantic database | `[semantic] dimension = 512` (re-embeds once) |

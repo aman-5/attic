@@ -855,7 +855,17 @@ impl BackgroundEnricher {
                     };
                     if should_reconcile {
                         let _release_gate = ReconcileGuard(&reconcile_gate);
-                        match reconcile(&conn, &store, provider.as_ref(), &cfg.selection) {
+                        // Clamp the gate to the provider that will actually
+                        // embed these units. Without this the gate keeps its
+                        // compile-time Candle-derived ceiling, and a narrower
+                        // provider (ONNX/DirectML at seq_len 512) turns every
+                        // unit in the gap into a permanent "input too large"
+                        // queue failure instead of a counted exclusion.
+                        let sel_cfg = cfg
+                            .selection
+                            .clone()
+                            .for_provider_capacity(provider.max_input_bytes());
+                        match reconcile(&conn, &store, provider.as_ref(), &sel_cfg) {
                             Ok(report) if report.enqueued > 0 => {
                                 tracing::info!(
                                     enqueued = report.enqueued,
