@@ -98,14 +98,8 @@ impl Fixture {
             .apply_pending(&self.pool, &self.writer, Some(u64::MAX / 2))
             .expect("apply_pending");
         assert!(!report.queue_saturated, "fixture queue must never saturate");
-        while run_next_task_synchronously(
-            &self.pool,
-            &self.writer,
-            &self.repo_dir,
-            &self.policy(),
-            None,
-        )
-        .expect("task execution")
+        while run_next_task_synchronously(&self.pool, &self.writer, &self.policy(), None)
+            .expect("task execution")
         {}
     }
 
@@ -115,14 +109,8 @@ impl Fixture {
             .apply_operations(&self.pool, &self.writer, ops)
             .expect("apply ops");
         assert!(!report.queue_saturated);
-        while run_next_task_synchronously(
-            &self.pool,
-            &self.writer,
-            &self.repo_dir,
-            &self.policy(),
-            None,
-        )
-        .expect("task execution")
+        while run_next_task_synchronously(&self.pool, &self.writer, &self.policy(), None)
+            .expect("task execution")
         {}
     }
 

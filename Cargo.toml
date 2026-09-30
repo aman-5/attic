@@ -11,7 +11,10 @@ members = [
     "crates/attic-indexing",
     "crates/attic-incremental",
     "crates/attic-retrieval",
+    "crates/attic-inference-worker",
     "crates/attic-server",
+    "crates/attic-gpu-telemetry-win",
+    "xtask",
 ]
 
 # Phase 7: production release profile.  Conservative, well-supported options
@@ -24,6 +27,108 @@ lto           = "thin"
 codegen-units = 1
 strip         = "symbols"
 
+# Phase 7 build-footprint: full debuginfo on Windows produces multi-GB .pdb
+# files per binary/test — the dominant contributor to a ~30 GB target dir.
+# Line tables keep stack traces/debugging usable while cutting artifact size
+# dramatically. Split-debuginfo keeps it out of the final binaries.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+
+# Compile compute-heavy tensor dependencies and semantic models with optimization in dev/test
+[profile.dev.package.candle-core]
+opt-level = 3
+
+[profile.dev.package.candle-nn]
+opt-level = 3
+
+[profile.dev.package.candle-transformers]
+opt-level = 3
+
+[profile.dev.package.attic-semantic]
+opt-level = 3
+
+[profile.test.package.candle-core]
+opt-level = 3
+
+[profile.test.package.candle-nn]
+opt-level = 3
+
+[profile.test.package.candle-transformers]
+opt-level = 3
+
+[profile.test.package.attic-semantic]
+opt-level = 3
+
+# Candle's CPU matmul kernels live in the `gemm*` crates (with `pulp` SIMD
+# dispatch and `half` conversions), not in candle-core itself, and BPE
+# tokenization lives in `tokenizers`. Optimizing only the candle crates above
+# left the actual arithmetic unoptimized: a real Qwen3 CPU run under the test
+# profile measured 3.7 tokens/s. Release builds are unaffected (everything is
+# already opt-level 3 there).
+[profile.dev.package.gemm]
+opt-level = 3
+
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[profile.dev.package.gemm-f32]
+opt-level = 3
+
+[profile.dev.package.gemm-f64]
+opt-level = 3
+
+[profile.dev.package.gemm-c32]
+opt-level = 3
+
+[profile.dev.package.gemm-c64]
+opt-level = 3
+
+[profile.dev.package.pulp]
+opt-level = 3
+
+[profile.dev.package.half]
+opt-level = 3
+
+[profile.dev.package.tokenizers]
+opt-level = 3
+
+[profile.test.package.gemm]
+opt-level = 3
+
+[profile.test.package.gemm-common]
+opt-level = 3
+
+[profile.test.package.gemm-f16]
+opt-level = 3
+
+[profile.test.package.gemm-f32]
+opt-level = 3
+
+[profile.test.package.gemm-f64]
+opt-level = 3
+
+[profile.test.package.gemm-c32]
+opt-level = 3
+
+[profile.test.package.gemm-c64]
+opt-level = 3
+
+[profile.test.package.pulp]
+opt-level = 3
+
+[profile.test.package.half]
+opt-level = 3
+
+[profile.test.package.tokenizers]
+opt-level = 3
+
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
@@ -33,7 +138,7 @@ license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/aman-5/attic"
 
 [workspace.dependencies]
-rusqlite           = { version = "0.40.2",  default-features = false, features = ["bundled"] }
+rusqlite           = { version = "0.40.2",  default-features = false, features = ["bundled", "cache"] }
 thiserror          = "2.0.20"
 serde              = { version = "1.0.219", features = ["derive"] }
 serde_json         = "1.0.140"
@@ -79,12 +184,12 @@ rmcp               = { version = "3.1.4",   features = ["server", "transport-io"
 anyhow             = "1"
 # Phase 7: cross-platform process memory measurement (real RSS, not counters).
 # default-features = false avoids gui/web deps; only the `system` feature is needed.
-sysinfo            = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo            = { version = "0.33", default-features = false, features = ["system", "disk"] }
 # Test utilities
 tempfile           = "3"
 # Phase 8: attic.toml resource/embedding tunables (pure parsing, no I/O)
 toml               = "1"
-# Phase 9: BgeEmbedder — real neural semantic embeddings (BAAI/bge-base-en-v1.5, 768d).
+# Production Neural Embedder: Qwen3Embedder (Qwen/Qwen3-Embedding-0.6B).
 # Pinned to 0.9.1, NOT the newer 0.10.0+/0.11.0 releases: starting at 0.10.0,
 # candle-core unconditionally depends on `tokenizers` with the `onig` feature
 # (a C library requiring a C compiler toolchain) on every non-wasm target —
@@ -95,11 +200,11 @@ toml               = "1"
 # reference-compatibility test (cosine >=0.999 against sentence-transformers
 # output) still passes on 0.9.1. CPU-only (no cuda/mkl/metal features) to
 # match the "no exotic backend" release profile above.
-candle-core        = "0.9.1"
-candle-nn          = "0.9.1"
-candle-transformers = "0.9.1"
+candle-core        = "0.11.0"
+candle-nn          = "0.11.0"
+candle-transformers = "0.11.0"
 # `fancy-regex` (pure Rust), NOT `onig` (a C library requiring a C compiler
-# toolchain) — the tokenizers crate requires one of the two; BGE's WordPiece
+# toolchain) — the tokenizers crate requires one of the two; Qwen3's byte-level BPE
 # tokenizer needs neither's advanced regex features, so the pure-Rust option
 # is strictly better here and keeps this dependency C-toolchain-free, matching
 # the reason Candle was chosen over ONNX-based alternatives in the first place.

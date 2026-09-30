@@ -185,6 +185,61 @@ fn swift_fixture_extracts_class_and_method_symbols() {
     );
 }
 
+// ── Kotlin ───────────────────────────────────────────────────────────────
+
+#[test]
+fn kotlin_fixture_extracts_spring_style_declarations() {
+    let reg = default_registry();
+    let code = r#"package com.acme.orders
+
+@RestController
+class OrderController(private val service: OrderService) {
+    @GetMapping("/orders/{id}")
+    fun find(id: Long): Order = service.find(id)
+
+    companion object Paths {
+        const val BASE = "/orders"
+    }
+}
+
+interface OrderService {
+    fun find(id: Long): Order
+}
+
+object OrderMetrics
+
+typealias OrderId = Long
+
+fun Order.total(): Long = lines.sumOf { it.price }
+"#;
+    let out = dispatch(&reg, input(code, "kotlin", FileType::Other));
+    assert!(!out.fallback_used, "diagnostics: {:?}", out.diagnostics);
+    for (name, kind) in [
+        ("OrderController", SymbolKind::Class),
+        ("OrderService", SymbolKind::Class),
+        ("OrderMetrics", SymbolKind::Class),
+        ("Paths", SymbolKind::Class),
+        ("find", SymbolKind::Function),
+        ("total", SymbolKind::Function),
+        ("OrderId", SymbolKind::TypeAlias),
+    ] {
+        assert!(
+            out.symbols
+                .iter()
+                .any(|s| s.short_name == name && s.kind == kind),
+            "expected {name} as {kind:?}; got {:?}",
+            out.symbols
+                .iter()
+                .map(|s| (&s.short_name, s.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !out.retrieval_units.is_empty(),
+        "lexical coverage must be preserved"
+    );
+}
+
 // ── Lua ──────────────────────────────────────────────────────────────────
 
 #[test]

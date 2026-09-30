@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use attic_discovery::DiscoveryPolicy;
 use attic_storage::{DbPool, IncrementalTaskPayload, ResourceMonitor, WriterQueueHandle};
@@ -470,7 +470,7 @@ impl IncrementalService {
                 .store(true, Ordering::SeqCst);
             let repo_id = self.resolve_repo(pool)?;
             mark_paths_unknown(writer, &repo_id, &cs.uncertain)?;
-            recovery::schedule_reconciliation_for(writer, &repo_id)?;
+            recovery::schedule_reconciliation(writer, &repo_id)?;
         }
 
         // ── Verified restorations: hash matched ⇒ UNKNOWN→CURRENT ─────────
@@ -483,7 +483,7 @@ impl IncrementalService {
         if cs.policy_changed {
             debug!("discovery-policy input changed; scheduling targeted rediscovery");
             let repo_id = self.resolve_repo(pool)?;
-            recovery::schedule_reconciliation_for(writer, &repo_id)?;
+            recovery::schedule_reconciliation(writer, &repo_id)?;
             report.policy_rediscovery_scheduled = true;
         }
 
@@ -512,7 +512,7 @@ impl IncrementalService {
                     &repo_id,
                     &cs.touched_paths().into_iter().collect::<Vec<_>>(),
                 )?;
-                recovery::schedule_reconciliation_for(writer, &repo_id)?;
+                recovery::schedule_reconciliation(writer, &repo_id)?;
                 report.queue_saturated = true;
             }
         }
@@ -689,13 +689,11 @@ impl IncrementalService {
                             for ev in &debounced {
                                 normalized.extend(events::normalize_debounced(ev, &svc_pump.root));
                             }
-                            if std::env::var("ATTIC_PUMP_TRACE").is_ok() {
-                                eprintln!(
-                                    "PUMP batch n={} drops={}",
-                                    normalized.len(),
-                                    dropped.load(Ordering::SeqCst)
-                                );
-                            }
+                            trace!(
+                                events = normalized.len(),
+                                drops = dropped.load(Ordering::SeqCst),
+                                "watch pump batch"
+                            );
                             let drops = svc_pump.note_raw_drops(&dropped);
                             if drops > 0 {
                                 // Saturation ⇒ authoritative rescan, deduped.
@@ -720,9 +718,6 @@ impl IncrementalService {
                             schedule_reconciliation_for_service(&svc_pump, &pool, &writer);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if std::env::var("ATTIC_PUMP_TRACE").is_ok() {
-                                eprintln!("PUMP tick");
-                            }
                             // TICK: pending coalesced events whose quiet
                             // period elapsed are flushed here even when the
                             // watcher produced nothing further.
@@ -872,21 +867,21 @@ pub(crate) fn apply_restored(
 }
 
 /// Best-effort reconciliation trigger from the watch pump thread, scoped to
-/// this service's own repository when it is already resolved. Falls back to
-/// the repository-less legacy form when the repository has not been
-/// bootstrapped yet — never silently reconciles a DIFFERENT repository.
+/// this service's own repository. A repository that is not bootstrapped yet
+/// has nothing to reconcile — its bootstrap performs the full authoritative
+/// discovery walk — so the trigger is skipped rather than aimed elsewhere.
 fn schedule_reconciliation_for_service(
     svc: &IncrementalService,
     pool: &DbPool,
     writer: &WriterQueueHandle,
 ) {
-    match svc.resolve_repo(pool).ok() {
-        Some(repo_id) => {
-            let _ = recovery::schedule_reconciliation_for(writer, &repo_id);
+    match svc.resolve_repo(pool) {
+        Ok(repo_id) => {
+            if let Err(e) = recovery::schedule_reconciliation(writer, &repo_id) {
+                warn!(repository_id = %repo_id, error = %e, "failed to schedule reconciliation");
+            }
         }
-        None => {
-            let _ = recovery::schedule_reconciliation(writer);
-        }
+        Err(e) => debug!(error = %e, "reconciliation skipped: repository not bootstrapped yet"),
     }
 }
 

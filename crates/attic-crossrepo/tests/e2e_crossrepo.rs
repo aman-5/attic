@@ -1479,3 +1479,95 @@ fn e2e_workspace_snapshot_revision_set_is_exact_no_fabrication() {
         );
     }
 }
+
+/// r12: OSGi bundle manifests on disk → sync parses them → resolver links
+/// importer repo to exporter repo across the workspace.
+#[test]
+fn e2e_osgi_import_export_links_bundles() {
+    let conn = seeded_conn();
+    let provider_dir = tempfile::tempdir().unwrap();
+    let consumer_dir = tempfile::tempdir().unwrap();
+
+    std::fs::create_dir_all(provider_dir.path().join("META-INF")).unwrap();
+    std::fs::write(
+        provider_dir.path().join("META-INF/MANIFEST.MF"),
+        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.acme.payment.core\r\nExport-Package: com.acme.payment.api;version=\"1.0.0\"\r\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(consumer_dir.path().join("META-INF")).unwrap();
+    std::fs::write(
+        consumer_dir.path().join("META-INF/MANIFEST.MF"),
+        "Manifest-Version: 1.0\r\nBundle-SymbolicName: com.acme.payment.ui\r\nImport-Package: com.acme.payment.api;version=\"[1.0,2.0)\"\r\n",
+    )
+    .unwrap();
+
+    insert_repo(
+        &conn,
+        "osgi-provider",
+        &provider_dir.path().to_string_lossy(),
+    );
+    insert_repo(
+        &conn,
+        "osgi-consumer",
+        &consumer_dir.path().to_string_lossy(),
+    );
+    insert_rev(&conn, "osgi-provider");
+    insert_rev(&conn, "osgi-consumer");
+
+    sync_repository(&conn, &tid("osgi-provider")).unwrap();
+    sync_repository(&conn, &tid("osgi-consumer")).unwrap();
+
+    let catalog_p =
+        attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("osgi-provider")).unwrap();
+    let catalog_c =
+        attic_storage::crossrepo_ops::catalog_entry(&conn, &tid("osgi-consumer")).unwrap();
+
+    let repo_data = vec![
+        RepoCatalogData {
+            repository_id: tid("osgi-provider"),
+            root_path: provider_dir.path().to_string_lossy().to_string(),
+            source_revision_id: catalog_p
+                .as_ref()
+                .map(|c| c.source_revision_id.clone())
+                .unwrap_or_default(),
+            provides: vec![ProvidedIdentity {
+                ecosystem: Ecosystem::Osgi,
+                name: "com.acme.payment.api".to_owned(),
+            }],
+            declarations: vec![],
+            primary_anchor_occurrence: None,
+            go_module_prefix: None,
+        },
+        RepoCatalogData {
+            repository_id: tid("osgi-consumer"),
+            root_path: consumer_dir.path().to_string_lossy().to_string(),
+            source_revision_id: catalog_c
+                .as_ref()
+                .map(|c| c.source_revision_id.clone())
+                .unwrap_or_default(),
+            provides: vec![],
+            declarations: vec![DependencyDeclaration {
+                path: "META-INF/MANIFEST.MF".to_owned(),
+                ecosystem: Ecosystem::Osgi,
+                name: "com.acme.payment.api".to_owned(),
+                version_req: Some("[1.0,2.0)".to_owned()),
+                kind: DeclarationKind::External,
+                local_hint: None,
+            }],
+            primary_anchor_occurrence: None,
+            go_module_prefix: None,
+        },
+    ];
+
+    let (edges, diagnostics) = resolver::resolve_workspace(&repo_data, &HashMap::new());
+    assert!(
+        diagnostics.is_empty(),
+        "no resolution diagnostics expected: {diagnostics:?}"
+    );
+    let edge = edges
+        .iter()
+        .find(|e| e.source_repository_id == tid("osgi-consumer"))
+        .expect("consumer must link to provider");
+    assert_eq!(edge.target_repository_id, tid("osgi-provider"));
+    assert_eq!(edge.dependency_basis, "OSGI_BUNDLE");
+}

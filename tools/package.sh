@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 7 release packaging for Attic.
+# Release packaging for Attic.
 #
 # Builds attic-server for a target triple and assembles a clean release
 # archive with the canonical layout:
@@ -14,13 +14,20 @@
 # The archive NEVER contains: target/, Cargo build artifacts, developer
 # scripts, local configuration, test databases, logs, or hidden files.
 #
-# Usage:
 #   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
+#                   [--features "<cargo-features>"] [--stage-only]
+#
+# Backend variants:
+#   default build                 Target default; Windows MSVC includes
+#                                 DirectML automatically.
+#   Windows DirectML              Built automatically for the MSVC target; no
+#                                 feature flag is needed. The
+#                                 `inference-worker` subcommand is part of the
+#                                 same binary; no extra artifact is packaged.
 #
 # Cross-compilation targets:
 #   x86_64-pc-windows-msvc      Windows x86_64
 #   x86_64-unknown-linux-gnu    Linux x86_64
-#   x86_64-apple-darwin         macOS x86_64
 #   aarch64-apple-darwin        macOS ARM64
 set -euo pipefail
 
@@ -29,6 +36,9 @@ usage() { echo "usage: $0 --target <triple> [--out <dir>] [--stage-only] | --ver
 MODE=build
 STAGE_ONLY=false
 TARGET=
+# Optional Cargo feature set for explicit backend variants. Empty = default
+# release build for the target.
+FEATURES=
 OUT=dist
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --out) OUT="$2"; shift 2 ;;
     --verify) MODE=verify; VERIFY_DIR="$2"; shift 2 ;;
     --stage-only) STAGE_ONLY=true; shift ;;
+    --features) FEATURES="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -43,7 +54,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${ATTIC_RELEASE_VERSION:-$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')}"
 
-SUPPORTED_TARGETS="x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin"
+SUPPORTED_TARGETS="x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin"
 
 if [[ "$MODE" == verify ]]; then
   DIR="${VERIFY_DIR:?--verify requires a directory}"
@@ -93,8 +104,45 @@ case " $SUPPORTED_TARGETS " in
 esac
 
 cd "$REPO_ROOT"
-echo "== building attic-server for $TARGET"
-cargo build --release --package attic-server --target "$TARGET"
+
+# Per-target GPU backend defaults.
+#
+# Windows      -> DirectML is compiled automatically for the MSVC target by
+#                 attic-semantic, so no feature flag is required.
+#
+# macOS arm64  -> candle-metal. Metal ships with the OS and needs no SDK
+#                 beyond the Xcode command line tools, so this cannot fail
+#                 to build on any machine that can already build the target,
+#                 and every Apple Silicon Mac can actually use it.
+#
+# Linux        -> nothing, DESPITE candle-cuda existing and working. It is a
+#                 deliberate omission, not an oversight: linking it requires
+#                 the NVIDIA CUDA toolkit *at build time*, so defaulting it
+#                 on would turn a routine release build into a hard failure
+#                 on every machine and CI runner without the toolkit
+#                 installed — and would do so for the majority of Linux
+#                 users, who have no NVIDIA card at all. Build the CUDA
+#                 variant explicitly on a toolkit-equipped machine:
+#
+#                     tools/package.sh --target x86_64-unknown-linux-gnu \
+#                       --features candle-cuda
+#
+# In every case `device.rs` resolves the actual device at runtime and falls
+# back to CPU with a stated reason, so a binary built with a GPU feature
+# still runs correctly on a machine that has no such device.
+if [[ -z "$FEATURES" ]]; then
+  case "$TARGET" in
+    aarch64-apple-darwin) FEATURES="candle-metal" ;;
+  esac
+  [[ -n "$FEATURES" ]] && echo "== enabling default GPU backend for $TARGET: $FEATURES"
+fi
+
+echo "== building attic-server for $TARGET${FEATURES:+ (features: $FEATURES)}"
+if [[ -n "$FEATURES" ]]; then
+  cargo build --release --package attic-server --target "$TARGET" --features "$FEATURES"
+else
+  cargo build --release --package attic-server --target "$TARGET"
+fi
 
 # The Cargo package is named `attic-server` but its `[[bin]]` target is
 # named `attic` (see crates/attic-server/Cargo.toml) — cargo therefore
@@ -118,9 +166,7 @@ for lic in LICENSE-MIT LICENSE-APACHE; do
   [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"
 done
 # Operator docs only (markdown), preserving relative structure under docs/.
-# FINAL_VALIDATION_TODO.md is an internal pre-release validation checklist,
-# not end-user documentation — deliberately excluded from release archives.
-(cd "$REPO_ROOT" && find docs -name '*.md' -type f ! -name 'FINAL_VALIDATION_TODO.md') | while read -r doc; do
+(cd "$REPO_ROOT" && find docs -name '*.md' -type f) | while read -r doc; do
   mkdir -p "$STAGE/$(dirname "$doc")"
   cp "$REPO_ROOT/$doc" "$STAGE/$doc"
 done

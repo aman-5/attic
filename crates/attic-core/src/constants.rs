@@ -13,42 +13,38 @@ pub const ANALYZER_REGISTRY_VERSION: &str = "0.2.0";
 /// Increment this whenever the ruleset changes to trigger re-scanning.
 pub const SECRET_PATTERN_VERSION: i64 = 1;
 
+/// Chunking/segmentation strategy version — a REAL, live value (Phase: identity
+/// split). MUST be bumped whenever chunk boundary logic changes (e.g. the
+/// generic analyzer's TARGET_CHUNK_CHARS or a content-class router), so stale
+/// generations are detectable instead of silently mixing chunk shapes.
+/// 1.x = legacy line-count cap; 2.0.0 = character-target (TARGET_CHUNK_CHARS).
+pub const CHUNKING_VERSION: &str = "2.0.0";
+
 /// Well-known keys used in the `subsystem_versions_json` map stored in
-/// `core_index_generations`. Keep in sync with the migration SQL.
+/// `core_index_generations`.
 pub mod subsystem_keys {
     /// Schema migration version.
     pub const SCHEMA: &str = "schema";
     /// Analyzer registry version.
     pub const ANALYZER_REGISTRY: &str = "analyzer_registry";
-    /// Segmentation algorithm version.
-    pub const SEGMENTATION: &str = "segmentation";
     /// Indexer pipeline version.
     pub const INDEXER: &str = "indexer";
-    /// Ranking algorithm version.
-    pub const RANKING: &str = "ranking";
-    /// Embedding model identifier.
-    pub const EMBEDDING_MODEL: &str = "embedding_model";
     /// Secret-detector ruleset version (mirrors `SECRET_PATTERN_VERSION`).
     pub const SECRET_DETECTOR: &str = "secret_detector";
-    /// General configuration version.
-    pub const CONFIGURATION: &str = "configuration";
 }
 
-/// Resource management constants for Phase 7 production hardening.
-///
-/// These are compile-time defaults that the server may override from
-/// configuration at startup.  They must not be changed between restarts
-/// without a migration.
+/// Built-in resource defaults, used when neither `attic.toml [resources]`
+/// nor the resource policy (hardware/mode sizing) supplies a value; see
+/// `attic_storage::resource_policy` and `resource_manager::ResourceConfig`.
 pub mod resources {
     /// Maximum concurrent foreground MCP queries.  Prevents query flooding.
     pub const MAX_FOREGROUND_QUERIES: usize = 64;
 
     /// Maximum concurrent indexing workers.  Prevents indexing from starving
-    /// foreground queries (see foreground_priority.md §2).
+    /// foreground queries.
     pub const MAX_INDEXING_WORKERS: usize = 8;
 
-    /// Maximum concurrent semantic enrichment workers.  Only active when
-    /// ATTIC_SEMANTIC=1; baseline hashing embedder is single-threaded.
+    /// Maximum concurrent semantic enrichment workers.
     pub const MAX_SEMANTIC_WORKERS: usize = 4;
 
     /// Total memory budget for all in-index operations (MiB).  When approached,
@@ -59,39 +55,6 @@ pub mod resources {
     /// Per-repository memory budget ceiling (MiB).  No single repository may
     /// consume more than this during indexing.
     pub const PER_REPO_MEMORY_BUDGET_MIB: u64 = 512;
-
-    /// Maximum disk I/O operations per second across all workers.  When
-    /// exceeded, the system backs off expensive fs operations.
-    pub const MAX_IO_OPS_PER_SEC: u64 = 200;
-
-    /// Maximum queue depth for the writer queue (pending mutations).  Beyond
-    /// this, `WriterQueueHandle::send` returns `QueueFull`.
-    pub const WRITER_QUEUE_CAPACITY: usize = 512;
-
-    /// Maximum batch size for writer commits (mutations per transaction).
-    pub const WRITER_BATCH_SIZE: usize = 256;
-
-    /// Flush the writer batch at least this often (ms).
-    pub const WRITER_FLUSH_INTERVAL_MS: u64 = 50;
-
-    /// Maximum pending incremental tasks in the queue.
-    pub const INCREMENTAL_TASK_QUEUE_CAPACITY: usize = 1024;
-
-    /// Maximum number of pending reconciliation tasks.
-    pub const RECONCILIATION_TASK_QUEUE_CAPACITY: usize = 256;
-
-    /// Maximum depth of graph traversal for evidence expansion.
-    pub const MAX_GRAPH_DEPTH: usize = 5;
-
-    /// Maximum nodes traversed in a single graph walk.
-    pub const MAX_GRAPH_NODES: usize = 500;
-
-    /// Maximum tokens consumed by context building for a single query.
-    pub const MAX_CONTEXT_TOKENS: usize = 8192;
-
-    /// Default timeout for background tasks (ms).  Tasks exceeding this are
-    /// cancelled and rescheduled.
-    pub const DEFAULT_TASK_TIMEOUT_MS: u64 = 300_000;
 
     /// Minimum free memory (MiB) that must be retained after foreground work.
     /// Background indexing pauses if falling below this threshold.
@@ -105,28 +68,10 @@ pub mod resources {
     /// which reject or clamp configurations that violate this invariant.
     pub const MIN_FREE_MEMORY_MIB: u64 = 400;
 
-    /// Backup directory relative to database path (for crash recovery backups).
+    /// Backup directory, relative to the Attic home (crash-recovery backups).
     pub const BACKUP_RELATIVE_DIR: &str = "backups";
 
-    /// Maximum number of backup checkpoints to retain (REC-B2).
-    pub const MAX_BACKUP_RETAIN: usize = 3;
-
-    /// Checkpoint interval: every N WAL frames OR every M minutes, whichever comes first.
-    pub const CHECKPOINT_WAL_FRAMES: u64 = 1000;
-
-    /// Checkpoint interval: every N minutes (alternative to WAL frames threshold).
-    pub const CHECKPOINT_MINUTES: u64 = 5;
-
-    /// Whether WAL auto-checkpoint is enabled.
-    pub const WAL_AUTOCKPT_ENABLED: bool = true;
-
-    /// Graceful shutdown timeout (ms).  Server waits this long for in-flight
-    /// tasks to complete before force-exiting.
+    /// Graceful shutdown timeout (ms).  The server waits this long for
+    /// in-flight tasks to complete before force-exiting.
     pub const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
-
-    /// Whether integrity check is performed at startup.
-    pub const STARTUP_INTEGRITY_CHECK: bool = true;
-
-    /// Whether foreign key check is performed at startup.
-    pub const STARTUP_FOREIGN_KEY_CHECK: bool = true;
 }

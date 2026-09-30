@@ -38,7 +38,13 @@ impl HardwareSnapshot {
         let mut sys = System::new();
         sys.refresh_memory();
         let total_memory_mib = sys.total_memory() / (1024 * 1024);
-        let cpu_cores = sys.physical_core_count().unwrap_or(0);
+        // Fault-injection hook (like ATTIC_FORCE_RESOURCE_PRESSURE): pin the
+        // core count so resource tests don't depend on the CI runner's size.
+        let cpu_cores = std::env::var("ATTIC_FORCE_CPU_CORES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| sys.physical_core_count().unwrap_or(0));
         if total_memory_mib == 0 || cpu_cores == 0 {
             return Err(ResourceDetectionError(format!(
                 "implausible hardware snapshot (total_memory_mib={total_memory_mib}, cpu_cores={cpu_cores})"
@@ -131,8 +137,7 @@ pub struct ResourcePolicy {
     pub min_free_memory_mib: u64,
     /// `ResourceMonitor` foreground admission capacity.
     pub max_foreground_queries: usize,
-    /// Embedding batch size (consumed by a future `SemanticProvider`
-    /// implementation; not yet consumed by `HashingEmbedder`).
+    /// Embedding batch size (consumed by `SemanticProvider` / `Qwen3Embedder`).
     pub embedding_batch_size: usize,
     /// Number of concurrent background embedding worker threads
     /// (`BackgroundEnricher::spawn`).
@@ -150,6 +155,32 @@ pub struct ResourcePolicy {
     /// disk I/O (reads, WAL checkpoints, backups are outside its
     /// visibility), only the writer's commit cadence.
     pub max_io_ops_per_sec: u32,
+}
+
+/// Developer-machine RAM allowance (Phase 6 — agreed policy).
+///
+/// Attic is a background developer tool; it must never push total system
+/// memory toward paging. The allowance is the minimum of:
+/// - 50% of physical RAM (burst ceiling),
+/// - keeping total system usage below 85% (Attic_share = 85% − other apps),
+/// - a 256 MiB floor so the function never returns a useless zero budget
+///   (the monitor's own Emergency tier still protects against runaway).
+///
+/// Pure so it is unit-testable without hardware.
+pub fn developer_machine_allowance_mib(total_memory_mib: u64) -> u64 {
+    if total_memory_mib == 0 {
+        return 2048; // detection failed — conservative baseline
+    }
+    // 50% burst ceiling.
+    let burst_ceiling = total_memory_mib / 2;
+    // Assume a typical developer workload (IDE + browser + build) occupies
+    // ~35% before Attic starts; Attic may then take total to 85%.
+    // => Attic share ≈ 85% − 35% = 50% of total — same as burst ceiling on
+    // an idle machine, tighter when other apps already use more. We encode
+    // the policy statically here; the live ResourceMonitor tiers enforce the
+    // dynamic part (reduce at 75%, pause at 82%) at runtime.
+    let allowance = burst_ceiling;
+    allowance.max(256)
 }
 
 impl ResourcePolicy {
@@ -237,6 +268,15 @@ impl ResourcePolicy {
             max_io_ops_per_sec: overrides
                 .max_io_ops_per_sec
                 .unwrap_or(self.max_io_ops_per_sec),
+            scheduler_workers: overrides
+                .scheduler_workers
+                .unwrap_or(self.scheduler_workers),
+            embedding_batch_size: overrides
+                .embedding_batch_size
+                .unwrap_or(self.embedding_batch_size),
+            embedding_worker_count: overrides
+                .embedding_worker_count
+                .unwrap_or(self.embedding_worker_count),
             ..self
         }
     }
@@ -318,16 +358,26 @@ impl ResourcePolicy {
     /// FINAL step, success path: hardware-dependent safety clamp, applied to
     /// the fully-resolved value so an override can never bypass it.
     pub fn clamp_to_hardware(self, snapshot: &HardwareSnapshot) -> EffectiveResourceConfig {
-        let memory_budget_mib = self
-            .memory_budget_mib
-            .min(snapshot.total_memory_mib * 60 / 100);
+        // Phase 6: the ceiling is the developer-machine allowance (50% of
+        // physical RAM). Performance mode on large-RAM machines still scales
+        // UP to that allowance (preserving the old grow-on-big-hardware
+        // behavior); any baseline above the allowance is clamped DOWN to it.
+        let allowance = developer_machine_allowance_mib(snapshot.total_memory_mib);
+        let memory_budget_mib = if self.memory_budget_mib == 8192 && allowance > 8192 {
+            allowance
+        } else {
+            self.memory_budget_mib.min(allowance)
+        };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
+        // r08: reserve two physical cores for the developer's foreground
+        // work — background indexing/embedding never gets the whole machine.
+        let usable_cores = snapshot.cpu_cores.saturating_sub(2).max(1);
         EffectiveResourceConfig {
             memory_budget_mib,
             min_free_memory_mib,
-            scheduler_workers: self.scheduler_workers.min(snapshot.cpu_cores).max(1),
-            embedding_worker_count: self.embedding_worker_count.min(snapshot.cpu_cores).max(1),
+            scheduler_workers: self.scheduler_workers.min(usable_cores).max(1),
+            embedding_worker_count: self.embedding_worker_count.min(usable_cores).max(1),
             ..self.into()
         }
     }
@@ -407,76 +457,153 @@ impl From<ResourcePolicy> for EffectiveResourceConfig {
     }
 }
 
+/// Resource-monitor admission limits that sit outside [`ResourcePolicy`]
+/// (they gate admission, not hardware sizing), read from
+/// `ATTIC_PER_REPO_MEMORY_BUDGET_MIB` / `ATTIC_MAX_BACKGROUND_WORKERS`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MonitorOverrides {
+    /// Per-repository memory budget used for admission decisions, in MiB.
+    pub per_repo_memory_budget_mib: Option<u64>,
+    /// Maximum concurrent background workers.
+    pub max_background_workers: Option<usize>,
+}
+
 impl EffectiveResourceConfig {
-    /// Project onto the existing [`ResourceConfig`] shape so
-    /// `ResourceMonitor::from_config` can consume it without a parallel
-    /// admission-control code path. `per_repo_memory_budget_mib` and
-    /// `max_background_workers` are outside `ResourcePolicy`'s 12 fields
-    /// (per Low-Level Design §1), so they're not part of the hardware/mode
-    /// policy pipeline — but they're still real, live admission-control
-    /// gates in `ResourceMonitor::from_config`, so their `ATTIC_*` env
-    /// overrides (read by the removed `ResourceConfig::load()`) are read
-    /// directly here rather than silently dropped.
-    pub fn as_resource_config(&self) -> ResourceConfig {
-        // ResourceConfig only covers the fields that ResourceMonitor consumes
-        // (memory budget, foreground/background admission).  The writer/IO
-        // fields (writer_batch_size, writer_queue_capacity,
-        // writer_flush_interval_ms, max_io_ops_per_sec) are consumed directly
-        // from EffectiveResourceConfig by the writer and scheduler subsystems —
-        // they are NOT ResourceMonitor concerns and must not be set here.
+    /// Project onto the [`ResourceConfig`] shape `ResourceMonitor::from_config`
+    /// consumes, so admission control has no parallel configuration path.
+    ///
+    /// Only the fields the monitor enforces (memory budget, foreground and
+    /// background admission) are set; the writer/IO fields are consumed
+    /// directly from this struct by the writer and scheduler.
+    pub fn as_resource_config(&self, monitor: MonitorOverrides) -> ResourceConfig {
         ResourceConfig {
             total_memory_budget_mib: Some(self.memory_budget_mib),
             min_free_memory_mib: Some(self.min_free_memory_mib),
             max_foreground_queries: Some(self.max_foreground_queries),
-            per_repo_memory_budget_mib: std::env::var("ATTIC_PER_REPO_MEMORY_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_background_workers: std::env::var("ATTIC_MAX_BACKGROUND_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            per_repo_memory_budget_mib: monitor.per_repo_memory_budget_mib,
+            max_background_workers: monitor.max_background_workers,
         }
     }
 }
 
+fn parse_env_value<T: std::str::FromStr>(
+    key: &str,
+    raw: Option<String>,
+) -> Result<Option<T>, attic_core::config::ConfigError> {
+    raw.map(|v| {
+        v.trim().parse::<T>().map_err(|_| {
+            attic_core::config::ConfigError::Invalid(format!(
+                "environment variable {key}={v:?} is not a valid value"
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// Read the [`MonitorOverrides`] environment variables. Fails closed exactly
+/// like [`env_resource_overrides`].
+pub fn env_monitor_overrides() -> Result<MonitorOverrides, attic_core::config::ConfigError> {
+    env_monitor_overrides_from(|key| std::env::var(key).ok())
+}
+
+/// [`env_monitor_overrides`] over an injectable lookup.
+pub fn env_monitor_overrides_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<MonitorOverrides, attic_core::config::ConfigError> {
+    let get = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
+    Ok(MonitorOverrides {
+        per_repo_memory_budget_mib: parse_env_value(
+            "ATTIC_PER_REPO_MEMORY_BUDGET_MIB",
+            get("ATTIC_PER_REPO_MEMORY_BUDGET_MIB"),
+        )?,
+        max_background_workers: parse_env_value(
+            "ATTIC_MAX_BACKGROUND_WORKERS",
+            get("ATTIC_MAX_BACKGROUND_WORKERS"),
+        )?,
+    })
+}
+
 /// Read `ATTIC_RESOURCE_MODE` / the `ATTIC_*` resource env vars as a
-/// [`ResourceOverrides`] layer — the sole env-var reader for these names now
-/// that the pre-Phase-8 `ResourceConfig::load()` (a second, independent
-/// parser for the same names) has been removed as dead code.
-pub fn env_resource_overrides() -> ResourceOverrides {
-    // `None` here means "ATTIC_RESOURCE_MODE not set (or not recognized)",
-    // distinct from `Some(Auto)` ("explicitly set to auto") — see the field
-    // doc on `ResourceOverrides::mode` for why that distinction matters.
-    let mode = match std::env::var("ATTIC_RESOURCE_MODE").ok().as_deref() {
-        Some("low") => Some(ResourceModeSetting::Low),
-        Some("balanced") => Some(ResourceModeSetting::Balanced),
-        Some("performance") => Some(ResourceModeSetting::Performance),
-        Some("auto") => Some(ResourceModeSetting::Auto),
-        _ => None,
+/// [`ResourceOverrides`] layer — the sole env-var reader for these names.
+///
+/// Fails closed: a variable that is set but cannot be parsed (e.g.
+/// `ATTIC_WRITER_BATCH_SIZE=abc`, `ATTIC_RESOURCE_MODE=fast`) is a startup
+/// error rather than being silently ignored, so an operator never believes an
+/// override is active when it is not. Unset (or empty) variables are `None`.
+pub fn env_resource_overrides() -> Result<ResourceOverrides, attic_core::config::ConfigError> {
+    env_resource_overrides_from(|key| std::env::var(key).ok())
+}
+
+/// [`env_resource_overrides`] over an injectable lookup, so parsing is
+/// testable without mutating the real process environment.
+pub fn env_resource_overrides_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ResourceOverrides, attic_core::config::ConfigError> {
+    use attic_core::config::ConfigError;
+
+    let get = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
+
+    // `None` here means "ATTIC_RESOURCE_MODE not set", distinct from
+    // `Some(Auto)` ("explicitly set to auto") — see the field doc on
+    // `ResourceOverrides::mode` for why that distinction matters.
+    let mode = match get("ATTIC_RESOURCE_MODE") {
+        None => None,
+        Some(v) => Some(match v.trim().to_ascii_lowercase().as_str() {
+            "low" => ResourceModeSetting::Low,
+            "balanced" => ResourceModeSetting::Balanced,
+            "performance" => ResourceModeSetting::Performance,
+            "auto" => ResourceModeSetting::Auto,
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "environment variable ATTIC_RESOURCE_MODE={v:?} must be one of \
+                     auto, low, balanced, performance"
+                )));
+            }
+        }),
     };
-    ResourceOverrides {
+    Ok(ResourceOverrides {
         mode,
-        total_memory_budget_mib: std::env::var("ATTIC_TOTAL_MEMORY_BUDGET_MIB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        min_free_memory_mib: std::env::var("ATTIC_MIN_FREE_MEMORY_MIB")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        max_foreground_queries: std::env::var("ATTIC_MAX_FOREGROUND_QUERIES")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_batch_size: std::env::var("ATTIC_WRITER_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_flush_interval_ms: std::env::var("ATTIC_WRITER_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        writer_queue_capacity: std::env::var("ATTIC_WRITER_QUEUE_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-        max_io_ops_per_sec: std::env::var("ATTIC_MAX_IO_OPS_PER_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok()),
-    }
+        total_memory_budget_mib: parse_env_value(
+            "ATTIC_TOTAL_MEMORY_BUDGET_MIB",
+            get("ATTIC_TOTAL_MEMORY_BUDGET_MIB"),
+        )?,
+        min_free_memory_mib: parse_env_value(
+            "ATTIC_MIN_FREE_MEMORY_MIB",
+            get("ATTIC_MIN_FREE_MEMORY_MIB"),
+        )?,
+        max_foreground_queries: parse_env_value(
+            "ATTIC_MAX_FOREGROUND_QUERIES",
+            get("ATTIC_MAX_FOREGROUND_QUERIES"),
+        )?,
+        writer_batch_size: parse_env_value(
+            "ATTIC_WRITER_BATCH_SIZE",
+            get("ATTIC_WRITER_BATCH_SIZE"),
+        )?,
+        writer_flush_interval_ms: parse_env_value(
+            "ATTIC_WRITER_FLUSH_INTERVAL_MS",
+            get("ATTIC_WRITER_FLUSH_INTERVAL_MS"),
+        )?,
+        writer_queue_capacity: parse_env_value(
+            "ATTIC_WRITER_QUEUE_CAPACITY",
+            get("ATTIC_WRITER_QUEUE_CAPACITY"),
+        )?,
+        max_io_ops_per_sec: parse_env_value(
+            "ATTIC_MAX_IO_OPS_PER_SEC",
+            get("ATTIC_MAX_IO_OPS_PER_SEC"),
+        )?,
+        scheduler_workers: parse_env_value(
+            "ATTIC_SCHEDULER_WORKERS",
+            get("ATTIC_SCHEDULER_WORKERS"),
+        )?,
+        embedding_batch_size: parse_env_value(
+            "ATTIC_EMBEDDING_BATCH_SIZE",
+            get("ATTIC_EMBEDDING_BATCH_SIZE"),
+        )?,
+        embedding_worker_count: parse_env_value(
+            "ATTIC_EMBEDDING_WORKERS",
+            get("ATTIC_EMBEDDING_WORKERS"),
+        )?,
+    })
 }
 
 /// Full resolution result: the clamped effective config, plus which
@@ -504,7 +631,19 @@ pub fn resolve_effective_config(
     snapshot: &Result<HardwareSnapshot, ResourceDetectionError>,
 ) -> Result<ResourceResolution, attic_core::config::ConfigError> {
     let (mode, mode_source) = match (env_overrides.mode, toml_overrides.mode, snapshot) {
+        (Some(ResourceModeSetting::Auto), _, Ok(snap)) => {
+            (detect_resource_mode(snap), ResourceModeSource::EnvOverride)
+        }
+        (Some(ResourceModeSetting::Auto), _, Err(_)) => {
+            (ResourceMode::Low, ResourceModeSource::EnvOverride)
+        }
         (Some(m), _, _) => (setting_to_mode(m), ResourceModeSource::EnvOverride),
+        (None, Some(ResourceModeSetting::Auto), Ok(snap)) => {
+            (detect_resource_mode(snap), ResourceModeSource::TomlOverride)
+        }
+        (None, Some(ResourceModeSetting::Auto), Err(_)) => {
+            (ResourceMode::Low, ResourceModeSource::TomlOverride)
+        }
         (None, Some(m), _) => (setting_to_mode(m), ResourceModeSource::TomlOverride),
         (None, None, Ok(snap)) => (detect_resource_mode(snap), ResourceModeSource::Detected),
         (None, None, Err(_)) => (ResourceMode::Low, ResourceModeSource::DetectionFailed),
@@ -590,6 +729,103 @@ mod tests {
         let applied = p.apply_overrides(&overrides);
         assert_eq!(applied.memory_budget_mib, 1234);
         assert_eq!(applied.writer_batch_size, p.writer_batch_size);
+    }
+
+    #[test]
+    fn apply_overrides_sets_worker_and_embedding_tunables() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Balanced);
+        let applied = p.apply_overrides(&ResourceOverrides {
+            scheduler_workers: Some(5),
+            embedding_batch_size: Some(24),
+            embedding_worker_count: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(applied.scheduler_workers, 5);
+        assert_eq!(applied.embedding_batch_size, 24);
+        assert_eq!(applied.embedding_worker_count, 2);
+        assert_eq!(applied.writer_batch_size, p.writer_batch_size);
+    }
+
+    #[test]
+    fn zero_worker_override_is_rejected_by_validation() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Balanced).apply_overrides(
+            &ResourceOverrides {
+                scheduler_workers: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(p.validate().is_err());
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn env_overrides_parse_all_supported_variables() {
+        let o = env_resource_overrides_from(env_of(&[
+            ("ATTIC_RESOURCE_MODE", "Performance"),
+            ("ATTIC_SCHEDULER_WORKERS", "3"),
+            ("ATTIC_EMBEDDING_BATCH_SIZE", " 12 "),
+            ("ATTIC_EMBEDDING_WORKERS", "1"),
+            ("ATTIC_WRITER_BATCH_SIZE", "128"),
+        ]))
+        .unwrap();
+        assert_eq!(o.mode, Some(ResourceModeSetting::Performance));
+        assert_eq!(o.scheduler_workers, Some(3));
+        assert_eq!(o.embedding_batch_size, Some(12));
+        assert_eq!(o.embedding_worker_count, Some(1));
+        assert_eq!(o.writer_batch_size, Some(128));
+        assert_eq!(o.max_io_ops_per_sec, None);
+    }
+
+    #[test]
+    fn env_overrides_treat_empty_values_as_unset() {
+        let o = env_resource_overrides_from(env_of(&[
+            ("ATTIC_RESOURCE_MODE", ""),
+            ("ATTIC_SCHEDULER_WORKERS", "  "),
+        ]))
+        .unwrap();
+        assert_eq!(o.mode, None);
+        assert_eq!(o.scheduler_workers, None);
+    }
+
+    #[test]
+    fn monitor_overrides_parse_and_fail_closed() {
+        let o = env_monitor_overrides_from(env_of(&[
+            ("ATTIC_PER_REPO_MEMORY_BUDGET_MIB", "768"),
+            ("ATTIC_MAX_BACKGROUND_WORKERS", " 3 "),
+        ]))
+        .unwrap();
+        assert_eq!(o.per_repo_memory_budget_mib, Some(768));
+        assert_eq!(o.max_background_workers, Some(3));
+        assert_eq!(
+            env_monitor_overrides_from(env_of(&[])).unwrap(),
+            MonitorOverrides::default()
+        );
+        for key in [
+            "ATTIC_PER_REPO_MEMORY_BUDGET_MIB",
+            "ATTIC_MAX_BACKGROUND_WORKERS",
+        ] {
+            let err = env_monitor_overrides_from(env_of(&[(key, "lots")])).unwrap_err();
+            assert!(err.to_string().contains(key), "{key} → {err}");
+        }
+    }
+
+    #[test]
+    fn env_overrides_fail_closed_on_unparsable_values() {
+        for (key, value) in [
+            ("ATTIC_WRITER_BATCH_SIZE", "abc"),
+            ("ATTIC_SCHEDULER_WORKERS", "-1"),
+            ("ATTIC_RESOURCE_MODE", "fast"),
+        ] {
+            let err = env_resource_overrides_from(env_of(&[(key, value)])).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value} → {err}");
+        }
     }
 
     #[test]
@@ -695,7 +931,25 @@ mod tests {
     fn clamp_never_exceeds_real_core_count() {
         let p = ResourcePolicy::baseline_for_mode(ResourceMode::Performance); // wants 8 workers
         let effective = p.clamp_to_hardware(&snap(32768, 4));
-        assert_eq!(effective.scheduler_workers, 4);
+        // r08: 4 cores − 2 reserved for foreground = 2.
+        assert_eq!(effective.scheduler_workers, 2);
+    }
+
+    /// r08: two physical cores stay reserved for the developer's foreground
+    /// work; on tiny machines (≤2 cores) one worker still runs.
+    #[test]
+    fn clamp_reserves_two_cores_for_foreground() {
+        let p = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
+        let eff14 = p.clamp_to_hardware(&snap(65536, 14));
+        assert_eq!(eff14.scheduler_workers, 8, "wants 8, 14-2=12 allows 8");
+        let eff4 = p.clamp_to_hardware(&snap(65536, 4));
+        assert_eq!(eff4.scheduler_workers, 2, "4 cores reserve 2");
+        assert_eq!(eff4.embedding_worker_count, 2, "embedding respects reserve");
+        let eff2 = p.clamp_to_hardware(&snap(65536, 2));
+        assert_eq!(
+            eff2.scheduler_workers, 1,
+            "tiny machine still makes progress"
+        );
     }
 
     #[test]
@@ -789,5 +1043,37 @@ mod tests {
         let snap = HardwareSnapshot::capture().expect("capture should succeed on a real machine");
         assert!(snap.total_memory_mib > 0);
         assert!(snap.cpu_cores > 0);
+    }
+
+    #[test]
+    fn toml_mode_auto_detects_performance_on_large_hardware() {
+        let toml = ResourceOverrides {
+            mode: Some(ResourceModeSetting::Auto),
+            ..Default::default()
+        };
+        let snapshot = Ok(snap(32768, 16));
+        let resolution =
+            resolve_effective_config(&toml, &ResourceOverrides::default(), &snapshot).unwrap();
+        assert_eq!(resolution.mode, ResourceMode::Performance);
+        assert_eq!(resolution.mode_source, ResourceModeSource::TomlOverride);
+    }
+
+    #[test]
+    fn clamp_scales_performance_above_8gb_on_large_ram() {
+        let policy = ResourcePolicy::baseline_for_mode(ResourceMode::Performance);
+        let snapshot = snap(32768, 16);
+        let effective = policy.clamp_to_hardware(&snapshot);
+        // Phase 6 developer-machine policy: 50% of physical RAM ceiling.
+        assert_eq!(effective.memory_budget_mib, 32768 / 2);
+        assert!(effective.memory_budget_mib > 8192);
+    }
+
+    #[test]
+    fn developer_machine_allowance_never_exceeds_half_ram() {
+        assert_eq!(developer_machine_allowance_mib(8192), 4096);
+        assert_eq!(developer_machine_allowance_mib(32768), 16384);
+        // Detection failure / tiny machine: conservative floor, never zero.
+        assert_eq!(developer_machine_allowance_mib(0), 2048);
+        assert_eq!(developer_machine_allowance_mib(256), 256);
     }
 }

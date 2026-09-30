@@ -31,6 +31,10 @@ pub enum DiagnosticKind {
     /// overlapped with a security-forbidden prefix — the exemption was
     /// rejected.
     ExemptionRejected,
+    /// A discovered path could not be normalized to a repo-relative string
+    /// (non-UTF-8 component, path traversal, or an absolute-path escape) and
+    /// was rejected before it could be classified further.
+    InvalidPath,
 }
 
 /// Cheap structured counters accumulated during a discovery walk, so callers

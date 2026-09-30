@@ -1,0 +1,184 @@
+//! CPU thread isolation and oversubscription guard for semantic inference.
+//!
+//! Enforces:
+//! - Strict compliance with the granted semantic CPU thread budget.
+//! - Prevention of the forbidden multiplication state (§21):
+//!   `granted_threads = 4`, but `4 lanes * 8 threads = 32 threads`.
+//! - Per-lane thread budgeting: `threads_per_lane = (granted_threads / lanes).max(1)`.
+//! - Tokenizer and internal library parallelism auditing.
+
+use serde::{Deserialize, Serialize};
+
+/// Calculated CPU thread distribution across inference lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuIsolationPlan {
+    pub granted_semantic_threads: usize,
+    pub inference_lanes: usize,
+    pub threads_per_lane: usize,
+    pub total_allocated_threads: usize,
+}
+
+impl CpuIsolationPlan {
+    /// Compute strict thread allocation preventing thread multiplication oversubscription (§21).
+    pub fn compute(granted_semantic_threads: usize, requested_lanes: usize) -> Self {
+        let granted = granted_semantic_threads.max(1);
+        let lanes = requested_lanes.max(1).min(granted);
+        let threads_per_lane = (granted / lanes).max(1);
+        let total_allocated = lanes * threads_per_lane;
+
+        Self {
+            granted_semantic_threads: granted,
+            inference_lanes: lanes,
+            threads_per_lane,
+            total_allocated_threads: total_allocated,
+        }
+    }
+
+    /// Audit whether a given thread and lane configuration violates CPU bounds.
+    pub fn is_oversubscribed(&self) -> bool {
+        self.total_allocated_threads > self.granted_semantic_threads
+    }
+
+    /// Configure global Rayon, native math, and BLAS thread ceilings once during startup,
+    /// before runtime initialization. Subsequent thread resizing at runtime via environment
+    /// variables is explicitly forbidden as it is ignored by already initialized pools.
+    ///
+    /// Must be called while the process is still single-threaded (first thing
+    /// in `main`): mutating the environment is only sound when no other thread
+    /// can read it concurrently. Values the user already set are respected.
+    pub fn configure_startup_thread_ceiling(max_threads: usize) {
+        let threads = max_threads.max(1);
+        let threads_str = threads.to_string();
+        // SAFETY: called from `main` before any other thread is spawned.
+        unsafe {
+            if std::env::var("RAYON_NUM_THREADS").is_err() {
+                std::env::set_var("RAYON_NUM_THREADS", &threads_str);
+            }
+            if std::env::var("OMP_NUM_THREADS").is_err() {
+                std::env::set_var("OMP_NUM_THREADS", &threads_str);
+            }
+            if std::env::var("MKL_NUM_THREADS").is_err() {
+                std::env::set_var("MKL_NUM_THREADS", &threads_str);
+            }
+        }
+    }
+
+    /// Build a dedicated, isolated Rayon thread pool for Attic's per-lane work.
+    ///
+    /// Note on native math concurrency: A local Rayon pool controls Attic tasks and
+    /// Rayon-based operations executed within it, but does not claim to override external
+    /// native BLAS/C runtime pools once initialized. Those are bounded by the startup
+    /// environment ceilings ([`Self::configure_startup_thread_ceiling`]) and by the
+    /// resource monitor's admission control.
+    pub fn create_lane_pool(&self) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads_per_lane)
+            .thread_name(|idx| format!("attic-qwen-lane-{idx}"))
+            .build()
+    }
+
+    /// Execute a closure inside a dedicated Rayon thread pool matching this plan's
+    /// per-lane CPU budget.
+    pub fn execute_isolated<F, R>(&self, op: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        if let Ok(pool) = self.create_lane_pool() {
+            pool.install(op)
+        } else {
+            op()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_prevents_oversubscription() {
+        // 4 granted threads, 4 requested lanes
+        let plan = CpuIsolationPlan::compute(4, 4);
+        assert_eq!(plan.inference_lanes, 4);
+        assert_eq!(plan.threads_per_lane, 1);
+        assert_eq!(plan.total_allocated_threads, 4);
+        assert!(!plan.is_oversubscribed());
+
+        // 8 granted threads, 2 requested lanes
+        let plan = CpuIsolationPlan::compute(8, 2);
+        assert_eq!(plan.inference_lanes, 2);
+        assert_eq!(plan.threads_per_lane, 4);
+        assert_eq!(plan.total_allocated_threads, 8);
+        assert!(!plan.is_oversubscribed());
+
+        // 2 granted threads, 4 requested lanes: lanes clamped to 2
+        let plan = CpuIsolationPlan::compute(2, 4);
+        assert_eq!(plan.inference_lanes, 2);
+        assert_eq!(plan.threads_per_lane, 1);
+        assert_eq!(plan.total_allocated_threads, 2);
+        assert!(!plan.is_oversubscribed());
+    }
+
+    #[test]
+    fn plan_execute_isolated_bounds_threads() {
+        for &(granted, lanes) in &[(8, 2), (4, 4), (2, 2), (6, 2)] {
+            let plan = CpuIsolationPlan::compute(granted, lanes);
+            let threads_used = plan.execute_isolated(rayon::current_num_threads);
+            assert_eq!(threads_used, plan.threads_per_lane);
+        }
+    }
+
+    #[test]
+    fn plan_candle_native_math_confinement_across_allocations() {
+        use candle_core::{Device, Tensor};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Validate real execution across changing allocations: 8 -> 4 -> 2 -> 6
+        let transitions = [(8, 2), (4, 4), (2, 2), (6, 2)];
+
+        for &(granted, lanes) in &transitions {
+            let plan = CpuIsolationPlan::compute(granted, lanes);
+            let threads_budget = plan.threads_per_lane;
+
+            // Execute real Candle CPU matrix multiplications inside execute_isolated
+            let result = plan.execute_isolated(|| {
+                let a = Tensor::randn(0f32, 1f32, (128, 128), &Device::Cpu).unwrap();
+                let b = Tensor::randn(0f32, 1f32, (128, 128), &Device::Cpu).unwrap();
+                let c = a.matmul(&b).unwrap();
+                c.to_vec2::<f32>().unwrap()
+            });
+            assert_eq!(result.len(), 128);
+
+            // Verify that create_lane_pool builds exactly the requested thread budget
+            let pool = plan.create_lane_pool().unwrap();
+            assert_eq!(pool.current_num_threads(), threads_budget);
+
+            // Execute parallel Candle tensor math across dedicated pool workers
+            let observed_threads = Arc::new(Mutex::new(HashSet::new()));
+            let observed_clone = Arc::clone(&observed_threads);
+
+            pool.broadcast(|ctx| {
+                let name = std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string();
+                let index = ctx.index();
+                observed_clone.lock().unwrap().insert((index, name));
+
+                // Perform real native tensor operations inside every worker
+                let t1 = Tensor::zeros((64, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
+                let t2 = Tensor::ones((64, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
+                let _ = t1.add(&t2).unwrap();
+            });
+
+            let observed = observed_threads.lock().unwrap();
+            assert_eq!(observed.len(), threads_budget);
+
+            for (idx, name) in observed.iter() {
+                assert_eq!(name, &format!("attic-qwen-lane-{}", idx));
+            }
+        }
+    }
+}

@@ -68,6 +68,14 @@ pub enum Ecosystem {
     Submodule,
     /// Generated API/schema relationship (protobuf imports).
     GeneratedApi,
+    /// OSGi bundle manifest (`MANIFEST.MF`): Bundle-SymbolicName provides the
+    /// bundle identity; Export-Package provides package identities;
+    /// Import-Package declares package dependencies (r12).
+    Osgi,
+    /// AEM component definition (`.content.xml` under `apps/`): provides the
+    /// component resource-type path; `sling:resourceSuperType` declares
+    /// component inheritance (r12).
+    AemComponent,
 }
 
 impl Ecosystem {
@@ -81,6 +89,8 @@ impl Ecosystem {
             Self::Python => "PYTHON",
             Self::Submodule => "SUBMODULE",
             Self::GeneratedApi => "GENERATED_API",
+            Self::Osgi => "OSGI",
+            Self::AemComponent => "AEM_COMPONENT",
         }
     }
 
@@ -94,6 +104,8 @@ impl Ecosystem {
             "PYTHON" => Ok(Self::Python),
             "SUBMODULE" => Ok(Self::Submodule),
             "GENERATED_API" => Ok(Self::GeneratedApi),
+            "OSGI" => Ok(Self::Osgi),
+            "AEM_COMPONENT" => Ok(Self::AemComponent),
             other => Err(CrossRepoError::UnknownVariant {
                 type_name: "Ecosystem",
                 value: other.to_owned(),

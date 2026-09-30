@@ -39,8 +39,7 @@ use attic_storage::{
 };
 
 use crate::{
-    FilePrep, FileRecord, IndexError, IndexOptions, IndexingStore, PendingUnit,
-    analyze_single_file, infer_file_type,
+    FilePrep, FileRecord, IndexError, IndexOptions, IndexingStore, PendingUnit, infer_file_type,
 };
 
 // ---------------------------------------------------------------------------
@@ -229,11 +228,7 @@ pub fn index_changes(
     }
 
     // ── 5. Analysis (Phase 1B preprocessing → Phase 1C dispatch), scoped ────
-    let registry = if opts.structural {
-        crate::structural_pipeline::default_registry()
-    } else {
-        crate::structural_pipeline::generic_only_registry()
-    };
+    let registry = crate::structural_pipeline::shared_registry(opts)?;
     let rev_id = SourceRevisionId::new_v4();
     let gen_id = IndexGenerationId::new_v4();
 
@@ -247,6 +242,7 @@ pub fn index_changes(
     let mut tombstones: Vec<PublicationFile> = Vec::new();
     let mut skip_tombstoned: usize = 0;
 
+    let mut candidates: Vec<FileRecord> = Vec::with_capacity(changes.upserts.len());
     for rel in &changes.upserts {
         let Some(hash) = upsert_hashes.get(rel) else {
             continue;
@@ -259,7 +255,7 @@ pub fn index_changes(
         // security_state/is_partial_scan are placeholders overwritten below
         // with the real, analyzer-derived values once known (P0-6) — never
         // published as-is.
-        let mut rec = FileRecord {
+        candidates.push(FileRecord {
             fi_id: store
                 .readers
                 .with_reader(|c| lookup_file_identity_by_basis(c, &format!("{repo_id_str}/{rel}")))
@@ -275,14 +271,32 @@ pub fn index_changes(
             security_state: SecurityState::Pending,
             file_type: infer_file_type(Path::new(rel)),
             is_partial_scan: false,
-        };
+        });
+    }
 
-        match analyze_single_file(
-            &rec,
-            &registry,
-            opts,
-            &attic_core::CancellationToken::default(),
-        ) {
+    // Analysis is pure, so a large change set (branch switch, bulk rewrite)
+    // is analyzed on the same bounded worker pool as a full index. Results
+    // come back in `changes.upserts` order, so everything below observes
+    // exactly the sequence a single-threaded pass would. No analysis cache is
+    // consulted: incremental work always analyzes the bytes it just hashed.
+    let threads = crate::resolve_analysis_threads(opts.analysis_threads, candidates.len());
+    let no_cache = HashMap::new();
+    let analyzed = crate::analyze_files(
+        candidates,
+        &crate::AnalysisCacheLookup {
+            entries: &no_cache,
+            policy_hash: &policy_hash,
+            version: "",
+        },
+        &registry,
+        opts,
+        &attic_core::CancellationToken::default(),
+        threads,
+    )?;
+
+    for crate::AnalyzedFile { mut rec, prep, .. } in analyzed {
+        let rel = rec.repo_relative.clone();
+        match prep {
             Ok(FilePrep::Indexable {
                 mut units,
                 captured,
@@ -290,18 +304,18 @@ pub fn index_changes(
                 is_partial_scan,
             }) => {
                 // Phase 6.4 — file-changed-during-capture guard: `hash` above
-                // and `analyze_single_file`'s independent re-read (just now)
-                // are two temporally-separated reads of the same path. If the
+                // and `analyze_single_file`'s independent re-read are two
+                // temporally-separated reads of the same path. If the
                 // file changed in between, `content_hash` and the indexed
                 // retrieval-unit text could come from two different
                 // snapshots — an internally-inconsistent occurrence. Fail
                 // closed: abort the whole scoped batch for retry, exactly
                 // like any other unresolved transient condition here.
-                let stat_before = upsert_stat_before.get(rel).copied().flatten();
+                let stat_before = upsert_stat_before.get(&rel).copied().flatten();
                 let stat_after = file_fingerprint(&rec.abs_path);
                 if stat_before.is_none() || stat_before != stat_after {
                     return Err(IndexError::Io {
-                        path: rel.clone(),
+                        path: rel,
                         source: std::io::Error::other(
                             "file changed between hash capture and analysis (unstable read)",
                         ),
@@ -309,7 +323,7 @@ pub fn index_changes(
                 }
                 rec.security_state = security_state;
                 rec.is_partial_scan = is_partial_scan;
-                pipeline.note_occurrence(rel, &rec.fo_id.to_string_repr());
+                pipeline.note_occurrence(&rel, &rec.fo_id.to_string_repr());
                 if let Some(captured) = captured {
                     pipeline.record(*captured);
                 }
@@ -327,7 +341,7 @@ pub fn index_changes(
                 // tombstone). A path with no prior occurrence is simply not
                 // indexed — nothing to retire.
                 debug!(path = %rel, "upsert permanently skipped (unsupported/excluded content)");
-                if old_snapshots.contains_key(rel) {
+                if old_snapshots.contains_key(&rel) {
                     skip_tombstoned += 1;
                     // Use the CURRENT file's hash (`rec.content_hash`, already
                     // known from step 2) rather than the old snapshot's — the
@@ -340,7 +354,7 @@ pub fn index_changes(
                         gen_id,
                         rec.fi_id,
                         rec.stable_id_basis.clone(),
-                        rel.clone(),
+                        rel,
                         rec.content_hash.clone(),
                     ));
                 }
@@ -409,6 +423,8 @@ pub fn index_changes(
             index_generation_id: gen_id_str.clone(),
             repository_id: repo_id_str.clone(),
             retrieval_text: u.retrieval_text,
+            canonical_text: u.canonical_text,
+            occurrence_metadata: u.occurrence_metadata,
             analyzer_id: u.analyzer_id,
             analyzer_version: u.analyzer_version,
             start_line: u.start_line,

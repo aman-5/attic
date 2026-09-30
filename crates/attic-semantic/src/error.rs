@@ -22,11 +22,28 @@ pub enum SemanticError {
     #[error("input exceeds provider maximum ({len} > {max} bytes)")]
     InputTooLarge { len: usize, max: usize },
 
+    /// Input needs more tokens than the provider's fixed sequence budget.
+    /// Permanent for this content under this provider: retrying unchanged
+    /// will fail identically — the caller must split upstream or quarantine.
+    #[error("input exceeds provider token budget ({tokens} > {max} tokens)")]
+    InputTooManyTokens { tokens: usize, max: usize },
+
     #[error("dimension mismatch: record has {record}, provider produces {expected}")]
     DimensionMismatch { record: usize, expected: usize },
 
     #[error("resource budget exhausted: {0}")]
     BudgetExhausted(String),
+
+    /// The device is under sustained resource pressure right now.
+    ///
+    /// Distinct from [`Self::ProviderUnavailable`], which means the provider
+    /// itself is broken or unsafe and is therefore classified permanent. A
+    /// desktop GPU is shared hardware: VRAM pressure is a transient
+    /// condition that clears when other applications release memory, so
+    /// treating it as permanent retired a perfectly healthy GPU for the rest
+    /// of the process lifetime after a single spike.
+    #[error("device under sustained resource pressure: {0}")]
+    DevicePressure(String),
 
     #[error("canonical index read failed: {0}")]
     Canonical(String),

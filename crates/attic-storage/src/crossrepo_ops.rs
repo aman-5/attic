@@ -289,18 +289,7 @@ pub struct XrepoEdge {
     pub source_revision_id: String,
 }
 
-impl XrepoEdge {
-    /// Repository on the OTHER side of the edge from `repo`.
-    pub fn other_side(&self, repo: &str) -> Option<&str> {
-        if self.source_repository_id == repo {
-            Some(&self.target_repository_id)
-        } else if self.target_repository_id == repo {
-            Some(&self.source_repository_id)
-        } else {
-            None
-        }
-    }
-}
+impl XrepoEdge {}
 
 /// Distinct repositories present in `core_repositories` (bounded).
 pub fn all_repository_ids(conn: &Connection) -> Result<Vec<String>, StorageError> {

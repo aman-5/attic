@@ -412,6 +412,18 @@ pub struct RetrievalUnitSpec {
     pub span: SourceSpan,
     /// Safe-to-store text for full-text indexing. Never contains raw secrets.
     pub retrieval_text: String,
+    /// Canonical body for semantic hashing/embedding (r03). May differ from
+    /// `retrieval_text` when the unit carries per-occurrence decoration
+    /// (JSON-pointer/environment headers): identical logical content across
+    /// files/environments must hash identically here. `None` means the
+    /// canonical body IS `retrieval_text` (no decoration to strip).
+    #[serde(default)]
+    pub canonical_text: Option<String>,
+    /// Per-occurrence provenance as a JSON object (e.g.
+    /// `{"json_pointer": "/services/0", "environment": "PROD"}`). Provenance
+    /// only — NEVER part of the content hash or embedding input.
+    #[serde(default)]
+    pub occurrence_metadata: Option<String>,
     /// Ordinal index of this unit within the file (0-based, stable ordering).
     pub ordinal: u32,
     /// Optional structural node index this unit is associated with.
@@ -497,6 +509,17 @@ pub mod diagnostic_codes {
     pub const CANCELLED: &str = "CANCELLED";
     pub const MALFORMED_INPUT: &str = "MALFORMED_INPUT";
     pub const UNSTABLE_CAPTURE: &str = "UNSTABLE_CAPTURE";
+    /// A single source line exceeded the per-unit size cap and was split
+    /// across several retrieval units at UTF-8 char boundaries.
+    ///
+    /// Distinct from `RESOURCE_EXHAUSTED` (analysis stopped early, output is
+    /// incomplete) and `PARTIAL_SCAN` (only part of the file was read):
+    /// here every byte IS indexed, just distributed across more units than
+    /// the line structure implies. Emitted so an oversized line is never
+    /// *silently* reshaped — downstream consumers (notably the semantic
+    /// layer's per-unit size gate) can see that a unit boundary is
+    /// synthetic rather than a real line break.
+    pub const UNIT_TRUNCATED: &str = "UNIT_TRUNCATED";
 }
 
 /// The complete output of a single analyzer invocation.

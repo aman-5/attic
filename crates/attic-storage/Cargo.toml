@@ -20,6 +20,13 @@ tracing.workspace     = true
 # Phase 7: cross-platform process RSS measurement (real memory enforcement)
 sysinfo            = { workspace = true }
 
+# Phase 5: VRAM telemetry (gpu_telemetry.rs). The actual DXGI FFI (which needs
+# `unsafe`) lives in the separate attic-gpu-telemetry-win crate, since this
+# crate sets `#![forbid(unsafe_code)]` crate-wide. Windows-only via
+# target-cfg dependency; never pulled in on non-Windows builds.
+[target.'cfg(windows)'.dependencies]
+attic-gpu-telemetry-win = { path = "../attic-gpu-telemetry-win" }
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile.workspace           = true

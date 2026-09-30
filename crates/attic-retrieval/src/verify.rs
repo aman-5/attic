@@ -268,9 +268,3 @@ fn text_of(r: &SpanRead) -> &str {
 fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-/// BLAKE3 hex of UTF-8 bytes (same hashing used at index time).
-#[allow(dead_code)]
-pub fn blake3_hash_hex(s: &str) -> String {
-    blake3::hash(s.as_bytes()).to_hex().to_string()
-}

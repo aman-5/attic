@@ -88,10 +88,8 @@ pub fn fts_retrieval_unit_insert(
     rowid: i64,
     retrieval_text: &str,
 ) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT INTO fts_retrieval_units(rowid, retrieval_text) VALUES (?1, ?2)",
-        params![rowid, retrieval_text],
-    )?;
+    conn.prepare_cached("INSERT INTO fts_retrieval_units(rowid, retrieval_text) VALUES (?1, ?2)")?
+        .execute(params![rowid, retrieval_text])?;
     Ok(())
 }
 
@@ -105,11 +103,11 @@ pub fn fts_retrieval_unit_delete(
     rowid: i64,
     old_retrieval_text: &str,
 ) -> Result<(), StorageError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO fts_retrieval_units(fts_retrieval_units, rowid, retrieval_text)
          VALUES ('delete', ?1, ?2)",
-        params![rowid, old_retrieval_text],
-    )?;
+    )?
+    .execute(params![rowid, old_retrieval_text])?;
     Ok(())
 }
 
@@ -124,39 +122,6 @@ pub fn fts_retrieval_unit_update(
 ) -> Result<(), StorageError> {
     fts_retrieval_unit_delete(conn, rowid, old_retrieval_text)?;
     fts_retrieval_unit_insert(conn, rowid, new_retrieval_text)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// fts_symbol_names — low-level insert / delete
-// ---------------------------------------------------------------------------
-
-/// Insert a row into the `fts_symbol_names` external-content FTS5 table.
-pub fn fts_symbol_name_insert(
-    conn: &Connection,
-    rowid: i64,
-    qualified_name: &str,
-    kind: &str,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT INTO fts_symbol_names(rowid, qualified_name, kind) VALUES (?1, ?2, ?3)",
-        params![rowid, qualified_name, kind],
-    )?;
-    Ok(())
-}
-
-/// Remove a row from the `fts_symbol_names` FTS5 table.
-pub fn fts_symbol_name_delete(
-    conn: &Connection,
-    rowid: i64,
-    old_qualified_name: &str,
-    old_kind: &str,
-) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT INTO fts_symbol_names(fts_symbol_names, rowid, qualified_name, kind)
-         VALUES ('delete', ?1, ?2, ?3)",
-        params![rowid, old_qualified_name, old_kind],
-    )?;
     Ok(())
 }
 
@@ -197,27 +162,57 @@ pub fn insert_retrieval_unit_with_fts(
     conn: &Connection,
     unit: &NewRetrievalUnit<'_>,
 ) -> Result<i64, StorageError> {
-    conn.execute(
+    insert_retrieval_unit_inner(conn, unit, None, None)
+}
+
+/// r03 publication variant: persists the canonical body and per-occurrence
+/// provenance alongside the retrieval text. `canonical_hash` is computed
+/// from the canonical body when present, else from `retrieval_text` —
+/// identical for undecorated units, and matching what the semantic layer
+/// hashes for legacy rows.
+pub fn insert_retrieval_unit_canonical(
+    conn: &Connection,
+    unit: &NewRetrievalUnit<'_>,
+    canonical_text: Option<&str>,
+    occurrence_metadata: Option<&str>,
+) -> Result<i64, StorageError> {
+    insert_retrieval_unit_inner(conn, unit, canonical_text, occurrence_metadata)
+}
+
+fn insert_retrieval_unit_inner(
+    conn: &Connection,
+    unit: &NewRetrievalUnit<'_>,
+    canonical_text: Option<&str>,
+    occurrence_metadata: Option<&str>,
+) -> Result<i64, StorageError> {
+    let canonical_hash = blake3::hash(canonical_text.unwrap_or(unit.retrieval_text).as_bytes())
+        .to_hex()
+        .to_string();
+    conn.prepare_cached(
         "INSERT INTO core_retrieval_units
              (id, repository_id, file_occurrence_id, index_generation_id,
               retrieval_text, analyzer_id, analyzer_version,
               start_line, end_line, is_redacted,
-              lexical_state, semantic_state, freshness_state)
+              lexical_state, semantic_state, freshness_state,
+              canonical_text, canonical_hash, occurrence_metadata)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 'CURRENT', 'NONE', 'CURRENT')",
-        rusqlite::params![
-            unit.id,
-            unit.repository_id,
-            unit.file_occurrence_id,
-            unit.index_generation_id,
-            unit.retrieval_text,
-            unit.analyzer_id,
-            unit.analyzer_version,
-            unit.start_line,
-            unit.end_line,
-            unit.is_redacted as i32,
-        ],
-    )?;
+                 'CURRENT', 'NONE', 'CURRENT', ?11, ?12, ?13)",
+    )?
+    .execute(rusqlite::params![
+        unit.id,
+        unit.repository_id,
+        unit.file_occurrence_id,
+        unit.index_generation_id,
+        unit.retrieval_text,
+        unit.analyzer_id,
+        unit.analyzer_version,
+        unit.start_line,
+        unit.end_line,
+        unit.is_redacted as i32,
+        canonical_text,
+        canonical_hash,
+        occurrence_metadata,
+    ])?;
     let rowid = conn.last_insert_rowid();
     fts_retrieval_unit_insert(conn, rowid, unit.retrieval_text)?;
     Ok(rowid)
@@ -254,7 +249,7 @@ pub fn delete_retrieval_units_for_file(
     file_occurrence_id: &str,
 ) -> Result<usize, StorageError> {
     let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT rowid, retrieval_text FROM core_retrieval_units
              WHERE file_occurrence_id = ?1",
         )?;
@@ -268,10 +263,8 @@ pub fn delete_retrieval_units_for_file(
     for (rowid, text) in &rows {
         fts_retrieval_unit_delete(conn, *rowid, text)?;
     }
-    conn.execute(
-        "DELETE FROM core_retrieval_units WHERE file_occurrence_id = ?1",
-        rusqlite::params![file_occurrence_id],
-    )?;
+    conn.prepare_cached("DELETE FROM core_retrieval_units WHERE file_occurrence_id = ?1")?
+        .execute(rusqlite::params![file_occurrence_id])?;
     Ok(count)
 }
 

@@ -10,23 +10,16 @@
 //! ## Coverage
 //!
 //! C, C++, Ruby, C#, Scala, PHP, Swift, Lua, Rust — 9 off-the-shelf grammars —
-//! plus Dockerfile via one hand-authored query (10 languages total). See
-//! [`tier2_table`] for the exact table.
+//! plus Dockerfile and Kotlin via hand-authored queries (11 languages total).
+//! See [`tier2_table`] for the exact table.
 //!
-//! **Kotlin — deviation from the original plan.** The plan listed Kotlin
-//! among the off-the-shelf tier-2 languages. Verified against the actual
-//! pinned crate (`tree-sitter-kotlin-ng` 1.1.0) and its upstream repository
-//! (`tree-sitter-grammars/tree-sitter-kotlin` at the exact published commit,
-//! confirmed via the GitHub API): neither ships **any** `queries/` directory
-//! at all — not `tags.scm`, not even `highlights.scm`. There is no upstream
-//! query to consume, unlike Dockerfile (whose grammar author simply never
-//! wrote a `tags.scm`, but whose grammar is simple enough for us to author
-//! one by hand — a multi-stage-build stage name is the only meaningful
-//! def/ref pair). Hand-authoring a full tags query for a general-purpose
-//! language grammar we did not write is a materially different, much larger
-//! undertaking than the few-line Dockerfile query, and out of scope for this
-//! pass. Kotlin `.kt`/`.kts` files therefore continue to get flat full-text
-//! (tier 3) coverage only, same as before this change.
+//! **Kotlin.** The pinned grammar (`tree-sitter-kotlin-ng` 1.1.0) ships no
+//! `queries/` directory, so [`KOTLIN_TAGS_QUERY`] is authored here against its
+//! `node-types.json`: classes (including interfaces and enum classes, which
+//! the grammar models as `class_declaration`), objects, companion objects,
+//! functions (top-level and members) and type aliases. That covers the
+//! declarations Spring/Kotlin navigation needs (controllers, services,
+//! configuration classes, extension functions).
 //!
 //! ## Honest capability declaration
 //!
@@ -220,6 +213,21 @@ const CSHARP_TAGS_QUERY: &str = r#"
 (namespace_declaration name: (identifier) @name) @definition.module
 "#;
 
+/// Hand-authored Kotlin tags query (definitions only — the engine stores
+/// `@definition.*` tags; see module docs). Node and field names come from the
+/// pinned grammar's `node-types.json`.
+const KOTLIN_TAGS_QUERY: &str = r#"
+(class_declaration name: (identifier) @name) @definition.class
+
+(object_declaration name: (identifier) @name) @definition.object
+
+(companion_object name: (identifier) @name) @definition.object
+
+(function_declaration name: (identifier) @name) @definition.function
+
+(type_alias type: (identifier) @name) @definition.type
+"#;
+
 // ---------------------------------------------------------------------------
 // Data-driven language table
 // ---------------------------------------------------------------------------
@@ -246,7 +254,7 @@ struct TagsLanguageSpec {
     locals_query: &'static str,
 }
 
-/// The full tier-2 table. See module docs for the Kotlin exclusion.
+/// The full tier-2 table.
 fn tier2_table() -> Vec<TagsLanguageSpec> {
     vec![
         TagsLanguageSpec {
@@ -354,6 +362,16 @@ fn tier2_table() -> Vec<TagsLanguageSpec> {
                 docs — no upstream tags.scm exists for this grammar).",
             grammar: tree_sitter_containerfile::LANGUAGE,
             tags_query: DOCKERFILE_TAGS_QUERY,
+            locals_query: "",
+        },
+        TagsLanguageSpec {
+            analyzer_id: "kotlin-tags",
+            language_tag: "kotlin",
+            description: "tree-sitter-tags structural analyzer for Kotlin: classes, interfaces, \
+                enum classes, objects, companion objects, functions and type aliases, via a \
+                hand-authored tags query (see module docs — the grammar ships none).",
+            grammar: tree_sitter_kotlin_ng::LANGUAGE,
+            tags_query: KOTLIN_TAGS_QUERY,
             locals_query: "",
         },
     ]

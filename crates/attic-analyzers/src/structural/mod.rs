@@ -57,7 +57,6 @@ use crate::api::{
     RetrievalUnitSpec, StructuralNodeSpec, SymbolSpec, diagnostic_codes,
 };
 use crate::cancellation::CancellationToken;
-use crate::generic::GenericAnalyzer;
 use crate::registry::AnalyzerRegistry;
 
 pub mod go;
@@ -831,6 +830,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: span_for_bytes(start, end, src),
                     retrieval_text: text,
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal: *ordinal,
                     structural_node_index: None,
                 });
@@ -846,6 +847,8 @@ pub(crate) mod engine {
             units.push(RetrievalUnitSpec {
                 span: nodes[node_idx].span,
                 retrieval_text: text,
+                canonical_text: None,
+                occurrence_metadata: None,
                 ordinal,
                 structural_node_index: Some(node_idx),
             });
@@ -866,6 +869,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: span_for_bytes(pos, end, src),
                     retrieval_text: src.text(pos, end),
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal,
                     structural_node_index: None,
                 });
@@ -879,6 +884,8 @@ pub(crate) mod engine {
                 units.push(RetrievalUnitSpec {
                     span: SourceSpan::new(0, 0, 0, 0),
                     retrieval_text: chunk_text.clone(),
+                    canonical_text: None,
+                    occurrence_metadata: None,
                     ordinal,
                     structural_node_index: None,
                 });
@@ -963,44 +970,16 @@ impl Analyzer for TreeSitterAnalyzer {
 // Registry wiring
 // ---------------------------------------------------------------------------
 
-/// Build the standard registry: `GenericAnalyzer` fallback plus every bundled
-/// structural language. Adding a language = one line here (plus its spec
-/// module); no other subsystem changes.
+/// Build the standard registry: `GenericAnalyzer` fallback plus every
+/// built-in plugin (see [`crate::plugin::PluginCatalog::builtin`]). Adding a
+/// language or platform means adding a plugin to that catalog; nothing here
+/// changes.
 ///
-/// Note: callers that need a *custom* registry (tests, future plugin hosts)
-/// can compose `AnalyzerRegistry` themselves — this helper is convenience,
-/// not a coupling point.
+/// Callers that need a configured subset use
+/// [`crate::plugin::PluginCatalog::build_registry`] with an
+/// [`crate::plugin::AnalyzerSelection`].
 pub fn default_registry() -> AnalyzerRegistry {
-    let mut reg = AnalyzerRegistry::new(Arc::new(GenericAnalyzer::new()) as Arc<dyn Analyzer>);
-    reg.register_specialized(java::analyzer());
-    reg.register_specialized(python::analyzer());
-    reg.register_specialized(go::analyzer());
-    reg.register_specialized(javascript::analyzer());
-    reg.register_specialized(typescript::analyzer());
-    // `.tsx` bug fix: register the JSX-aware grammar under an explicit
-    // language tag rather than `FileType::TypeScript` — both `TypeScriptSpec`
-    // and `TsxSpec` declare identical capability levels, so registering both
-    // under the same `FileType` key would hit `best_entry`'s alphabetical
-    // tie-break ("tsx-treesitter" < "typescript-treesitter"), incorrectly
-    // selecting the TSX grammar for *every* `.ts` file too. Keying by
-    // language hint instead makes the choice unambiguous: `.tsx` sources
-    // carry `language_hint = Some("tsx")` (set by `attic-indexing`) and hit
-    // this entry directly; `.ts` sources carry `Some("typescript")` (or no
-    // hint at all), which never matches here and falls through to the
-    // `FileType::TypeScript` map above, where `TypeScriptSpec` is the sole
-    // entry.
-    reg.register_for_language("tsx", typescript::tsx_analyzer());
-
-    // Tier 2 — tags.scm-based structural coverage (Phase 3 broadening).
-    // Registered only under explicit language tags, never under `FileType`,
-    // so they can never collide with (or shadow) the tier-1 hand-written
-    // analyzers above. (Java/Python/Go/JavaScript/TypeScript/Tsx language
-    // tags are already claimed above; `tags_generic::tier2_analyzers()` never
-    // emits those tags — see its own module docs for the exclusion list.)
-    for (tag, analyzer) in tags_generic::tier2_analyzers() {
-        reg.register_for_language(tag, analyzer);
-    }
-    reg
+    crate::plugin::PluginCatalog::builtin().build_all()
 }
 
 /// Shared helper for language modules: construct the public analyzer.

@@ -21,7 +21,7 @@ attic-incremental.workspace = true
 attic-retrieval = { path = '../attic-retrieval' }
 attic-crossrepo = { path = '../attic-crossrepo' }
 attic-semantic  = { path = '../attic-semantic' }
-attic-evidence = { path = '../attic-evidence' }
+attic-inference-worker = { path = '../attic-inference-worker' }
 rmcp  = { workspace = true, features = ["client"] }
 tokio = { workspace = true, features = ["process", "io-util"] }
 serde.workspace           = true
@@ -35,5 +35,16 @@ interprocess = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-regex = "1"
 
+
+[features]
+# GPU semantic backends.
+#   ort-directml : no-op alias. DirectML (any DX12 GPU) is built in
+#                  automatically on Windows MSVC; nothing to enable.
+#   candle-cuda  : NVIDIA on Linux and Windows (requires the CUDA toolkit).
+#   candle-metal : Apple Silicon macOS.
+# Build e.g.: cargo build -p attic-server --features candle-metal
+default = []
+ort-directml = ["attic-semantic/ort-directml"]
+candle-cuda = ["attic-semantic/candle-cuda"]
+candle-metal = ["attic-semantic/candle-metal"]

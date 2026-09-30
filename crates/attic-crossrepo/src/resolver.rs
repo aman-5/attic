@@ -164,6 +164,8 @@ fn basis_for(eco: Ecosystem) -> &'static str {
         Ecosystem::Python => "PYTHON_PACKAGE",
         Ecosystem::Submodule => "SUBMODULE",
         Ecosystem::GeneratedApi => "GENERATED_API",
+        Ecosystem::Osgi => "OSGI_BUNDLE",
+        Ecosystem::AemComponent => "AEM_COMPONENT",
     }
 }
 

@@ -24,3 +24,4 @@ thiserror.workspace       = true
 tempfile.workspace           = true
 rusqlite.workspace           = true
 attic-incremental.workspace  = true
+attic-discovery.workspace    = true

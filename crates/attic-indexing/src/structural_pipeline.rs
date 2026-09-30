@@ -23,7 +23,7 @@
 //! Everything else remains `SYNTACTIC` with an honest confidence ≤ 0.6.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use attic_analyzers::{Analyzer, GenericAnalyzer, ImportSpec, ResolutionLevel};
@@ -33,15 +33,61 @@ use attic_storage::{
     PublicationNode, PublicationRelationship, PublicationStructuralFile, PublicationSymbolDef,
 };
 
-/// Registry with GenericAnalyzer plus every bundled structural language.
-pub(crate) fn default_registry() -> attic_analyzers::AnalyzerRegistry {
-    attic_analyzers::default_registry()
-}
-
 /// Registry with ONLY the GenericAnalyzer — the Phase 1D baseline used by
 /// `IndexOptions { structural: false }` (benchmarks / kill-switch).
 pub(crate) fn generic_only_registry() -> attic_analyzers::AnalyzerRegistry {
     attic_analyzers::AnalyzerRegistry::new(Arc::new(GenericAnalyzer::new()) as Arc<dyn Analyzer>)
+}
+
+/// The registry an indexing run should use, built once per distinct
+/// analyzer configuration and shared by every run (full and incremental)
+/// in the process. Analyzers are `Send + Sync` and read-only during
+/// `analyze`, so one instance safely serves concurrent runs.
+///
+/// Registries are built outside the cache lock (building compiles tags
+/// queries), so a first build never blocks runs using another configuration.
+/// A poisoned lock is recovered rather than propagated: the map only ever
+/// holds fully built registries.
+pub(crate) fn shared_registry(
+    opts: &crate::IndexOptions,
+) -> Result<Arc<attic_analyzers::AnalyzerRegistry>, crate::IndexError> {
+    type Key = (bool, attic_analyzers::AnalyzerSelection);
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Key, Arc<attic_analyzers::AnalyzerRegistry>>>,
+    > = std::sync::OnceLock::new();
+
+    let catalog = attic_analyzers::PluginCatalog::builtin();
+    // Fail closed on unknown plugin ids even when structural analysis is
+    // off, so a typo never lies dormant until the kill-switch is flipped.
+    catalog
+        .validate(&opts.analyzers)
+        .map_err(|e| crate::IndexError::AnalyzerConfig(e.to_string()))?;
+    let key: Key = if opts.structural {
+        (true, opts.analyzers.clone())
+    } else {
+        (false, attic_analyzers::AnalyzerSelection::all())
+    };
+
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(found) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(Arc::clone(found));
+    }
+
+    let built = Arc::new(if key.0 {
+        catalog
+            .build_registry(&key.1)
+            .map_err(|e| crate::IndexError::AnalyzerConfig(e.to_string()))?
+    } else {
+        generic_only_registry()
+    });
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(Arc::clone(guard.entry(key).or_insert(built)))
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +231,6 @@ pub(crate) struct ResolverDeps<'a> {
 }
 
 pub(crate) struct StructuralPipeline {
-    #[allow(dead_code)]
-    repo_root: PathBuf,
     known_paths: BTreeSet<String>,
     go_module_prefix: Option<String>,
     files: Vec<CapturedFile>,
@@ -200,7 +244,6 @@ impl StructuralPipeline {
     pub(crate) fn new(repo_root: &Path, known_paths: BTreeSet<String>) -> Self {
         let go_module_prefix = read_go_module_prefix(repo_root);
         Self {
-            repo_root: repo_root.to_path_buf(),
             known_paths,
             go_module_prefix,
             files: Vec::new(),

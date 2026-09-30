@@ -18,6 +18,7 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: windows-latest
+          # Apple Silicon runner, matching release.yml.
           - os: macos-latest
 
     runs-on: ${{ matrix.os }}

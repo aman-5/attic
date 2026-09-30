@@ -1,4 +1,4 @@
-# Attic — Architecture
+# 🏛️ Attic — Architecture
 
 This document describes Attic **as it exists in the current codebase**, not
 as a history of how it was built. "Key design decisions" and "Core
@@ -6,6 +6,24 @@ behavioral invariants" below consolidate what used to be a separate ADR/
 contract document set; this file is now the single authoritative
 architecture reference — nothing else needs to be read to understand how
 the system behaves.
+
+## Contents
+
+- [What Attic is](#what-attic-is)
+- [Architecture overview](#architecture-overview)
+- [Process and ownership model](#process-and-ownership-model)
+- [Storage concurrency](#storage-concurrency)
+- [Language support](#language-support)
+- [Project Knowledge authority model](#project-knowledge-authority-model)
+- [Known design limitations](#known-design-limitations)
+- [Key design decisions](#key-design-decisions)
+- [Core behavioral invariants](#core-behavioral-invariants)
+- [Semantic layer](#semantic-layer-optional-default-enabled)
+- [Resource management](#resource-management)
+- [Security](#security)
+- [Crash recovery](#crash-recovery)
+- [Logical workspace model](#logical-workspace-model-multi-root-mcp-configured)
+- [MCP surface](#mcp-surface)
 
 ## What Attic is
 
@@ -36,15 +54,19 @@ flowchart TD
 ```
 
 - **Discovery + security** (`attic-discovery`) — gitignore-aware walk,
-  path-traversal/symlink guards, secrets scan. Any nested Git repository —
+  path-traversal/symlink guards, secrets scan. Hidden entries (dot-prefixed,
+  plus the hidden attribute on Windows) are skipped, except content-bearing
+  dot-files listed in `INDEXED_HIDDEN_FILE_NAMES` (AEM/FileVault
+  `.content.xml`). Any nested Git repository —
   submodule or plain independent checkout — becomes one `core_repositories`
   entry each (ADR-006).
 - **Analyzers** (`attic-analyzers`) — `GenericAnalyzer` (universal
-  fallback, every text file searchable) plus two structural tiers: full
-  hand-written tree-sitter analyzers (Java, Python, Go, JavaScript,
-  TypeScript) and a generic `tags.scm`-driven engine (symbols + intra-file
-  references only) covering ten more languages — see
-  [Language support](#language-support) below.
+  fallback, every text file searchable) plus pluggable language and
+  platform analyzers composed from a `PluginCatalog`: full hand-written
+  tree-sitter analyzers (Java, Python, Go, JavaScript, TypeScript), a
+  generic `tags.scm`-driven engine (symbols + intra-file references only)
+  covering eleven more languages, a JSON analyzer, and the AEM platform plugin
+  — see [Language support](#language-support) below.
 - **Canonical index** (`attic-storage`, SQLite + FTS5) — files, retrieval
   units, structural nodes, symbols, relationships. One coordinated
   `WriterQueue` (single writer, serialized transactions); a `DbPool` of
@@ -70,7 +92,8 @@ flowchart TD
   cross-repo-dependent answers while degraded.
 - **MCP surface** (`attic-server`) — rmcp stdio transport (relayed over a
   daemon's local socket/named pipe on later launches); tools: `file`,
-  `search`, `repo_map`, `status`, `context`, `workspace`, `logging`.
+  `search`, `repo_map`, `status`, `context`, `workspace`, `logging`, and the
+  admin tool `debug_drain_task`.
 
 ### Indexing pipeline
 
@@ -88,6 +111,19 @@ Each file's `SourceRevision` (content-addressed identity via BLAKE3) and
 the workspace's `WorkspaceSnapshot` are computed during discovery, before
 the analyzer stage — every downstream artifact traces back to the exact
 revision it was derived from.
+
+**Throughput design.** Per-file analysis is pure (no database access), so
+both full and incremental indexing run it on a bounded worker pool
+(`[indexing] analysis_threads`, default logical CPUs minus two). Workers
+pull files from one shared cursor over a largest-first order, so a few
+multi-megabyte files never leave the other workers idle; results are
+reassembled in discovery order, so output never depends on thread count.
+The analyzer registry is built once per configuration and shared. The
+single atomic publication reuses prepared statements for every per-row
+insert/delete (retrieval units, FTS rows, structural nodes, symbols,
+relationships), and structural nodes of a replaced file are deleted with
+one statement per file (the self-referential `parent_id` foreign key is
+`NO ACTION`, checked at statement end).
 
 ### Retrieval & evidence
 
@@ -136,11 +172,23 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   or on SIGINT; a crashed daemon's `attic.lock` is released automatically
   by the OS, so the next launch re-elects cleanly. See
   `crates/attic-server/src/daemon.rs` for the election/relay/accept-loop
-  implementation. Attic still does **not** support multiple *daemons*
-  concurrently writing to the same database — only one process is ever the
-  daemon for a given database at a time; setting `ATTIC_NO_DAEMON=1`
-  reproduces the older, stricter behavior where a second launch simply
-  refuses to start instead of relaying.
+  implementation. There is exactly one serving path: only one process is
+  ever the daemon for a given database. If the daemon wins the lock but
+  cannot create its local socket, it still serves its own client and exits
+  as soon as that client disconnects (nobody else could connect). A relay
+  whose daemon dies re-runs the election and, if it wins, promotes itself
+  to daemon while keeping its own client's session alive. The idle timeout
+  defaults to 90 s (`ATTIC_DAEMON_IDLE_TIMEOUT_MS`).
+
+  ```mermaid
+  stateDiagram-v2
+      [*] --> Election: launch
+      Election --> Daemon: won attic.lock
+      Election --> Relay: lock held, attic.ipc found
+      Relay --> Election: daemon disconnected
+      Daemon --> [*]: idle timeout / Ctrl+C
+      Relay --> [*]: client disconnected
+  ```
 - **Multi-root workspaces**: the logical workspace is the SET of
   configured repository roots, not one filesystem directory — roots may
   live anywhere on disk with no common parent, no symlinks, and no Git
@@ -150,8 +198,9 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   exclusive). Each root is validated and bootstrapped independently and
   becomes its own `core_repositories` row. Cross-repository dependency
   resolution (`attic-crossrepo::maintenance::sync_workspace`) runs once at
-  startup, inside that single process, over every repository currently in
-  storage:
+  startup, inside the daemon, over the configured member repositories
+  (repositories left in storage by an earlier configuration never
+  contribute edges):
 
   ```text
   Logical Workspace
@@ -165,10 +214,13 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   ```
 
   The scheduler's task queue is shared across every configured
-  repository: each claimed task resolves its OWN repository's root from
-  storage before doing any filesystem work, so a task belonging to repo B
-  is never executed against repo A's root, and one bad root never blocks
-  or corrupts the others (failure isolation).
+  repository: every task carries its repository, and each claimed task
+  resolves that repository's root from storage before doing any filesystem
+  work — a task whose repository is no longer registered fails instead of
+  running anywhere else — so one bad root never blocks or corrupts the
+  others (failure isolation). Bootstrap, the watcher filter, background
+  reconciliation and recomputation all use one discovery policy, so
+  `attic.toml [indexing] exclude` applies identically everywhere.
 
 - **Repository isolation / stable identity**: every repository, file, and
   retrieval unit has a stable, content-addressed identity independent of
@@ -211,25 +263,66 @@ import or relationship resolution — is a single generic engine
 (`crates/attic-analyzers/src/structural/tags_generic.rs`) driven by
 tree-sitter's `tags.scm` convention (the same mechanism GitHub/Neovim/Helix
 use for cross-language "go to definition"), covering **C, C++, Ruby, C#,
-Scala, PHP, Swift, Lua, Rust, and Dockerfile** without any hand-written
+Scala, PHP, Swift, Lua, Rust, Kotlin, and Dockerfile** without any hand-written
 per-language AST-walking code; the capability gap versus tier 1 is
 declared explicitly in code (`ImportExtraction=None`,
 `RelationshipResolution=None`), not silently overclaimed. Every other
-text-based language or format not on either list — Kotlin, config files,
-docs, build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
+text-based language or format not on either list — config files, docs,
+build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
 still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
-gate on usability. A file's language hint (`AnalyzerInput.language_hint`,
-populated by `attic-indexing`'s `infer_language_hint`) is tried against the
-tier-2 table before falling back to the existing `FileType`-keyed
-registry lookup, so tier-1 languages are never shadowed by a tier-2 entry.
+gate on usability.
+
+### Analyzer plugins
+
+Every language or platform is an `AnalyzerPlugin`
+(`crates/attic-analyzers/src/plugin.rs`): a stable config-facing id, a
+`language_hint(path)` that claims repository-relative paths, and a
+`register` that adds its analyzers to an `AnalyzerRegistry`. The
+`PluginCatalog` orders plugins (path-specific platform plugins such as AEM
+first, so they win over extension rules) and builds a registry from an
+`AnalyzerSelection` — `attic.toml [indexing] analyzers` /
+`disabled_analyzers`, where empty means every plugin and unknown ids fail
+startup. `attic-indexing`'s `infer_language_hint` delegates to the catalog,
+so hint tags and registered tags come from one place and cannot drift. A
+hint is tried against the language-tag map before the `FileType`-keyed map,
+so tier-1 languages are never shadowed by a tier-2 entry, and a disabled
+plugin's tag is simply unregistered: its files fall through to
+`GenericAnalyzer` and stay fully searchable. Paths are matched with `/`
+separators and ASCII case-insensitively on every platform. Third-party
+plugins join a catalog through `PluginCatalog::with_plugin` (duplicate ids
+are rejected). The analysis cache is keyed on the effective plugin set, so a
+retry after a configuration change never replays output from different
+analyzers.
+
+### AEM platform plugin
+
+`crates/attic-analyzers/src/aem.rs` classifies FileVault content by path —
+`.content.xml` and `*.xml` under `jcr_root/` (JCR content), `*.html` under
+`jcr_root/` and `*.htl` (HTL), `*.cfg.json` and Felix `*.config` in
+`config*`/`osgiconfig` folders (OSGi configuration), and `js.txt`/`css.txt`
+under `jcr_root/` (clientlib manifests). Plain HTML/XML/JSON elsewhere is
+never claimed. It extracts path-qualified JCR nodes (FileVault names such as
+`_cq_dialog` decode to `cq:dialog`) with `jcr:primaryType`,
+`sling:resourceType`/`resourceSuperType`, `cq:template` and clientlib
+metadata; HTL `data-sly-template` definitions and `data-sly-use` bindings;
+OSGi PIDs, factory names, run modes and properties; and clientlib sources.
+Resource types, super types, templates, HTL use/include/resource targets and
+clientlib embeds/dependencies are recorded as imports. Retrieval units come
+from `GenericAnalyzer`, so lexical coverage is unchanged. Parsing is
+tolerant (malformed input yields partial structure plus a warning, never a
+dispatch error) and bounded by the entity cap, time budget and
+cancellation. Capabilities are declared honestly: symbols and imports only,
+no cross-file resolution.
 
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
 | Java / Python / Go / JS / TS (incl. `.tsx`) | Tier 1 — hand-written tree-sitter | Full symbols, definitions, imports, relationships |
-| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Dockerfile | Tier 2 — generic tags.scm | Symbol definitions + intra-file references only |
-| Everything else (Kotlin, etc.) | Tier 3 — `GenericAnalyzer` (today) | Full-text search; a dedicated structural analyzer can be added later without changing the pipeline |
+| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Kotlin / Dockerfile | Tier 2 — generic tags.scm | Symbol definitions + intra-file references only |
+| JSON | `JsonAnalyzer` | Canonical subtree chunks with JSON-pointer addressing |
+| AEM (JCR content, HTL, OSGi configs, clientlibs) | `aem` platform plugin | Path-qualified nodes/symbols and imports; lexical units from `GenericAnalyzer` |
+| Everything else | Tier 3 — `GenericAnalyzer` | Full-text (and semantic) search; a dedicated analyzer can be added as a plugin without changing the pipeline (see `docs/PLAYBOOK.md`) |
 
 ## Project Knowledge authority model
 
@@ -265,20 +358,14 @@ contradictions. The boundary is the `knowledge/` path prefix only —
 filenames are never special-cased outside it. See `knowledge/README.md` in
 this repository for the end-user-facing explanation and template.
 
-## Known design limitations (not blocking, no action taken)
+## Known design limitations
 
-These are honest, currently-accurate statements about gaps between the
-schema/contracts and the current implementation — not defects introduced by
-this pass, and not silently resolved by it. Each needs a product decision
-before being closed:
+Honest statements about current gaps between the schema/contracts and the
+implementation. Each needs a product decision before it is closed:
 
-- **`core_knowledge_items` is schema-only.** The table exists (referenced by
-  cascading invalidation in `attic-storage::invalidation_ops`) but nothing
-  currently writes to it — knowledge evidence is derived directly from path
-  classification (`knowledge/**`) against the standard FTS/file-occurrence
-  data, not from this dedicated table. Populating it would enable richer
-  semantics (explicit supersession chains, `applicable_versions`) but has no
-  current consumer.
+<details>
+<summary><strong>Show the four known limitations</strong></summary>
+
 - **Rename detection is heuristic only.** `core_identity_links` supports a
   `GIT_RENAME`/`EXACT` basis in its schema, but no code path currently
   computes it — all renames/moves are recorded via `CONTENT_MATCH`
@@ -288,20 +375,19 @@ before being closed:
   `src/main/java/...`-style path candidates plus in-run symbol evidence, not
   `pom.xml`/`build.gradle` dependency-scope parsing. The relationship schema
   already carries `dependency_basis=MAVEN|GRADLE` for when this is added.
-- **No automatic re-index on analyzer-version bump.** Each index generation
-  records the running `ANALYZER_REGISTRY_VERSION`, but nothing diffs a
-  stored generation's recorded version against the current one to schedule
-  invalidation automatically — an analyzer upgrade requires a manual
-  re-index (see `docs/PLAYBOOK.md` Maintenance). Republication does replace
-  analyzer-derived artifacts wholesale once triggered.
+- **Analyzer changes apply on restart, not live.** Every startup runs a
+  full authoritative index pass per configured root, and the analysis cache
+  is keyed on `ANALYZER_REGISTRY_VERSION` plus the effective plugin set, so
+  an upgraded binary or a changed `[indexing] analyzers` selection
+  re-analyzes affected files on the next start. A running daemon does not
+  hot-reload analyzers.
 - **A corrupt database is not auto-quarantined.** On a startup integrity-check
   failure, Attic logs the violation and refuses to serve (fail-closed) but
   does **not** rename or move the corrupt `attic.db` aside automatically —
   the operator must do this manually before restoring from backup or
   rebuilding (see `docs/PLAYBOOK.md` Recovery).
-- **No enforced upper bound on `max_context_tokens`.** `ResourceConfig::
-  validate()` only rejects `0`; there is no configured ceiling on how high
-  `ATTIC_MAX_CONTEXT_TOKENS` (default `8192`) can be set.
+
+</details>
 
 ## Key design decisions
 
@@ -309,11 +395,14 @@ Permanent, non-obvious decisions worth knowing when changing this system —
 condensed from the project's ADR history (full alternatives-considered
 rationale lives only in the archive branch's git history now):
 
+<details>
+<summary><strong>Show all design decisions</strong></summary>
+
 - **SQLite WAL checkpointing**: automatic frame-count checkpointing
   (`PRAGMA wal_autocheckpoint = 1000`, PASSIVE) on the writer connection,
-  plus a background PASSIVE checkpoint every 5 minutes and a FULL checkpoint
-  immediately before every backup — chosen over a purely time-based trigger
-  to bound WAL growth under bursty write load without blocking readers.
+  plus a `TRUNCATE` checkpoint during clean shutdown immediately before the
+  crash-recovery backup — bounding WAL growth under bursty write load
+  without ever blocking readers.
 - **Secret-pattern versioning**: `core_file_occurrences.secret_pattern_version`
   and `core_index_generations.secret_detector_version` are tracked
   independently of the schema version so that shipping an improved secret
@@ -327,10 +416,9 @@ rationale lives only in the archive branch's git history now):
   model](#process-and-ownership-model): one daemon owns the writer per
   database; later launches relay to it rather than opening a second one).
 - **Per-subsystem compatibility versioning**: `core_index_generations.
-  subsystem_versions_json` tracks schema/analyzer/segmentation/discovery
-  versions independently, so a change in one subsystem (e.g. an analyzer
-  upgrade) triggers exactly the scoped invalidation it needs
-  (`PARTIALLY_REBUILDABLE`) instead of an all-or-nothing rebuild.
+  subsystem_versions_json` records the schema, analyzer-registry, indexer
+  and secret-detector versions independently, so each generation states
+  exactly which subsystem versions produced it.
 - **Discovery uses the `ignore` crate** (ripgrep's gitignore engine) rather
   than a hand-rolled `.gitignore` parser, and **BLAKE3** for all content
   hashing — both chosen to avoid subtly-wrong reimplementations of
@@ -355,10 +443,11 @@ rationale lives only in the archive branch's git history now):
   picks the analyzer with the highest-ordinal `CapabilityKind` for a file
   type, breaking ties by name — reproducible indexing runs are a hard
   requirement, so "first registered wins" was rejected.
-- **`GenericAnalyzer` chunks at 500 lines per `RetrievalUnit`** — large
-  enough for useful context, small enough to stay well under embedding
-  token limits if the semantic layer is enabled; language-agnostic since it
-  requires no parser.
+- **`GenericAnalyzer` chunks at ~2,000 characters per `RetrievalUnit`**
+  (`TARGET_CHUNK_CHARS`, recorded as `CHUNKING_VERSION`) — large enough for
+  useful context, small enough to stay well under embedding token limits;
+  chunks tile the file exactly and an over-long single line is split
+  losslessly. Language-agnostic since it requires no parser.
 - **Filesystem watching uses `notify-debouncer-full`** (on top of `notify`
   8.2.x) for cross-platform debounced change events, with periodic
   reconciliation as the documented fallback when native watching isn't
@@ -377,6 +466,8 @@ rationale lives only in the archive branch's git history now):
   pipeline does not allow a claim in a `context` response to reference
   evidence that isn't part of the assembled context returned alongside it.
 
+</details>
+
 ## Core behavioral invariants
 
 A condensed reference of the invariants that most affect correctness and
@@ -384,6 +475,9 @@ observable behavior, verified against the current implementation. This is
 not exhaustive engineering detail (that level of specification now exists
 only in git history on the archive branch) — it's what a maintainer changing
 this system needs to not accidentally break.
+
+<details>
+<summary><strong>Show invariants by area</strong> (Discovery, Identity, Secrets, Storage, Freshness, Evidence, Recovery, Resources)</summary>
 
 **Discovery & security**
 - A path marked security-forbidden is never made eligible by any include
@@ -417,8 +511,6 @@ this system needs to not accidentally break.
   as invalid rather than trusted.
 - No user-controlled string is ever concatenated into SQL; all queries use
   parameter binding.
-- `core_evidence` rows are append-only — a stale row is marked `STALE`, not
-  overwritten.
 
 **Freshness & invalidation**
 - An artifact in `INVALID` state is never returned as valid evidence; a
@@ -455,29 +547,95 @@ this system needs to not accidentally break.
 - The writer queue is drained (bounded) before process exit — shutdown never
   abandons a write mid-flight without at least attempting to finish it.
 
+</details>
+
 ## Semantic layer (optional, default-enabled)
 
 Semantic (embedding-based) retrieval is **enabled by default**; set
-`ATTIC_SEMANTIC=0` to disable it. When enabled, `BgeEmbedder` — a
-real, Candle-backed neural embedder (`BAAI/bge-base-en-v1.5`, 768-dim) — is the
-default provider; `HashingEmbedder`, a deterministic feature-hashing
-baseline, remains available as an explicit `attic.toml` `[embedding]`
-override and is what CI/tests use to stay offline and byte-deterministic.
-See [Resource management](#resource-management) below for the
-`EmbeddingProfile` persistence and `ResourceMode`/`ResourcePolicy` design,
-and `crates/attic-retrieval/src/hybrid.rs` for the RRF hybrid-search fusion.
+`ATTIC_SEMANTIC=0` to disable it. When enabled, `Qwen3Embedder` — a
+real, Candle-backed neural embedder (`Qwen/Qwen3-Embedding-0.6B`) — is the
+production provider; `HashingEmbedder` serves strictly as a deterministic
+test double for offline test isolation.
+Every vector is tied to an `EmbeddingFingerprint` (model, revision,
+dimension, pooling, normalization, tokenizer, chunking, instruction,
+backend, quantization) and a semantic generation, so vectors from
+incompatible configurations are never mixed; see
+`crates/attic-retrieval/src/hybrid.rs` for the RRF hybrid-search fusion.
 When disabled or degraded, canonical (lexical/structural)
 retrieval is entirely unaffected; the semantic layer never gates or blocks
 an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
 rationale.
 
-The background embedding worker (`crates/attic-semantic/src/enrich.rs`)
-runs a resource-tier-scaled number of threads — 1 on `low`, 3 on
-`balanced`/`performance` (`crates/attic-storage/src/resource_policy.rs`) —
-rather than exactly one thread always. A shared reconcile-coordination
-gate prevents the (expensive) rescan from running redundantly per thread,
-an atomic queue-claim prevents two threads from claiming the same unit,
-and backoff sleeps are jittered to avoid thundering-herd wakeups.
+Backend selection (see README's Semantic engine notes for the exact env
+vars and build flags):
+
+```mermaid
+flowchart TD
+    S[Semantic layer enabled] --> P{Which GPU feature<br/>is compiled in?}
+    P -- ort-directml --> O{fp16 ONNX assets present?}
+    O -- yes --> G[GPU: ORT/DirectML fp16<br/>Qwen3-Embedding-0.6B]
+    O -- no --> DL[Background download<br/>CPU this run, GPU next start]
+    P -- candle-cuda / candle-metal --> DEV{Device actually available?}
+    DEV -- yes --> GC[GPU: Candle f32<br/>same safetensors as CPU]
+    DEV -- no --> C
+    P -- none --> C[CPU: Candle Qwen3Embedder<br/>safetensors f32]
+    DL --> C
+    G --> R[status: semantic_identity<br/>reports active backend<br/>+ fallback reason]
+    GC --> R
+    C --> R
+```
+
+Two distinct GPU stories, which is easy to conflate:
+
+* **DirectML** is a *different provider* — a separate fp16 ONNX export with
+  its own fingerprint (`qwen3-ort` / `fp16-onnx`), so its vectors occupy a
+  different vector space from the Candle ones and the two must never mix.
+* **CUDA and Metal** are the *same* Candle provider on a different device.
+  They load the identical `model.safetensors` the CPU path downloads, and
+  `DTYPE` stays `F32` on every device precisely so that moving between CPU
+  and GPU never invalidates an existing index.
+
+Every GPU path falls back to CPU with a stated reason rather than failing,
+and `execution_backend` is deliberately excluded from identity verification
+so a fallback degrades instead of erroring.
+
+Isolation: neural embedding always runs inside the supervised
+`attic inference-worker` child process regardless of which backend is
+selected — a hung or crashed model runtime is killed and restarted without
+touching the MCP server (see README's "Isolated inference worker" note).
+
+The background embedding workers (`crates/attic-semantic/src/enrich.rs`)
+scale with the resource mode — 1 / 3 / 8 on `low` / `balanced` /
+`performance`, overridable via `embedding_worker_count` — and share one
+work queue with a single, well-defined lifecycle:
+
+```mermaid
+flowchart LR
+    U[Retrieval units] -->|selection policy| O[Occurrence registry]
+    O -->|canonical vector exists| P[Projected into the<br/>active generation]
+    O -->|missing| Q[Leased queue]
+    Q -->|claim: lease + fencing token| W[Embedding worker]
+    W -->|commit with token| V[(Canonical vectors<br/>by vector space + content hash)]
+    V --> P
+```
+
+A claim takes a time-bounded lease and bumps a fencing token; a commit
+carrying an older token is rejected, so a stalled or crashed worker can
+never overwrite newer work, and expired leases return to the queue on the
+next drive. Canonical vectors are keyed by (vector space, content hash), so
+unchanged content re-indexed under a new source revision reuses its vector
+instead of being embedded again. A shared reconcile gate prevents the
+rescan from running redundantly per thread, and backoff sleeps are jittered
+to avoid thundering-herd wakeups.
+
+**Batching never changes a vector.** Batches are right-padded and the CPU
+attention path applies a causal mask, so every real token attends exactly
+as it would unbatched; the provider refuses any batch that is not
+right-padded. A regression test (`qwen3_model::tests`) and the real-model
+benchmark (`crates/attic-semantic/tests/qwen3_throughput_bench.rs`, min
+batched-vs-single cosine) guard this. Dev/test builds optimize the `gemm*`,
+`pulp`, `half` and `tokenizers` crates alongside `candle-*`, because the
+CPU matmul kernels live there.
 
 ## Resource management
 
@@ -488,6 +646,14 @@ calls) is never starved by background work (indexing, semantic enrichment) —
 background capacity is capped strictly below foreground capacity, and under
 memory pressure (`Pause`/`Emergency` advisories) expensive `DEEP` retrieval
 mode is automatically downgraded to `NORMAL` rather than failing outright.
+
+Resource values resolve as environment variable > `attic.toml [resources]`
+> hardware-detected mode baseline, are range-validated
+(`ResourcePolicy::validate`), and are clamped to the machine as the final
+step, so no override can exceed real hardware. `scheduler_workers`,
+`embedding_batch_size` and `embedding_worker_count` are user-tunable; SQLite
+cache/mmap sizing stays mode-derived. Unparsable environment values and
+unknown `attic.toml` tables/keys fail startup rather than being ignored.
 
 ## Security
 
@@ -503,8 +669,10 @@ mode is automatically downgraded to `NORMAL` rather than failing outright.
 ## Crash recovery
 
 On every startup, before serving any MCP request, Attic runs
-`run_startup_recovery`: it resets orphaned tasks, reconciles any indexing run
-that was interrupted mid-publication, and records the watcher epoch. This is
+`run_startup_recovery`: interrupted tasks return to `PENDING`, refreshes a
+crash cut short return to `STALE` (and are rescheduled), in-progress secret
+scans restart, and the watcher epoch is bumped. Publication is atomic, so a
+crash mid-run never exposes partial state as `CURRENT`. This is
 fail-closed — if recovery cannot establish a safe state, or the subsequent
 database integrity check fails, the process refuses to serve rather than
 present possibly-stale or corrupt data as `CURRENT`. On clean shutdown,
@@ -556,9 +724,10 @@ pins the entire application home: config + database + backups + scratch.
 Attic speaks MCP exclusively over stdio: **stdout carries only the MCP
 JSON-RPC protocol; every log line goes to stderr** (`tracing`, controlled by
 `ATTIC_LOG`/`RUST_LOG`). This has been verified by a smoke test that spawns
-the release binary and inspects both streams directly. The seven registered
+the release binary and inspects both streams directly. The eight registered
 tools (`file`, `search`, `repo_map`, `status`, `context`, `workspace`,
-`logging`) are documented in the README; their exact schemas are defined once in
+`logging`, `debug_drain_task`) are documented in the README; their exact
+schemas are defined once in
 `crates/attic-server/src/main.rs::make_tools()` and returned verbatim via
 `tools/list` — that function is the single source of truth for the tool
 surface.

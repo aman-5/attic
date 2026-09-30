@@ -56,19 +56,6 @@ impl ValidationVerdict {
     }
 }
 
-/// Parse a stored span string `start_line:start_col-end_line:end_col`.
-pub fn parse_span(s: &str) -> Option<attic_core::SourceSpan> {
-    let mut parts = s.split(['-', ':']);
-    let sl = parts.next()?.parse::<u32>().ok()?;
-    let sc = parts.next()?.parse::<u32>().ok()?;
-    let el = parts.next()?.parse::<u32>().ok()?;
-    let ec = parts.next()?.parse::<u32>().ok()?;
-    if el < sl || (el == sl && ec < sc) {
-        return None;
-    }
-    Some(attic_core::SourceSpan::new(sl, sc, el, ec))
-}
-
 fn freshness_permits(state: FreshnessState, req: FreshnessRequirement) -> bool {
     match req {
         FreshnessRequirement::CurrentOnly => state == FreshnessState::Current,

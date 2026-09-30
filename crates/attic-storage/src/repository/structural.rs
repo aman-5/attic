@@ -69,58 +69,24 @@ pub fn delete_structural_for_occurrences(
         }
     }
 
-    // ── 4. Structural nodes — leaves first (self-referential parent FK) ────
+    // ── 4. Structural nodes ────────────────────────────────────────────────
     //
-    // Repeatedly delete only nodes that are nobody's parent (within the
-    // whole table; parents and children always share one occurrence).
-    // Bounded by row count so a corrupt parent chain fails loudly instead
-    // of looping.
-    let mut remaining: Vec<String> = {
-        let mut stmt =
-            conn.prepare("SELECT id FROM core_structural_nodes WHERE file_occurrence_id = ?1")?;
-        let mut all = Vec::new();
+    // `parent_id` is a NO ACTION self-reference, which SQLite checks at the
+    // end of each statement rather than per row, and parents and children
+    // always share one occurrence. Deleting every node of an occurrence in
+    // one statement is therefore valid. A node elsewhere still pointing at
+    // one of these (a corrupt cross-occurrence chain) fails the statement
+    // with a foreign-key error and rolls the publication back, exactly as
+    // loudly as the old leaves-first loop did. That loop issued one probe
+    // query per remaining node per tree level, which dominated warm
+    // re-index publication.
+    {
+        let mut del =
+            conn.prepare("DELETE FROM core_structural_nodes WHERE file_occurrence_id = ?1")?;
         for id in occurrence_ids {
-            let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
-            for r in rows {
-                all.push(r?);
-            }
+            nodes += del.execute([id])?;
         }
-        all
-    };
-    let total = remaining.len();
-    while !remaining.is_empty() {
-        let mut leaf_ids: Vec<String> = Vec::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM core_structural_nodes n
-                  WHERE n.id = ?1
-                    AND NOT EXISTS (
-                          SELECT 1 FROM core_structural_nodes c
-                           WHERE c.parent_id = n.id)",
-            )?;
-            for id in &remaining {
-                if stmt.query_row([id], |_| Ok(())).is_ok() {
-                    leaf_ids.push(id.clone());
-                }
-            }
-        }
-        if leaf_ids.is_empty() {
-            return Err(StorageError::Worker(
-                "structural deletion stalled: no leaf nodes among remaining rows \
-                 (corrupt parent_id chain)"
-                    .into(),
-            ));
-        }
-        {
-            let mut del = conn.prepare("DELETE FROM core_structural_nodes WHERE id = ?1")?;
-            for id in &leaf_ids {
-                nodes += del.execute([id])?;
-            }
-        }
-        let done: std::collections::HashSet<&String> = leaf_ids.iter().collect();
-        remaining.retain(|id| !done.contains(id));
     }
-    debug_assert_eq!(nodes, total);
 
     Ok((links, rels, symbols, nodes))
 }
@@ -144,26 +110,26 @@ pub fn insert_structural_file(
         // Merge the partial-analysis marker into per-row metadata so any
         // consumer reading a node sees the completeness verdict directly.
         let metadata_json = merge_partial_marker(&n.metadata_json, sf.structurally_complete);
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO core_structural_nodes
                  (id, repository_id, file_occurrence_id, parent_id, node_type,
                   structural_identity, source_span, content_hash,
                   analyzer_id, analyzer_version, metadata_json, freshness_state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'CURRENT')",
-            rusqlite::params![
-                node_ids[idx],
-                repository_id,
-                sf.file_occurrence_id,
-                parent_id,
-                n.node_type,
-                n.structural_identity,
-                n.span_str,
-                n.content_hash,
-                sf.analyzer_id,
-                sf.analyzer_version,
-                metadata_json,
-            ],
-        )
+        )?
+        .execute(rusqlite::params![
+            node_ids[idx],
+            repository_id,
+            sf.file_occurrence_id,
+            parent_id,
+            n.node_type,
+            n.structural_identity,
+            n.span_str,
+            n.content_hash,
+            sf.analyzer_id,
+            sf.analyzer_version,
+            metadata_json,
+        ])
         .map_err(StorageError::from)?;
     }
 
@@ -171,10 +137,12 @@ pub fn insert_structural_file(
     let mut symbol_ids: Vec<String> = Vec::with_capacity(sf.symbols.len());
     for s in &sf.symbols {
         let existing: Option<String> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT id FROM core_symbol_identities
                   WHERE repository_id = ?1 AND language = ?2 AND qualified_name = ?3
                         AND kind = ?4 AND disambiguator IS ?5",
+            )?
+            .query_row(
                 rusqlite::params![
                     repository_id,
                     s.language,
@@ -193,40 +161,40 @@ pub fn insert_structural_file(
             Some(id) => id,
             None => {
                 let id = uuid::Uuid::new_v4().to_string();
-                conn.execute(
+                conn.prepare_cached(
                     "INSERT INTO core_symbol_identities
                          (id, repository_id, language, qualified_name, kind, disambiguator)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        id,
-                        repository_id,
-                        s.language,
-                        s.qualified_name,
-                        s.kind,
-                        s.disambiguator
-                    ],
-                )
+                )?
+                .execute(rusqlite::params![
+                    id,
+                    repository_id,
+                    s.language,
+                    s.qualified_name,
+                    s.kind,
+                    s.disambiguator
+                ])
                 .map_err(StorageError::from)?;
                 id
             }
         };
         let occ_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO core_symbol_occurrences
                  (id, symbol_identity_id, file_occurrence_id, source_revision_id,
                   source_span, signature, visibility, is_definition)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                occ_id,
-                identity_id,
-                sf.file_occurrence_id,
-                source_revision_id,
-                s.span_str,
-                s.signature,
-                s.visibility,
-                s.is_definition,
-            ],
-        )
+        )?
+        .execute(rusqlite::params![
+            occ_id,
+            identity_id,
+            sf.file_occurrence_id,
+            source_revision_id,
+            s.span_str,
+            s.signature,
+            s.visibility,
+            s.is_definition,
+        ])
         .map_err(StorageError::from)?;
         symbol_ids.push(occ_id);
     }
@@ -246,7 +214,7 @@ pub fn insert_structural_file(
         } else {
             (logical_target_id(&r.target_entity_id), "FILE_OCCURRENCE")
         };
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO core_relationships
                  (id, source_repository_id, source_entity_id, source_entity_type,
                   target_repository_id, target_entity_id, target_entity_type,
@@ -254,22 +222,22 @@ pub fn insert_structural_file(
                   provenance_json, source_revision_id, freshness_state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      'CURRENT')",
-            rusqlite::params![
-                uuid::Uuid::new_v4().to_string(),
-                repository_id,
-                source_id,
-                source_type,
-                repository_id,
-                target_id,
-                target_type,
-                r.rel_type,
-                r.dependency_basis,
-                r.resolution,
-                r.confidence,
-                r.provenance_json,
-                source_revision_id,
-            ],
-        )
+        )?
+        .execute(rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            repository_id,
+            source_id,
+            source_type,
+            repository_id,
+            target_id,
+            target_type,
+            r.rel_type,
+            r.dependency_basis,
+            r.resolution,
+            r.confidence,
+            r.provenance_json,
+            source_revision_id,
+        ])
         .map_err(StorageError::from)?;
         rel_count += 1;
     }
@@ -280,12 +248,12 @@ pub fn insert_structural_file(
         let Some(node_uuid) = node_ids.get(l.node_index) else {
             continue;
         };
-        conn.execute(
+        conn.prepare_cached(
             "INSERT OR IGNORE INTO core_retrieval_unit_nodes
                  (retrieval_unit_id, structural_node_id, ordinal)
              VALUES (?1, ?2, ?3)",
-            rusqlite::params![l.retrieval_unit_id, node_uuid, l.ordinal],
-        )
+        )?
+        .execute(rusqlite::params![l.retrieval_unit_id, node_uuid, l.ordinal])
         .map_err(StorageError::from)?;
         link_count += 1;
     }

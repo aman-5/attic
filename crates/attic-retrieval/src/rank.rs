@@ -12,9 +12,9 @@ use attic_evidence::{AuthorityLevel, Evidence};
 use crate::candidates::RetrieverKind;
 use crate::query::QueryType;
 
-/// Slot indexes into the weight-table rows (documented order).
-#[allow(dead_code)]
-mod w {
+/// Slot indexes shared by the weight-table rows and the signal vector, so a
+/// weight can never be applied to the wrong signal.
+mod slot {
     pub const LEXICAL: usize = 0;
     pub const SYMBOL: usize = 1;
     pub const INTENT: usize = 2;
@@ -114,9 +114,9 @@ pub fn apply_signals_and_rank(
     if ev.signals.freshness_score.is_none() {
         ev.signals.freshness_score = Some(freshness_score(ev.freshness_state));
     }
-    let w = intent_weights(qt);
+    let weights = intent_weights(qt);
     if ev.signals.knowledge_authority.is_none()
-        && intent_weights(qt)[w::KNOWLEDGE] > 0.0
+        && weights[slot::KNOWLEDGE] > 0.0
         && matches!(
             ev.authority,
             AuthorityLevel::ProjectKnowledge | AuthorityLevel::Doc
@@ -128,36 +128,36 @@ pub fn apply_signals_and_rank(
         });
     }
     if ev.signals.test_relevance.is_none()
-        && intent_weights(qt)[w::TEST] > 0.0
+        && weights[slot::TEST] > 0.0
         && ev.source_type == ST::Test
     {
         ev.signals.test_relevance = Some(1.0);
     }
 
-    let vals = [
-        ev.signals.lexical_score,
-        ev.signals.symbol_match_score,
-        ev.signals.query_intent_match,
-        ev.signals.repository_relevance,
-        ev.signals.freshness_score,
-        ev.signals.structural_proximity,
-        ev.signals
-            .relationship_confidence
-            .or(ev.relationship.as_ref().map(|r| r.confidence)),
-        ev.signals.knowledge_authority,
-        ev.signals.test_relevance,
-        // Phase 5: set ONLY by the semantic generator; absence competes as
-        // zero contribution but the weight still enters the denominator for
-        // every item, so hybrid ordering stays explainable.
-        ev.signals.semantic_score,
-    ];
+    let mut vals = [None; 10];
+    vals[slot::LEXICAL] = ev.signals.lexical_score;
+    vals[slot::SYMBOL] = ev.signals.symbol_match_score;
+    vals[slot::INTENT] = ev.signals.query_intent_match;
+    vals[slot::REPO] = ev.signals.repository_relevance;
+    vals[slot::FRESHNESS] = ev.signals.freshness_score;
+    vals[slot::STRUCTURAL] = ev.signals.structural_proximity;
+    vals[slot::RELATIONSHIP] = ev
+        .signals
+        .relationship_confidence
+        .or(ev.relationship.as_ref().map(|r| r.confidence));
+    vals[slot::KNOWLEDGE] = ev.signals.knowledge_authority;
+    vals[slot::TEST] = ev.signals.test_relevance;
+    // Set ONLY by the semantic generator; absence competes as zero
+    // contribution but the weight still enters the denominator for every
+    // item, so hybrid ordering stays explainable.
+    vals[slot::SEMANTIC] = ev.signals.semantic_score;
     let mut num = 0.0;
     let mut den = 0.0;
-    for (i, v) in vals.iter().enumerate() {
-        if w[i] > 0.0 {
-            den += w[i];
-            if let Some(v) = v {
-                num += w[i] * v.clamp(0.0, 1.0);
+    for (weight, value) in weights.iter().zip(vals) {
+        if *weight > 0.0 {
+            den += weight;
+            if let Some(v) = value {
+                num += weight * v.clamp(0.0, 1.0);
             }
         }
     }

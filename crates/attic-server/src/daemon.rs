@@ -1,5 +1,4 @@
-//! Shared daemon per database, thin relay clients (Fix 1 in
-//! `docs/Plan-1.md`).
+//! The MCP process model: one shared daemon per database, thin relay clients.
 //!
 //! Only the first `attic-server` launch for a given database wins
 //! `attic.lock` and becomes the **daemon**: it alone owns the SQLite writer,
@@ -19,13 +18,12 @@
 //! `Clone`+`Arc`-backed, so the daemon just runs `server.clone().serve(..)`
 //! per accepted connection, identical to today's stdio call.
 //!
-//! `ATTIC_NO_DAEMON=1` (or `true`) skips all of this and reproduces the
-//! exact legacy single-process behavior (see `daemon::no_daemon_mode`),
-//! preserving existing test behavior and serving as an upgrade-compat
-//! fallback if an old pre-daemon binary is holding the lock.
+//! There is exactly one serving path. If the lock is won but the socket or
+//! `attic.ipc` cannot be set up, the process still runs as the daemon for its
+//! own stdio client — it simply cannot accept relays, and exits as soon as
+//! that client disconnects (there is nobody else who could connect).
 
 use std::{
-    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::{
@@ -74,22 +72,8 @@ const IPC_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(75);
 /// daemon's own shutdown sequence (bounded task-join up to that timeout,
 /// plus an unbounded WAL checkpoint/backup) can legitimately take close to
 /// that long, and a client racing a good-faith shutdown must keep retrying
-/// through it rather than timing out with a misleading "old pre-daemon
-/// build" error.
+/// through it rather than timing out.
 const CLIENT_TOTAL_RETRY_BUDGET: Duration = Duration::from_secs(40);
-
-/// Returns `true` if `ATTIC_NO_DAEMON` is set to `1` or `true`
-/// (case-insensitive) — the escape hatch that skips the whole election flow
-/// and reproduces the exact legacy single-process stdio behavior.
-pub(crate) fn no_daemon_mode() -> bool {
-    match std::env::var("ATTIC_NO_DAEMON") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        }
-        Err(_) => false,
-    }
-}
 
 fn idle_timeout() -> Duration {
     std::env::var("ATTIC_DAEMON_IDLE_TIMEOUT_MS")
@@ -100,28 +84,24 @@ fn idle_timeout() -> Duration {
 }
 
 /// Everything the winning process needs to run as the daemon: the still-held
-/// `attic.lock` guard (kept alive for the daemon's entire lifetime, same
-/// contract as the legacy single-instance lock), the bound IPC listener, and
-/// the path of the address-discovery file it published (removed best-effort
-/// on shutdown).
+/// `attic.lock` guard (kept alive for the daemon's entire lifetime), and —
+/// when the local socket could be set up — the bound IPC listener plus the
+/// `attic.ipc` address file it published (removed best-effort on shutdown).
+/// `ipc` is `None` when socket/IPC setup failed: the daemon then serves only
+/// its own stdio client.
 pub(crate) struct DaemonHandle {
+    // Field order is drop order: the listener (which unlinks its socket file
+    // on macOS/BSD) must be dropped BEFORE the lock is released, or a
+    // replacement daemon that wins the lock in between would have its fresh
+    // socket unlinked by our late drop.
+    ipc: Option<(IpcListener, PathBuf)>,
     _lock_guard: std::fs::File,
-    listener: IpcListener,
-    ipc_path: PathBuf,
 }
 
 impl DaemonHandle {
-    /// Returns the IPC discovery file path (e.g. `attic.ipc`).
-    #[allow(dead_code)]
-    pub(crate) fn ipc_path(&self) -> &Path {
-        &self.ipc_path
-    }
-
-    /// Derive the database path from the IPC path (sibling file convention:
-    /// `attic.ipc` lives next to `attic.db`).
-    #[allow(dead_code)]
-    pub(crate) fn db_path(&self) -> PathBuf {
-        self.ipc_path.with_file_name("attic.db")
+    /// Whether other launches (relays) can connect to this daemon.
+    pub(crate) fn accepts_relays(&self) -> bool {
+        self.ipc.is_some()
     }
 }
 
@@ -132,14 +112,10 @@ pub(crate) struct RelayHandle {
 }
 
 /// Outcome of [`elect`]: this process either won the race and must now run
-/// as the daemon, lost it and should relay to whoever won, or won the lock
-/// but couldn't stand up the socket/IPC side of the daemon role and should
-/// fall back to legacy single-process serving while still holding the lock
-/// it already won (see `ElectAttempt::BindOrIpcFailed`).
+/// as the daemon, or lost it and should relay to whoever won.
 pub(crate) enum ElectionResult {
     Daemon(DaemonHandle),
     Relay(RelayHandle),
-    Fallback(std::fs::File),
 }
 
 /// Outcome of [`run_relay_supervised`]: explicitly describes why relay
@@ -247,7 +223,16 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 
 fn bind_listener(socket_name: &str) -> io::Result<IpcListener> {
     let name = socket_name.to_ns_name::<GenericNamespaced>()?;
-    ListenerOptions::new().name(name).create_tokio()
+    // Only the process holding `attic.lock` binds (see `try_become_daemon`),
+    // so an existing socket is a dead daemon's leftover. On macOS/BSD the
+    // namespaced socket is a real file that outlives a killed process (Linux
+    // uses the abstract namespace, Windows named pipes), and without
+    // overwriting it every replacement daemon failed with AddrInUse.
+    ListenerOptions::new()
+        .name(name)
+        .try_overwrite(true)
+        .max_spin_time(Duration::from_secs(2))
+        .create_tokio()
 }
 
 async fn connect_stream(socket_name: &str) -> io::Result<IpcStream> {
@@ -259,14 +244,9 @@ async fn connect_stream(socket_name: &str) -> io::Result<IpcStream> {
 enum ElectAttempt {
     /// Another process already holds `attic.lock`.
     NotElected,
-    /// Won `attic.lock`, bound the listener, and published `attic.ipc`.
-    Daemon(DaemonHandle),
-    /// Won `attic.lock`, but binding the local socket/named-pipe listener or
-    /// writing `attic.ipc` failed. This process already safely holds
-    /// `attic.lock` — it can fall back to legacy single-process serving
-    /// with this same guard rather than hard-failing, since nothing else
-    /// can be holding the lock at the same time.
-    BindOrIpcFailed(std::fs::File, anyhow::Error),
+    /// Won `attic.lock`. The handle carries the listener when socket/IPC
+    /// setup also succeeded (boxed: it is far larger than `NotElected`).
+    Daemon(Box<DaemonHandle>),
 }
 
 /// Attempt to become the daemon: `try_lock()` the (already-open-or-opened)
@@ -274,10 +254,10 @@ enum ElectAttempt {
 /// `attic.ipc` — in that order, which is what closes the "client reads an
 /// address nobody is listening on yet" race. Returns
 /// `Ok(ElectAttempt::NotElected)` (not an error) when another process
-/// already holds the lock, and `Ok(ElectAttempt::BindOrIpcFailed(..))` (also
-/// not an error — see that variant's doc) when the lock was won but the
-/// socket/IPC setup failed. Only a failure to even open/lock the file
-/// itself propagates as `Err`.
+/// already holds the lock. When the lock is won but socket/IPC setup fails,
+/// this is still the daemon (it safely holds the lock) — it just serves its
+/// own client only. Only a failure to even open/lock the file itself
+/// propagates as `Err`.
 fn try_become_daemon(
     db_path: &Path,
     lock_path: &Path,
@@ -296,9 +276,7 @@ fn try_become_daemon(
         Err(std::fs::TryLockError::Error(e)) => {
             // A genuine I/O failure (locking unsupported on this filesystem,
             // permissions) is not the same as ordinary contention and must
-            // not be silently treated as "someone else is the daemon" — see
-            // this function's doc comment and the same distinction made at
-            // the legacy-mode lock site in `main.rs`.
+            // not be silently treated as "someone else is the daemon".
             return Err(anyhow::anyhow!(
                 "failed to lock '{}': {e}",
                 lock_path.display()
@@ -307,30 +285,31 @@ fn try_become_daemon(
     }
 
     let socket_name = derive_socket_name(db_path);
-    let listener = match bind_listener(&socket_name) {
-        Ok(listener) => listener,
+    let ipc = match bind_listener(&socket_name) {
+        Ok(listener) => match std::fs::write(ipc_path, &socket_name) {
+            Ok(()) => Some((listener, ipc_path.to_path_buf())),
+            Err(e) => {
+                warn!(
+                    "attic: daemon failed to write IPC address file '{}' ({e}); serving this \
+                     client only — other launches for this database cannot share it",
+                    ipc_path.display()
+                );
+                None
+            }
+        },
         Err(e) => {
-            return Ok(ElectAttempt::BindOrIpcFailed(
-                lock_file,
-                anyhow::anyhow!("daemon failed to bind IPC listener '{socket_name}': {e}"),
-            ));
+            warn!(
+                "attic: daemon failed to bind IPC listener '{socket_name}' ({e}); serving this \
+                 client only — other launches for this database cannot share it"
+            );
+            None
         }
     };
-    if let Err(e) = std::fs::write(ipc_path, &socket_name) {
-        return Ok(ElectAttempt::BindOrIpcFailed(
-            lock_file,
-            anyhow::anyhow!(
-                "daemon failed to write IPC address file '{}': {e}",
-                ipc_path.display()
-            ),
-        ));
-    }
 
-    Ok(ElectAttempt::Daemon(DaemonHandle {
+    Ok(ElectAttempt::Daemon(Box::new(DaemonHandle {
         _lock_guard: lock_file,
-        listener,
-        ipc_path: ipc_path.to_path_buf(),
-    }))
+        ipc,
+    })))
 }
 
 /// Poll `ipc_path` for a non-empty address, bounded by
@@ -355,20 +334,12 @@ async fn read_ipc_with_backoff(ipc_path: &Path, overall_deadline: Instant) -> Op
 
 /// Common handling for one `try_become_daemon` outcome, shared between the
 /// initial election attempt and the re-election retry after a stale-socket
-/// reconnect failure in `elect()` below — both used to repeat this three-arm
-/// match verbatim. `Some(result)` means the caller should immediately return
-/// that from `elect()`; `None` means `NotElected`, i.e. fall through to the
-/// caller's own retry/re-election logic.
+/// reconnect failure in `elect()` below. `Some(result)` means the caller
+/// should immediately return that from `elect()`; `None` means
+/// `NotElected`, i.e. fall through to the caller's own retry logic.
 fn handle_elect_attempt(attempt: ElectAttempt) -> Option<ElectionResult> {
     match attempt {
-        ElectAttempt::Daemon(handle) => Some(ElectionResult::Daemon(handle)),
-        ElectAttempt::BindOrIpcFailed(lock_file, e) => {
-            warn!(
-                "attic: daemon socket/IPC setup failed ({e}); falling back to legacy \
-                 single-process mode for this launch (attic.lock is still held)"
-            );
-            Some(ElectionResult::Fallback(lock_file))
-        }
+        ElectAttempt::Daemon(handle) => Some(ElectionResult::Daemon(*handle)),
         ElectAttempt::NotElected => None,
     }
 }
@@ -417,11 +388,10 @@ pub(crate) async fn elect(db_path: &Path) -> anyhow::Result<ElectionResult> {
 
         if Instant::now() >= overall_deadline {
             anyhow::bail!(
-                "another attic-server instance holds the lock for database '{}' (lock '{}') \
-                 but never published a usable IPC address at '{}' within {CLIENT_TOTAL_RETRY_BUDGET:?} \
-                 — this usually means an old pre-daemon attic-server build is running against \
-                 this database; upgrade or stop it, or set ATTIC_NO_DAEMON=1 to use the legacy \
-                 single-process mode",
+                "another attic process holds the lock for database '{}' (lock '{}') but never \
+                 published a usable IPC address at '{}' within {CLIENT_TOTAL_RETRY_BUDGET:?}. \
+                 That process may still be starting up, may be serving a single client because \
+                 its local socket could not be created, or may be hung; stop it and relaunch",
                 db_path.display(),
                 lock_path.display(),
                 ipc_path.display(),
@@ -448,17 +418,6 @@ pub(crate) enum RelayExit {
 
 // ── Phase 7: MCP session cache + in-flight request tracking ─────────────────
 
-/// Delivery state of one MCP request forwarded to the daemon.
-///
-/// Currently only `Sent` is used; stored so future phases can distinguish
-/// "queued but not yet written" from "bytes flushed to the socket" without a
-/// schema change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeliveryState {
-    /// The framed request bytes were successfully written to the daemon socket.
-    Sent,
-}
-
 /// One MCP request that was forwarded to the daemon but whose response has not
 /// yet been observed. Kept until the daemon sends back a matching `id`.
 pub(crate) struct InFlightRequest {
@@ -473,9 +432,6 @@ pub(crate) struct InFlightRequest {
     /// so an eligible read-only request can be retried exactly once against
     /// the replacement daemon.
     pub(crate) framed: Vec<u8>,
-    /// Delivery state at the moment the daemon disconnected.
-    #[allow(dead_code)]
-    pub(crate) delivery: DeliveryState,
     /// Whether this request has already been retried once across daemon recovery.
     /// Invariant: request_retry_count <= 1 across all daemon deaths.
     pub(crate) retried: bool,
@@ -818,7 +774,6 @@ async fn run_relay_with_cache(
                                             id_raw,
                                             method: effective_method_for_classification(m, body),
                                             framed: framed.clone(),
-                                            delivery: DeliveryState::Sent,
                                             retried: false,
                                         });
                                     }
@@ -916,7 +871,6 @@ async fn replay_session_and_resolve_inflight(
                 id_raw: req.id_raw,
                 method: req.method,
                 framed: req.framed,
-                delivery: DeliveryState::Sent,
                 retried: true,
             });
         } else {
@@ -999,6 +953,10 @@ async fn recover_daemon(
 
             Ok(RecoveredTarget::Connected(new_relay.stream))
         }
+        ElectionResult::Daemon(handle) if !handle.accepts_relays() => Err(anyhow::anyhow!(
+            "attic: relay won the daemon lock during recovery but could not create the local \
+             socket; the existing client cannot be reconnected"
+        )),
         ElectionResult::Daemon(handle) => {
             if let Some(starter) = daemon_starter {
                 observe_and_clean_owned_daemon(owned_daemon).await;
@@ -1035,9 +993,6 @@ async fn recover_daemon(
                 Ok(RecoveredTarget::WonElection(handle))
             }
         }
-        ElectionResult::Fallback(_lock) => Err(anyhow::anyhow!(
-            "attic: relay won the daemon lock but IPC setup failed; cannot continue in relay mode"
-        )),
     }
 }
 
@@ -1205,46 +1160,6 @@ pub(crate) async fn run_relay_supervised(
     run_relay_supervised_internal(relay, db_path, daemon_starter, recovery, None).await
 }
 
-/// Low-level relay that simply splices `stdin ↔ stream` byte-for-byte with
-/// no session caching. Used only for the `ATTIC_NO_DAEMON` fast-path and in
-/// tests that don't need Phase 6/7 recovery.
-#[allow(dead_code)]
-pub(crate) async fn run_relay(relay: RelayHandle) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let (mut recv_half, mut send_half) = relay.stream.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = [0u8; 4096];
-    let mut daemon_buf = [0u8; 4096];
-
-    loop {
-        tokio::select! {
-            n = stdin.read(&mut stdin_buf) => {
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if send_half.write_all(&stdin_buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            n = recv_half.read(&mut daemon_buf) => {
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdout.write_all(&daemon_buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handle one accepted IPC connection on the daemon side: run the MCP server
 /// over this socket connection (reading from the socket, writing to the
 /// socket) using `server.serve()`.
@@ -1284,16 +1199,6 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-/// Handle one accepted stdio connection on the daemon side.  Used when the
-/// daemon is invoked directly (no relay) — i.e. the first launch with
-/// `ATTIC_NO_DAEMON=0` that wins election still reads from its own stdin.
-#[allow(dead_code)]
-pub(crate) async fn handle_stdio_connection(server: AtticServer) -> anyhow::Result<()> {
-    let running = server.serve(rmcp::transport::stdio()).await?;
-    let _ = running.waiting().await;
-    Ok(())
 }
 
 /// Spawn the daemon accept loop on a background task so the caller retains
@@ -1415,13 +1320,12 @@ pub(crate) async fn resume_relay_after_promotion(
     }
 }
 
-/// Accept loop run by the daemon process.  Accepts IPC connections from relay
-/// processes, services each one with a clone of `server`, then performs the
-/// same graceful shutdown sequence as [`crate::serve_until_closed`] once the
-/// loop exits (idle-timeout, Ctrl+C, or zero active connections).
-///
-/// Mirrors [`crate::serve_until_closed`]'s interface so `main` can dispatch
-/// to either path with the same three arguments.
+/// The one serving loop for an MCP daemon: serves this process's own stdio
+/// client (when `serve_stdio`), accepts relay connections from other
+/// launches when the local socket is available, and runs the graceful
+/// shutdown sequence ([`crate::run_shutdown_sequence`]) once the loop exits
+/// — on Ctrl+C, or when no client has been connected for the idle timeout
+/// (immediately, when relays cannot connect at all).
 pub(crate) async fn run_daemon_accept_loop(
     server: AtticServer,
     semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
@@ -1458,7 +1362,7 @@ pub(crate) async fn run_daemon_accept_loop(
     // cleanly (e.g. on Ctrl+C).
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Ctrl+C / SIGINT handler — mirrors serve_until_closed.
+    // Ctrl+C / SIGINT handler.
     let _ctrl_c = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("daemon: ctrl_c/SIGINT received – initiating graceful shutdown");
@@ -1466,9 +1370,15 @@ pub(crate) async fn run_daemon_accept_loop(
         }
     });
 
-    info!("daemon: IPC accept loop started");
+    info!("daemon: accept loop started");
     let active_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-    let idle_timeout = idle_timeout();
+    // Without a listener nobody else can ever connect, so there is nothing
+    // to wait for once the last client leaves.
+    let idle_timeout = if handle.accepts_relays() {
+        idle_timeout()
+    } else {
+        Duration::ZERO
+    };
     let mut idle_since: Option<Instant> = None;
 
     // When launched directly as the primary daemon (serve_stdio = true),
@@ -1476,12 +1386,14 @@ pub(crate) async fn run_daemon_accept_loop(
     // client or integration test runner). Serve that stdio connection
     // concurrently with the IPC accept loop, tracking it in active_connections
     // so idle-timeout triggers only after both stdio and all IPC relays close.
+    // The connection is counted before the task is spawned, so the idle check
+    // below can never observe zero connections before the client is served.
     if serve_stdio {
         let stdin_server = server.clone();
-        let stdin_active = Arc::clone(&active_connections);
+        let stdin_guard = ConnectionGuard::new(Arc::clone(&active_connections));
         let stdin_handles = Arc::clone(&handles);
         tokio::spawn(async move {
-            let _guard = ConnectionGuard::new(stdin_active);
+            let _guard = stdin_guard;
             debug!("daemon: starting own stdio MCP session");
             match stdin_server.serve(rmcp::transport::stdio()).await {
                 Ok(running) => {
@@ -1500,6 +1412,10 @@ pub(crate) async fn run_daemon_accept_loop(
         // Idle-timeout check.
         if active_connections.load(Ordering::Relaxed) == 0 {
             match idle_since {
+                None if idle_timeout.is_zero() => {
+                    info!("daemon: last client disconnected; shutting down");
+                    break;
+                }
                 None => idle_since = Some(Instant::now()),
                 Some(t) if t.elapsed() >= idle_timeout => {
                     info!(
@@ -1514,7 +1430,12 @@ pub(crate) async fn run_daemon_accept_loop(
             idle_since = None;
         }
 
-        let accept_future = handle.listener.accept();
+        let accept_future = async {
+            match handle.ipc.as_ref() {
+                Some((listener, _)) => listener.accept().await,
+                None => std::future::pending().await,
+            }
+        };
         let timeout_future = tokio::time::sleep(Duration::from_millis(500));
 
         tokio::select! {
@@ -1550,7 +1471,9 @@ pub(crate) async fn run_daemon_accept_loop(
     }
 
     // Remove the IPC address file so stale relays get a clean election.
-    let _ = std::fs::remove_file(&handle.ipc_path);
+    if let Some((_, ipc_path)) = handle.ipc.as_ref() {
+        let _ = std::fs::remove_file(ipc_path);
+    }
     info!("daemon: accept loop exited");
 
     // Unwrap the Arc — every spawned connection task holds a clone, but by
@@ -1573,26 +1496,6 @@ pub(crate) async fn run_daemon_accept_loop(
 
     run_shutdown_sequence(sh, semantic_enricher, "daemon accept loop exited").await;
     Ok(())
-}
-
-/// Returns a human-readable summary of the relay recovery backoff schedule
-/// for use in log messages and diagnostics.
-#[allow(dead_code)]
-pub(crate) fn relay_recovery_info() -> HashMap<&'static str, String> {
-    let mut m = HashMap::new();
-    m.insert(
-        "recovery_budget_secs",
-        RELAY_RECOVERY_BUDGET.as_secs().to_string(),
-    );
-    m.insert(
-        "backoff_steps_ms",
-        RELAY_RECOVERY_BACKOFFS_MS
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    m
 }
 
 #[cfg(test)]
@@ -1705,13 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_recovery_info() {
-        let info = relay_recovery_info();
-        assert_eq!(info.get("recovery_budget_secs").unwrap(), "30");
-        assert_eq!(info.get("backoff_steps_ms").unwrap(), "100,250,500,1000");
-    }
-
-    #[test]
     fn test_derive_socket_name_deterministic() {
         let p1 = Path::new("C:/test/path/attic.db");
         let p2 = Path::new("C:/test/path/attic.db");
@@ -1754,7 +1650,6 @@ mod tests {
             id_raw: "101".to_string(),
             method: "status".to_string(),
             framed: framed.into_bytes(),
-            delivery: DeliveryState::Sent,
             retried: false,
         });
 
@@ -1795,7 +1690,6 @@ mod tests {
             id_raw: "102".to_string(),
             method: "workspace/add".to_string(),
             framed: b"dummy mutation".to_vec(),
-            delivery: DeliveryState::Sent,
             retried: false,
         });
         let ok3 = replay_session_and_resolve_inflight(
@@ -1813,7 +1707,6 @@ mod tests {
             id_raw: "103".to_string(),
             method: "custom_unknown_method".to_string(),
             framed: b"dummy unknown".to_vec(),
-            delivery: DeliveryState::Sent,
             retried: false,
         });
         let ok4 = replay_session_and_resolve_inflight(

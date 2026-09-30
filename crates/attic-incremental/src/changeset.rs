@@ -3,13 +3,15 @@
 //! Canonical change detection compares **actual BLAKE3 content** of the real
 //! filesystem against the persisted occurrence snapshot — never timestamps
 //! alone.  Hints that prove wrong (duplicate events, no-op touches) are
-/// dropped here so they can never reach invalidation or scheduling.
+//! dropped here so they can never reach invalidation or scheduling.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
 use attic_core::RepositoryId;
 use attic_storage::{DbPool, OccurrenceSnapshot, lookup_occurrence_snapshot};
+use tracing::debug;
 
 use crate::coalesce::CoalescedChange;
 
@@ -81,7 +83,7 @@ pub enum PathRead {
     NotFound,
     /// Exists-but-unreadable, transient I/O error, unstable read, hash
     /// failure, or the path having turned into a directory.
-    Uncertain(#[allow(dead_code)] String),
+    Uncertain(String),
 }
 
 pub(crate) fn classify_read(result: std::io::Result<String>, path: &Path) -> PathRead {
@@ -187,7 +189,7 @@ pub fn verify_with_hasher(
     enum Read {
         Present(String),
         Missing,
-        Uncertain(#[allow(dead_code)] String),
+        Uncertain,
     }
     let mut reads: BTreeMap<String, Read> = BTreeMap::new();
 
@@ -200,10 +202,8 @@ pub fn verify_with_hasher(
         // never satisfy a file hash.
         if abs.is_dir() {
             cs.uncertain.push(path.clone());
-            reads.insert(
-                path.clone(),
-                Read::Uncertain("path became a directory".to_owned()),
-            );
+            debug!(path = %path, "hinted path became a directory → uncertain");
+            reads.insert(path.clone(), Read::Uncertain);
             continue;
         }
         match classify_read(hasher(&abs), &abs) {
@@ -214,8 +214,9 @@ pub fn verify_with_hasher(
                 reads.insert(path.clone(), Read::Missing);
             }
             PathRead::Uncertain(why) => {
+                debug!(path = %path, why, "hinted path unreadable → uncertain");
                 cs.uncertain.push(path.clone());
-                reads.insert(path.clone(), Read::Uncertain(why));
+                reads.insert(path.clone(), Read::Uncertain);
             }
         }
     }
@@ -229,7 +230,7 @@ pub fn verify_with_hasher(
     for (path, hint) in &hints {
         let snap = snapshots.snapshot(path);
         match reads.get(path) {
-            Some(Read::Uncertain(_)) | None => { /* already recorded as uncertain */ }
+            Some(Read::Uncertain) | None => { /* already recorded as uncertain */ }
             Some(Read::Present(hash)) => {
                 content_by_path.insert(path.clone(), hash.clone());
                 let unchanged = matches!(&snap, Some(s)

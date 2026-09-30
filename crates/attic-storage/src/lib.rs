@@ -2,20 +2,19 @@
 #![deny(missing_docs)]
 //! `attic-storage` — SQLite-backed persistence layer for the Attic MCP server.
 //!
-//! Phase 1A implements:
-//! - S1: connection configuration (WAL, PRAGMAs, pool)
-//! - S2: migration runner
-//! - S3: core repository/file CRUD
-//! - S4: publication batch
-//! - S5: FTS helpers (external-content tables)
-//! - S6: bounded writer queue
-//! - S7: production resource manager (Phase 7 hardening)
+//! - connection configuration (WAL, PRAGMAs, reader pool) and migrations
+//! - repository/file/structural CRUD and atomic index publication
+//! - FTS5 helpers (external-content tables)
+//! - the single bounded writer queue
+//! - resource policy (hardware/mode sizing) and the runtime resource monitor
 
 pub mod analysis_cache;
 pub mod connection;
 pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
+pub mod gpu_telemetry;
+pub mod gpu_thermal;
 pub mod indexing_publication;
 pub mod invalidation_ops;
 pub mod migration;
@@ -66,11 +65,12 @@ pub use ops_tasks::{
 pub use resource_manager::{
     EmbeddingHeavyPermit, IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig,
     ResourceMonitor, adaptive_embedding_batch, adaptive_embedding_limit, adaptive_indexing_limit,
+    sample_process_rss_mib,
 };
 pub use resource_policy::{
-    EffectiveResourceConfig, HardwareSnapshot, ResourceDetectionError, ResourceMode,
-    ResourceModeSource, ResourcePolicy, ResourceResolution, detect_resource_mode,
-    env_resource_overrides, resolve_effective_config,
+    EffectiveResourceConfig, HardwareSnapshot, MonitorOverrides, ResourceDetectionError,
+    ResourceMode, ResourceModeSource, ResourcePolicy, ResourceResolution, detect_resource_mode,
+    env_monitor_overrides, env_resource_overrides, resolve_effective_config,
 };
 pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
 pub use writer::{WriterConfig, WriterQueue, WriterQueueHandle};
@@ -101,8 +101,7 @@ pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occu
 pub use retrieval_reads::{
     FileHeader, NewRetrievalPlanRecord, NodeRow, RelationshipEdge, SymbolHit, file_header_by_id,
     get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
-    lookup_symbol_exact, relationships_for_entity, search_symbols, structural_nodes_by_type,
-    structural_nodes_for_file,
+    lookup_symbol_exact, relationships_for_entity, search_symbols, structural_nodes_for_file,
 };
 pub use semantic_reads::{
     SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, retrieval_unit_anchors, semantic_unit_rows,

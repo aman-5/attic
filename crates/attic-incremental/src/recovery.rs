@@ -2,10 +2,9 @@
 //!
 //! Startup sequence (recovery contract §3, Phase 2 scope):
 //! 1. interrupted `ops_tasks` RUNNING → PENDING (idempotent);
-//! 2. incomplete `ops_indexing_log` RUNNING → ABANDONED;
-//! 3. occurrences left PENDING_REFRESH → STALE (rescheduled below);
-//! 4. secret scans stuck IN_PROGRESS → PENDING;
-//! 5. watcher epoch bumped in `ops_server_state`.
+//! 2. occurrences left PENDING_REFRESH → STALE (rescheduled below);
+//! 3. secret scans stuck IN_PROGRESS → PENDING;
+//! 4. watcher epoch bumped in `ops_server_state`.
 //!
 //! After the server is serving (REC-W2), a background **reconciliation** walk
 //! compares persisted state against actual disk content and schedules exactly
@@ -27,8 +26,6 @@ use crate::{IncrementalError, VerifiedChangeSet, changeset, run_on_writer};
 pub struct RecoveryReport {
     /// RUNNING tasks reset to PENDING.
     pub tasks_reset: u64,
-    /// Indexing runs marked ABANDONED.
-    pub indexing_runs_abandoned: u64,
     /// Occurrences moved PENDING_REFRESH → STALE.
     pub refreshes_rescheduled: u64,
     /// Secret scans IN_PROGRESS → PENDING.
@@ -50,14 +47,6 @@ pub fn run_startup_recovery(
             .is_some();
 
         let tasks_reset = recover_interrupted_tasks(conn)?;
-
-        conn.execute(
-            "UPDATE ops_indexing_log
-                SET status = 'ABANDONED', completed_at = ?1
-              WHERE status = 'RUNNING'",
-            [crate::now_micros()],
-        )?;
-        let indexing_runs_abandoned = conn.changes();
 
         // PENDING_REFRESH at startup means recomputation was scheduled but a
         // crash hit before completion — back to STALE so it is rescheduled.
@@ -87,7 +76,6 @@ pub fn run_startup_recovery(
 
         Ok(RecoveryReport {
             tasks_reset,
-            indexing_runs_abandoned,
             refreshes_rescheduled,
             secret_scans_reset,
             watcher_epoch,
@@ -97,7 +85,6 @@ pub fn run_startup_recovery(
 
     info!(
         tasks_reset = report.tasks_reset,
-        abandoned_runs = report.indexing_runs_abandoned,
         rescheduled = report.refreshes_rescheduled,
         epoch = report.watcher_epoch,
         "startup recovery complete"
@@ -313,41 +300,23 @@ pub fn record_clean_shutdown_marker(writer: &WriterQueueHandle) -> Result<(), In
     })
 }
 
-/// Enqueue a RECONCILIATION task with no repository scope (legacy/global;
-/// deduped against other repository-less reconciliation tasks).
+/// Enqueue a RECONCILIATION task for one repository.
 ///
-/// Kept for single-repository callers/tests where the process has exactly
-/// one configured root. Multi-root callers MUST use
-/// [`schedule_reconciliation_for`] so the task carries the repository it
-/// actually applies to — otherwise a repository-less task is only ever
-/// executed against whichever default root the scheduler was started with,
-/// silently skipping every other configured repository.
-pub fn schedule_reconciliation(writer: &WriterQueueHandle) -> Result<bool, IncrementalError> {
-    schedule_reconciliation_scoped(writer, None)
-}
-
-/// Enqueue a RECONCILIATION task scoped to one specific repository (deduped
-/// per-repository, so N configured repositories can each have an
-/// outstanding reconciliation task at the same time without colliding).
-pub fn schedule_reconciliation_for(
+/// Deduplicated per repository, so every configured repository can have one
+/// outstanding reconciliation at a time without colliding. Returns `true`
+/// when a new task was created (`false` = one was already pending).
+pub fn schedule_reconciliation(
     writer: &WriterQueueHandle,
     repository_id: &str,
 ) -> Result<bool, IncrementalError> {
-    schedule_reconciliation_scoped(writer, Some(repository_id))
-}
-
-fn schedule_reconciliation_scoped(
-    writer: &WriterQueueHandle,
-    repository_id: Option<&str>,
-) -> Result<bool, IncrementalError> {
     const RECONCILE_PRIORITY: i64 = 40;
     let id = uuid::Uuid::new_v4().to_string();
-    let repository_id = repository_id.map(|s| s.to_string());
+    let repository_id = repository_id.to_owned();
     let outcome = run_on_writer(writer, move |conn| {
         enqueue_task(
             conn,
             &id,
-            repository_id.as_deref(),
+            Some(&repository_id),
             TASK_RECONCILIATION,
             RECONCILE_PRIORITY,
             "{}",

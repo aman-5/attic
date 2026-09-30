@@ -198,6 +198,51 @@ pub fn walk_with_cancellation(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Dot-files that carry source content and are indexed even though hidden
+/// entries are otherwise skipped (compared ASCII case-insensitively).
+///
+/// FileVault content packages (Adobe Experience Manager) store every JCR
+/// node's properties — component definitions, dialogs, templates, page
+/// content, clientlib folders — in a `.content.xml`. Without this entry an
+/// AEM repository's content tree is invisible to indexing. Security
+/// exclusions still apply to these files like any other.
+pub const INDEXED_HIDDEN_FILE_NAMES: &[&str] = &[".content.xml"];
+
+/// Walk filter: skip hidden directories and hidden files, except files named
+/// in [`INDEXED_HIDDEN_FILE_NAMES`]. "Hidden" means a leading `.` on every
+/// platform, and additionally the hidden file attribute on Windows — the
+/// same definition the `ignore` walker's `hidden(true)` applies.
+fn keep_walk_entry(entry: &ignore::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    let dot_hidden = name.starts_with('.');
+    if !dot_hidden && !has_hidden_attribute(entry) {
+        return true;
+    }
+    let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+    dot_hidden
+        && is_file
+        && INDEXED_HIDDEN_FILE_NAMES
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+#[cfg(windows)]
+fn has_hidden_attribute(entry: &ignore::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    entry
+        .metadata()
+        .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+}
+
+#[cfg(not(windows))]
+fn has_hidden_attribute(_entry: &ignore::DirEntry) -> bool {
+    false
+}
+
 /// Absolute paths already counted into `WalkResult::counters`, shared
 /// across every pass of one `walk()` call so a directory/file re-visited by
 /// a later pass is never double-counted (bundled into one struct to keep
@@ -238,7 +283,12 @@ where
         .git_global(respect_gitignore && policy.global_gitconfig_excludes)
         .git_exclude(respect_gitignore)
         .ignore(false)
-        .hidden(true)
+        // Hidden entries are filtered by `keep_walk_entry` instead of the
+        // walker's own `hidden(true)`, so content-bearing dot-files (AEM's
+        // `.content.xml`) can be admitted while every other hidden entry
+        // stays excluded exactly as before.
+        .hidden(false)
+        .filter_entry(keep_walk_entry)
         .follow_links(false);
 
     builder.threads(1);
@@ -310,7 +360,25 @@ where
                 // ── Skip files under detected submodule roots ──────────────
                 let repo_rel = match normalize_repo_relative(abs_path, root) {
                     Some(r) => r,
-                    None => continue,
+                    None => {
+                        // Every file counted in `files_seen` must reach a
+                        // terminal accounting bucket. A path that fails
+                        // normalization (non-UTF-8 component, traversal, or
+                        // an absolute-path escape) previously fell through
+                        // this `continue` with no counter/diagnostic at
+                        // all, silently breaking the
+                        // `files_indexed + files_skipped == files_seen`
+                        // completeness invariant callers rely on.
+                        if is_new_file {
+                            result.counters.security_exclusions += 1;
+                            result.diagnostics.push(Diagnostic {
+                                kind: DiagnosticKind::InvalidPath,
+                                path: abs_path.to_path_buf(),
+                                message: "path failed repo-relative normalization (non-UTF-8 component, traversal, or absolute-path escape); excluded".into(),
+                            });
+                        }
+                        continue;
+                    }
                 };
 
                 if submodule_prefixes
@@ -666,6 +734,47 @@ mod tests {
             .iter()
             .any(|e| e.repo_relative == ".env" || e.repo_relative.starts_with(".env."));
         assert!(!has_env, ".env files must be security-excluded");
+    }
+
+    #[test]
+    fn aem_content_xml_dot_files_are_discovered_but_other_hidden_entries_are_not() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        setup_git_repo(root);
+        let component = "ui.apps/src/main/content/jcr_root/apps/site/components/hero";
+        write(root, &format!("{component}/.content.xml"), "<jcr:root/>");
+        write(
+            root,
+            &format!("{component}/_cq_dialog/.CONTENT.XML"),
+            "<jcr:root/>",
+        );
+        write(root, &format!("{component}/hero.html"), "<div></div>");
+        write(root, ".hidden-dir/visible-name.rs", "fn x() {}");
+        write(root, "src/.secret-notes", "notes");
+        write(root, ".env", "SECRET=abc");
+
+        let result = walk(root, &DiscoveryPolicy::default_non_git()).unwrap();
+        let paths: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.repo_relative.as_str())
+            .collect();
+
+        assert!(
+            paths.contains(&format!("{component}/.content.xml").as_str()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&format!("{component}/_cq_dialog/.CONTENT.XML").as_str()),
+            "allowlist matching must be case-insensitive: {paths:?}"
+        );
+        assert!(paths.contains(&format!("{component}/hero.html").as_str()));
+        for excluded in [".hidden-dir/visible-name.rs", "src/.secret-notes", ".env"] {
+            assert!(
+                !paths.contains(&excluded),
+                "{excluded} must stay excluded: {paths:?}"
+            );
+        }
     }
 
     #[test]

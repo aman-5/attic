@@ -42,6 +42,41 @@ use crate::cancellation::CancellationToken;
 /// predictable size regardless of how long individual lines are.
 pub const TARGET_CHUNK_CHARS: usize = 2_000;
 
+/// Hard upper bound on a single `RetrievalUnit`'s `retrieval_text`, in bytes.
+///
+/// `TARGET_CHUNK_CHARS` is a *soft* target: `next_chunk_end` always consumes at
+/// least one line, so a single line longer than the target becomes one
+/// oversized unit. That was deliberate — never drop content — but it left a
+/// gap: the semantic layer rejects or truncates units past its own per-unit
+/// limit, so an oversized unit is silently only half-embedded. Long
+/// single-line content (pretty-printed JSON with multi-KB values, minified
+/// JS/CSS, log and SQL dumps, CSV rows) hits this routinely.
+///
+/// This cap closes that gap for every format at once, with no per-format
+/// analyzer: a line past the cap is split at UTF-8 char boundaries into
+/// several units, and a [`diagnostic_codes::UNIT_TRUNCATED`] warning records
+/// that the split happened. Splitting keeps all bytes searchable; the
+/// alternative (emit one huge unit) loses the tail at embedding time without
+/// telling anyone.
+///
+/// Kept at 2× the target so ordinary multi-line chunks are unaffected — only
+/// genuinely pathological single lines are split.
+/// Kept equal to the chunk target, NOT 2× it.
+///
+/// A chunk's *content* is bounded at `TARGET_CHUNK_CHARS` by `next_chunk_end`,
+/// but `build_retrieval_unit_from_lines` rejoins with `\n`, so a chunk of many
+/// short lines can reach up to `2 * target - 1` bytes. An earlier version of
+/// this cap allowed for that worst case — which meant a split unit could still
+/// be 4000 bytes and get rejected by the semantic layer's per-unit gate
+/// (`attic_semantic::selection`, ~2048 bytes derived from the Qwen3 token
+/// ceiling). Splitting would then have merely moved the loss downstream from
+/// "tokenizer truncates it" to "selection excludes it".
+///
+/// Capping at the target instead guarantees every emitted unit fits the gate,
+/// so oversized content is split into genuinely embeddable pieces. The regression
+/// test `every_emitted_unit_fits_the_semantic_gate` pins this end to end.
+pub const MAX_UNIT_CHARS: usize = TARGET_CHUNK_CHARS;
+
 /// Maximum bytes held in the inter-chunk carry buffer.
 pub const MAX_CARRY_BYTES: usize = 65_536; // 64 KiB
 
@@ -210,8 +245,6 @@ fn decode_bytes_lossy(bytes: &[u8]) -> (String, bool) {
 
 struct ParsedLine {
     content: String,
-    #[allow(dead_code)]
-    byte_len_with_terminator: usize,
 }
 
 /// Split `text` into lines. Does NOT use `str::lines()` (CRLF-aware).
@@ -230,20 +263,12 @@ fn split_lines_bytes(text: &str) -> Vec<ParsedLine> {
                     nl
                 };
                 let content = text[pos..content_end].to_string();
-                let byte_len_with_terminator = nl + 1 - pos;
-                result.push(ParsedLine {
-                    content,
-                    byte_len_with_terminator,
-                });
+                result.push(ParsedLine { content });
                 pos = nl + 1;
             }
             None => {
                 let content = text[pos..].to_string();
-                let byte_len_with_terminator = len - pos;
-                result.push(ParsedLine {
-                    content,
-                    byte_len_with_terminator,
-                });
+                result.push(ParsedLine { content });
                 pos = len;
             }
         }
@@ -268,6 +293,262 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
         .rev()
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(0)
+}
+
+/// How far back from the hard byte cap a structural boundary is worth looking
+/// for.
+///
+/// A quarter of the cap: wide enough to reach the end of a typical JSON record
+/// or a long prose line, narrow enough that a boundary-aligned unit is never
+/// dramatically smaller than a blind one. Units stay within
+/// `[MAX_UNIT_CHARS - SPLIT_SEARCH_WINDOW, MAX_UNIT_CHARS]`, so retrieval-unit
+/// counts and embedding costs are unchanged in the aggregate.
+const SPLIT_SEARCH_WINDOW: usize = MAX_UNIT_CHARS / 4;
+
+/// Boundary quality, worst to best. Ordering is the whole point of the type:
+/// a later variant always wins over an earlier one at the same position.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BoundaryRank {
+    /// After a run of whitespace — splits between words rather than inside one.
+    Word,
+    /// After a value separator (`,` or `;`) — splits between sibling values.
+    Separator,
+    /// After a newline — splits between lines.
+    Line,
+    /// After a container closed back to the outermost level — splits between
+    /// whole top-level records.
+    Record,
+}
+
+/// Nesting/quote state carried across consecutive split pieces of one source
+/// text. The splitter is invoked once per piece over the *remainder* of the
+/// text, so each invocation must inherit where the previous cut left the
+/// scanner. Restarting from zeroed state made every `}` inside an array look
+/// like a top-level record end from the second piece onward, cutting
+/// mid-record while believing a record boundary had been found.
+#[derive(Clone, Copy, Debug, Default)]
+struct ScannerState {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
+/// Choose where to cut `s` so the piece before the cut ends at the most
+/// complete structural boundary available at or below `cap` bytes.
+///
+/// This is deliberately **format-agnostic**: it infers structure from the text
+/// itself rather than from a file extension or a content sniff, so it improves
+/// JSON, JSONL, YAML, CSV, JS/TS object literals, logs, and plain prose with
+/// one code path and gains nothing to maintain when a new format shows up.
+///
+/// The ladder is: end of a top-level record > end of a line > after a value
+/// separator > after whitespace > blind byte cut. Brackets and separators are
+/// only counted outside double-quoted strings, so a `{` inside a string value
+/// cannot desynchronise nesting depth.
+///
+/// `state` carries the nesting/quote state inherited from the previous piece
+/// and is updated to the state at the returned cut, so the next invocation
+/// starts from the truth rather than from zero.
+///
+/// Degradation is by design. If the text has no recognisable structure in the
+/// search window — or quoting is unbalanced enough that the scanner believes
+/// it is inside a string — no candidate is found and the result is exactly the
+/// blind `floor_char_boundary` cut this function replaced. The worst case is
+/// therefore the previous behaviour, never worse.
+///
+/// The returned index is always a UTF-8 char boundary and always `>= 1` when
+/// `s` is non-empty, so callers are guaranteed forward progress.
+fn structural_split_point(s: &str, cap: usize, state: &mut ScannerState) -> usize {
+    let hard = floor_char_boundary(s, cap);
+    if hard >= s.len() {
+        return hard;
+    }
+    let window_start = hard.saturating_sub(SPLIT_SEARCH_WINDOW);
+
+    let mut best: Option<(BoundaryRank, usize, ScannerState)> = None;
+    let mut consider = |rank: BoundaryRank, at: usize, snapshot: ScannerState| {
+        if at <= window_start || at > hard || !s.is_char_boundary(at) {
+            return;
+        }
+        // `>=` so that among equally ranked boundaries the latest one wins,
+        // keeping units as close to the cap as possible.
+        match best {
+            Some((best_rank, _, _)) if rank < best_rank => {}
+            _ => best = Some((rank, at, snapshot)),
+        }
+    };
+
+    let mut depth: u32 = state.depth;
+    let mut in_string = state.in_string;
+    let mut escaped = state.escaped;
+    // Scanning must start at index 0, not at `window_start`: nesting depth and
+    // string state at the window are only correct if every preceding byte has
+    // been seen. It starts from the *carried* state, not from zero — a piece
+    // begins wherever the previous cut left the scanner (see `ScannerState`).
+    for (i, ch) in s[..hard].char_indices() {
+        let after = i + ch.len_utf8();
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    consider(
+                        BoundaryRank::Record,
+                        after,
+                        ScannerState {
+                            depth,
+                            in_string,
+                            escaped,
+                        },
+                    );
+                }
+            }
+            ',' | ';' => {
+                let rank = if depth == 0 {
+                    BoundaryRank::Record
+                } else {
+                    BoundaryRank::Separator
+                };
+                consider(
+                    rank,
+                    after,
+                    ScannerState {
+                        depth,
+                        in_string,
+                        escaped,
+                    },
+                );
+            }
+            '\n' => consider(
+                BoundaryRank::Line,
+                after,
+                ScannerState {
+                    depth,
+                    in_string,
+                    escaped,
+                },
+            ),
+            c if c.is_whitespace() => consider(
+                BoundaryRank::Word,
+                after,
+                ScannerState {
+                    depth,
+                    in_string,
+                    escaped,
+                },
+            ),
+            _ => {}
+        }
+    }
+
+    match best {
+        Some((_, at, snapshot)) => {
+            *state = snapshot;
+            at.max(1)
+        }
+        None => {
+            // Blind cut at `hard`: the emitted piece is `s[..hard]`, so the
+            // carried state is whatever the scanner had reached at `hard`.
+            *state = ScannerState {
+                depth,
+                in_string,
+                escaped,
+            };
+            hard.max(1)
+        }
+    }
+}
+
+/// Emit one chunk as one or more retrieval units, splitting any chunk whose
+/// joined text exceeds [`MAX_UNIT_CHARS`].
+///
+/// Normal chunks (the overwhelming majority) produce exactly one unit and take
+/// the same path as before. The split branch only triggers for content whose
+/// individual lines are pathologically long, because `next_chunk_end` stops
+/// accumulating as soon as the target is passed — so a chunk can only exceed
+/// the cap if it is a *single* line that does.
+///
+/// Splitting prefers the most complete structural boundary available within a
+/// bounded look-back window (see [`structural_split_point`]) and always lands
+/// on a UTF-8 char boundary, so multi-byte characters are never cut in half
+/// and a minified structured file is cut between records rather than through
+/// the middle of one. Every emitted piece keeps the original line's span: the
+/// pieces genuinely come from that one source line, and reporting a fabricated
+/// line range would corrupt the span→source mapping that evidence verification
+/// depends on.
+///
+/// Returns the number of units emitted, and pushes exactly one
+/// [`diagnostic_codes::UNIT_TRUNCATED`] warning per split chunk.
+fn emit_chunk_units(
+    units: &mut Vec<RetrievalUnitSpec>,
+    diagnostics: &mut Vec<AnalyzerDiagnostic>,
+    start_line_0: u32,
+    chunk_lines: &[String],
+    cumulative_text_bytes: &mut u64,
+) -> usize {
+    let unit = build_retrieval_unit_from_lines(units.len() as u32, start_line_0, chunk_lines);
+    if unit.retrieval_text.len() <= MAX_UNIT_CHARS {
+        *cumulative_text_bytes += unit.retrieval_text.len() as u64;
+        units.push(unit);
+        return 1;
+    }
+
+    // Oversized: split the joined text into cap-sized, char-boundary-aligned
+    // pieces. `span` is preserved across pieces (see doc comment above).
+    let span = unit.span;
+    let text = unit.retrieval_text;
+    let total_len = text.len();
+    let mut offset = 0usize;
+    let mut emitted = 0usize;
+    let mut scanner = ScannerState::default();
+    while offset < total_len {
+        let remaining = &text[offset..];
+        let take = if remaining.len() <= MAX_UNIT_CHARS {
+            remaining.len()
+        } else {
+            // Guarantee forward progress: `structural_split_point` clamps to
+            // at least 1 byte, so even a first char wider than the cap — which
+            // MAX_UNIT_CHARS (thousands of bytes) makes impossible — cannot
+            // spin forever. `scanner` carries nesting/quote state into each
+            // piece so the split of piece N starts from where piece N-1 was
+            // cut, not from a zeroed re-read of a mid-structure slice.
+            structural_split_point(remaining, MAX_UNIT_CHARS, &mut scanner)
+        };
+        let piece = &remaining[..take];
+        *cumulative_text_bytes += piece.len() as u64;
+        units.push(RetrievalUnitSpec {
+            span,
+            retrieval_text: piece.to_string(),
+            canonical_text: None,
+            occurrence_metadata: None,
+            ordinal: units.len() as u32,
+            structural_node_index: None,
+        });
+        offset += take;
+        emitted += 1;
+    }
+
+    diagnostics.push(AnalyzerDiagnostic::warning(
+        diagnostic_codes::UNIT_TRUNCATED,
+        format!(
+            "line span starting at {} produced {total_len} bytes, over the {MAX_UNIT_CHARS}-byte \
+             per-unit cap; split into {emitted} units so no content is lost to downstream \
+             per-unit size limits",
+            span.start_line
+        ),
+    ));
+    emitted
 }
 
 /// Compute the exclusive end index of the next chunk starting at `start`,
@@ -316,6 +597,8 @@ fn build_retrieval_unit_from_lines(
     RetrievalUnitSpec {
         span: SourceSpan::new(start_line_0, 0, end_line_0, end_col_0),
         retrieval_text,
+        canonical_text: None,
+        occurrence_metadata: None,
         ordinal,
         structural_node_index: None,
     }
@@ -421,16 +704,25 @@ fn chunk_text_into_units(
         }
 
         let chunk_end = next_chunk_end(chunk_start, lines.len(), TARGET_CHUNK_CHARS, |i| {
-            lines[i].content.len()
+            // Account for the '\n' that `build_retrieval_unit_from_lines` will
+            // re-insert between lines. Without this, a chunk of many short
+            // lines passes the content-only target and then overshoots once
+            // joined — which is how units used to exceed the per-unit cap
+            // without any single line being oversized.
+            lines[i].content.len() + 1
         });
         let chunk_lines: Vec<String> = lines[chunk_start..chunk_end]
             .iter()
             .map(|l| l.content.clone())
             .collect();
         let start_line_0 = line_number_base + chunk_start as u32;
-        let unit = build_retrieval_unit_from_lines(units.len() as u32, start_line_0, &chunk_lines);
-        *cumulative_text_bytes += unit.retrieval_text.len() as u64;
-        units.push(unit);
+        emit_chunk_units(
+            units,
+            diagnostics,
+            start_line_0,
+            &chunk_lines,
+            cumulative_text_bytes,
+        );
         chunk_start = chunk_end;
 
         if check_and_emit_resource(
@@ -592,17 +884,21 @@ fn stream_into_units(
         // stop and wait for more stream data rather than flushing early.
         loop {
             let take = next_chunk_end(0, pending_lines.len(), TARGET_CHUNK_CHARS, |i| {
-                pending_lines[i].len()
+                // +1 for the rejoining '\n' — see the buffered path.
+                pending_lines[i].len() + 1
             });
             if take >= pending_lines.len() {
                 break;
             }
             let chunk_lines: Vec<String> = pending_lines.drain(..take).collect();
-            let unit =
-                build_retrieval_unit_from_lines(units.len() as u32, next_line_0, &chunk_lines);
+            emit_chunk_units(
+                units,
+                diagnostics,
+                next_line_0,
+                &chunk_lines,
+                &mut cumulative_text_bytes,
+            );
             next_line_0 += chunk_lines.len() as u32;
-            cumulative_text_bytes += unit.retrieval_text.len() as u64;
-            units.push(unit);
             if check_and_emit_resource(
                 units,
                 diagnostics,
@@ -689,13 +985,18 @@ fn flush_stream_pending(
             return;
         }
         let take = next_chunk_end(0, pending_lines.len(), TARGET_CHUNK_CHARS, |i| {
-            pending_lines[i].len()
+            // +1 for the rejoining '\n' — see the buffered path.
+            pending_lines[i].len() + 1
         });
         let chunk_lines: Vec<String> = pending_lines.drain(..take).collect();
-        let unit = build_retrieval_unit_from_lines(units.len() as u32, *next_line_0, &chunk_lines);
+        emit_chunk_units(
+            units,
+            diagnostics,
+            *next_line_0,
+            &chunk_lines,
+            cumulative_text_bytes,
+        );
         *next_line_0 += chunk_lines.len() as u32;
-        *cumulative_text_bytes += unit.retrieval_text.len() as u64;
-        units.push(unit);
         if check_and_emit_resource(
             units,
             diagnostics,
@@ -817,40 +1118,159 @@ mod tests {
 
     #[test]
     fn exceeding_target_chars_produces_multiple_chunks() {
-        // Each line's content is "x" (1 char). Accumulation stops as soon as
-        // adding the NEXT line would push the running total over
-        // TARGET_CHUNK_CHARS, so exactly TARGET_CHUNK_CHARS 1-char lines
-        // (total length == target, not yet over it) fill the first chunk.
+        // Each line is "x" (1 content byte) plus the '\n' that rejoining will
+        // re-insert, so each line costs 2 bytes against TARGET_CHUNK_CHARS.
+        // A chunk therefore holds target/2 lines, and n lines produce
+        // ceil(n / (target/2)) chunks.
+        //
+        // Counting the separator here is what keeps a joined unit within
+        // MAX_UNIT_CHARS: before, a chunk of many short lines passed a
+        // content-only target and then overshot the cap once joined.
         let line = "x\n";
         let n = TARGET_CHUNK_CHARS + 3;
         let text: String = line.repeat(n);
         let out = analyzer().analyze(text_input(&text));
-        assert_eq!(out.retrieval_units.len(), 2, "must split into 2 chunks");
 
-        let u0 = &out.retrieval_units[0];
-        assert_eq!(u0.span.start_line, 0);
-        assert_eq!(u0.span.end_line, TARGET_CHUNK_CHARS as u32);
-        assert_eq!(u0.ordinal, 0);
+        let lines_per_chunk = TARGET_CHUNK_CHARS / 2;
+        let expected_chunks = n.div_ceil(lines_per_chunk);
+        assert_eq!(
+            out.retrieval_units.len(),
+            expected_chunks,
+            "n={n} lines at 2 bytes each must split into {expected_chunks} chunks"
+        );
 
-        let u1 = &out.retrieval_units[1];
-        assert_eq!(u1.span.start_line, TARGET_CHUNK_CHARS as u32);
-        assert_eq!(u1.span.end_line, n as u32);
-        assert_eq!(u1.ordinal, 1);
+        // Spans must tile the input exactly: contiguous, no gaps, no overlap.
+        let mut expected_start = 0u32;
+        for (i, u) in out.retrieval_units.iter().enumerate() {
+            assert_eq!(u.ordinal, i as u32, "ordinals must be sequential");
+            assert_eq!(
+                u.span.start_line, expected_start,
+                "chunk {i} must start where the previous one ended"
+            );
+            expected_start = u.span.end_line;
+        }
+        assert_eq!(
+            expected_start, n as u32,
+            "the final chunk must end at the last line"
+        );
+
+        // Every unit must respect the per-unit cap once joined.
+        for (i, u) in out.retrieval_units.iter().enumerate() {
+            assert!(
+                u.retrieval_text.len() <= MAX_UNIT_CHARS,
+                "chunk {i} is {} bytes, over the {MAX_UNIT_CHARS}-byte cap",
+                u.retrieval_text.len()
+            );
+        }
     }
 
     #[test]
-    fn single_line_exceeding_target_chars_still_becomes_one_chunk() {
-        // A single line far longer than TARGET_CHUNK_CHARS must still become
-        // its own chunk (never dropped, never split mid-line in the buffered
-        // path) rather than being merged with anything else.
+    fn single_line_over_the_cap_is_split_losslessly_and_reported() {
+        // Supersedes `single_line_exceeding_target_chars_still_becomes_one_chunk`,
+        // which asserted the old never-split behaviour. That behaviour was the
+        // defect: an oversized unit passes the analyzer intact, then loses its
+        // tail at embedding time against the semantic layer's per-unit limit.
+        //
+        // The contract now: every byte is still indexed (nothing dropped), the
+        // pieces are capped, and the reshaping is reported rather than silent.
         let text = "x".repeat(TARGET_CHUNK_CHARS * 5);
+        let out = analyzer().analyze(text_input(&text));
+
+        assert!(
+            out.retrieval_units.len() > 1,
+            "an oversized line must be split, not emitted as one unit"
+        );
+        for (i, u) in out.retrieval_units.iter().enumerate() {
+            assert!(
+                u.retrieval_text.len() <= MAX_UNIT_CHARS,
+                "unit {i} is {} bytes, over the {MAX_UNIT_CHARS}-byte cap",
+                u.retrieval_text.len()
+            );
+        }
+        // Lossless: concatenating the pieces reproduces the original exactly.
+        let rejoined: String = out
+            .retrieval_units
+            .iter()
+            .map(|u| u.retrieval_text.as_str())
+            .collect();
+        assert_eq!(
+            rejoined, text,
+            "splitting must preserve every byte of the original line"
+        );
+
+        let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains(&diagnostic_codes::UNIT_TRUNCATED),
+            "a split must be reported via UNIT_TRUNCATED; got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_lines_are_never_split_and_emit_no_truncation_diagnostic() {
+        // Guards against the cap leaking into the normal path: multi-line
+        // content under the target must behave exactly as before.
+        let text = String::from("fn a() {}\nfn b() {}\nfn c() {}\n");
         let out = analyzer().analyze(text_input(&text));
         assert_eq!(
             out.retrieval_units.len(),
             1,
-            "one oversized line must still produce exactly one chunk"
+            "small multi-line input must still be a single unit"
         );
-        assert_eq!(out.retrieval_units[0].retrieval_text.len(), text.len());
+        let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            !codes.contains(&diagnostic_codes::UNIT_TRUNCATED),
+            "no split occurred, so UNIT_TRUNCATED must not be emitted; got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn splitting_never_cuts_a_multibyte_char_in_half() {
+        // The split is byte-oriented, so it must land on UTF-8 boundaries.
+        // A 3-byte char repeated past the cap puts a boundary mid-character
+        // unless `floor_char_boundary` is honoured.
+        let text = "日".repeat(MAX_UNIT_CHARS); // 3 bytes each → well over the cap
+        let out = analyzer().analyze(text_input(&text));
+        assert!(out.retrieval_units.len() > 1, "must have split");
+        let rejoined: String = out
+            .retrieval_units
+            .iter()
+            .map(|u| u.retrieval_text.as_str())
+            .collect();
+        assert_eq!(
+            rejoined, text,
+            "multi-byte content must round-trip exactly across a split"
+        );
+    }
+
+    #[test]
+    fn split_of_minified_json_tracks_nesting_across_pieces() {
+        // Regression: the splitter restarted its depth/quote scan from zero on
+        // every piece, so from the second piece onward a `}` inside an array
+        // looked like a top-level record end. Cuts then landed *before* the
+        // separating comma (piece ends `}`, next starts `,`) instead of after
+        // it. With carried state, every piece after the first must begin at a
+        // record boundary.
+        let record = format!("{{\"key\":\"{}\"}}", "a".repeat(180)); // ~190 bytes
+        let text = format!("[{}]", vec![record; 40].join(","));
+        assert!(
+            text.len() > MAX_UNIT_CHARS * 3,
+            "input must force several split pieces"
+        );
+
+        let out = analyzer().analyze(text_input(&text));
+        let units = &out.retrieval_units;
+        assert!(units.len() > 2, "must have split into several units");
+
+        let rejoined: String = units.iter().map(|u| u.retrieval_text.as_str()).collect();
+        assert_eq!(rejoined, text, "split must be lossless");
+
+        for (i, u) in units.iter().enumerate().skip(1) {
+            assert!(
+                u.retrieval_text.starts_with('{'),
+                "piece {i} must start at a record boundary, got: {:.30}…",
+                u.retrieval_text
+            );
+        }
     }
 
     // ── RedactedBytes ─────────────────────────────────────────────────────────

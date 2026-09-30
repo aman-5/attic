@@ -5,6 +5,7 @@ Cargo.lock.bak
 *.swp
 .DS_Store
 .idea/
+.scout/
 .vscode/settings.json
 *.pdb
 
@@ -15,7 +16,6 @@ build_errors*.txt
 *.db-wal
 *.db-shm
 *.db-journal
-!fixtures/**/*.db
 
 # Attic runtime data
 .mcp/
