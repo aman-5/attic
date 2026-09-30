@@ -134,41 +134,48 @@ pub fn reconcile(
 
     let missing_ids: std::collections::HashSet<&str> =
         missing.iter().map(|(id, _)| id.as_str()).collect();
-    for su in &selected {
+    // One transaction for every occurrence + queue row. Row-at-a-time
+    // autocommit writes took ~30 s for a 45K-unit repository before the
+    // first chunk could be embedded.
+    let mut records: Vec<crate::store::NewOccurrence<'_>> =
+        Vec::with_capacity(missing.len() + duplicates.len());
+    let hashes: Vec<String> = selected
+        .iter()
+        .map(|su| {
+            su.row
+                .canonical_hash
+                .clone()
+                .unwrap_or_else(|| crate::identity::content_hash(&su.row.canonical_text))
+        })
+        .collect();
+    for (su, hash) in selected.iter().zip(&hashes) {
         if !missing_ids.contains(su.row.unit_id.as_str()) {
             continue;
         }
-        let hash = su
-            .row
-            .canonical_hash
-            .clone()
-            .unwrap_or_else(|| crate::identity::content_hash(&su.row.canonical_text));
-        store.add_occurrence(
-            &su.row.unit_id,
-            &su.row.unit_id,
-            &vsid,
-            &hash,
-            &su.row.repository_id,
-            &su.row.source_revision_id,
-            &su.row.index_generation_id,
-            &cgid,
-            "{}",
-        )?;
-        store.queue_enqueue(&su.row.unit_id, su.score)?;
+        records.push(crate::store::NewOccurrence {
+            occurrence_id: &su.row.unit_id,
+            vector_space_id: &vsid,
+            canonical_hash: hash,
+            repository_id: &su.row.repository_id,
+            source_revision_id: &su.row.source_revision_id,
+            index_generation_id: &su.row.index_generation_id,
+            content_generation_id: &cgid,
+            enqueue_priority: Some(su.score),
+        });
     }
     for (drow, hash) in &duplicates {
-        store.add_occurrence(
-            &drow.unit_id,
-            &drow.unit_id,
-            &vsid,
-            hash,
-            &drow.repository_id,
-            &drow.source_revision_id,
-            &drow.index_generation_id,
-            &cgid,
-            "{}",
-        )?;
+        records.push(crate::store::NewOccurrence {
+            occurrence_id: &drow.unit_id,
+            vector_space_id: &vsid,
+            canonical_hash: hash,
+            repository_id: &drow.repository_id,
+            source_revision_id: &drow.source_revision_id,
+            index_generation_id: &drow.index_generation_id,
+            content_generation_id: &cgid,
+            enqueue_priority: None,
+        });
     }
+    store.add_occurrences_and_enqueue(&records)?;
 
     report.enqueued = missing.len();
     Ok(report)

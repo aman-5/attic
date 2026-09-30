@@ -297,6 +297,20 @@ impl GenerationIndex {
     }
 }
 
+/// One occurrence row for [`SemanticStore::add_occurrences_and_enqueue`].
+/// The occurrence id doubles as the retrieval unit id (one occurrence per
+/// unit, see `invalidate::reconcile`).
+pub struct NewOccurrence<'a> {
+    pub occurrence_id: &'a str,
+    pub vector_space_id: &'a str,
+    pub canonical_hash: &'a str,
+    pub repository_id: &'a str,
+    pub source_revision_id: &'a str,
+    pub index_generation_id: &'a str,
+    pub content_generation_id: &'a str,
+    /// `Some` enqueues the occurrence for embedding at this priority.
+    pub enqueue_priority: Option<f64>,
+}
 /// Shared-handle-safe semantic store: rusqlite connections are `!Sync`, so
 /// every access goes through an internal mutex (contention is negligible at
 /// Phase 5 scales; queries hold it only for bounded reads).
@@ -540,6 +554,53 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Record many occurrences (and queue the ones with a priority) in ONE
+    /// transaction with prepared statements. Same rows as calling
+    /// [`Self::add_occurrence`] + [`Self::queue_enqueue`] per unit, which
+    /// autocommitted each row and dominated reconcile time on large repos.
+    pub fn add_occurrences_and_enqueue(
+        &self,
+        records: &[NewOccurrence<'_>],
+    ) -> Result<(), SemanticError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let conn = self.guard()?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let now = Self::now_ms();
+            let mut occ = tx.prepare(
+                "INSERT OR REPLACE INTO sem_embedding_occurrences
+                     (occurrence_id, retrieval_unit_id, vector_space_id,
+                      canonical_hash, repository_id, source_revision_id,
+                      index_generation_id, content_generation_id, metadata_json,
+                      created_at_ms)
+                 VALUES (?1,?1,?2,?3,?4,?5,?6,?7,'{}',?8)",
+            )?;
+            let mut queue = tx.prepare(
+                "INSERT OR IGNORE INTO sem_queue_v2
+                     (occurrence_id, priority, state, attempts, enqueued_at_ms)
+                 VALUES (?1,?2,'PENDING',0,?3)",
+            )?;
+            for r in records {
+                occ.execute(params![
+                    r.occurrence_id,
+                    r.vector_space_id,
+                    r.canonical_hash,
+                    r.repository_id,
+                    r.source_revision_id,
+                    r.index_generation_id,
+                    r.content_generation_id,
+                    now
+                ])?;
+                if let Some(priority) = r.enqueue_priority {
+                    queue.execute(params![r.occurrence_id, priority, now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
     /// Count occurrences sharing one canonical embedding — the dedup proof.
     pub fn occurrence_count_for_canonical(
         &self,

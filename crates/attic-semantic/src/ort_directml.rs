@@ -248,10 +248,18 @@ impl OrtDirectMlProvider {
 
         // No `sequence_length` dimension override: the session accepts every
         // bucket width. Shapes stay bounded by the fixed pass-size set.
+        // Memory-pattern planning must be OFF for DirectML (ONNX Runtime
+        // DirectML EP requirement); it was left at the default (on), which
+        // plans host/device buffers per shape for a variable-shape workload.
         let session = Session::builder()
             .map_err(|e| SemanticError::ProviderUnavailable {
                 provider: ORT_PROVIDER_ID.into(),
                 reason: format!("session builder: {e}"),
+            })?
+            .with_memory_pattern(false)
+            .map_err(|e| SemanticError::ProviderUnavailable {
+                provider: ORT_PROVIDER_ID.into(),
+                reason: format!("session options: {e}"),
             })?
             .with_execution_providers([DirectML::default()
                 .with_performance_preference(
