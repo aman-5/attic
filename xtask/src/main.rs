@@ -125,21 +125,19 @@ fn run_check() -> XtaskResult<()> {
 }
 
 fn run_install(skip_build: bool) -> XtaskResult<()> {
-    if !skip_build {
-        run_cargo_step(
-            "release build",
-            &["build", "--release", "-p", "attic-server"],
-        )?;
-    }
-
-    let release_dir = release_dir()?;
-    let source_binary = release_dir.join(binary_file_name());
-    if !source_binary.is_file() {
-        return Err(format!(
-            "expected release binary was not found: {}",
-            source_binary.display()
-        ));
-    }
+    // The artifact path comes from cargo itself, so `[build] target` or
+    // `target-dir` set in any Cargo config file is honoured. Guessing it from
+    // environment variables alone installed a stale binary whenever a user
+    // config forced a different target.
+    let source_binary = if skip_build {
+        newest_existing_release_binary()?
+    } else {
+        build_release_binary()?
+    };
+    let release_dir = source_binary
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("binary has no parent: {}", source_binary.display()))?;
 
     stop_attic_processes()?;
     thread::sleep(Duration::from_secs(2));
@@ -215,18 +213,95 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn release_dir() -> XtaskResult<PathBuf> {
+/// Build the release binary and return the executable path cargo reports.
+fn build_release_binary() -> XtaskResult<PathBuf> {
+    let args = [
+        "build",
+        "--release",
+        "-p",
+        "attic-server",
+        "--message-format=json-render-diagnostics",
+    ];
+    println!("Running `{}`...", command_line(cargo(), &args));
+    let output = Command::new(cargo())
+        .args(args)
+        .current_dir(workspace_root())
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("failed to start `release build`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "step `release build` failed with {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|line| line.contains("\"reason\":\"compiler-artifact\""))
+        .filter_map(|line| json_string_field(line, "executable"))
+        .map(PathBuf::from)
+        .rfind(|path| path.file_name().and_then(OsStr::to_str) == Some(binary_file_name()))
+        .ok_or_else(|| "cargo reported no `attic` executable for attic-server".to_string())
+}
+
+/// Minimal JSON string-field reader for cargo's one-object-per-line output.
+fn json_string_field(line: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":\"");
+    let start = line.find(&pattern)? + pattern.len();
+    let mut out = String::new();
+    let mut chars = line[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// `--skip-build`: the most recently built release binary under the target
+/// directory, whichever target triple produced it.
+fn newest_existing_release_binary() -> XtaskResult<PathBuf> {
     let target_dir = match env::var_os("CARGO_TARGET_DIR") {
         Some(path) if !path.is_empty() => absolutize_workspace_path(path),
         _ => workspace_root().join("target"),
     };
-
-    let release_dir = match env::var_os("CARGO_BUILD_TARGET") {
-        Some(target) if !target.is_empty() => target_dir.join(target).join("release"),
-        _ => target_dir.join("release"),
-    };
-
-    Ok(release_dir)
+    let mut candidates = vec![target_dir.join("release").join(binary_file_name())];
+    if let Ok(entries) = fs::read_dir(&target_dir) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("release").join(binary_file_name()));
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| {
+            println!("Using existing build: {}", path.display());
+            path
+        })
+        .ok_or_else(|| {
+            format!(
+                "no release build of {} found under {}; run without --skip-build",
+                binary_file_name(),
+                target_dir.display()
+            )
+        })
 }
 
 fn absolutize_workspace_path(path: OsString) -> PathBuf {
@@ -321,7 +396,7 @@ fn install_dir() -> XtaskResult<PathBuf> {
 fn copy_binary_with_retry(source: &Path, destination: &Path) -> XtaskResult<()> {
     let attempts = 5;
     for attempt in 1..=attempts {
-        match fs::copy(source, destination) {
+        match replace_file(source, destination) {
             Ok(_) => return Ok(()),
             Err(error) if attempt < attempts => {
                 eprintln!(
@@ -341,6 +416,23 @@ fn copy_binary_with_retry(source: &Path, destination: &Path) -> XtaskResult<()> 
     }
 
     Ok(())
+}
+
+/// Copy `source` to a temporary sibling of `destination`, then rename it into
+/// place. Overwriting in place keeps the old inode, and on macOS the kernel's
+/// cached code signature for it no longer matches — the reinstalled binary is
+/// then killed on launch ("Killed: 9"). A rename gives it a fresh inode.
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut temp_name = destination
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_default();
+    temp_name.push(".xtask-new");
+    let temp = destination.with_file_name(temp_name);
+    fs::copy(source, &temp)?;
+    fs::rename(&temp, destination).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 #[cfg(unix)]
@@ -380,7 +472,7 @@ fn copy_runtime_libraries(release_dir: &Path, install_dir: &Path) -> XtaskResult
                 continue;
             };
             let destination = install_dir.join(file_name);
-            fs::copy(&path, &destination).map_err(|error| {
+            replace_file(&path, &destination).map_err(|error| {
                 format!(
                     "failed to copy {} to {}: {error}",
                     path.display(),

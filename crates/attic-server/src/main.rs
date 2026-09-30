@@ -3008,8 +3008,48 @@ struct ResourceStatus<'a> {
 // real rolling rate from the actual delta. Process-lifetime static: there
 // is one semantic store per server process, so no per-instance state is
 // needed beyond this.
-static LAST_SEMANTIC_PROGRESS_SAMPLE: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
-    std::sync::Mutex::new(None);
+/// `(sample time, queue_done)` from recent `status` calls, oldest first,
+/// used to report a wall-clock embedding rate over [`PROGRESS_RATE_WINDOW`].
+static SEMANTIC_PROGRESS_SAMPLES: std::sync::Mutex<
+    std::collections::VecDeque<(std::time::Instant, u64)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Window for the reported chunks/sec. Long enough to span several GPU
+/// batches (one batch of large chunks takes 10-30 s), so the figure no longer
+/// flips between 0 and a per-batch burst rate on every poll.
+const PROGRESS_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Wall-clock rate over the samples in `window`, after recording `(now, done)`.
+/// Resets when `done` goes backwards (queue reset / generation switch).
+fn windowed_progress_rate(
+    samples: &mut std::collections::VecDeque<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    done: u64,
+    window: std::time::Duration,
+) -> f64 {
+    if samples.back().is_some_and(|&(_, d)| done < d) {
+        samples.clear();
+    }
+    samples.push_back((now, done));
+    while samples.len() > 2
+        && samples
+            .front()
+            .is_some_and(|&(t, _)| now.duration_since(t) > window)
+    {
+        samples.pop_front();
+    }
+    match samples.front() {
+        Some(&(t0, d0)) if done > d0 => {
+            let elapsed = now.duration_since(t0).as_secs_f64();
+            if elapsed > 0.0 {
+                (done - d0) as f64 / elapsed
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn handle_status(
@@ -3177,27 +3217,15 @@ fn handle_status(
             "loading"
         };
 
-        // [FIX] Real rolling chunks/sec derived from the queue_done delta
-        // since the last status poll, replacing the previous hardcoded
-        // 50.0/200.0 literals that never reflected actual throughput.
+        // Wall-clock chunks/sec over the last couple of minutes of `status`
+        // polls. A delta between consecutive polls alternated between 0 and a
+        // per-batch burst rate, which overstated and understated real speed.
         let now = std::time::Instant::now();
         let chunks_per_sec = {
-            let mut last = LAST_SEMANTIC_PROGRESS_SAMPLE
+            let mut samples = SEMANTIC_PROGRESS_SAMPLES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let rate = match *last {
-                Some((last_time, last_done)) if done > last_done => {
-                    let elapsed = now.duration_since(last_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        (done - last_done) as f64 / elapsed
-                    } else {
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            };
-            *last = Some((now, done));
-            rate
+            windowed_progress_rate(&mut samples, now, done, PROGRESS_RATE_WINDOW)
         };
         // batch_latency_ms is derived (not independently measured): the
         // configured batch size divided by the real chunks/sec rate above.
@@ -5055,6 +5083,32 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
+
+    #[test]
+    fn progress_rate_is_wall_clock_over_the_window_not_per_poll() {
+        use std::time::{Duration, Instant};
+        let mut s = std::collections::VecDeque::new();
+        let t0 = Instant::now();
+        let w = Duration::from_secs(120);
+        assert_eq!(windowed_progress_rate(&mut s, t0, 0, w), 0.0);
+        // A 128-chunk batch every 20 s, polled every 10 s: the per-poll delta
+        // flipped 0 / 12.8; the windowed rate is the true 6.4.
+        let mut done = 0;
+        let mut last = 0.0;
+        for i in 1..=12u64 {
+            if i % 2 == 0 {
+                done += 128;
+            }
+            last = windowed_progress_rate(&mut s, t0 + Duration::from_secs(i * 10), done, w);
+        }
+        assert!((last - 6.4).abs() < 0.01, "rate {last}");
+        // Going backwards (queue reset) restarts the window instead of
+        // producing a negative/garbage rate.
+        assert_eq!(
+            windowed_progress_rate(&mut s, t0 + Duration::from_secs(130), 0, w),
+            0.0
+        );
+    }
 
     fn make_server(tmp: &TempDir) -> AtticServer {
         // Explicit `false`, not `AtticServer::new()`: `new()` now defaults

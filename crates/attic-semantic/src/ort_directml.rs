@@ -715,7 +715,7 @@ impl SemanticProvider for OrtDirectMlProvider {
         }
 
         usage.elapsed_ms += t0.elapsed().as_millis() as u64;
-        tracing::info!(
+        tracing::debug!(
             items = inputs.len(),
             passes,
             shrunk_by_vram = shrunk,

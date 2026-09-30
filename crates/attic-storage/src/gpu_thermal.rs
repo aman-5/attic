@@ -100,8 +100,8 @@ struct Cache {
     at: Option<Instant>,
     value: Option<u32>,
     nvidia_smi_ok: bool,
-    /// When a background refresh was started; `None` when none is running.
-    refreshing_since: Option<Instant>,
+    /// A background refresh is running; never start a second one.
+    refreshing: bool,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -111,13 +111,15 @@ fn cache() -> &'static Mutex<Cache> {
             at: None,
             value: None,
             nvidia_smi_ok: true,
-            refreshing_since: None,
+            refreshing: false,
         })
     })
 }
 
-/// A refresh stuck this long (hung `nvidia-smi`) no longer blocks new ones.
-const REFRESH_STUCK: Duration = Duration::from_secs(30);
+/// `nvidia-smi` is killed if it has not answered within this long, so a
+/// wedged driver can neither hang the first (blocking) read nor pin the
+/// background refresh thread forever.
+const SMI_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hottest GPU core temperature in °C, cached for [`SAMPLE_INTERVAL`].
 /// `None` means no supported sensor on this machine.
@@ -136,11 +138,8 @@ pub fn gpu_temperature_c() -> Option<u32> {
         c.value = value;
         return value;
     };
-    let refresh_running = c
-        .refreshing_since
-        .is_some_and(|since| since.elapsed() < REFRESH_STUCK);
-    if at.elapsed() >= SAMPLE_INTERVAL && !refresh_running {
-        c.refreshing_since = Some(Instant::now());
+    if at.elapsed() >= SAMPLE_INTERVAL && !c.refreshing {
+        c.refreshing = true;
         let smi_ok = c.nvidia_smi_ok;
         let spawned = std::thread::Builder::new()
             .name("attic-gpu-temp".into())
@@ -150,10 +149,10 @@ pub fn gpu_temperature_c() -> Option<u32> {
                 c.nvidia_smi_ok = smi_ok;
                 c.at = Some(Instant::now());
                 c.value = value;
-                c.refreshing_since = None;
+                c.refreshing = false;
             });
         if spawned.is_err() {
-            c.refreshing_since = None;
+            c.refreshing = false;
         }
     }
     c.value
@@ -191,7 +190,23 @@ fn read_nvidia_smi() -> Option<u32> {
         // CREATE_NO_WINDOW: never flash a console from a background daemon.
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output().ok()?;
+    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < SMI_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::debug!("nvidia-smi did not answer within {SMI_TIMEOUT:?}; killed");
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
     }

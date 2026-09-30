@@ -693,7 +693,7 @@ fn drive_leased(
                 {
                     Ok(committed) => {
                         stats.embedded += committed.len() as u64;
-                        tracing::info!(
+                        tracing::debug!(
                             claimed = claims.len(),
                             embedded = committed.len(),
                             input_bytes = to_embed.iter().map(|i| i.text.len()).sum::<usize>(),

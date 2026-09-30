@@ -105,6 +105,12 @@ fn classify(err: &SemanticError, batch_items: usize) -> GpuFailureClass {
                 GpuFailureClass::Ignored
             }
         }
+        // A content problem with ONE input (too many tokens, too large, wrong
+        // shape) says nothing about the device. Counting it let a single
+        // dense JSON window demote a healthy GPU to CPU for good.
+        SemanticError::InputTooManyTokens { .. }
+        | SemanticError::InputTooLarge { .. }
+        | SemanticError::DimensionMismatch { .. } => GpuFailureClass::Ignored,
         _ => GpuFailureClass::TransientCountable,
     }
 }
@@ -112,6 +118,23 @@ fn classify(err: &SemanticError, batch_items: usize) -> GpuFailureClass {
 #[cfg(test)]
 mod device_pressure_tests {
     use super::*;
+
+    #[test]
+    fn content_errors_never_count_against_the_gpu() {
+        for e in [
+            SemanticError::InputTooManyTokens {
+                tokens: 540,
+                max: 512,
+            },
+            SemanticError::InputTooLarge {
+                len: 5000,
+                max: 1024,
+            },
+        ] {
+            assert!(matches!(classify(&e, 1), GpuFailureClass::Ignored), "{e}");
+            assert!(matches!(classify(&e, 64), GpuFailureClass::Ignored), "{e}");
+        }
+    }
 
     /// VRAM pressure used to arrive as `ProviderUnavailable`, which is
     /// classified permanent — so one spike on a shared desktop GPU retired

@@ -299,6 +299,19 @@ fn fmt_span(d: Duration) -> String {
     }
 }
 
+/// Re-type the worker's "input exceeds provider token budget (N > M)"
+/// message, so callers can split the input instead of failing it.
+fn too_many_tokens(message: &str) -> Option<SemanticError> {
+    let inner = message
+        .strip_prefix("input exceeds provider token budget (")?
+        .strip_suffix(')')?;
+    let (tokens, max) = inner.split_once(" > ")?;
+    Some(SemanticError::InputTooManyTokens {
+        tokens: tokens.trim().parse().ok()?,
+        max: max.trim().parse().ok()?,
+    })
+}
+
 fn map_supervisor_error(e: SupervisorError) -> SemanticError {
     match e {
         SupervisorError::WorkerTimeout(d) => SemanticError::EmbeddingFailed(format!(
@@ -313,7 +326,9 @@ fn map_supervisor_error(e: SupervisorError) -> SemanticError {
         SupervisorError::Engine { class, message } => match class {
             WorkerErrorClass::OutOfMemory => SemanticError::BudgetExhausted(message),
             WorkerErrorClass::ResourcePressure => SemanticError::DevicePressure(message),
-            WorkerErrorClass::InvalidInput => SemanticError::EmbeddingFailed(message),
+            WorkerErrorClass::InvalidInput => {
+                too_many_tokens(&message).unwrap_or(SemanticError::EmbeddingFailed(message))
+            }
             WorkerErrorClass::Artifact => SemanticError::ProviderUnavailable {
                 provider: "inference-worker".into(),
                 reason: message,
@@ -503,10 +518,13 @@ impl SupervisedWorkerProvider {
                     // per-batch resource signal the adaptive batch-cap halving
                     // in `enrich.rs` already owns, not evidence the worker
                     // itself is broken, so it alone does not flip readiness.
+                    // Neither does a rejected input (e.g. too many tokens):
+                    // the worker answered normally, and marking it failed
+                    // forced a full model reload per rejected window.
                     if !matches!(
                         e,
                         SupervisorError::Engine {
-                            class: WorkerErrorClass::OutOfMemory,
+                            class: WorkerErrorClass::OutOfMemory | WorkerErrorClass::InvalidInput,
                             ..
                         }
                     ) {
@@ -728,6 +746,29 @@ mod expected_fingerprint_tests {
             matches!(mapped, SemanticError::DevicePressure(_)),
             "resource pressure must stay typed, got {mapped:?}"
         );
+    }
+
+    #[test]
+    fn token_overflow_survives_the_worker_boundary() {
+        let mapped = map_supervisor_error(SupervisorError::Engine {
+            class: WorkerErrorClass::InvalidInput,
+            message: "input exceeds provider token budget (540 > 512)".into(),
+        });
+        assert!(
+            matches!(
+                mapped,
+                SemanticError::InputTooManyTokens {
+                    tokens: 540,
+                    max: 512
+                }
+            ),
+            "got {mapped:?}"
+        );
+        let other = map_supervisor_error(SupervisorError::Engine {
+            class: WorkerErrorClass::InvalidInput,
+            message: "bad utf-8".into(),
+        });
+        assert!(matches!(other, SemanticError::EmbeddingFailed(_)));
     }
 
     #[test]

@@ -90,8 +90,12 @@ fn idle_timeout() -> Duration {
 /// `ipc` is `None` when socket/IPC setup failed: the daemon then serves only
 /// its own stdio client.
 pub(crate) struct DaemonHandle {
-    _lock_guard: std::fs::File,
+    // Field order is drop order: the listener (which unlinks its socket file
+    // on macOS/BSD) must be dropped BEFORE the lock is released, or a
+    // replacement daemon that wins the lock in between would have its fresh
+    // socket unlinked by our late drop.
     ipc: Option<(IpcListener, PathBuf)>,
+    _lock_guard: std::fs::File,
 }
 
 impl DaemonHandle {
@@ -219,7 +223,16 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 
 fn bind_listener(socket_name: &str) -> io::Result<IpcListener> {
     let name = socket_name.to_ns_name::<GenericNamespaced>()?;
-    ListenerOptions::new().name(name).create_tokio()
+    // Only the process holding `attic.lock` binds (see `try_become_daemon`),
+    // so an existing socket is a dead daemon's leftover. On macOS/BSD the
+    // namespaced socket is a real file that outlives a killed process (Linux
+    // uses the abstract namespace, Windows named pipes), and without
+    // overwriting it every replacement daemon failed with AddrInUse.
+    ListenerOptions::new()
+        .name(name)
+        .try_overwrite(true)
+        .max_spin_time(Duration::from_secs(2))
+        .create_tokio()
 }
 
 async fn connect_stream(socket_name: &str) -> io::Result<IpcStream> {
