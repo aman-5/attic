@@ -632,16 +632,17 @@ mod tests {
     // Test helpers
     // -----------------------------------------------------------------------
 
-    fn migrated_file_db() -> (std::path::PathBuf, Connection) {
-        // Auto-deleted on drop (after the connections below): the shared
-        // %TEMP% no longer accumulates per-run database files.
+    /// Returns the owning `TempDir`: callers must keep it alive for the whole
+    /// test. Dropping it deletes the directory, which on Unix succeeds even
+    /// while the database is open, so a later connection finds no file.
+    fn migrated_file_db() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_writer_{}.db", uuid::Uuid::new_v4()));
         let conn = open_rw(&path).unwrap();
         configure_connection(&conn).unwrap();
         run_migrations(&conn).unwrap();
-        (path, conn)
+        (tmp, path, conn)
     }
 
     fn cleanup(path: &std::path::Path) {
@@ -725,7 +726,7 @@ mod tests {
 
     #[test]
     fn writer_executes_mutation_and_returns_ok() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new(writer_conn).unwrap();
         let handle = queue.handle();
 
@@ -760,7 +761,7 @@ mod tests {
 
     #[test]
     fn writer_returns_error_on_mutation_failure() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new(writer_conn).unwrap();
         let handle = queue.handle();
 
@@ -800,7 +801,7 @@ mod tests {
 
     #[test]
     fn mid_batch_failure_rolls_back_batch() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new(writer_conn).unwrap();
 
         // We need to send multiple items that will land in the same batch.
@@ -926,7 +927,7 @@ mod tests {
 
     #[test]
     fn rollback_failure_after_mutation_error_poisons_writer() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
 
         let queue = WriterQueue::new_with_finalizer(
             writer_conn,
@@ -965,7 +966,7 @@ mod tests {
 
     #[test]
     fn rollback_corrects_earlier_successful_results_in_the_same_batch() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let poisoned = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
 
@@ -1041,7 +1042,7 @@ mod tests {
 
     #[test]
     fn commit_failure_with_successful_rollback_returns_worker_error_to_all_callers() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
 
         let queue = WriterQueue::new_with_finalizer(writer_conn, FailCommitFinalizer).unwrap();
         let handle = queue.handle();
@@ -1071,7 +1072,7 @@ mod tests {
 
     #[test]
     fn commit_and_rollback_failure_poisons_writer() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
 
         let queue = WriterQueue::new_with_finalizer(writer_conn, FailBothFinalizer).unwrap();
         let handle = queue.handle();
@@ -1100,7 +1101,7 @@ mod tests {
 
     #[test]
     fn shutdown_does_not_hang_when_queue_full() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new(writer_conn).unwrap();
 
         // Set the shutdown flag directly to simulate a full-queue drop scenario.
@@ -1118,7 +1119,7 @@ mod tests {
 
     #[test]
     fn worker_thread_joins_on_drop() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new(writer_conn).unwrap();
 
         // Verify the thread was created (worker is Some).
@@ -1168,7 +1169,7 @@ mod tests {
 
     #[test]
     fn max_io_ops_per_sec_actually_throttles_commit_rate() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         // batch_size: 1 so every insert is its own COMMIT (one throttled
         // "IO op" per row) — isolates the throttle from batching effects.
         let queue = WriterQueue::new_with_config(
@@ -1200,7 +1201,7 @@ mod tests {
 
     #[test]
     fn default_writer_config_is_not_throttled() {
-        let (path, writer_conn) = migrated_file_db();
+        let (_tmp, path, writer_conn) = migrated_file_db();
         let queue = WriterQueue::new_with_config(
             writer_conn,
             WriterConfig {
