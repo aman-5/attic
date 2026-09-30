@@ -214,14 +214,21 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Build the release binary and return the executable path cargo reports.
+///
+/// On Apple Silicon the Metal GPU backend is enabled automatically, matching
+/// the release packages (`tools/package.sh`); Windows gets DirectML from the
+/// MSVC target, so every platform keeps the same generic command.
 fn build_release_binary() -> XtaskResult<PathBuf> {
-    let args = [
+    let mut args = vec![
         "build",
         "--release",
         "-p",
         "attic-server",
         "--message-format=json-render-diagnostics",
     ];
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        args.extend(["--features", "candle-metal"]);
+    }
     println!("Running `{}`...", command_line(cargo(), &args));
     let output = Command::new(cargo())
         .args(args)

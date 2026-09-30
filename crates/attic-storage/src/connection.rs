@@ -521,7 +521,10 @@ mod tests {
 
     #[test]
     fn pool_with_reader_returns_value() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_pool_read_{}.db", uuid::Uuid::new_v4()));
 
         // Create and initialise the file via a rw connection.
@@ -544,7 +547,10 @@ mod tests {
 
     #[test]
     fn pool_connection_returned_after_use() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_pool_return_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -572,7 +578,10 @@ mod tests {
     fn pool_exhausted_when_at_capacity() {
         // Build a pool at a tiny path; we will not actually open connections —
         // instead we manipulate in_use directly to simulate saturation.
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_pool_exhaust_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -601,7 +610,10 @@ mod tests {
 
     #[test]
     fn open_db_returns_writer_and_pool() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_open_db_{}.db", uuid::Uuid::new_v4()));
 
         let (writer, _pool) = open_db(&path).expect("open_db should succeed");
@@ -618,7 +630,10 @@ mod tests {
 
     #[test]
     fn wal_autocheckpoint_pragma_is_set() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_wal_pragma_{}.db", uuid::Uuid::new_v4()));
 
         let (writer, _pool) = open_db(&path).expect("open_db should succeed");
@@ -634,7 +649,10 @@ mod tests {
 
     #[test]
     fn db_reopen_preserves_data() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_reopen_{}.db", uuid::Uuid::new_v4()));
 
         // Write data.
@@ -675,7 +693,10 @@ mod tests {
 
     #[test]
     fn panicking_reader_does_not_leak_pool_slot() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_pool_panic_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -724,7 +745,10 @@ mod tests {
 
     #[test]
     fn checkpoint_wal_truncates_and_maintenance_passes() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_maint_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -769,7 +793,10 @@ mod tests {
     /// cleanly and the file does not grow as a result.
     #[test]
     fn run_maintenance_with_vacuum_true_succeeds_and_does_not_grow_file() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_vacuum_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -822,7 +849,10 @@ mod tests {
     /// it with a clear error instead of surfacing SQLite's own message.
     #[test]
     fn run_maintenance_vacuum_rejected_inside_open_transaction() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_vacuum_txn_{}.db", uuid::Uuid::new_v4()));
 
         {
@@ -845,7 +875,10 @@ mod tests {
 
     #[test]
     fn corruption_is_detected_by_verify_connection() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_corrupt_{}.db", uuid::Uuid::new_v4()));
 
         // Build a REAL database with real page content first. A hand-crafted
@@ -916,6 +949,9 @@ mod tests {
             }
         }
 
+        // Close before deleting: Windows cannot remove an open file, and the
+        // leftover attic_corrupt_*.db files piled up in %TEMP% on every run.
+        drop(conn);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
@@ -923,7 +959,10 @@ mod tests {
 
     #[test]
     fn backups_created_and_retained() {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_bk_{}.db", uuid::Uuid::new_v4()));
         let backup_dir = dir.join(format!("attic_bk_dir_{}", uuid::Uuid::new_v4()));
 

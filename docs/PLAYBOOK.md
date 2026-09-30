@@ -21,11 +21,37 @@ For what Attic is, start with the [README](../README.md); for how it is built,
 
 ### Start and stop
 
-Your MCP client starts Attic for you. To run it by hand:
+Your MCP client normally starts Attic for you. To run it by hand, set a
+workspace root and launch the installed binary.
+
+<details open>
+<summary><b>PowerShell</b></summary>
+
+```powershell
+$env:ATTIC_WORKSPACE_ROOT = 'C:\code\repo'
+~\.attic\attic-server.exe
+```
+
+</details>
+
+<details>
+<summary><b>cmd.exe</b></summary>
+
+```bat
+set ATTIC_WORKSPACE_ROOT=C:\code\repo
+%USERPROFILE%\.attic\attic-server.exe
+```
+
+</details>
+
+<details>
+<summary><b>Linux / macOS shell</b></summary>
 
 ```sh
-ATTIC_WORKSPACE_ROOT=/path/to/repo target/release/attic   # target\release\attic.exe on Windows
+ATTIC_WORKSPACE_ROOT=/code/repo ~/.attic/attic-server
 ```
+
+</details>
 
 With no workspace configured anywhere, Attic starts **unconfigured**: it
 answers `status` and `workspace`, and query tools return a clear "workspace
@@ -36,6 +62,10 @@ for the idle timeout (90 s by default). Both paths run the same graceful
 shutdown: stop accepting work, stop watchers and the scheduler, stop semantic
 workers, record a clean-shutdown marker, prune old records, checkpoint the
 WAL, write a crash-recovery backup and close the databases.
+
+> [!NOTE]
+> On macOS, a replacement daemon can take over a killed daemon's leftover
+> socket file, so relay/daemon failover does not require manual socket cleanup.
 
 ### Indexing lifecycle
 
@@ -123,19 +153,55 @@ for the template.
 
 Semantic search is **on by default**. Turn it off with `ATTIC_SEMANTIC=0` or
 `[semantic] enabled = false`; delete `semantic.db` to reclaim the disk.
-Canonical (lexical/structural) retrieval never depends on it. Embedding
-workers scale with the resource mode (1 / 3 / 8 for low / balanced /
-performance). See [`PERFORMANCE.md`](PERFORMANCE.md) for expected throughput.
+Canonical (lexical/structural) retrieval never depends on it.
+
+```mermaid
+flowchart LR
+    R[Retrieval units] --> S[Semantic selection]
+    S --> Q[Persistent queue]
+    Q --> W[Window + pack]
+    W --> E[Embedding worker]
+    E --> V[(semantic.db)]
+    V --> H[Hybrid search]
+```
+
+Backend defaults:
+
+| Platform | Default backend |
+|---|---|
+| Windows MSVC | DirectML GPU on any DX12 GPU (NVIDIA / AMD / Intel) |
+| Apple Silicon | Metal GPU via `candle-metal` (automatic with `cargo xtask install`) |
+| Linux | CPU; NVIDIA CUDA requires `--features candle-cuda` and was not validated in the Sep 2026 measurement round |
+| Intel Mac | CPU |
+
+Selection defaults also depend on backend, unless explicitly set in
+`attic.toml`:
+
+| Key | GPU | CPU |
+|---|---:|---:|
+| `min_score` | `0.0` | `0.30` |
+| `max_units_per_repo` | `100000` | `2560` |
+| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
+| `max_units_total` | `100000` | `100000` |
+
+The server logs `semantic selection defaults` at startup. If the GPU later
+falls back to CPU at runtime, the startup defaults remain. First start downloads
+the fp16 ONNX model (~1.2 GB) into `~/.attic/models` in the background; that
+session embeds on CPU and the GPU backend is used from the next start.
+
+> [!TIP]
+> `status.semantic_progress.chunks_per_sec` is a wall-clock rate over the last
+> 120 s. It no longer jumps between zero and a per-poll burst rate.
 
 ### Attic home layout
 
 `ATTIC_HOME` defaults to `~/.attic`. Startup creates the home directory, the
 main `attic.db*` files, and `attic.toml` when missing. Other directories are
-lazy: `models/` is created only for model downloads (or an explicit
-`ATTIC_MODEL_CACHE_DIR` elsewhere), `logs/` only after the `logging` tool is
-turned on, and `backups/` only after the shutdown backup first succeeds.
+lazy: `models/` is created only for model downloads, `logs/` only after the
+`logging` tool is turned on, and `backups/` only after the shutdown backup
+first succeeds.
 Attic does not read from or write to `~/.cache/huggingface`; model assets live
-under the Attic model cache.
+under `ATTIC_HOME`.
 
 ## Troubleshooting
 
@@ -149,19 +215,28 @@ under the Attic model cache.
 | Indexing seems stuck | `status.incremental.tasks` not decreasing across calls; stderr scheduler errors |
 | Watcher degraded | `status.watcher.mode` = `periodic-reconciliation` — a documented fallback, not a crash |
 | Cross-repo answers withheld | Startup cross-repo sync not finished or failed (stderr `cross-repo workspace sync failed`); single-repo retrieval unaffected |
-| No semantic results | `status.semantic_progress`; stderr `semantic layer unavailable` means lexical-only by design |
+| No semantic results yet | `status.semantic_progress`; first model download embeds on CPU and GPU starts on the next launch when `~/.attic/models/onnx-fp16` exists |
+| GPU expected, CPU used on Windows | Check the Rust target. DirectML is automatic on Windows MSVC; if Cargo config forces GNU, set `CARGO_BUILD_TARGET=x86_64-pc-windows-msvc` |
+| GPU slow or hot | `ATTIC_LOG=debug`; inspect `DirectML embed batch` wait/forward times, `shrunk_by_vram`, and temperature. Thermal pause/resume defaults are 90 °C / 85 °C |
 | "server busy" / memory | `status.resource_pressure`; raise `total_memory_budget_mib` / `max_foreground_queries`, or index fewer repositories at once |
 | Disk usage | `attic.db*`, `semantic.db`, lazy `models/` / `backups/` under `ATTIC_HOME` — not Cargo's `target/` or `~/.cache/huggingface` |
 
 <details>
-<summary><strong>Details</strong></summary>
+<summary><strong>Details and diagnostics</strong></summary>
 
 - **Relay says the daemon never published an address.** Another process holds
   `attic.lock` but has no `attic.ipc`: it is still starting, serving a single
   client because its socket could not be created, or hung. Stop it and
-  relaunch.
+  relaunch. On macOS, a replacement daemon can take over a killed daemon's
+  leftover socket file.
 - **"workspace not configured"** is the intended first-run state — configure
   through the `workspace` tool, `ATTIC_CONFIG` or `ATTIC_WORKSPACE_ROOT`.
+- **Semantic debug logging.** `ATTIC_LOG=debug` adds `semantic batch` lines
+  (claimed, embedded, input bytes, prep/embed/commit ms) and `DirectML embed
+  batch` lines (items, passes, `shrunk_by_vram`, tokenize/forward/wait/total
+  ms). Worker stderr is forwarded.
+- **Content errors.** Too-large or too-token-heavy units are counted for that
+  unit only; they do not demote GPU to CPU and do not force a model reload.
 - **Disk over time.** Every clean shutdown (including the daemon's idle exit)
   prunes tombstones, invalidation records and finished tasks past their
   retention (90 / 90 / 30 days) and vacuums both databases, so size tracks
@@ -299,6 +374,10 @@ changes, so cached analyses are recomputed on the next start.
 
 ## Development
 
+> [!WARNING]
+> These commands run Cargo. Do not run them while another build is holding the
+> target lock unless you intentionally want to wait.
+
 ```sh
 rustup show                                   # installs the pinned toolchain
 cargo build --package attic-server            # debug build → target/debug/attic
@@ -310,16 +389,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Pre-commit checks and local install
 
-The same commands on every OS; no feature flags or `--target` needed (the
-DirectML GPU backend is built in automatically on Windows MSVC).
+The same commands work on Windows, Linux and macOS:
 
 ```sh
 cargo xtask check
 cargo xtask install
 ```
 
-`cargo xtask check` runs the same pre-commit checks as plain Cargo commands,
-stopping at the first failure:
+`cargo xtask check` is exactly:
 
 ```sh
 cargo fmt --all --check
@@ -327,54 +404,50 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo xtask install` runs `cargo build --release -p attic-server`, stops any
-running local `attic-server` / `attic` process, then installs the binary and
-adjacent runtime libraries into `ATTIC_HOME` or `~/.attic`.
+`cargo xtask install` performs a release build of `attic-server`, stops any
+running local `attic-server` / `attic`, and installs the binary plus runtime
+libraries (for example `DirectML.dll`) into `$ATTIC_HOME` or `~/.attic`. It
+uses Cargo's JSON output to find the executable, so a configured `[build]`
+target is honoured, and replaces files via temp+rename so macOS code
+signatures remain valid.
+
+On Apple Silicon it automatically adds `--features candle-metal`, matching the
+`aarch64-apple-darwin` release packages. On Windows MSVC, DirectML is built in
+automatically; the legacy `ort-directml` feature is a no-op kept for old
+scripts. Linux defaults to CPU; NVIDIA CUDA requires `--features candle-cuda`
+and was not validated in the Sep 2026 measurement round.
 
 The real-GPU end-to-end test runs automatically inside `cargo test` when
 `~/.attic/models/onnx-fp16` exists; `ATTIC_RUN_MODEL_E2E=0` skips it.
-
-If `%USERPROFILE%\.cargo\config.toml` forces `target = "x86_64-pc-windows-gnu"`
-(see below), delete that line when MSVC is installed, or run
-`$env:CARGO_BUILD_TARGET='x86_64-pc-windows-msvc'` once per shell before the
-commands above. `cargo xtask install` will then build and install from
-`target/x86_64-pc-windows-msvc/release/` automatically.
 
 <details>
 <summary><b>Toolchains per platform</b></summary>
 
 - **Windows (recommended):** rustup's default `x86_64-pc-windows-msvc` plus
-  "Build Tools for Visual Studio" with the C++ workload. The DirectML GPU
-  backend is built in automatically with MSVC — plain `cargo build` /
-  `cargo test` include it, no feature flag.
+  Build Tools for Visual Studio with the C++ workload. DirectML is automatic;
+  no feature flag is needed.
 
-  > **The GNU override below silently disables the GPU build.** ONNX Runtime
-  > publishes no `x86_64-pc-windows-gnu` binaries, so a `[build] target`
-  > override in `%USERPROFILE%\.cargo\config.toml` produces a CPU-only
-  > binary. If you have that override set but also have MSVC installed,
-  > either delete the override or pass the target explicitly:
-  >
-  > ```
-  > cargo build --release --target x86_64-pc-windows-msvc
-  > ```
-  >
-  > and install from `target/x86_64-pc-windows-msvc/release/`, copying the
-  > `onnxruntime*.dll` and `DirectML.dll` staged beside the binary along
-  > with it — DirectML fails to load if they are not adjacent to the exe.
-- **Windows without MSVC:** MinGW via [Scoop](https://scoop.sh)
-  (`scoop install mingw`, no admin), `rustup target add x86_64-pc-windows-gnu`,
-  and a **local, untracked** override in `%USERPROFILE%\.cargo\config.toml`:
+  If a personal Cargo config forces GNU (`x86_64-pc-windows-gnu`), override it
+  before the same `cargo xtask` commands:
 
-  ```toml
-  [build]
-  target = "x86_64-pc-windows-gnu"
-
-  [target.x86_64-pc-windows-gnu]
-  linker = "C:\\Users\\<you>\\scoop\\apps\\mingw\\current\\bin\\gcc.exe"
+  ```powershell
+  $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
+  cargo xtask check
+  cargo xtask install
   ```
 
-- **Linux:** a system C compiler (`build-essential` / `gcc`).
-- **macOS:** `xcode-select --install`.
+  In `cmd.exe`:
+
+  ```bat
+  set CARGO_BUILD_TARGET=x86_64-pc-windows-msvc
+  cargo xtask check
+  cargo xtask install
+  ```
+
+- **Linux:** a system C compiler (`build-essential` / `gcc`). CPU is the
+  default semantic backend. CUDA is opt-in with `--features candle-cuda`.
+- **macOS:** `xcode-select --install`. Apple Silicon gets Metal automatically
+  through `cargo xtask install`; Intel Mac uses CPU.
 
 </details>
 
@@ -385,7 +458,7 @@ commands above. `cargo xtask install` will then build and install from
 |---|---|
 | `ATTIC_BENCH_INDEX=1` (+ `ATTIC_BENCH_ROOT`, …) | Indexing benchmark — see [`PERFORMANCE.md`](PERFORMANCE.md) |
 | `ATTIC_BENCH_QWEN=1` (+ `ATTIC_BENCH_QWEN_CORPUS`, …) | Real-model embedding benchmark |
-| `ATTIC_RUN_MODEL_E2E=0/1` | Real-model e2e: runs automatically on Windows MSVC when `~/.attic/models/onnx-fp16` exists; `0` skips, `1` forces (CPU if no GPU assets) |
+| `ATTIC_RUN_MODEL_E2E=0` | Skip the real-GPU e2e test that runs automatically when `~/.attic/models/onnx-fp16` exists |
 | `ATTIC_ACCEPTANCE_DUMP=<dir>` | Frozen-count acceptance run over the reference JSON-export corpus |
 | `ATTIC_ACCEPTANCE_WORKSPACE=<dir>` | Frozen-count acceptance run over the reference 20-repository workspace |
 | `ATTIC_FORCE_RESOURCE_PRESSURE` | Fault injection: start at a fixed pressure tier |

@@ -1,11 +1,16 @@
 # ⏱️ Attic — Performance and sizing
 
 What to expect when Attic indexes your repositories, and how to measure it on
-your own code. Every number here is a direct measurement unless marked
-**estimate**.
+your own code. Every number here is a direct measurement from 29–30 Sep 2026
+unless it is explicitly marked **estimate**.
 
-Reference machine: 14-core / 20-thread laptop CPU (Intel i7-1370P), 32 GB RAM,
-4 GB laptop GPU (NVIDIA RTX A500), Windows, SSD.
+> [!NOTE]
+> Search never waits for embeddings. Lexical and structural results are
+> available first; semantic candidates join automatically as vectors appear.
+
+**Measurement setup.** NVIDIA RTX A500 Laptop GPU, 4 GB (3,965 MiB reported),
+Windows, DirectML fp16 ONNX, laptop power-capped at about 25 W and 82–84 °C
+under sustained load. Model: `Qwen/Qwen3-Embedding-0.6B`.
 
 ## Contents
 
@@ -19,15 +24,42 @@ Reference machine: 14-core / 20-thread laptop CPU (Intel i7-1370P), 32 GB RAM,
 
 ## The short version
 
-| You want | Typical time |
+| You want | Expectation |
 |---|---|
 | Search a freshly added repository | Seconds to about a minute — lexical and structural indexing is fast |
 | See an edit reflected | Well under a second of work per changed file, after a short debounce |
-| Full semantic coverage | Background work: minutes on a GPU, hours on a CPU for large repositories |
+| Full semantic coverage on a 4 GB DirectML GPU | Minutes for small/medium repositories; hours for very large corpora, depending on chunk size |
+| Full semantic coverage on CPU | **Estimate:** much slower (earlier CPU throughput was ≈0.7–1.6 chunks/s), so defaults intentionally select less work |
 
-Search never waits for embeddings: results are lexical until vectors exist,
-then semantic candidates join automatically. The embedding queue is persisted,
-so progress survives restarts.
+> [!TIP]
+> Chunks/s is not portable across corpora. The stable metric on the measured
+> GPU is **≈5,600–6,000 padded tokens/s** (about 700 ms per 4,096-token pass).
+
+### Which backend/defaults do I get?
+
+```mermaid
+flowchart TD
+    A[Start Attic with semantic enabled] --> OS{OS / target}
+    OS -->|Windows MSVC| W[DirectML GPU by default<br/>any DX12 GPU: NVIDIA / AMD / Intel]
+    OS -->|Apple Silicon| M[Metal GPU with candle-metal<br/>automatic in cargo xtask install and release packages]
+    OS -->|Linux| L{Built with candle-cuda?}
+    OS -->|Intel Mac| IC[CPU]
+    L -->|yes, NVIDIA CUDA available| Cuda[CUDA GPU<br/>not validated in this measurement round]
+    L -->|no| LC[CPU]
+    W --> Model{fp16 ONNX model in ~/.attic/models?}
+    Model -->|no, first start| DL[Download in background<br/>this session embeds on CPU]
+    Model -->|yes, next start| DGPU[GPU selection defaults]
+    M --> MGPU[GPU selection defaults]
+    Cuda --> CGPU[GPU selection defaults]
+    DL --> CPU[CPU selection defaults]
+    LC --> CPU
+    IC --> CPU
+```
+
+Explicit `[semantic]` values in `attic.toml` override both GPU and CPU
+automatic defaults. Startup logs `semantic selection defaults` with the values
+chosen for that run. If a GPU later falls back to CPU at runtime, the startup
+selection defaults remain in effect.
 
 ## Indexing (lexical + structural)
 
@@ -37,140 +69,169 @@ Cold database, production pipeline, optimized build:
 |---|---|---|
 | Synthetic mixed-language benchmark (the default bench corpus) | 800 files, 112,784 retrieval units | **21.8 s** cold · 26.0 s full re-index of the unchanged tree · **4.1 s** incremental republish of 300 edited files |
 | JSON environment exports | 18 files, 21 MB (five ~4.5 MB exports, 3 unsupported DOCX/PDF reported) | **9.6 s** · 45,110 units collapsing to 10,596 distinct bodies (77% canonical dedup) |
-| Enterprise multi-repository workspace (AEM + Java) | 20 nested repositories, ~224k files on disk, 12,161 eligible | **≈ 1 min** · 95,886 units |
+| Enterprise multi-repository workspace (AEM + Java) | 20 nested repositories, ~224k files on disk, 12,161 eligible | **≈1 min** · 95,886 units |
 
-Where the time goes (synthetic benchmark, cold): per-file analysis ≈ 53%,
-database publication ≈ 44%, discovery ≈ 2%. Analysis runs on all but two
+Where the time goes (synthetic benchmark, cold): per-file analysis ≈53%,
+database publication ≈44%, discovery ≈2%. Analysis runs on all but two
 logical CPUs (largest files first, so one huge file never serializes the tail);
 publication goes through the single writer in large prepared-statement
 batches.
 
+> [!NOTE]
+> Reconcile now writes all occurrence and queue rows in one transaction. On the
+> Dump corpus, indexing→queue-ready time improved from **30.7 s** to **8.7 s**.
+
 ## Embeddings (semantic layer)
 
-Model: `Qwen/Qwen3-Embedding-0.6B`. Throughput is real (unpadded) tokens per
-second; parity is the minimum cosine similarity against the Hugging Face
-reference implementation.
+Model: `Qwen/Qwen3-Embedding-0.6B`. The fp16 ONNX model is about **1.2 GB** and
+is downloaded into `~/.attic/models` in the background on first start. Attic
+does not use `~/.cache/huggingface`.
 
-| Backend | Throughput | Parity |
-|---|---|---|
-| GPU — ONNX Runtime / DirectML, fp16 (Windows GPU build) | **3,130 tok/s** | 0.99996 |
-| CPU — Candle f32 (8-item batches, 1.6 KB chunks) | **62 tok/s** | batched = unbatched (cosine 1.000000) |
-| CPU — Candle Q8 GGUF | 16 tok/s | 0.9992 |
-| GPU — DirectML Q8 / int8 exports | slower than fp16 | 0.75 / 0.72 — **rejected** |
+### Embedding pipeline
 
-Batching never changes a vector: batches are right-padded with a causal
-attention mask, and the benchmark asserts batched and single-item vectors
-match. The model is a one-time ~1.2 GB download, verified against pinned
-SHA-256 hashes; it is never counted in indexing time.
+```mermaid
+flowchart LR
+    I[Index retrieval units] --> S[Select semantic candidates<br/>backend-specific defaults]
+    S --> Q[Persisted embedding queue]
+    Q --> W[Window large units<br/>up to 16 windows]
+    W --> G{GPU backend available?}
+    G -->|yes| P[Pack by length bucket<br/>4096 padded tokens/pass]
+    P --> D[GPU worker process<br/>DirectML / Metal / CUDA]
+    G -->|no| C[CPU worker]
+    D --> M[Mean-pool windows<br/>L2-normalise]
+    C --> M
+    M --> V[(Canonical vector pool<br/>vector space + content hash)]
+    V --> DB[(semantic.db)]
+```
 
-### GPU batching (ONNX / DirectML)
+### Selection defaults
 
-- **Length buckets.** Inputs are grouped by token length into buckets of
-  32/48/64/96/128/192/256/384/… (powers of two plus 1.5× midpoints, up to `onnx_seq_len`) and padded only to their bucket, not
-  to the full window. Code chunks are mostly short, so this removes most
-  padding work. Vectors are unchanged (cosine ≥ 0.9999 vs fixed-512 padding).
-- **Token budget per pass.** Each forward pass carries
-  `gpu_batch_tokens / bucket` items (power-of-two sizes, so DirectML sees a
-  small fixed set of shapes and its memory arena stops growing).
-- **Stays on the GPU.** Shapes that already ran are always admitted; a new
-  shape runs only if free VRAM covers it, otherwise the pass shrinks. An
-  out-of-memory pass is retried at half size — never demoted to CPU.
-- **Thermal guard.** At `gpu_temp_pause_c − 1` the token budget halves; at
-  `gpu_temp_pause_c` (default 90 °C) embedding pauses until the GPU cools to
-  `gpu_temp_resume_c` (default 85 °C). Sensor: `nvidia-smi` (NVIDIA on
-  Windows/Linux) or Linux hwmon; macOS and other Windows adapters have no
-  readable sensor, so the OS's own thermal management applies. `status` →
-  `semantic_identity.gpu.thermal_guard` shows `active` with the current temperature, or
-  `inactive` when no sensor is readable.
-- **Poison isolation.** If a multi-item batch fails on content or crashes
-  the worker, it is split in halves until the offender is found: good items
-  commit, only the offender is marked failed, so one bad chunk never stalls
-  the queue.
-- **Lazy load, idle unload.** The model worker starts only when chunks are
-  pending or a semantic query arrives — never at server startup, and never
-  when `[semantic] enabled = false`. After `gpu_idle_unload_secs` (default
-  900) with no embedding work the worker process exits, so the OS reclaims
-  all of its VRAM (including the driver's pool). The next chunk or query
-  reloads it (≈2–7 s on an RTX A500); a query's time budget is extended by
-  the load time, so a cold query never times out. `status` →
-  `semantic_identity.worker` shows `not loaded` / `loading` / `loaded (load
-  took …)` / `unloaded (idle 15m)` and the last-use time.
-- **GPU eligibility, decided once at startup.** The adapter DirectML will
-  use (high-performance order, so the discrete GPU on hybrid laptops) is
-  checked before any model download: less dedicated VRAM than
-  `gpu_min_vram_mb` (default 4096; a nominal 4 GB card reporting ≈3.9 GB
-  qualifies) or an integrated GPU (unless `allow_integrated_gpu = true`)
-  means CPU from the start. `status` → `semantic_identity.device` says which
-  and why, e.g. `GPU: NVIDIA RTX A500 Laptop GPU (3965 MB)` or
-  `CPU: GPU … has 2048 MB VRAM < gpu_min_vram_mb=4096`. If the model then
-  fails to load on an eligible GPU, the CPU fallback takes over and the line
-  reads `CPU: GPU failed at runtime: …`.
-- **Stall watchdog, not a flat timeout.** The GPU worker sends a heartbeat
-  after every forward pass. A worker silent for 60 s is killed and
-  restarted (`status` → `semantic_identity.worker.stall_kills`), and the
-  batch is bisected like any other crash. Each batch also has a work budget
-  of 60 s + ~1 s per 500 estimated tokens (at most 300 s). Thermal pauses
-  and VRAM-headroom waits are reported as paused and are not charged to
-  either limit, so a hot GPU is never mistaken for a hung one; a single
-  thermal pause is capped at 10 minutes, after which the batch returns to
-  the queue. CPU (Candle) keeps the flat 300 s limit.
-- **Failed items retry at the back of the queue.** A failed attempt
-  re-queues the item behind healthy work of the same priority; after
-  `max_attempts` (3) it is quarantined. Worker crashes and cancellations
-  release items without charging an attempt.
+| Key | GPU (DirectML / Metal / CUDA) | CPU |
+|---|---:|---:|
+| `min_score` | `0.0` | `0.30` |
+| `max_units_per_repo` | `100000` | `2560` |
+| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
+| `max_units_total` | `100000` | `100000` |
 
-Measured on an RTX A500 (4 GB, 3,965 MiB reported), attic repository,
-11,142 selected chunks, `min_score = 0.0`: **76–89 chunks/s steady**
-(previously 38–51), drained in 160 s including indexing and model load,
-first 1,000 chunks at ≈33 s, peak 85 °C, peak VRAM 3,486 MiB, 0 failures,
-no CPU fallback. A 200,000-chunk queue with 16 poison items (mock engine)
-drains completely: 16 quarantined, 0 left pending or in flight.
+Reason: on the measured GPU, full coverage costs minutes for typical
+repositories; on CPU it would be about **1 hour per repository** (**estimate**),
+so CPU defaults stay conservative. With CPU-style defaults, the Dump corpus
+embeds only **66** documentation chunks; the large JSON exports remain
+lexical-only.
+
+### Windowing, packing and worker behaviour
+
+- **Windowed embedding.** A unit larger than one model window is split on
+  character/line boundaries into up to **16** windows. Each window is embedded,
+  then vectors are length-weighted mean-pooled and L2-normalised into one
+  vector. Units that fit one window are embedded unchanged (bit-identical
+  vectors). If dense text still exceeds the token window, only that unit is
+  bisected and re-split at half the window, at most **2** times. Nothing is
+  truncated; units bigger than 16 windows are excluded and counted as
+  `exceeds_max_input_bytes`.
+- **Model window.** DirectML uses `onnx_seq_len = 512` on cards below **6 GB**
+  (1 KiB per window) and `1024` otherwise (2 KiB per window).
+- **GPU pass packing.** Length buckets are
+  `32/48/64/96/128/192/256/384/512` — powers of two plus 1.5× midpoints — with
+  **7–20% less padded work** measured with the real tokenizer. The default
+  `gpu_batch_tokens` is **4096 padded tokens per pass**.
+- **DirectML efficiency.** The run requests only `last_hidden_state`; the
+  previous 56 unused KV-cache tensors copied about **448 MiB** per pass to host
+  memory. DirectML memory pattern is disabled, as required by ONNX Runtime for
+  this dynamic-shape use.
+- **Thermal guard.** GPU temperature is read in the background via
+  `nvidia-smi` on NVIDIA Windows/Linux and hwmon on Linux. It is inactive on
+  macOS and non-NVIDIA Windows. `nvidia-smi` is killed after **5 s**. Embedding
+  pauses at **90 °C** and resumes at **85 °C**.
+- **Failures.** Content errors such as too many tokens or too-large units never
+  count toward GPU→CPU demotion and never force a model reload.
+- **Progress.** `status` → `semantic_progress.chunks_per_sec` is a wall-clock
+  rate over the last **120 s**, not a per-poll burst delta.
+
+### Measured results
+
+Full-coverage settings, GPU, 0 failures, no CPU fallback:
+
+| Corpus | Chunks | Selected (after dedup) | Throughput (wall, since first embed) | First embed | Full embed |
+|---|---:|---:|---:|---:|---:|
+| Dump folder: five 3.4–4.9 MB AEM form-code JSON exports + a few docs | 45,110 | 10,596 | **13.7 chunks/s** (was 9.97 before reconcile/memory-pattern fixes) | **34 s** (was 71 s) | **≈13 min** (**projection** from measured rate) |
+| AEM Forms project (client codebase, 2,245 files, 133 MB) | 5,019 | 3,220 | **6.22 chunks/s** (was 3.4 before reload/token fixes; measured before reconcile fix) | **30 s** | **≈9 min** (**projection**) |
+| Attic repo (small code chunks, ~34 tokens/chunk) | 11,142 | 11,142 | **76–89 chunks/s** (earlier measurement) | — | **≈2.5 min** |
+
+AEM Forms project chunks average **5.6 model windows per chunk** (713 windows per 128 chunks)
+versus about **1.1** on Dump, so that project reports fewer chunks/s even when the GPU
+is doing comparable token work. VRAM never limited a pass (`shrunk_by_vram = 0`)
+and thermal/VRAM waits were **0–63 ms** per batch.
+
+> [!WARNING]
+> Do not raise `gpu_batch_tokens` on 4 GB cards without measuring. On the AEM Forms project,
+> **8192** padded tokens/pass dropped throughput to **2.83 chunks/s** versus
+> **6.22 chunks/s** at **4096**, with VRAM peaking at **3,899 / 4,096 MiB** and
+> spilling into shared memory.
+
+<details>
+<summary><b>Debug lines and status fields</b></summary>
+
+Set `ATTIC_LOG=debug` to see per-batch diagnostics:
+
+- `semantic batch`: claimed, embedded, input bytes, prep ms, embed ms, commit ms
+- `DirectML embed batch`: items, passes, `shrunk_by_vram`, tokenize ms,
+  forward ms, wait ms, total ms
+
+Worker stderr is forwarded to the parent process. `status` reports
+`semantic_progress`, `semantic_identity`, and `diagnostics.why_slow`.
+
+</details>
 
 ## Sizing your own workspace
 
 **Estimate** the semantic workload from the text that will actually be
 embedded:
 
-1. Start from source bytes, minus what `.gitignore`, built-in skips,
-   `[indexing] exclude`, `[semantic] exclude_globs` and
-   `[semantic] max_file_bytes` (256 KiB default) remove. Identical JSON
-   subtrees are embedded once.
-2. Tokens ≈ bytes ÷ 4 for code and prose.
-3. Time ≈ tokens ÷ throughput, plus roughly 50% for tokenization, queueing
-   and vector commits.
+1. Start from source bytes, minus `.gitignore`, built-in skips,
+   `[indexing] exclude`, `[semantic] exclude_globs`, and `[semantic]
+   max_file_bytes`. Identical bodies are embedded once.
+2. Estimate unique tokens. For mixed code/prose, bytes ÷ 4 is a rough first
+   pass; dense generated data may differ.
+3. Use the measured padded-token rate:
+   `time ≈ unique_tokens × 1.25 padding ÷ 5,800 tokens/s`.
 
-| Unique tokens | GPU (fp16) | CPU (f32) |
-|---|---|---|
-| 1 M (a large service) | ≈ 8–12 min | ≈ 6–7 h |
-| 10 M | ≈ 1.5 h | ≈ 2.5–3 days |
-| 40 M (a big multi-repo estate) | ≈ 5–6 h | not practical — use the GPU build or narrow `exclude_globs` |
+| Workload | Estimate basis | Time estimate on the measured GPU |
+|---|---|---:|
+| 1 M unique tokens | Formula above | **≈3.5–4 min** |
+| 10 M unique tokens | Formula above | **≈36 min** |
+| 40 M unique tokens | Formula above | **≈2.4 h** |
+| 500,000 Dump-sized chunks | Measured Dump chunks/s | **≈10 h** |
+| 500,000 AEM-Forms-project-sized chunks | Measured AEM Forms project chunks/s | **≈22 h** |
+| CPU full coverage | Earlier CPU throughput ≈0.7–1.6 chunks/s | Far slower; narrow selection or use GPU |
+
+All values in this table are **estimates**. Replace them with local
+measurements when sizing a production workspace.
 
 ## Tuning
 
-| Goal | Change |
-|---|---|
-| Faster embeddings on Windows | Nothing to do on MSVC: DirectML is built in by default. The fp16 ONNX export downloads automatically on first run; `ATTIC_ONNX_MODEL_DIR` is only needed to point at your own export |
-| Faster embeddings on Apple Silicon | Build with `--features candle-metal` (the default for `aarch64-apple-darwin` release builds) |
-| Faster embeddings on Linux + NVIDIA | Build with `--features candle-cuda` on a machine with the CUDA toolkit installed |
-| Less embedding work | `[semantic] exclude_globs` for generated, vendored or snapshot data; lower `max_file_bytes`; raise `min_score` (default 0.30) |
-| More semantic coverage | Lower `[semantic] min_score` (0.0 embeds every eligible unit) and raise `max_units_per_repo` (default 2560) / `max_units_total` (default 100000) |
-| Bigger GPU passes on a larger card | Raise `[semantic] gpu_batch_tokens` (default 4096, sized for a 4 GB card) |
-| GPU running hot | Lower `[semantic] gpu_temp_pause_c` / `gpu_temp_resume_c` (defaults 90 / 85 °C) |
-| Free GPU memory sooner / never | `[semantic] gpu_idle_unload_secs` (default 900; 0 keeps the model resident) |
-| Force CPU, or try a small / integrated GPU | `[semantic] gpu_min_vram_mb` (default 4096; set above your VRAM to force CPU, 0 to always try) and `allow_integrated_gpu` (default false) |
-| Faster GPU embeddings, less coverage | `[semantic] onnx_seq_len = 512`. Halves the padded window; units above one window are embedded in up to 16 windows and mean-pooled into one vector, so they cost more passes but are still embedded (only units above 16 windows are excluded as `exceeds_max_input_bytes`). Leave unset (1024) unless you have measured the trade |
-| Keep the laptop responsive | `[resources] mode = "low"`, or lower `[indexing] analysis_threads` |
-| Index many repositories faster | `[resources] mode = "performance"` or a higher `scheduler_workers` |
-| Smaller semantic database | `[semantic] dimension = 512` (re-embeds once) |
-| Lexical-only (no model at all) | `ATTIC_SEMANTIC=0` or `[semantic] enabled = false` |
-
-The `status` tool reports semantic progress (`semantic_progress`) and a
-plain-language bottleneck diagnosis (`diagnostics.why_slow`).
+| I want… | Change… | Notes |
+|---|---|---|
+| Full semantic coverage on a GPU | Usually nothing | GPU defaults are `min_score = 0.0`, `max_units_per_repo = 100000`, `max_file_bytes = 8 MiB`, `max_units_total = 100000` |
+| Less embedding work | `[semantic] exclude_globs`, lower `max_file_bytes`, raise `min_score`, lower `max_units_per_repo` | Good for generated, vendored, snapshot or export data |
+| CPU to behave like GPU coverage | Set the GPU values explicitly under `[semantic]` | CPU time can be about 1 h per repository (**estimate**) |
+| Keep a 4 GB GPU out of shared memory | Keep `gpu_batch_tokens = 4096` | 8192 was slower on the measured 4 GB card |
+| Try bigger passes on a larger GPU | Raise `gpu_batch_tokens`, then measure | Watch `shrunk_by_vram`, VRAM peak and chunks/s |
+| Reduce hot-laptop pauses | Lower `gpu_temp_pause_c` / `gpu_temp_resume_c` | Defaults are 90 °C / 85 °C |
+| Fit a small GPU | Let `onnx_seq_len` auto-select 512 below 6 GB, or set 512 explicitly | Units above one window are mean-pooled, not truncated |
+| Free VRAM sooner | Lower `gpu_idle_unload_secs` | Default is 900 s; 0 keeps the model resident |
+| Linux NVIDIA GPU | Build with `--features candle-cuda` | Not validated in this measurement round |
+| Apple Silicon GPU | Use `cargo xtask install` or the aarch64 release package | It enables `candle-metal` automatically; throughput not yet measured |
+| Lexical-only search | `ATTIC_SEMANTIC=0` or `[semantic] enabled = false` | No model download, no `semantic.db` growth |
+| Debug slow embeddings | `ATTIC_LOG=debug`, then inspect `semantic batch` and `DirectML embed batch` | Also check `status.diagnostics.why_slow` |
 
 ## Benchmark your own repositories
 
 Both benchmarks are opt-in and read-only: they never modify the directory
 they measure.
+
+<details open>
+<summary><b>PowerShell</b></summary>
 
 ```powershell
 # Indexing: cold, warm and incremental timings with a per-stage breakdown
@@ -178,19 +239,33 @@ $env:ATTIC_BENCH_INDEX = '1'
 $env:ATTIC_BENCH_ROOT  = 'C:\code\my-repo'      # omit for the synthetic corpus
 cargo test --release -p attic-indexing --test index_throughput_bench -- --ignored --nocapture
 
-# Embeddings: real-model CPU throughput and batch equivalence (needs the cached model)
+# Embeddings: real-model CPU/GPU throughput and batch equivalence (needs the cached model)
 $env:ATTIC_BENCH_QWEN        = '1'
 $env:ATTIC_BENCH_QWEN_CORPUS = 'C:\code\my-repo' # omit to sample Attic's own sources
 cargo test --release -p attic-semantic --test qwen3_throughput_bench -- --ignored --nocapture
 ```
 
-On macOS/Linux use `export ATTIC_BENCH_INDEX=1` and so on. Further knobs:
-`ATTIC_BENCH_THREADS`, `ATTIC_BENCH_REPLICAS`, `ATTIC_BENCH_INCR_FILES`,
-`ATTIC_BENCH_QWEN_ITEMS`, `ATTIC_BENCH_QWEN_BATCH` and
-`ATTIC_BENCH_QWEN_CHUNK_BYTES` (see the header of each benchmark file).
+</details>
+
+<details>
+<summary><b>Linux / macOS shell</b></summary>
+
+```sh
+ATTIC_BENCH_INDEX=1 ATTIC_BENCH_ROOT=/code/my-repo \
+  cargo test --release -p attic-indexing --test index_throughput_bench -- --ignored --nocapture
+
+ATTIC_BENCH_QWEN=1 ATTIC_BENCH_QWEN_CORPUS=/code/my-repo \
+  cargo test --release -p attic-semantic --test qwen3_throughput_bench -- --ignored --nocapture
+```
+
+</details>
+
+Further knobs: `ATTIC_BENCH_THREADS`, `ATTIC_BENCH_REPLICAS`,
+`ATTIC_BENCH_INCR_FILES`, `ATTIC_BENCH_QWEN_ITEMS`, `ATTIC_BENCH_QWEN_BATCH`
+and `ATTIC_BENCH_QWEN_CHUNK_BYTES` (see the header of each benchmark file).
 
 ## Not yet measured
 
-- A complete GPU embedding drain of a large workspace end to end through the
-  MCP server — the GPU times above are computed from measured throughput.
-- p95 query latency under concurrent MCP load while indexing.
+- Metal throughput on Apple Silicon.
+- CUDA throughput on Linux NVIDIA after `--features candle-cuda`.
+- p95 query latency under concurrent MCP load while indexing and embedding.

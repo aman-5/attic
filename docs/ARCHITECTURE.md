@@ -552,90 +552,130 @@ this system needs to not accidentally break.
 ## Semantic layer (optional, default-enabled)
 
 Semantic (embedding-based) retrieval is **enabled by default**; set
-`ATTIC_SEMANTIC=0` to disable it. When enabled, `Qwen3Embedder` — a
-real, Candle-backed neural embedder (`Qwen/Qwen3-Embedding-0.6B`) — is the
-production provider; `HashingEmbedder` serves strictly as a deterministic
-test double for offline test isolation.
-Every vector is tied to an `EmbeddingFingerprint` (model, revision,
-dimension, pooling, normalization, tokenizer, chunking, instruction,
-backend, quantization) and a semantic generation, so vectors from
-incompatible configurations are never mixed; see
-`crates/attic-retrieval/src/hybrid.rs` for the RRF hybrid-search fusion.
-When disabled or degraded, canonical (lexical/structural)
-retrieval is entirely unaffected; the semantic layer never gates or blocks
-an answer (ADR-014, decision D1). See ADR-013/ADR-014 for the original
-rationale.
+`ATTIC_SEMANTIC=0` to disable it. Canonical lexical/structural retrieval is
+entirely unaffected when the semantic layer is disabled or degraded.
+`Qwen3Embedder` (`Qwen/Qwen3-Embedding-0.6B`) is the production provider;
+`HashingEmbedder` is only a deterministic test double for offline tests.
 
-Backend selection (see README's Semantic engine notes for the exact env
-vars and build flags):
+Every vector is tied to an `EmbeddingFingerprint` (model, revision, dimension,
+pooling, normalization, tokenizer, chunking, instruction, backend and
+quantization) and a semantic generation, so incompatible vectors are never
+mixed. Hybrid search fuses lexical and semantic candidates with RRF in
+`crates/attic-retrieval/src/hybrid.rs`.
+
+### Backend and default selection
 
 ```mermaid
 flowchart TD
-    S[Semantic layer enabled] --> P{Which GPU feature<br/>is compiled in?}
-    P -- ort-directml --> O{fp16 ONNX assets present?}
-    O -- yes --> G[GPU: ORT/DirectML fp16<br/>Qwen3-Embedding-0.6B]
-    O -- no --> DL[Background download<br/>CPU this run, GPU next start]
-    P -- candle-cuda / candle-metal --> DEV{Device actually available?}
-    DEV -- yes --> GC[GPU: Candle f32<br/>same safetensors as CPU]
-    DEV -- no --> C
-    P -- none --> C[CPU: Candle Qwen3Embedder<br/>safetensors f32]
-    DL --> C
-    G --> R[status: semantic_identity<br/>reports active backend<br/>+ fallback reason]
-    GC --> R
-    C --> R
+    A[Semantic enabled] --> OS{Platform / target}
+    OS -->|Windows MSVC| W[DirectML GPU<br/>any DX12 GPU: NVIDIA / AMD / Intel]
+    OS -->|Apple Silicon| M[Metal GPU via candle-metal<br/>automatic with cargo xtask install]
+    OS -->|Linux| L{Built with candle-cuda?}
+    OS -->|Intel Mac| IM[CPU]
+    L -->|yes, NVIDIA available| CUDA[CUDA GPU<br/>not validated in Sep 2026 measurements]
+    L -->|no| LC[CPU]
+    W --> ONNX{~/.attic/models/onnx-fp16 exists?}
+    ONNX -->|no: first start| D[Download fp16 ONNX in background<br/>embed on CPU this session]
+    ONNX -->|yes: next start| GD[GPU defaults]
+    M --> GD
+    CUDA --> GD
+    D --> CD[CPU defaults]
+    LC --> CD
+    IM --> CD
+    GD --> Log[Startup log: semantic selection defaults]
+    CD --> Log
 ```
 
-Two distinct GPU stories, which is easy to conflate:
+First start downloads the fp16 ONNX model (~1.2 GB) into `~/.attic/models`.
+Attic does not use Hugging Face's global `~/.cache/huggingface` cache. If a GPU
+falls back to CPU after startup, the startup selection defaults remain.
 
-* **DirectML** is a *different provider* — a separate fp16 ONNX export with
-  its own fingerprint (`qwen3-ort` / `fp16-onnx`), so its vectors occupy a
-  different vector space from the Candle ones and the two must never mix.
-* **CUDA and Metal** are the *same* Candle provider on a different device.
-  They load the identical `model.safetensors` the CPU path downloads, and
-  `DTYPE` stays `F32` on every device precisely so that moving between CPU
-  and GPU never invalidates an existing index.
+| Selection key | GPU (DirectML / Metal / CUDA) | CPU |
+|---|---:|---:|
+| `min_score` | `0.0` | `0.30` |
+| `max_units_per_repo` | `100000` | `2560` |
+| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
+| `max_units_total` | `100000` | `100000` |
 
-Every GPU path falls back to CPU with a stated reason rather than failing,
-and `execution_backend` is deliberately excluded from identity verification
-so a fallback degrades instead of erroring.
+The reason for backend-specific defaults is cost: full coverage is minutes on
+the measured GPU but would be about one hour per repository on CPU
+(**estimate**). Explicit `[semantic]` values in `attic.toml` override the table.
 
-Isolation: neural embedding always runs inside the supervised
-`attic inference-worker` child process regardless of which backend is
-selected — a hung or crashed model runtime is killed and restarted without
-touching the MCP server (see README's "Isolated inference worker" note).
-
-The background embedding workers (`crates/attic-semantic/src/enrich.rs`)
-scale with the resource mode — 1 / 3 / 8 on `low` / `balanced` /
-`performance`, overridable via `embedding_worker_count` — and share one
-work queue with a single, well-defined lifecycle:
+### Embedding queue and vector pool
 
 ```mermaid
 flowchart LR
-    U[Retrieval units] -->|selection policy| O[Occurrence registry]
-    O -->|canonical vector exists| P[Projected into the<br/>active generation]
-    O -->|missing| Q[Leased queue]
-    Q -->|claim: lease + fencing token| W[Embedding worker]
-    W -->|commit with token| V[(Canonical vectors<br/>by vector space + content hash)]
-    V --> P
+    U[Index retrieval units] --> S[Select units<br/>score + caps + file size]
+    S --> O[Occurrence / queue reconcile<br/>single transaction]
+    O --> Q[Leased queue<br/>fencing token]
+    Q --> W[Window large unit]
+    W --> B[Bucket + pack pass]
+    B --> P[Inference worker process]
+    P --> N[Mean-pool windows<br/>L2-normalise]
+    N --> V[(Canonical vectors<br/>vector space + content hash)]
+    V --> G[Project into active generation]
+    G --> H[Hybrid retrieval]
 ```
 
-A claim takes a time-bounded lease and bumps a fencing token; a commit
-carrying an older token is rejected, so a stalled or crashed worker can
-never overwrite newer work, and expired leases return to the queue on the
-next drive. Canonical vectors are keyed by (vector space, content hash), so
-unchanged content re-indexed under a new source revision reuses its vector
-instead of being embedded again. A shared reconcile gate prevents the
-rescan from running redundantly per thread, and backoff sleeps are jittered
-to avoid thundering-herd wakeups.
+A claim takes a time-bounded lease and bumps a fencing token; a commit carrying
+an older token is rejected, so a stalled or crashed worker can never overwrite
+newer work. Expired leases return to the queue on the next drive. Canonical
+vectors are keyed by vector space and content hash, so unchanged content
+re-indexed under a new source revision reuses its vector instead of being
+embedded again. Reconcile writes all occurrence and queue rows in one
+transaction.
 
-**Batching never changes a vector.** Batches are right-padded and the CPU
-attention path applies a causal mask, so every real token attends exactly
-as it would unbatched; the provider refuses any batch that is not
-right-padded. A regression test (`qwen3_model::tests`) and the real-model
-benchmark (`crates/attic-semantic/tests/qwen3_throughput_bench.rs`, min
-batched-vs-single cosine) guard this. Dev/test builds optimize the `gemm*`,
-`pulp`, `half` and `tokenizers` crates alongside `candle-*`, because the
-CPU matmul kernels live there.
+Neural embedding always runs inside the supervised `attic inference-worker`
+child process. Worker stderr is forwarded. A hung or crashed model runtime is
+killed and restarted without taking down the MCP server.
+
+### Windowed embedding and GPU packing
+
+Batching never changes a vector: batches are right-padded and masked, and
+regression tests compare batched versus single-item vectors.
+
+- A unit larger than one model window is split on character/line boundaries
+  into up to **16** windows. Each window is embedded, then vectors are
+  length-weighted mean-pooled and L2-normalised into one vector. Units that fit
+  one window are embedded unchanged (bit-identical vectors).
+- If a dense-text window still exceeds the token window, only that unit is
+  bisected and re-split at half the window, at most **2** times. Nothing is
+  truncated. Units bigger than 16 windows are excluded and counted as
+  `exceeds_max_input_bytes`.
+- DirectML uses `onnx_seq_len = 512` on cards below **6 GB** (1 KiB per window)
+  and `1024` otherwise (2 KiB per window).
+- GPU pass packing uses buckets `32/48/64/96/128/192/256/384/512`, powers of two
+  plus 1.5× midpoints, with **7–20% less padded work** measured with the real
+  tokenizer. The default `gpu_batch_tokens` is **4096 padded tokens per pass**.
+- The DirectML worker requests only `last_hidden_state`; the older path copied
+  56 unused KV-cache tensors (about **448 MiB** per pass) to host memory.
+  DirectML memory pattern is disabled, as required by ONNX Runtime for this
+  dynamic-shape workload.
+
+DirectML fp16 ONNX uses its own fingerprint/vector space. CUDA and Metal are
+Candle GPU backends; moving between compatible Candle CPU/GPU backends is
+represented through the embedding fingerprint/generation rules rather than by
+mixing incompatible vectors.
+
+### Progress, diagnostics and failure policy
+
+`status` → `semantic_progress.chunks_per_sec` is a wall-clock rate over the
+last **120 s**. `status.semantic_identity` reports the active backend and
+fallback reason, and `diagnostics.why_slow` summarizes bottlenecks.
+
+With `ATTIC_LOG=debug`, the parent logs:
+
+- `semantic batch` — claimed, embedded, input bytes, prep ms, embed ms, commit ms
+- `DirectML embed batch` — items, passes, `shrunk_by_vram`, tokenize ms,
+  forward ms, wait ms, total ms
+
+GPU temperature is sampled in the background through `nvidia-smi` on NVIDIA
+Windows/Linux and hwmon on Linux; it is inactive on macOS and non-NVIDIA
+Windows. `nvidia-smi` is killed after **5 s**. Embedding pauses at **90 °C**
+and resumes at **85 °C**.
+
+Content errors — too many tokens, too-large units, or the `exceeds_max_input_bytes`
+case — never count toward GPU→CPU demotion and never force a model reload.
 
 ## Resource management
 
