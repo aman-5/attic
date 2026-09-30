@@ -125,6 +125,36 @@ impl Default for SelectionConfig {
     }
 }
 
+/// Full-coverage `min_score` used when embedding runs on a GPU.
+pub const GPU_MIN_SCORE: f64 = 0.0;
+/// Full-coverage per-repository cap used when embedding runs on a GPU.
+pub const GPU_MAX_UNITS_PER_REPO: usize = 100_000;
+/// Full-coverage file-size ceiling used when embedding runs on a GPU (8 MiB).
+pub const GPU_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+impl SelectionConfig {
+    /// Defaults for the backend that will do the embedding.
+    ///
+    /// On a GPU, full coverage is cheap enough to be the default: measured
+    /// on an RTX A500 laptop, a 3,220-chunk AEM repo embeds in ~9 min and a
+    /// 10,596-chunk export folder in ~13 min. On CPU (~1 chunk/s) the same
+    /// coverage would take roughly an hour per repository, so the
+    /// conservative [`Self::baseline`] stays the CPU default. Any value set
+    /// explicitly in `attic.toml` overrides both.
+    pub fn for_backend(gpu: bool) -> Self {
+        let base = Self::baseline();
+        if !gpu {
+            return base;
+        }
+        Self {
+            min_score: GPU_MIN_SCORE,
+            max_units_per_repo: GPU_MAX_UNITS_PER_REPO,
+            max_file_bytes: GPU_MAX_FILE_BYTES,
+            ..base
+        }
+    }
+}
+
 /// The size limits in the pipeline must form a chain, or content is silently
 /// lost between them:
 ///
@@ -834,6 +864,21 @@ mod tests {
         )];
         let (sel, _dups, rep) = select_units(&rows, &HashMap::new(), &cfg);
         assert_eq!(sel.len(), 1, "report: {rep:?}");
+    }
+
+    #[test]
+    fn gpu_defaults_are_full_coverage_cpu_defaults_stay_conservative() {
+        let cpu = SelectionConfig::for_backend(false);
+        assert_eq!(cpu.min_score, SelectionConfig::baseline().min_score);
+        assert_eq!(cpu.max_units_per_repo, 2_560);
+        assert_eq!(cpu.max_file_bytes, DEFAULT_SEMANTIC_MAX_FILE_BYTES);
+
+        let gpu = SelectionConfig::for_backend(true);
+        assert_eq!(gpu.min_score, 0.0);
+        assert_eq!(gpu.max_units_per_repo, 100_000);
+        assert_eq!(gpu.max_file_bytes, 8 * 1024 * 1024);
+        assert_eq!(gpu.max_units_total, cpu.max_units_total);
+        assert_eq!(gpu.max_input_bytes, cpu.max_input_bytes);
     }
 
     /// A provider wider than the default must not *raise* the gate — the

@@ -75,17 +75,17 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub exclude_globs: Vec<String>,
     /// Files larger than this many bytes are never selected for embedding
-    /// (generated exports/dumps). `None` uses the built-in default of
-    /// 256 KiB.
+    /// (generated exports/dumps). `None` uses the backend default: 8 MiB on a
+    /// GPU, 256 KiB on CPU.
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
     /// Minimum selection score (0.0–1.0) a unit needs to be embedded.
-    /// Lower = more coverage, more GPU/CPU work. `None` uses the built-in
-    /// default (0.30).
+    /// Lower = more coverage, more GPU/CPU work. `None` uses the backend
+    /// default: 0.0 on a GPU, 0.30 on CPU.
     #[serde(default)]
     pub min_score: Option<f64>,
-    /// Maximum units embedded per repository. `None` uses the built-in
-    /// default (2560). Raise it on a GPU build to embed whole large repos.
+    /// Maximum units embedded per repository. `None` uses the backend
+    /// default: 100000 on a GPU, 2560 on CPU.
     #[serde(default)]
     pub max_units_per_repo: Option<usize>,
     /// Maximum units embedded across the whole workspace (bounds queue and
@@ -611,8 +611,11 @@ model = "qwen3-embedding-0.6b"
 
 # Admission policy for the embedding queue. Excluded content stays fully
 # lexical-searchable; it is simply never embedded.
-# Files larger than this are never embedded (default: 262144 = 256 KiB) —
-# multi-megabyte exports/dumps are generated data, not prose.
+# Selection defaults depend on the embedding backend: full coverage on a
+# GPU (min_score 0.0, max_units_per_repo 100000, max_file_bytes 8 MiB), and
+# conservative on CPU (0.30 / 2560 / 256 KiB), where full coverage takes
+# about an hour per repository. Values set here override both.
+# Files larger than this are never embedded.
 # max_file_bytes = 262144
 # Additional paths to keep out of the embedding queue.
 # exclude_globs = ["**/*.min.js", "testdata/"]
@@ -621,11 +624,11 @@ model = "qwen3-embedding-0.6b"
 # (default: 60000 = 60s). This is NOT a per-batch inference deadline; a
 # claimed batch always runs to completion under its own hang timeout.
 # drive_budget_ms = 60000
-# Minimum selection score a unit needs to be embedded (default 0.30).
+# Minimum selection score a unit needs to be embedded (GPU 0.0, CPU 0.30).
 # Lower it for more semantic coverage at the cost of more embedding work.
 # min_score = 0.30
-# Embedding caps: per repository (default 2560) and workspace-wide
-# (default 100000). Raise both on a GPU build to embed large repos fully.
+# Embedding caps: per repository (GPU 100000, CPU 2560) and workspace-wide
+# (default 100000).
 # max_units_per_repo = 2560
 # max_units_total = 100000
 

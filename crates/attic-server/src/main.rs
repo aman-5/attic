@@ -4567,7 +4567,25 @@ pub(crate) fn build_server_and_enricher(
                 std::thread::available_parallelism().map_or(1, usize::from),
             ),
             selection: {
-                let defaults = attic_semantic::SelectionConfig::default();
+                // Full coverage by default when the embedding backend is a
+                // GPU; conservative defaults on CPU. Explicit attic.toml
+                // values win either way.
+                let gpu_backend = stack.provider.fingerprint().is_some_and(|fp| {
+                    matches!(
+                        fp.execution_backend,
+                        attic_semantic::ExecutionBackend::OrtDirectMl
+                            | attic_semantic::ExecutionBackend::CandleCuda
+                            | attic_semantic::ExecutionBackend::CandleMetal
+                    )
+                });
+                let defaults = attic_semantic::SelectionConfig::for_backend(gpu_backend);
+                info!(
+                    gpu_backend,
+                    min_score = defaults.min_score,
+                    max_units_per_repo = defaults.max_units_per_repo,
+                    max_file_bytes = defaults.max_file_bytes,
+                    "semantic selection defaults (attic.toml values override)"
+                );
                 attic_semantic::SelectionConfig {
                     exclude_globs: server.attic_config.semantic.exclude_globs.clone(),
                     max_file_bytes: server

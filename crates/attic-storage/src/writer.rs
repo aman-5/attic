@@ -633,7 +633,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn migrated_file_db() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir();
+        // Auto-deleted on drop (after the connections below): the shared
+        // %TEMP% no longer accumulates per-run database files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(format!("attic_writer_{}.db", uuid::Uuid::new_v4()));
         let conn = open_rw(&path).unwrap();
         configure_connection(&conn).unwrap();

@@ -28,7 +28,7 @@ writes into your projects.
 
 - [Quick start](#quick-start) — install, connect, index
 - [Pick your stack](#pick-your-stack) — Python · Java/Spring/Kotlin · JS/TS · Go · AEM · everything else
-- [Ask questions](#ask-questions) · [MCP tools](#mcp-tools)
+- [Ask questions](#ask-questions) · [Semantic backend & performance](#semantic-backend--performance) · [MCP tools](#mcp-tools)
 - [How it works](#how-it-works) · [Workspaces](#workspaces)
 - [Configuration](#configuration) — files, `attic.toml`, environment variables
 - [Languages & analyzer plugins](#languages--analyzer-plugins)
@@ -270,6 +270,44 @@ Search and `file` work as soon as the first index finishes (seconds for most
 repositories). Semantic results join in automatically while embeddings are
 generated in the background; until then search is purely lexical.
 
+## Semantic backend & performance
+
+Semantic search is enabled by default and runs locally. The model is downloaded
+once into `~/.attic/models` (never `~/.cache/huggingface`). On first start with
+no cached fp16 ONNX model, Attic downloads in the background and embeds that
+session on CPU; the GPU backend is used from the next start.
+
+```mermaid
+flowchart TD
+    A[Start Attic] --> B{Platform}
+    B -->|Windows MSVC| W[DirectML GPU<br/>any DX12 GPU]
+    B -->|Apple Silicon| M[Metal GPU<br/>automatic with cargo xtask install]
+    B -->|Linux default| L[CPU]
+    L -->|build with --features candle-cuda| C[CUDA GPU<br/>not validated in Sep 2026 round]
+    B -->|Intel Mac| I[CPU]
+    W --> D{~/.attic/models/onnx-fp16 exists?}
+    D -->|no| F[Download now<br/>CPU for this session]
+    D -->|yes| G[GPU defaults]
+    M --> G
+    C --> G
+    F --> CPU[CPU defaults]
+    L --> CPU
+    I --> CPU
+```
+
+| Default | GPU (DirectML / Metal / CUDA) | CPU |
+|---|---:|---:|
+| `min_score` | `0.0` | `0.30` |
+| `max_units_per_repo` | `100000` | `2560` |
+| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
+| `max_units_total` | `100000` | `100000` |
+
+> [!TIP]
+> Measured on an RTX A500 Laptop GPU, DirectML fp16 ONNX reaches about
+> **5,600–6,000 padded tokens/s**. Chunks/s varies with chunk size: Attic's own
+> small chunks measured **76–89 chunks/s**, while larger AEM chunks measured
+> **6.22–13.7 chunks/s**. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
 ## MCP tools
 
 | Tool | What it does |
@@ -367,7 +405,7 @@ repositories and never in Hugging Face's global `~/.cache/huggingface` cache:
 | `semantic.db` | Embeddings — disposable |
 | `config.toml` | Workspace membership (`[[repositories]]`) |
 | `attic.toml` | Tunables (below); a commented template is written on first run |
-| `models/` | Embedding model cache (`ATTIC_MODEL_CACHE_DIR` overrides); created only when model assets are downloaded |
+| `models/` | Embedding model cache under `ATTIC_HOME`; created only when model assets are downloaded |
 | `logs/` | Daily file log — off by default, created only after `logging {"action":"on"}` |
 | `backups/` | Crash-recovery backups (last 3), created only when the shutdown backup first runs |
 | `attic.lock`, `attic.ipc` | Daemon election and relay address |
@@ -401,12 +439,18 @@ clear error. Restart Attic after editing.
 
 **`[semantic]`**
 
+Explicit values override the backend-specific automatic defaults. Attic logs
+`semantic selection defaults` at startup with the resolved values.
+
 | Key | Default | Effect |
 |---|---|---|
 | `enabled` | `true` | `false` keeps search lexical-only and never downloads the model |
 | `model` | `"qwen3-embedding-0.6b"` | The supported embedding model |
 | `dimension` | native (1024) | Smaller vectors (e.g. `512`) use less disk and RAM; changing it re-embeds |
-| `max_file_bytes` | `262144` | Larger files are searchable but never embedded (generated data) |
+| `min_score` | GPU `0.0` / CPU `0.30` | Minimum selection score to embed a unit; 0.0 embeds every eligible unit |
+| `max_units_per_repo` | GPU `100000` / CPU `2560` | Embedding cap per repository |
+| `max_file_bytes` | GPU `8388608` (8 MiB) / CPU `262144` (256 KiB) | Larger files are searchable but never embedded |
+| `max_units_total` | `100000` | Whole-workspace embedding cap |
 | `exclude_globs` | `[]` | Paths never embedded, e.g. `["**/*.min.js", "testdata/"]` |
 
 **`[indexing]`**
@@ -441,7 +485,6 @@ clear error. Restart Attic after editing.
 | Variable | Effect |
 |---|---|
 | `ATTIC_SEMANTIC` | `0` disables semantic search (default: on) |
-| `ATTIC_MODEL_CACHE_DIR` | Model cache directory — point at a pre-populated copy for offline machines |
 | `ATTIC_ONNX_MODEL_DIR` | GPU build only: directory with `model_fp16.onnx` + `tokenizer.json` |
 | `ATTIC_VRAM_CEILING_MIB` | GPU build only: VRAM budget override |
 
@@ -529,28 +572,82 @@ from `ATTIC_HOME`; everything is rebuilt from source. More in
 
 ## Build from source
 
+The developer install path is intentionally the same on Windows, Linux and
+macOS:
+
 ```sh
 git clone https://github.com/aman-5/attic
 cd attic
-cargo build --release --package attic-server
-# → target/release/attic   (target\release\attic.exe on Windows)
+cargo xtask check
 cargo xtask install
-# → installs the local server to ~/.attic (or %USERPROFILE%\.attic on Windows)
 ```
 
-Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (`rustup show`
-installs it) and a C compiler for the bundled tree-sitter grammars —
-Build Tools for Visual Studio (or MinGW) on Windows, `build-essential` on
-Linux, `xcode-select --install` on macOS. On Windows with MSVC the DirectML
-GPU backend is built in automatically; no feature flag is needed.
+`cargo xtask check` runs:
 
 ```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#development) for `cargo xtask check`,
-the full developer workflow, benchmarks and the release process.
+`cargo xtask install` performs a release build of `attic-server`, stops any
+running local `attic-server` / `attic`, and installs the binary plus required
+runtime libraries (for example `DirectML.dll`) into `$ATTIC_HOME` or
+`~/.attic`. It reads the executable path from Cargo's JSON output, so personal
+Cargo `[build] target` settings are honoured, and it replaces files with a
+temp+rename sequence that is safe for macOS code signatures.
+
+<details open>
+<summary><b>Windows</b></summary>
+
+Use the MSVC Rust target for GPU support. DirectML is built in automatically on
+Windows MSVC; the legacy `ort-directml` feature flag is a no-op kept only for
+old scripts.
+
+If a personal Cargo config forces GNU (`x86_64-pc-windows-gnu`), override it
+for this shell before running the same commands:
+
+```powershell
+$env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
+cargo xtask check
+cargo xtask install
+```
+
+In `cmd.exe`:
+
+```bat
+set CARGO_BUILD_TARGET=x86_64-pc-windows-msvc
+cargo xtask check
+cargo xtask install
+```
+
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+On Apple Silicon, `cargo xtask install` automatically adds
+`--features candle-metal`, matching the `aarch64-apple-darwin` release
+packages. Intel Macs use CPU embeddings by default.
+
+</details>
+
+<details>
+<summary><b>Linux</b></summary>
+
+Linux defaults to CPU embeddings. For NVIDIA CUDA, build with
+`--features candle-cuda` on a machine with the CUDA toolkit installed; this path
+was not validated in the 29–30 Sep 2026 measurement round.
+
+</details>
+
+Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (`rustup show`
+installs it) and a C compiler for the bundled tree-sitter grammars — Build
+Tools for Visual Studio on Windows, `build-essential`/`gcc` on Linux, and
+`xcode-select --install` on macOS.
+
+See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#development) for benchmarks,
+opt-in GPU tests, and the release process.
 
 ## Documentation
 
