@@ -199,12 +199,20 @@ pub struct DiagnosticContext {
     pub resource_pressure_restricted: bool,
     pub available_ram_mib: u64,
     pub queue_depth: u64,
+    /// The queue is large AND growing faster than it drains (not merely
+    /// large: a 30k queue on a healthy GPU is normal work, not backpressure).
     pub queue_backpressure_active: bool,
     pub canonical_indexing_active: bool,
     pub semantic_inference_active: bool,
     pub model_loading_or_warmup: bool,
     pub mcp_high_latency: bool,
     pub user_caps_active: bool,
+    /// Embedding is running on a GPU (dedicated or unified-memory), which is
+    /// gated by its own host-RAM floor rather than the pressure tiers.
+    pub gpu_embedding: bool,
+    /// Available host RAM is below that GPU's floor, so GPU embedding is
+    /// paused.
+    pub host_ram_floor_breached: bool,
 }
 
 /// Determine the most critical reason why Attic is slow or throttled (§62).
@@ -215,11 +223,25 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
             explanation: "free disk space is below emergency reserve; semantic indexing is halted"
                 .to_string(),
         }
+    } else if ctx.gpu_embedding && ctx.host_ram_floor_breached {
+        WhySlowDiagnostic {
+            code: "host_ram_floor",
+            explanation: "available host RAM is below the GPU embedding safety floor; GPU \
+                          embedding is paused until memory is freed"
+                .to_string(),
+        }
     } else if ctx.resource_pressure_restricted {
         WhySlowDiagnostic {
             code: "resource_monitor_pressure",
-            explanation: "high host memory or CPU pressure; background work is throttled"
-                .to_string(),
+            explanation: if ctx.gpu_embedding {
+                "high host memory pressure; background indexing is throttled, while GPU \
+                 embedding is exempt from the pressure tiers and continues (it pauses only \
+                 below its host-RAM floor)"
+                    .to_string()
+            } else {
+                "high host memory pressure; background indexing and embedding are throttled"
+                    .to_string()
+            },
         }
     } else if ctx.mcp_high_latency {
         WhySlowDiagnostic {
@@ -237,7 +259,7 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
         WhySlowDiagnostic {
             code: "semantic_queue_backpressure",
             explanation: format!(
-                "enrichment queue depth ({}) exceeded high watermark",
+                "the embedding queue ({} chunks) is growing faster than it drains",
                 ctx.queue_depth
             ),
         }
@@ -247,11 +269,23 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
             explanation: "canonical file parsing and semantic embedding are actively sharing system resources".to_string(),
         }
     } else if ctx.semantic_inference_active {
-        WhySlowDiagnostic {
-            code: "semantic_cpu_inference",
-            explanation:
-                "neural embedding inference is actively executing on allocated CPU threads"
-                    .to_string(),
+        if ctx.gpu_embedding {
+            WhySlowDiagnostic {
+                code: "semantic_inference",
+                explanation: format!(
+                    "embedding {} queued chunks on the GPU; nothing is wrong, this is normal \
+                     background work",
+                    ctx.queue_depth
+                ),
+            }
+        } else {
+            WhySlowDiagnostic {
+                code: "semantic_cpu_inference",
+                explanation: format!(
+                    "embedding {} queued chunks on allocated CPU threads",
+                    ctx.queue_depth
+                ),
+            }
         }
     } else if ctx.available_ram_mib < 2048 {
         WhySlowDiagnostic {
@@ -403,6 +437,8 @@ mod tests {
             model_loading_or_warmup: false,
             mcp_high_latency: true,
             user_caps_active: false,
+            gpu_embedding: false,
+            host_ram_floor_breached: false,
         };
         assert_eq!(diagnose_why_slow(&ctx).code, "disk_pressure");
 
@@ -410,6 +446,52 @@ mod tests {
         let mut ctx2 = ctx.clone();
         ctx2.disk_emergency = false;
         assert_eq!(diagnose_why_slow(&ctx2).code, "resource_monitor_pressure");
+        assert!(
+            diagnose_why_slow(&ctx2)
+                .explanation
+                .contains("embedding are throttled")
+        );
+
+        // A GPU is exempt from the tiers, and the report says so.
+        let mut gpu = ctx2.clone();
+        gpu.gpu_embedding = true;
+        let d = diagnose_why_slow(&gpu);
+        assert_eq!(d.code, "resource_monitor_pressure");
+        assert!(d.explanation.contains("exempt"), "{}", d.explanation);
+
+        // Only the hard host floor pauses dedicated-GPU embedding.
+        gpu.host_ram_floor_breached = true;
+        assert_eq!(diagnose_why_slow(&gpu).code, "host_ram_floor");
+
+        // A large queue being worked through on a healthy GPU is normal
+        // work, reported as such — not as an error-sounding backpressure.
+        let working = DiagnosticContext {
+            disk_emergency: false,
+            disk_warning: false,
+            resource_pressure_restricted: false,
+            available_ram_mib: 8192,
+            queue_depth: 23_055,
+            queue_backpressure_active: false,
+            canonical_indexing_active: false,
+            semantic_inference_active: true,
+            model_loading_or_warmup: false,
+            mcp_high_latency: false,
+            user_caps_active: false,
+            gpu_embedding: true,
+            host_ram_floor_breached: false,
+        };
+        let d = diagnose_why_slow(&working);
+        assert_eq!(d.code, "semantic_inference");
+        assert!(
+            d.explanation.contains("23055 queued chunks on the GPU"),
+            "{}",
+            d.explanation
+        );
+        let cpu = DiagnosticContext {
+            gpu_embedding: false,
+            ..working.clone()
+        };
+        assert_eq!(diagnose_why_slow(&cpu).code, "semantic_cpu_inference");
 
         // Normal state
         let nominal_ctx = DiagnosticContext {
@@ -424,6 +506,8 @@ mod tests {
             model_loading_or_warmup: false,
             mcp_high_latency: false,
             user_caps_active: false,
+            gpu_embedding: false,
+            host_ram_floor_breached: false,
         };
         assert_eq!(diagnose_why_slow(&nominal_ctx).code, "nominal");
     }

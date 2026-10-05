@@ -350,8 +350,8 @@ fn handle_elect_attempt(attempt: ElectAttempt) -> Option<ElectionResult> {
 /// incumbent crashed and left a stale `attic.ipc`) within a bounded total
 /// budget before giving up with a clear, distinct error.
 pub(crate) async fn elect(db_path: &Path) -> anyhow::Result<ElectionResult> {
-    let lock_path = db_path.with_file_name("attic.lock");
-    let ipc_path = db_path.with_file_name("attic.ipc");
+    let lock_path = attic_core::sibling(db_path, "attic.lock");
+    let ipc_path = attic_core::sibling(db_path, "attic.ipc");
 
     if let Some(result) = handle_elect_attempt(try_become_daemon(db_path, &lock_path, &ipc_path)?) {
         return Ok(result);

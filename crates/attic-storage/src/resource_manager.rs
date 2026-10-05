@@ -35,6 +35,65 @@ pub const SYSTEM_EMERGENCY_PCT: u64 = 90;
 /// of percentages (r08).
 pub const SYSTEM_MIN_AVAILABLE_MIB: u64 = 2048;
 
+/// Host-RAM safety floor for embedding on a DEDICATED GPU.
+///
+/// The system-memory tiers above protect the developer's other applications
+/// from Attic's CPU/RAM appetite. Embedding on a dedicated GPU keeps its model
+/// and activations in VRAM and only stages small tokenized batches through
+/// host RAM, so parking it at a host-RAM tier protects nothing and just leaves
+/// the GPU idle. Dedicated-GPU embedding therefore ignores the tiers and
+/// pauses only when fewer than this many MiB of host RAM are available.
+pub const DEDICATED_GPU_HOST_FLOOR_MIB: u64 = 512;
+
+/// Host-RAM safety floor for embedding on a UNIFIED-MEMORY GPU (Apple Silicon
+/// Metal, or an integrated GPU allowed via `allow_integrated_gpu`).
+///
+/// Such a GPU allocates its model and activations out of system RAM, so host
+/// pressure is real for it — but the percentage tiers are a poor signal on
+/// these machines (macOS keeps RAM "used" by compressed memory and file cache
+/// that it reclaims on demand), and parking at 90% used idles a GPU that
+/// still has gigabytes of headroom. Unified-memory embedding therefore parks
+/// only below the same absolute reserve the system tiers already treat as
+/// Emergency, and shrinks its batch under pressure instead (see
+/// [`unified_gpu_embedding_batch`]), since batch size is what drives its
+/// transient memory.
+pub const UNIFIED_GPU_HOST_FLOOR_MIB: u64 = SYSTEM_MIN_AVAILABLE_MIB;
+
+/// Where an embedding backend keeps its working set, which decides how
+/// host-RAM pressure gates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingMemoryClass {
+    /// CPU inference (or unknown): full host-RAM tier gate, parks at Emergency.
+    HostRam,
+    /// GPU sharing system RAM (Apple Metal, integrated GPU): parks below
+    /// [`UNIFIED_GPU_HOST_FLOOR_MIB`], batch shrinks at Critical/Emergency.
+    UnifiedGpu,
+    /// GPU with its own VRAM: ignores host-RAM tiers, parks only below
+    /// [`DEDICATED_GPU_HOST_FLOOR_MIB`], always full batch.
+    DedicatedGpu,
+}
+
+impl EmbeddingMemoryClass {
+    /// Stable label for status output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostRam => "host_ram",
+            Self::UnifiedGpu => "unified_gpu",
+            Self::DedicatedGpu => "dedicated_gpu",
+        }
+    }
+
+    /// Available-RAM floor below which this class parks, or `None` when it
+    /// follows the host-RAM tiers instead.
+    pub fn host_floor_mib(self) -> Option<u64> {
+        match self {
+            Self::HostRam => None,
+            Self::UnifiedGpu => Some(UNIFIED_GPU_HOST_FLOOR_MIB),
+            Self::DedicatedGpu => Some(DEDICATED_GPU_HOST_FLOOR_MIB),
+        }
+    }
+}
+
 const HYSTERESIS_EXIT_WARNING_PCT: u64 = 65;
 const HYSTERESIS_EXIT_CRITICAL_PCT: u64 = 78;
 const HYSTERESIS_EXIT_EMERGENCY_PCT: u64 = 82;
@@ -253,6 +312,21 @@ pub fn adaptive_embedding_batch(max: usize, pressure: ResourcePressure) -> usize
         ResourcePressure::Warning => (max / 2).max(1),
         ResourcePressure::Critical => (max / 4).max(1),
         ResourcePressure::Emergency => 0,
+    }
+}
+
+/// Embedding batch for a unified-memory GPU: gentler than the CPU curve
+/// (never 0 — parking is decided by the host floor, not the tier) but still
+/// shrinking, because on shared memory the batch's activations come out of
+/// system RAM.
+///
+/// Normal/Warning → `max`, Critical → `max/2`, Emergency → `max/4` (min 1).
+pub fn unified_gpu_embedding_batch(max: usize, pressure: ResourcePressure) -> usize {
+    let max = max.max(1);
+    match pressure {
+        ResourcePressure::Normal | ResourcePressure::Warning => max,
+        ResourcePressure::Critical => (max / 2).max(1),
+        ResourcePressure::Emergency => (max / 4).max(1),
     }
 }
 
@@ -733,8 +807,12 @@ impl ResourceMonitor {
         attic_pct.max(system_pct)
     }
 
-    #[cfg(test)]
-    fn set_system_memory_for_testing(&self, total_mib: u64, used_mib: u64, available_mib: u64) {
+    /// Test-only override of the whole-system memory sample. Public (hidden)
+    /// so other crates' tests can drive the dedicated-GPU host floor; pair
+    /// with `set_forced_pressure_for_testing` so a live refresh does not
+    /// overwrite the injected values.
+    #[doc(hidden)]
+    pub fn set_system_memory_for_testing(&self, total_mib: u64, used_mib: u64, available_mib: u64) {
         self.system_total_mib.store(total_mib, Ordering::Relaxed);
         self.system_used_mib.store(used_mib, Ordering::Relaxed);
         self.system_available_mib
@@ -1004,6 +1082,103 @@ impl ResourceMonitor {
     /// do not cache the value across batch boundaries.
     pub fn current_embedding_batch(&self) -> usize {
         self.effective_embedding_batch.load(Ordering::Acquire)
+    }
+
+    // ── Backend-aware embedding gate ──────────────────────────────────────
+
+    /// Last sampled whole-system available RAM in MiB, or `None` before the
+    /// first sample (or when sampling is unavailable).
+    pub fn system_available_mib(&self) -> Option<u64> {
+        if self.system_total_mib.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(self.system_available_mib.load(Ordering::Relaxed))
+    }
+
+    /// Whether embedding of this memory class must park right now.
+    ///
+    /// `HostRam` follows the tier gate (Emergency parks). GPU classes ignore
+    /// the tiers and park only when a real sample shows available RAM below
+    /// the class floor; an unsampled monitor never parks a GPU, because
+    /// absence of data must not idle a healthy device.
+    pub fn embedding_parked(&self, class: EmbeddingMemoryClass) -> bool {
+        match class.host_floor_mib() {
+            None => self.is_emergency(),
+            Some(floor) => self
+                .system_available_mib()
+                .is_some_and(|avail| avail < floor),
+        }
+    }
+
+    /// Embedding concurrency ceiling for this memory class right now.
+    ///
+    /// GPU classes use the configured (unreduced) ceiling — the tiers do not
+    /// describe GPU capacity — or 0 while parked by their host floor.
+    pub fn embedding_limit_for(&self, class: EmbeddingMemoryClass) -> usize {
+        match class {
+            EmbeddingMemoryClass::HostRam => self.effective_embedding_limit(),
+            _ if self.embedding_parked(class) => 0,
+            _ => self.max_embedding_heavy.load(Ordering::Acquire).max(1),
+        }
+    }
+
+    /// Embedding batch size for this memory class right now. Callers must
+    /// read it immediately before each batch, like
+    /// [`Self::current_embedding_batch`].
+    pub fn embedding_batch_for(&self, class: EmbeddingMemoryClass) -> usize {
+        let max = self.max_embedding_batch.load(Ordering::Acquire);
+        match class {
+            EmbeddingMemoryClass::HostRam => self.current_embedding_batch(),
+            _ if self.embedding_parked(class) => 0,
+            EmbeddingMemoryClass::DedicatedGpu => max.max(1),
+            EmbeddingMemoryClass::UnifiedGpu => {
+                unified_gpu_embedding_batch(max, self.guidance_pressure())
+            }
+        }
+    }
+
+    /// Non-blocking embedding permit for this memory class. Every class
+    /// shares the one active counter, so the configured ceiling holds no
+    /// matter which classes hold permits.
+    pub fn try_embedding_heavy_for(
+        &self,
+        class: EmbeddingMemoryClass,
+    ) -> Option<EmbeddingHeavyPermit<'_>> {
+        if class == EmbeddingMemoryClass::HostRam {
+            return self.try_embedding_heavy();
+        }
+        let limit = self.embedding_limit_for(class);
+        if limit == 0 {
+            return None;
+        }
+        let prev = self.embedding_heavy_active.fetch_add(1, Ordering::AcqRel);
+        if prev < limit {
+            Some(EmbeddingHeavyPermit { monitor: self })
+        } else {
+            self.embedding_heavy_active.fetch_sub(1, Ordering::AcqRel);
+            None
+        }
+    }
+
+    /// Blocking form of [`Self::try_embedding_heavy_for`]. Returns `None` on
+    /// cancellation.
+    pub fn acquire_embedding_heavy_blocking_for(
+        &self,
+        class: EmbeddingMemoryClass,
+        cancel: impl Fn() -> bool,
+    ) -> Option<EmbeddingHeavyPermit<'_>> {
+        loop {
+            if cancel() {
+                return None;
+            }
+            self.refresh_process_memory();
+            if let Some(permit) = self.try_embedding_heavy_for(class) {
+                return Some(permit);
+            }
+            let (lock, cvar) = &*self.embedding_capacity_notify;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(500));
+        }
     }
 
     // ── Phase 93+: Observability accessors ────────────────────────────────
@@ -1290,6 +1465,108 @@ mod tests {
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Critical), 2);
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Emergency), 0);
         assert_eq!(adaptive_indexing_limit(1, ResourcePressure::Critical), 1);
+    }
+
+    /// Backend-aware gate matrix under a forced Emergency tier: CPU parks;
+    /// a dedicated GPU keeps full permits and batch until its 512 MiB floor;
+    /// a unified-memory GPU keeps running with a quarter batch until its
+    /// 2 GiB floor. The configured concurrency ceiling holds for every class.
+    #[test]
+    fn embedding_gate_matrix_by_memory_class() {
+        use EmbeddingMemoryClass::*;
+        let m = monitor_with_budget(8192);
+        m.apply_resource_policy(8, 2, 16);
+        m.set_forced_pressure_for_testing(Some(ResourcePressure::Emergency));
+        // 91% used, ~2.9 GiB available: Emergency by percentage, above both floors.
+        m.set_system_memory_for_testing(32_768, 29_800, 2_968);
+
+        assert!(m.embedding_parked(HostRam));
+        assert!(
+            m.try_embedding_heavy_for(HostRam).is_none(),
+            "CPU path parks"
+        );
+        assert_eq!(m.embedding_batch_for(HostRam), 0);
+
+        assert!(!m.embedding_parked(DedicatedGpu));
+        assert_eq!(m.embedding_batch_for(DedicatedGpu), 16);
+        assert_eq!(m.embedding_limit_for(DedicatedGpu), 2);
+
+        assert!(!m.embedding_parked(UnifiedGpu));
+        assert_eq!(
+            m.embedding_batch_for(UnifiedGpu),
+            4,
+            "quarter batch at Emergency"
+        );
+
+        let p1 = m.try_embedding_heavy_for(DedicatedGpu).expect("permit 1");
+        let p2 = m.try_embedding_heavy_for(UnifiedGpu).expect("permit 2");
+        assert!(
+            m.try_embedding_heavy_for(DedicatedGpu).is_none(),
+            "configured ceiling is shared across classes"
+        );
+        drop((p1, p2));
+        assert_eq!(m.embedding_heavy_active(), 0);
+
+        // 1.5 GiB available: below the unified floor, above the dedicated one.
+        m.set_system_memory_for_testing(32_768, 31_232, 1_536);
+        assert!(m.embedding_parked(UnifiedGpu));
+        assert_eq!(m.embedding_batch_for(UnifiedGpu), 0);
+        assert!(m.try_embedding_heavy_for(UnifiedGpu).is_none());
+        assert!(!m.embedding_parked(DedicatedGpu));
+
+        // Below the dedicated floor: every class parks.
+        m.set_system_memory_for_testing(32_768, 32_300, DEDICATED_GPU_HOST_FLOOR_MIB - 1);
+        assert!(m.embedding_parked(DedicatedGpu));
+        assert_eq!(m.embedding_limit_for(DedicatedGpu), 0);
+        assert!(
+            m.acquire_embedding_heavy_blocking_for(DedicatedGpu, || true)
+                .is_none()
+        );
+
+        // The floor is exclusive.
+        m.set_system_memory_for_testing(32_768, 32_256, DEDICATED_GPU_HOST_FLOOR_MIB);
+        assert!(!m.embedding_parked(DedicatedGpu));
+        assert!(
+            m.acquire_embedding_heavy_blocking_for(DedicatedGpu, || false)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unified_gpu_batch_curve_is_gentle_and_never_zero() {
+        assert_eq!(
+            unified_gpu_embedding_batch(16, ResourcePressure::Normal),
+            16
+        );
+        assert_eq!(
+            unified_gpu_embedding_batch(16, ResourcePressure::Warning),
+            16
+        );
+        assert_eq!(
+            unified_gpu_embedding_batch(16, ResourcePressure::Critical),
+            8
+        );
+        assert_eq!(
+            unified_gpu_embedding_batch(16, ResourcePressure::Emergency),
+            4
+        );
+        assert_eq!(
+            unified_gpu_embedding_batch(1, ResourcePressure::Emergency),
+            1
+        );
+        assert_eq!(unified_gpu_embedding_batch(0, ResourcePressure::Normal), 1);
+    }
+
+    #[test]
+    fn unsampled_monitor_never_parks_a_gpu() {
+        let m = monitor_with_budget(8192);
+        assert_eq!(m.system_available_mib(), None);
+        assert!(!m.embedding_parked(EmbeddingMemoryClass::DedicatedGpu));
+        assert!(!m.embedding_parked(EmbeddingMemoryClass::UnifiedGpu));
+        assert!(
+            m.try_embedding_heavy_for(EmbeddingMemoryClass::DedicatedGpu)
+                .is_some()
+        );
     }
 
     /// r08: whole-system memory pressure escalates even when Attic itself is

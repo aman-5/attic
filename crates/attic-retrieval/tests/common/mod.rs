@@ -112,14 +112,16 @@ fn opts() -> IndexOptions {
 }
 
 pub struct Fixture {
-    /// Owns the temp workspace lifetime.
-    pub dir: TempDir,
     pub root: PathBuf,
     /// Canonical index file (for direct read-only connections).
     pub db_path: PathBuf,
     pub pool: DbPool,
     _queue: WriterQueue,
     pub writer: WriterQueueHandle,
+    /// Declared LAST: fields drop in order, so the directory is removed only
+    /// after every SQLite handle above is closed (Windows cannot delete open
+    /// files, which silently leaked one temp dir per test).
+    pub dir: TempDir,
 }
 
 impl Fixture {

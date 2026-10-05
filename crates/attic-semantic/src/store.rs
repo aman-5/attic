@@ -487,6 +487,22 @@ impl SemanticStore {
     }
 
     /// Fetch the canonical embedding for reuse across occurrences.
+    /// Every canonical hash that already has a vector in `vector_space_id`.
+    pub fn canonical_hashes_with_vectors(
+        &self,
+        vector_space_id: &str,
+    ) -> Result<std::collections::HashSet<String>, SemanticError> {
+        let conn = self.guard()?;
+        let mut stmt = conn
+            .prepare("SELECT canonical_hash FROM sem_embeddings_v2 WHERE vector_space_id = ?1")?;
+        let mut rows = stmt.query(params![vector_space_id])?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(r) = rows.next()? {
+            out.insert(r.get(0)?);
+        }
+        Ok(out)
+    }
+
     pub fn embedding_for_canonical(
         &self,
         vector_space_id: &str,
@@ -561,12 +577,13 @@ impl SemanticStore {
     pub fn add_occurrences_and_enqueue(
         &self,
         records: &[NewOccurrence<'_>],
-    ) -> Result<(), SemanticError> {
+    ) -> Result<usize, SemanticError> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let conn = self.guard()?;
         let tx = conn.unchecked_transaction()?;
+        let mut newly_enqueued = 0usize;
         {
             let now = Self::now_ms();
             let mut occ = tx.prepare(
@@ -594,12 +611,109 @@ impl SemanticStore {
                     now
                 ])?;
                 if let Some(priority) = r.enqueue_priority {
-                    queue.execute(params![r.occurrence_id, priority, now])?;
+                    newly_enqueued += queue.execute(params![r.occurrence_id, priority, now])?;
                 }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(newly_enqueued)
+    }
+
+    /// `retrieval_unit_id -> canonical_hash` for every occurrence registered
+    /// in one vector space (lets reconcile skip rewriting unchanged rows).
+    pub fn occurrence_hashes(
+        &self,
+        vector_space_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, SemanticError> {
+        let conn = self.guard()?;
+        let mut stmt = conn.prepare(
+            "SELECT retrieval_unit_id, canonical_hash FROM sem_embedding_occurrences
+              WHERE vector_space_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![vector_space_id])?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(r) = rows.next()? {
+            out.insert(r.get(0)?, r.get(1)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete the per-generation projection rows of `unit_ids` for one model
+    /// in ONE transaction (reconcile's stale set can be tens of thousands of
+    /// rows; one autocommit per row held the store mutex for ~1 minute), then
+    /// recount the affected generations and drop the units from the
+    /// in-memory candidate index. Returns rows deleted.
+    pub fn delete_projections(
+        &self,
+        unit_ids: &[String],
+        provider: &str,
+        model: &str,
+    ) -> Result<usize, SemanticError> {
+        if unit_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.guard()?;
+        let tx = conn.transaction()?;
+        let mut n = 0usize;
+        {
+            let mut del = tx.prepare(
+                "DELETE FROM sem_embeddings
+                  WHERE retrieval_unit_id = ?1 AND provider_id = ?2 AND model_id = ?3",
+            )?;
+            for id in unit_ids {
+                n += del.execute(params![id, provider, model])?;
+            }
+        }
+        if n > 0 {
+            tx.execute(
+                "UPDATE sem_generations SET unit_count =
+                    (SELECT COUNT(*) FROM sem_embeddings e
+                      WHERE e.generation_id = sem_generations.generation_id)",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if n > 0 {
+            self.tombstone_units_in_all_indexes(unit_ids.iter().map(String::as_str));
+        }
+        Ok(n)
+    }
+
+    /// Remove occurrences in `vector_space_id` whose unit is not in `keep`
+    /// (the unit left the canonical index or is no longer selected/linked),
+    /// except ones a queue row still references (an INFLIGHT lease completes
+    /// or releases on its own). Without this, every vanished unit's
+    /// occurrence was re-projected after each drive slice and deleted again
+    /// by the next reconcile, forever. Returns occurrences removed.
+    pub fn prune_occurrences(
+        &self,
+        vector_space_id: &str,
+        keep: &std::collections::HashSet<&str>,
+    ) -> Result<usize, SemanticError> {
+        let conn = self.guard()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS sem_keep_occ (id TEXT PRIMARY KEY);
+             DELETE FROM temp.sem_keep_occ;",
+        )?;
+        {
+            let mut ins = tx.prepare("INSERT OR IGNORE INTO temp.sem_keep_occ (id) VALUES (?1)")?;
+            for id in keep {
+                ins.execute(params![id])?;
+            }
+        }
+        let n = tx.execute(
+            "DELETE FROM sem_embedding_occurrences
+              WHERE vector_space_id = ?1
+                AND retrieval_unit_id NOT IN (SELECT id FROM temp.sem_keep_occ)
+                AND NOT EXISTS (SELECT 1 FROM sem_queue_v2 q
+                                 WHERE q.occurrence_id = sem_embedding_occurrences.occurrence_id)",
+            params![vector_space_id],
+        )?;
+        tx.execute("DELETE FROM temp.sem_keep_occ", [])?;
+        tx.commit()?;
+        Ok(n)
     }
     /// Count occurrences sharing one canonical embedding — the dedup proof.
     pub fn occurrence_count_for_canonical(
@@ -1245,6 +1359,85 @@ impl SemanticStore {
             params![active_provider, active_model],
         )?;
         if n > 0 {
+            self.candidate_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        Ok(n)
+    }
+
+    /// Remove every semantic row belonging to a repository removed from the
+    /// workspace: queue entries, occurrences, per-generation projection rows,
+    /// and canonical vectors no remaining occurrence references. Idempotent.
+    /// Returns the number of rows deleted.
+    pub fn evict_repository(&self, repository_id: &str) -> Result<usize, SemanticError> {
+        let mut conn = self.guard()?;
+        // One transaction, and every statement scoped to this repository's
+        // rows (no whole-table scans), so the store mutex is held briefly and
+        // a crash leaves either nothing or everything deleted. Deleting the
+        // queue rows also fences out any batch for this repo already
+        // in flight: `commit_batch` only completes a queue row that still
+        // exists with the presented fencing token.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS evict_hashes
+                (vector_space_id TEXT NOT NULL, canonical_hash TEXT NOT NULL,
+                 PRIMARY KEY (vector_space_id, canonical_hash));
+             CREATE TEMP TABLE IF NOT EXISTS evict_generations
+                (generation_id INTEGER PRIMARY KEY);
+             DELETE FROM evict_hashes;
+             DELETE FROM evict_generations;",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO evict_hashes
+                SELECT vector_space_id, canonical_hash
+                  FROM sem_embedding_occurrences WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO evict_generations
+                SELECT DISTINCT generation_id FROM sem_embeddings
+                 WHERE repository_id = ?1 AND generation_id IS NOT NULL",
+            params![repository_id],
+        )?;
+        let mut n = tx.execute(
+            "DELETE FROM sem_queue_v2 WHERE occurrence_id IN
+                (SELECT occurrence_id FROM sem_embedding_occurrences WHERE repository_id = ?1)",
+            params![repository_id],
+        )?;
+        n += tx.execute(
+            "DELETE FROM sem_embedding_occurrences WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        let projections = tx.execute(
+            "DELETE FROM sem_embeddings WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        n += projections;
+        tx.execute(
+            "UPDATE sem_generations SET unit_count =
+                (SELECT COUNT(*) FROM sem_embeddings e
+                  WHERE e.generation_id = sem_generations.generation_id)
+              WHERE generation_id IN (SELECT generation_id FROM evict_generations)",
+            [],
+        )?;
+        n += tx.execute(
+            "DELETE FROM sem_embeddings_v2
+              WHERE (vector_space_id, canonical_hash) IN
+                    (SELECT vector_space_id, canonical_hash FROM evict_hashes)
+                AND NOT EXISTS
+                    (SELECT 1 FROM sem_embedding_occurrences o
+                      WHERE o.vector_space_id = sem_embeddings_v2.vector_space_id
+                        AND o.canonical_hash  = sem_embeddings_v2.canonical_hash)",
+            [],
+        )?;
+        tx.execute_batch("DELETE FROM evict_hashes; DELETE FROM evict_generations;")?;
+        tx.commit()?;
+        drop(conn);
+        if projections > 0 {
+            // The in-memory candidate index only syncs forward by rowid; drop
+            // it so it is rebuilt without the evicted repository.
             self.candidate_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -6,7 +6,9 @@
 // arguments, and genuine bounded streaming for LARGE files.
 
 mod daemon;
+mod eviction;
 mod inference_worker;
+mod setup_models;
 
 use attic_discovery::{
     DiscoveryPolicy, GlobRule, SecretScanDecision, canonicalize_within_root,
@@ -289,6 +291,69 @@ pub(crate) struct AtticServer {
     /// `stop_watcher`. Lets `status` report a real reason for `DISABLED`
     /// instead of silently absorbing the failure into a bare catch-all.
     watcher_start_failures: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// Central knowledge folder (`attic.toml [knowledge] dir`): indexed and
+    /// watched as a hidden repository that is never a workspace member, and
+    /// searched separately by every `context` answer.
+    knowledge: Arc<std::sync::RwLock<KnowledgeState>>,
+}
+
+/// Lifecycle of the central knowledge folder, reported by `status`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KnowledgeState {
+    /// Canonical folder in use, when configured and valid.
+    dir: Option<PathBuf>,
+    /// Hidden repository id once the first index run finished.
+    repository_id: Option<String>,
+    /// `off` | `indexing` | `ready` | `failed`.
+    state: &'static str,
+    /// Why the feature is off or failed.
+    reason: Option<String>,
+}
+
+impl KnowledgeState {
+    fn to_json(&self) -> Value {
+        json!({
+            "state": if self.state.is_empty() { "off" } else { self.state },
+            "dir": self.dir.as_ref().map(|d| d.display().to_string()),
+            "repository_id": self.repository_id,
+            "reason": self.reason,
+        })
+    }
+}
+
+/// Resolve the central knowledge folder to a canonical directory.
+/// `Ok(None)` = turned off (`enabled = false`). With no `dir`, the default
+/// `default_dir` (`<ATTIC_HOME>/knowledge`) is created if missing. A
+/// configured `dir` is never created; a missing or non-directory path is an
+/// `Err` with a reason for `status` and never stops the server.
+fn resolve_knowledge_dir(
+    cfg: &attic_core::KnowledgeConfig,
+    default_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let path = match cfg.dir.as_deref() {
+        Some(raw) => PathBuf::from(raw.trim()),
+        None => {
+            std::fs::create_dir_all(default_dir).map_err(|e| {
+                format!(
+                    "cannot create default knowledge folder {}: {e}",
+                    default_dir.display()
+                )
+            })?;
+            default_dir.to_path_buf()
+        }
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("[knowledge] dir {} is not accessible: {e}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "[knowledge] dir {} is not a directory",
+            path.display()
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 /// Map the configured `semantic.device` preference onto the Candle backend
@@ -354,15 +419,26 @@ fn candle_backend_from_config(attic_config: &attic_core::AtticConfig) -> &'stati
 static ACTIVE_ONNX_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The startup device decision in one line, e.g. `GPU: NVIDIA RTX A500
-/// (3965 MB)` or `CPU: GPU has 2048 MB VRAM < gpu_min_vram_mb=4096`. Set
+/// (3965 MB)` or `CPU: GPU has 2048 MB VRAM < gpu_min_vram_mb=3960`. Set
 /// once by `resolve_semantic_provider`; a later runtime fallback is reported
 /// by `device_line` on top of it.
 static GPU_DECISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The semantic selection policy the enricher was actually started with,
+/// plus where each value came from (`gpu_defaults` / `cpu_defaults` /
+/// `attic.toml`). Surfaced by `status` as `semantic_selection_effective`.
+static SELECTION_EFFECTIVE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+
+/// Whether the enricher was told the GPU adapter shares host RAM (integrated
+/// GPU). Recorded once at enricher start so `status` reports the same gate
+/// decision the enricher makes.
+static GPU_UNIFIED_MEMORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Decide whether the DirectML adapter may be used. `Ok` carries the GPU
-/// description, `Err` the reason embedding runs on CPU instead.
+/// description, `Err` the reason embedding runs on CPU instead. Shared with
+/// `setup-models`, so install-time downloads match the server's decision.
 #[cfg_attr(not(all(windows, target_env = "msvc")), allow(dead_code))]
-fn gpu_gate(
+pub(crate) fn gpu_gate(
     semantic: &attic_core::config::SemanticConfig,
     adapter: Option<&attic_storage::gpu_telemetry::GpuAdapterInfo>,
 ) -> Result<String, String> {
@@ -430,14 +506,25 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
         .as_ref()
         .is_some_and(|d| attic_semantic::onnx_assets::assets_present(Path::new(d)));
 
-    // Only DirectML has a real provider behind it today. The `CandleCuda`,
-    // `CandleMetal` and `OrtCoreMl` enum variants exist in
-    // `ExecutionBackend` but are never constructed by any code path, so
-    // claiming GPU support on Linux/macOS here would be a lie.
-    let platform_supported = cfg!(target_os = "windows");
+    // Which GPU backends this binary can actually drive on this platform:
+    // DirectML on Windows (MSVC), and Candle CUDA / Metal when this build
+    // compiled the `candle-cuda` / `candle-metal` feature for a matching OS.
+    // Asking attic-semantic (which owns those features) keeps this honest —
+    // a Linux CUDA or Apple Silicon Metal build is a supported GPU platform.
+    let candle_gpu = match attic_semantic::device::compiled_gpu_preference() {
+        attic_semantic::DevicePreference::Cuda => Some("candle-cuda"),
+        attic_semantic::DevicePreference::Metal => Some("candle-metal"),
+        _ => None,
+    };
+    let directml_platform = cfg!(target_os = "windows");
+    let platform_supported = directml_platform || candle_gpu.is_some();
 
     let status = if !platform_supported {
         "unsupported_platform"
+    } else if !directml_platform {
+        // Candle GPU backend compiled in; the device itself is confirmed by
+        // the worker at load time (falling back to CPU with a logged reason).
+        "available"
     } else if !compiled {
         "not_compiled"
     } else if configured_dir.is_none() {
@@ -450,9 +537,15 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
 
     let explanation = match status {
         "unsupported_platform" => format!(
-            "GPU acceleration is not implemented for this platform ({}); \
-             only the Windows ort-directml backend exists today, so embeddings run on CPU",
+            "no GPU embedding backend is compiled into this binary for this platform ({}); \
+             build with `--features candle-cuda` (NVIDIA, Linux/Windows) or \
+             `--features candle-metal` (Apple Silicon) to enable GPU, otherwise embeddings run on CPU",
             std::env::consts::OS
+        ),
+        "available" if !directml_platform => format!(
+            "GPU acceleration via {} is compiled in; the device is confirmed when the \
+             embedding worker loads (it falls back to CPU with a logged reason if unavailable)",
+            candle_gpu.unwrap_or("candle")
         ),
         "not_compiled" => "this binary was built with the Windows GNU toolchain, which has no \
              DirectML support; rebuild with the MSVC toolchain (x86_64-pc-windows-msvc) \
@@ -484,8 +577,9 @@ fn gpu_capability_report(attic_config: &attic_core::AtticConfig) -> serde_json::
     json!({
         "status": status,
         "explanation": explanation,
-        "compiled_with_gpu_support": compiled,
+        "compiled_with_gpu_support": compiled || candle_gpu.is_some(),
         "platform_has_gpu_backend": platform_supported,
+        "candle_gpu_backend": candle_gpu,
         "onnx_model_dir": configured_dir,
         "onnx_assets_present": assets_present,
         "adapter": adapter,
@@ -751,6 +845,20 @@ fn resolve_semantic_provider(
     deferred
 }
 
+/// Remove model files Attic never reads (the ONNX download cache once the
+/// GPU model is complete, duplicate Windows blob copies) in the background.
+/// Best effort and idempotent; see `attic_semantic::model_cache`.
+fn spawn_model_cache_cleanup(cache_dir: PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("attic-model-cleanup".into())
+        .spawn(move || {
+            let report = attic_semantic::model_cache::cleanup_model_cache(&cache_dir);
+            for action in &report.actions {
+                tracing::info!("model cache cleanup: {action}");
+            }
+        });
+}
+
 /// Background acquisition of the ONNX export used by the GPU backend.
 ///
 /// Mirrors `spawn_model_download_task`'s policy — off the startup path, 3
@@ -772,6 +880,7 @@ fn spawn_onnx_download_task(cache_dir: PathBuf) {
                             dir = %dir.display(),
                             "ONNX GPU assets ready; the GPU backend is selected on the next start"
                         );
+                        spawn_model_cache_cleanup(cache_dir.clone());
                         return;
                     }
                     Err(e) if attempt < ATTEMPTS => {
@@ -1001,6 +1110,7 @@ fn spawn_model_download_task(
                                 tracing::info!(
                                     "Qwen3 model verified against pinned manifest; supervised worker provider swapped in — semantic retrieval is now live"
                                 );
+                                spawn_model_cache_cleanup(cache_dir.clone());
                                 return;
                             }
                             Err(
@@ -1091,7 +1201,7 @@ mod resolve_provider_tests {
         );
         assert_eq!(
             super::gpu_gate(&s, Some(&adapter(1024, false, false))).unwrap_err(),
-            "CPU: GPU Test GPU has 1024 MB VRAM < gpu_min_vram_mb=4096"
+            "CPU: GPU Test GPU has 1024 MB VRAM < gpu_min_vram_mb=3960"
         );
         assert!(
             super::gpu_gate(&s, Some(&adapter(128, true, false)))
@@ -1199,7 +1309,7 @@ impl AtticServer {
         // (falling back to an in-memory AtticConfig::default() if the write
         // itself fails, e.g. a read-only directory) so every install ends up
         // with a real, editable attic.toml instead of an invisible default.
-        let attic_toml_path = db_path.with_file_name("attic.toml");
+        let attic_toml_path = attic_core::sibling(db_path, "attic.toml");
         let attic_config = if attic_toml_path.exists() {
             let contents = std::fs::read_to_string(&attic_toml_path).map_err(|e| {
                 ServerError::InvalidArg(format!(
@@ -1293,13 +1403,13 @@ impl AtticServer {
         // retrieval DISABLED unless explicitly opted in. Absent/disabled/
         // degraded semantic layers never affect canonical intelligence
         // (ADR-014 D1).
-        let semantic_path = db_path.with_file_name("semantic.db");
+        let semantic_path = attic_core::sibling(db_path, "semantic.db");
         // Model/tokenizer cache dir for Qwen3Embedder — a `models`
         // directory beside the database by default, overridable so multiple
         // Attic instances (or tests) can share one cache.
         let model_cache_dir = std::env::var("ATTIC_MODEL_CACHE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| db_path.with_file_name("models"));
+            .unwrap_or_else(|_| attic_core::sibling(db_path, "models"));
         let semantic = if semantic_opt_in {
             match attic_semantic::SemanticStore::open(&semantic_path) {
                 Ok(store) => {
@@ -1310,6 +1420,7 @@ impl AtticServer {
                         &model_cache_dir,
                         &store,
                     );
+                    spawn_model_cache_cleanup(model_cache_dir.clone());
                     info!(
                         provider = provider.id(),
                         model = provider.model_id(),
@@ -1366,7 +1477,7 @@ impl AtticServer {
             scheduler: Arc::new(std::sync::Mutex::new(None)),
             workspace_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
-            default_config: db_path.with_file_name("config.toml"),
+            default_config: attic_core::sibling(db_path, "config.toml"),
             unavailable_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             pending_index_failed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             semantic,
@@ -1381,6 +1492,7 @@ impl AtticServer {
             last_discovery_diagnostics: Arc::new(std::sync::RwLock::new(HashMap::new())),
             container_repo_roots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             watcher_start_failures: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            knowledge: Arc::new(std::sync::RwLock::new(KnowledgeState::default())),
         })
     }
 
@@ -1555,6 +1667,29 @@ impl AtticServer {
                         let outcome = self
                             .bootstrap_workspace_cancellable(&root, cancellation)
                             .map(|id| (root, id));
+                        // Container roots: publish each nested repository the
+                        // moment it is indexed, so it shows in `status` and is
+                        // searchable while its siblings are still running
+                        // (previously the whole container stayed invisible
+                        // until its last repository finished).
+                        if let Ok((ref done_root, ref repo_id)) = outcome
+                            && done_root.as_path() != configured_root
+                            && !cancellation.is_cancelled()
+                        {
+                            if let Ok(mut g) = self.container_repo_roots.write() {
+                                let entry =
+                                    g.entry(root_identity_key(configured_root)).or_default();
+                                if !entry.contains(done_root) {
+                                    entry.push(done_root.clone());
+                                }
+                            }
+                            tracing::info!(
+                                root = %done_root.display(),
+                                container_root = %configured_root.display(),
+                                repository_id = %repo_id,
+                                "nested repository indexed"
+                            );
+                        }
                         results_mutex
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1593,27 +1728,38 @@ impl AtticServer {
         Ok(ok_results)
     }
 
-    /// Instant runtime kill switch for the file log — flips
-    /// `LOG_RELOAD_HANDLE`'s filter between `INFO` and `OFF` in the
-    /// already-running process. No restart, unlike an env var (which only
-    /// takes effect on the next launch). `stderr` output is a separate,
-    /// always-on layer and is never affected by this.
+    /// Runtime control of the persistent file log via `LOG_RELOAD_HANDLE`:
+    /// `on` (optionally with `level`), `off`, `level` and `status` take effect
+    /// in the already-running process, no restart. `stderr` output is a
+    /// separate, always-on layer and is never affected by this.
     fn handle_logging(args: &HashMap<String, Value>) -> Result<CallToolResult, ServerError> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ServerError::InvalidArg("missing 'action' (on|off|status)".into()))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ServerError::InvalidArg("missing 'action' (on|off|level|status)".into())
+        })?;
         let handle = LOG_RELOAD_HANDLE
             .get()
             .ok_or_else(|| ServerError::InvalidArg("log reload handle not initialized".into()))?;
+        let parse_level = |required: bool| -> Result<LevelFilter, ServerError> {
+            match args.get("level").and_then(|v| v.as_str()) {
+                None if !required => Ok(LevelFilter::INFO),
+                None => Err(ServerError::InvalidArg(
+                    "missing 'level' (error|warn|info|debug|trace)".into(),
+                )),
+                Some(s) => match level_filter_from_name(s) {
+                    Some(l) if l != LevelFilter::OFF => Ok(l),
+                    _ => Err(ServerError::InvalidArg(format!(
+                        "unknown level '{s}' (expected error|warn|info|debug|trace)"
+                    ))),
+                },
+            }
+        };
         let body = match action {
-            "on" => {
-                handle
-                    .modify(|filter| *filter = LevelFilter::INFO)
-                    .map_err(|e| {
-                        ServerError::InvalidArg(format!("failed to enable file logging: {e}"))
-                    })?;
-                "file logging: ON".to_string()
+            "on" | "level" => {
+                let level = parse_level(action == "level")?;
+                handle.modify(|filter| *filter = level).map_err(|e| {
+                    ServerError::InvalidArg(format!("failed to set file logging level: {e}"))
+                })?;
+                format!("file logging: ON (level {level})")
             }
             "off" => {
                 handle
@@ -1630,15 +1776,15 @@ impl AtticServer {
                 format!(
                     "file logging: {}",
                     if current == LevelFilter::OFF {
-                        "OFF"
+                        "OFF".to_string()
                     } else {
-                        "ON"
+                        format!("ON (level {current})")
                     }
                 )
             }
             other => {
                 return Err(ServerError::InvalidArg(format!(
-                    "unknown action '{other}' (expected on|off|status)"
+                    "unknown action '{other}' (expected on|off|level|status)"
                 )));
             }
         };
@@ -1723,210 +1869,32 @@ impl AtticServer {
             )]));
         }
 
-        /// Validate + canonicalize a single root path for membership changes.
-        fn validate_root(path: &str) -> Result<PathBuf, ServerError> {
-            let p = PathBuf::from(path);
-            if !p.exists() {
-                return Err(ServerError::InvalidArg(format!(
-                    "path does not exist: {path}"
-                )));
-            }
-            if !p.is_dir() {
-                return Err(ServerError::InvalidArg(format!(
-                    "path is not a directory: {path}"
-                )));
-            }
-            p.canonicalize()
-                .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
-        }
-
-        /// Deterministic canonical dedup preserving configuration order,
-        /// comparing via [`root_identity_key`] so a root reached through a
-        /// differently-produced `PathBuf` (see PR-6) is still recognized as
-        /// the same root everywhere, not just at the `remove` call site.
-        fn dedup_keep_order(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-            let mut seen = HashSet::new();
-            let mut out = Vec::new();
-            for r in roots {
-                if seen.insert(root_identity_key(&r)) {
-                    out.push(r);
-                }
-            }
-            out
-        }
-
-        // PR-9: serialize the whole compute → persist → commit sequence by
-        // holding `active_roots`'s own write lock across it, rather than a
-        // separate parallel lock — `active_roots` is already the single
-        // source of truth for membership, so it's the natural single point
-        // of mutual exclusion for mutating it too. Scoped in an explicit
-        // block so the guard is structurally out of scope (not just
-        // manually dropped) before the `.await` below — the async-fn Send
-        // analysis needs that to prove the guard is never held across it.
-        let (new_active, added, removed): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
-            let mut active_guard = lock_or_server_err!(self.active_roots.write(), "active_roots")?;
-
-            let new_active: Vec<PathBuf> = match action.as_str() {
-                "add" => {
-                    let path = args
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
-                    let canon = validate_root(path)?;
-                    let mut active = active_guard.clone();
-                    if !active
-                        .iter()
-                        .any(|r| root_identity_key(r) == root_identity_key(&canon))
-                    {
-                        active.push(canon);
-                    }
-                    dedup_keep_order(active)
-                }
-                "remove" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-                        ServerError::InvalidArg("missing 'path' for remove".into())
-                    })?;
-                    let target = PathBuf::from(path);
-                    // Two-path strategy (principal-architect audit A-06): a
-                    // configured root that has been deleted or moved must still
-                    // be removable. `canonicalize()` requires the path to exist,
-                    // so fall back to a lexical (filesystem-free) normalization
-                    // when it doesn't — comparison then goes through the shared
-                    // `root_identity_key` so either form matches the persisted
-                    // canonical root.
-                    let normalized = if target.exists() {
-                        target.canonicalize().map_err(|e| {
-                            ServerError::InvalidArg(format!(
-                                "cannot canonicalize removal path '{path}': {e}"
-                            ))
-                        })?
-                    } else {
-                        normalize_root_lexically(&target).map_err(|e| {
-                            ServerError::InvalidArg(format!(
-                                "cannot normalize removal path '{path}': {e}"
-                            ))
-                        })?
-                    };
-                    let target_key = root_identity_key(&normalized);
-                    dedup_keep_order(
-                        active_guard
-                            .iter()
-                            .filter(|r| root_identity_key(r) != target_key)
-                            .cloned()
-                            .collect(),
-                    )
-                }
-                "set" => {
-                    let paths = args
-                        .get("paths")
-                        .and_then(|v| v.as_array())
-                        .ok_or_else(|| {
-                            ServerError::InvalidArg("missing 'paths' (array) for set".into())
-                        })?
-                        .iter()
-                        .map(|v| {
-                            v.as_str().ok_or_else(|| {
-                                ServerError::InvalidArg("paths must be strings".into())
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut validated = Vec::new();
-                    for p in paths {
-                        validated.push(validate_root(p)?);
-                    }
-                    dedup_keep_order(validated)
-                }
-                other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
-            };
-
-            // Compute added/removed roots relative to the current live membership.
-            let old_active = active_guard.clone();
-            let added: Vec<PathBuf> = new_active
-                .iter()
-                .filter(|r| !old_active.contains(r))
-                .cloned()
-                .collect();
-            let removed: Vec<PathBuf> = old_active
-                .iter()
-                .filter(|r| !new_active.contains(r))
-                .cloned()
-                .collect();
-
-            // 1. Persist the new membership atomically BEFORE touching live state,
-            //    so a crash still leaves a coherent durable config.
-            if new_active.is_empty() {
-                remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
-            } else {
-                persist_repositories_config(&self.default_config, &new_active)
-                    .map_err(ServerError::InvalidArg)?;
-            }
-
-            // 2. Update in-memory authoritative membership + configured flag.
-            *active_guard = new_active.clone();
-            self.workspace_configured
-                .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
-
-            (new_active, added, removed)
-            // `active_guard` drops here, going out of scope before the `.await`
-            // points below.
-        };
-
-        // 3. Reconcile LIVE watchers: stop watchers for removed roots,
-        //    start+bootstrap watchers for added roots. Each is isolated so a
-        //    single failure never corrupts the rest of the reconciliation.
-        let mut events = Vec::new();
-        for root in &removed {
-            let job_key = root_identity_key(root);
-            if let Ok(jobs) = self.bootstrap_jobs.lock() {
-                for job in jobs.iter().filter(|job| job.root_key == job_key) {
-                    job.cancellation.cancel();
-                }
-            }
-            // A configured root may have fanned out into N effective
-            // repository roots (container with nested git repos); look up
-            // and clear that mapping so every fanned-out repo's watcher and
-            // diagnostics get cleaned up, not just a single lookup on the
-            // configured root itself (which is never itself a repo row in
-            // the fan-out case).
-            let effective_roots = self
-                .container_repo_roots
-                .write()
-                .ok()
-                .and_then(|mut g| g.remove(&job_key))
-                .unwrap_or_else(|| vec![root.clone()]);
-            let mut stopped = 0usize;
-            for effective_root in &effective_roots {
-                let repo_id = self
-                    .pool
-                    .with_reader(|c| {
-                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
-                    })
-                    .ok()
-                    .flatten()
-                    .map(|id| id.to_string());
-                if let Some(id) = repo_id {
-                    self.stop_watcher(&id);
-                    // PR-3 counters are keyed by repository_id; a removed root's
-                    // entry would otherwise never be cleaned up, growing this
-                    // map unboundedly over a long-running process's lifetime.
-                    if let Ok(mut counters) = self.last_discovery_counters.write() {
-                        counters.remove(&id);
-                    }
-                    if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
-                        diagnostics.remove(&id);
-                    }
-                    stopped += 1;
-                }
-            }
-            if stopped > 0 {
-                events.push(format!(
-                    "stopped {stopped} watcher(s) for: {}",
-                    root.display()
-                ));
-            } else {
-                events.push(format!("removed (no registered repo): {}", root.display()));
-            }
-        }
+        // Membership changes do blocking work — lock waits, the atomic
+        // config write, SQLite lookups, watcher shutdown and the eviction
+        // enqueue (which waits for the single writer). Run all of it on the
+        // blocking pool so a slow step can never stall the async runtime
+        // that serves every other MCP request, and log each stage so a slow
+        // request is diagnosable from the log alone.
+        let started = std::time::Instant::now();
+        tracing::info!(action = %action, path = ?args.get("path"), "workspace request started");
+        let server = self.clone();
+        let (args_owned, action_owned) = (args.clone(), action.clone());
+        let WorkspaceChange {
+            new_active,
+            added,
+            mut events,
+        } = tokio::task::spawn_blocking(move || {
+            server.apply_workspace_change(&action_owned, &args_owned)
+        })
+        .await
+        .map_err(|e| ServerError::InvalidArg(format!("workspace update task failed: {e}")))??;
+        tracing::info!(
+            action = %action,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            added = added.len(),
+            membership = new_active.len(),
+            "workspace membership updated"
+        );
         for root in &added {
             let server = self.clone();
             let root = root.clone();
@@ -2021,6 +1989,361 @@ impl AtticServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&payload)?,
         )]))
+    }
+
+    /// Synchronous part of a `workspace` add/remove/set: validate, persist,
+    /// update live membership, and tear down removed roots. Returns
+    /// `(new_active, added, events)`; the caller bootstraps `added`.
+    fn apply_workspace_change(
+        &self,
+        action: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<WorkspaceChange, ServerError> {
+        let t0 = std::time::Instant::now();
+        /// Validate + canonicalize a single root path for membership changes.
+        fn validate_root(path: &str) -> Result<PathBuf, ServerError> {
+            let p = PathBuf::from(path);
+            if !p.exists() {
+                return Err(ServerError::InvalidArg(format!(
+                    "path does not exist: {path}"
+                )));
+            }
+            if !p.is_dir() {
+                return Err(ServerError::InvalidArg(format!(
+                    "path is not a directory: {path}"
+                )));
+            }
+            p.canonicalize()
+                .map_err(|e| ServerError::InvalidArg(format!("cannot canonicalize '{path}': {e}")))
+        }
+
+        /// Deterministic canonical dedup preserving configuration order,
+        /// comparing via [`root_identity_key`] so a root reached through a
+        /// differently-produced `PathBuf` (see PR-6) is still recognized as
+        /// the same root everywhere, not just at the `remove` call site.
+        fn dedup_keep_order(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for r in roots {
+                if seen.insert(root_identity_key(&r)) {
+                    out.push(r);
+                }
+            }
+            out
+        }
+
+        // PR-9: serialize the whole compute → persist → commit sequence by
+        // holding `active_roots`'s own write lock across it, rather than a
+        // separate parallel lock — `active_roots` is already the single
+        // source of truth for membership, so it's the natural single point
+        // of mutual exclusion for mutating it too. Scoped in an explicit
+        // block so the guard is structurally out of scope (not just
+        // manually dropped) before the `.await` below — the async-fn Send
+        // analysis needs that to prove the guard is never held across it.
+        let (new_active, added, removed): (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) = {
+            // Bounded wait: a request must fail with a clear, retriable error
+            // rather than hang until the client's own timeout fires.
+            let lock_started = std::time::Instant::now();
+            let mut active_guard = loop {
+                match self.active_roots.try_write() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(ServerError::InvalidArg(
+                            "internal lock poisoned: active_roots".into(),
+                        ));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if lock_started.elapsed() > std::time::Duration::from_secs(10) {
+                            return Err(ServerError::InvalidArg(
+                                "workspace is busy (another membership change is in progress); retry shortly"
+                                    .into(),
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            };
+            tracing::debug!(
+                wait_ms = lock_started.elapsed().as_millis() as u64,
+                "workspace: membership lock acquired"
+            );
+
+            let new_active: Vec<PathBuf> = match action {
+                "add" => {
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ServerError::InvalidArg("missing 'path' for add".into()))?;
+                    let canon = validate_root(path)?;
+                    let mut active = active_guard.clone();
+                    if !active
+                        .iter()
+                        .any(|r| root_identity_key(r) == root_identity_key(&canon))
+                    {
+                        active.push(canon);
+                    }
+                    dedup_keep_order(active)
+                }
+                "remove" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ServerError::InvalidArg("missing 'path' for remove".into())
+                    })?;
+                    let target = PathBuf::from(path);
+                    // Two-path strategy (principal-architect audit A-06): a
+                    // configured root that has been deleted or moved must still
+                    // be removable. `canonicalize()` requires the path to exist,
+                    // so fall back to a lexical (filesystem-free) normalization
+                    // when it doesn't — comparison then goes through the shared
+                    // `root_identity_key` so either form matches the persisted
+                    // canonical root.
+                    let normalized = if target.exists() {
+                        target.canonicalize().map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot canonicalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    } else {
+                        normalize_root_lexically(&target).map_err(|e| {
+                            ServerError::InvalidArg(format!(
+                                "cannot normalize removal path '{path}': {e}"
+                            ))
+                        })?
+                    };
+                    let target_key = root_identity_key(&normalized);
+                    dedup_keep_order(
+                        active_guard
+                            .iter()
+                            .filter(|r| root_identity_key(r) != target_key)
+                            .cloned()
+                            .collect(),
+                    )
+                }
+                "set" => {
+                    let paths = args
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| {
+                            ServerError::InvalidArg("missing 'paths' (array) for set".into())
+                        })?
+                        .iter()
+                        .map(|v| {
+                            v.as_str().ok_or_else(|| {
+                                ServerError::InvalidArg("paths must be strings".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut validated = Vec::new();
+                    for p in paths {
+                        validated.push(validate_root(p)?);
+                    }
+                    dedup_keep_order(validated)
+                }
+                other => return Err(ServerError::InvalidArg(format!("unknown action '{other}'"))),
+            };
+
+            // Compute added/removed roots relative to the current live membership.
+            let old_active = active_guard.clone();
+            let added: Vec<PathBuf> = new_active
+                .iter()
+                .filter(|r| !old_active.contains(r))
+                .cloned()
+                .collect();
+            let removed: Vec<PathBuf> = old_active
+                .iter()
+                .filter(|r| !new_active.contains(r))
+                .cloned()
+                .collect();
+
+            // 1. Persist the new membership atomically BEFORE touching live state,
+            //    so a crash still leaves a coherent durable config.
+            if new_active.is_empty() {
+                remove_workspace_config(&self.default_config).map_err(ServerError::InvalidArg)?;
+            } else {
+                persist_repositories_config(&self.default_config, &new_active)
+                    .map_err(ServerError::InvalidArg)?;
+            }
+
+            tracing::debug!(
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "workspace: membership persisted"
+            );
+            // 2. Update in-memory authoritative membership + configured flag.
+            *active_guard = new_active.clone();
+            self.workspace_configured
+                .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
+
+            (new_active, added, removed)
+            // `active_guard` drops here, going out of scope before the `.await`
+            // points below.
+        };
+
+        // 3. Reconcile LIVE watchers: stop watchers for removed roots,
+        //    start+bootstrap watchers for added roots. Each is isolated so a
+        //    single failure never corrupts the rest of the reconciliation.
+        let mut events = Vec::new();
+        for root in &removed {
+            let job_key = root_identity_key(root);
+            if let Ok(jobs) = self.bootstrap_jobs.lock() {
+                for job in jobs.iter().filter(|job| job.root_key == job_key) {
+                    job.cancellation.cancel();
+                }
+            }
+            // A configured root may have fanned out into N effective
+            // repository roots (container with nested git repos); look up
+            // and clear that mapping so every fanned-out repo's watcher and
+            // diagnostics get cleaned up, not just a single lookup on the
+            // configured root itself (which is never itself a repo row in
+            // the fan-out case).
+            let effective_roots = self
+                .container_repo_roots
+                .write()
+                .ok()
+                .and_then(|mut g| g.remove(&job_key))
+                .unwrap_or_else(|| vec![root.clone()]);
+            let mut stopped = 0usize;
+            for effective_root in &effective_roots {
+                let repo_id = self
+                    .pool
+                    .with_reader(|c| {
+                        lookup_repository_by_root_path(c, &effective_root.to_string_lossy())
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|id| id.to_string());
+                if let Some(id) = repo_id {
+                    self.stop_watcher(&id);
+                    // Durable background deletion of everything this repo
+                    // left in attic.db / semantic.db (cancelled if re-added).
+                    if let Err(e) = eviction::enqueue_eviction(&self.writer, &id, effective_root) {
+                        tracing::warn!(repository_id = %id, "could not queue data eviction: {e}");
+                    }
+                    // PR-3 counters are keyed by repository_id; a removed root's
+                    // entry would otherwise never be cleaned up, growing this
+                    // map unboundedly over a long-running process's lifetime.
+                    if let Ok(mut counters) = self.last_discovery_counters.write() {
+                        counters.remove(&id);
+                    }
+                    if let Ok(mut diagnostics) = self.last_discovery_diagnostics.write() {
+                        diagnostics.remove(&id);
+                    }
+                    stopped += 1;
+                }
+            }
+            if stopped > 0 {
+                events.push(format!(
+                    "stopped {stopped} watcher(s) for: {}",
+                    root.display()
+                ));
+            } else {
+                events.push(format!("removed (no registered repo): {}", root.display()));
+            }
+        }
+        tracing::debug!(
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "workspace: removed roots reconciled"
+        );
+        Ok(WorkspaceChange {
+            new_active,
+            added,
+            events,
+        })
+    }
+    /// Hidden repository id of the central knowledge folder, once indexed.
+    fn knowledge_repository_id(&self) -> Option<String> {
+        self.knowledge
+            .read()
+            .ok()
+            .and_then(|k| k.repository_id.clone())
+    }
+
+    fn set_knowledge(&self, state: KnowledgeState) {
+        if let Ok(mut k) = self.knowledge.write() {
+            *k = state;
+        }
+    }
+
+    /// Index and watch the central knowledge folder in the background. Never
+    /// blocks or fails startup; the outcome is reported by `status`. The
+    /// folder is NOT added to workspace membership.
+    fn start_central_knowledge(&self) {
+        let default_dir = attic_core::sibling(&self.db_path, "knowledge");
+        let dir = match resolve_knowledge_dir(&self.attic_config.knowledge, &default_dir) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return,
+            Err(reason) => {
+                warn!(%reason, "central knowledge folder disabled");
+                self.set_knowledge(KnowledgeState {
+                    state: "failed",
+                    reason: Some(reason),
+                    ..KnowledgeState::default()
+                });
+                return;
+            }
+        };
+        self.set_knowledge(KnowledgeState {
+            dir: Some(dir.clone()),
+            state: "indexing",
+            ..KnowledgeState::default()
+        });
+        let srv = self.clone();
+        let cancellation = attic_core::CancellationToken::new();
+        let token = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            let (job_srv, job_dir, job_token) = (srv.clone(), dir.clone(), token.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                job_srv.bootstrap_workspace_cancellable(&job_dir, &job_token)
+            })
+            .await;
+            if token.is_cancelled() {
+                return;
+            }
+            match outcome {
+                Ok(Ok(id)) => {
+                    // A folder that is also a workspace root already has that
+                    // root's watcher; a second one would replace it.
+                    let is_workspace_root = srv.active_roots.read().is_ok_and(|roots| {
+                        roots
+                            .iter()
+                            .any(|r| root_identity_key(r) == root_identity_key(&dir))
+                    });
+                    if !is_workspace_root {
+                        srv.start_watcher(&dir, &id);
+                    }
+                    info!(repository_id = %id, dir = %dir.display(), "central knowledge folder indexed");
+                    srv.set_knowledge(KnowledgeState {
+                        dir: Some(dir),
+                        repository_id: Some(id),
+                        state: "ready",
+                        reason: None,
+                    });
+                }
+                Ok(Err(e)) => {
+                    error!(dir = %dir.display(), "central knowledge folder indexing failed: {e}");
+                    srv.set_knowledge(KnowledgeState {
+                        dir: Some(dir),
+                        state: "failed",
+                        reason: Some(e.to_string()),
+                        ..KnowledgeState::default()
+                    });
+                }
+                Err(e) => {
+                    error!(dir = %dir.display(), "central knowledge folder task failed: {e}");
+                    srv.set_knowledge(KnowledgeState {
+                        dir: Some(dir),
+                        state: "failed",
+                        reason: Some(e.to_string()),
+                        ..KnowledgeState::default()
+                    });
+                }
+            }
+        });
+        if let Ok(mut jobs) = self.bootstrap_jobs.lock() {
+            jobs.push(BootstrapJob {
+                root_key: "__knowledge__".to_string(),
+                cancellation,
+                handle,
+            });
+        }
     }
 
     /// Stop the live watcher for `repository_id`, if any, and drop its
@@ -2661,6 +2984,15 @@ enum McpWorkClass {
     Mutation,
 }
 
+/// Result of the synchronous part of a `workspace` membership change.
+struct WorkspaceChange {
+    /// Membership after the change.
+    new_active: Vec<PathBuf>,
+    /// Roots to bootstrap.
+    added: Vec<PathBuf>,
+    /// Human-readable events for the response.
+    events: Vec<String>,
+}
 /// Map a tool name to its [`McpWorkClass`].
 ///
 /// This is the **single, centralised** place that assigns a cost class.
@@ -2795,17 +3127,33 @@ fn handle_file(
 /// (FTS) and semantic (kNN) candidates via RRF. When `semantic` is `None`
 /// (semantic disabled), every result is lexical-only, ranked exactly as
 /// `fts_search` ranks it.
+///
+/// Every result carries `source_type` (`knowledge` / `documentation` /
+/// `code` / `config` / `test`). `scope: "knowledge"` returns only knowledge:
+/// central knowledge folder hits first (when configured), then repository
+/// `knowledge/` hits. Default (`scope` absent or `"all"`) results are
+/// unchanged and never include the central folder.
 fn handle_search(
     pool: &DbPool,
     semantic: Option<&attic_retrieval::semantic::SemanticStack>,
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
+    knowledge_repository_id: Option<&str>,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
     validate_filter("query", query, 512)?;
+    let knowledge_only = match args.get("scope").and_then(Value::as_str) {
+        None | Some("all") => false,
+        Some("knowledge") => true,
+        Some(other) => {
+            return Err(ServerError::InvalidArg(format!(
+                "scope must be \"all\" or \"knowledge\", got {other}"
+            )));
+        }
+    };
 
     let repo_id = args.get("repository_id").and_then(Value::as_str);
     if let Some(id) = repo_id {
@@ -2843,9 +3191,44 @@ fn handle_search(
     response
         .results
         .retain(|r| active_ids.contains(&r.repository_id));
+
+    let label = |r: &attic_retrieval::HybridSearchResult| {
+        if knowledge_repository_id == Some(r.repository_id.as_str()) {
+            "knowledge"
+        } else {
+            attic_retrieval::candidates::search_label_for_path(&r.path)
+        }
+    };
+    let mut results: Vec<&attic_retrieval::HybridSearchResult> = Vec::new();
+    let central;
+    if knowledge_only {
+        if let (Some(kid), None) = (knowledge_repository_id, repo_id) {
+            let mut kopts = opts.clone();
+            kopts.repository_id = Some(kid.to_owned());
+            central = searcher.search(query, &kopts)?.results;
+            results.extend(central.iter().filter(|r| {
+                r.repository_id == kid
+                    && !attic_retrieval::candidates::is_central_knowledge_readme(&r.path)
+            }));
+        }
+        results.extend(response.results.iter().filter(|r| label(r) == "knowledge"));
+        results.truncate(MAX_SEARCH_RESULTS);
+    } else {
+        results.extend(response.results.iter());
+    }
+    let results: Vec<Value> = results
+        .into_iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r)?;
+            if let Value::Object(m) = &mut v {
+                m.insert("source_type".into(), Value::from(label(r)));
+            }
+            Ok(v)
+        })
+        .collect::<Result<_, serde_json::Error>>()?;
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&json!({
-            "results": response.results,
+            "results": results,
             "semantic_degraded": response.semantic_degraded,
         }))?,
     )]))
@@ -3000,55 +3383,67 @@ struct ResourceStatus<'a> {
     effective_resources: attic_storage::EffectiveResourceConfig,
     semantic: Option<&'a attic_retrieval::semantic::SemanticStack>,
     attic_config: &'a attic_core::AtticConfig,
+    /// Central knowledge folder state (`status.knowledge`).
+    knowledge: Value,
 }
 
-// [FIX] `chunks_per_sec` in `semantic_progress` used to be a hardcoded
-// literal (50.0), so ETA never reflected reality. This tracks the previous
-// poll's (timestamp, queue_done count) so each status call can derive a
-// real rolling rate from the actual delta. Process-lifetime static: there
-// is one semantic store per server process, so no per-instance state is
-// needed beyond this.
-/// `(sample time, queue_done)` from recent `status` calls, oldest first,
-/// used to report a wall-clock embedding rate over [`PROGRESS_RATE_WINDOW`].
-static SEMANTIC_PROGRESS_SAMPLES: std::sync::Mutex<
-    std::collections::VecDeque<(std::time::Instant, u64)>,
-> = std::sync::Mutex::new(std::collections::VecDeque::new());
+/// `off|error|warn|info|debug|trace` (any case) as a tracing level filter.
+fn level_filter_from_name(name: &str) -> Option<LevelFilter> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::OFF),
+        "error" => Some(LevelFilter::ERROR),
+        "warn" => Some(LevelFilter::WARN),
+        "info" => Some(LevelFilter::INFO),
+        "debug" => Some(LevelFilter::DEBUG),
+        "trace" => Some(LevelFilter::TRACE),
+        _ => None,
+    }
+}
 
-/// Window for the reported chunks/sec. Long enough to span several GPU
-/// batches (one batch of large chunks takes 10-30 s), so the figure no longer
-/// flips between 0 and a per-batch burst rate on every poll.
-const PROGRESS_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// File-log level at startup from `[logging] file_level` in attic.toml;
+/// OFF when unset or unreadable (an invalid attic.toml is reported loudly
+/// by the server's own config load moments later).
+fn configured_file_log_level(db_path: &Path) -> LevelFilter {
+    std::fs::read_to_string(attic_core::sibling(db_path, "attic.toml"))
+        .ok()
+        .and_then(|s| attic_core::AtticConfig::parse_str(&s).ok())
+        .and_then(|c| c.logging.file_level())
+        .and_then(|l| level_filter_from_name(&l))
+        .unwrap_or(LevelFilter::OFF)
+}
 
-/// Wall-clock rate over the samples in `window`, after recording `(now, done)`.
-/// Resets when `done` goes backwards (queue reset / generation switch).
-fn windowed_progress_rate(
-    samples: &mut std::collections::VecDeque<(std::time::Instant, u64)>,
+/// Queue depth above which a GROWING queue is reported as backpressure.
+const QUEUE_BACKPRESSURE_DEPTH: u64 = 5_000;
+
+/// True when the embedding queue is large and has grown since a sample at
+/// least 30 s old. A large queue that is draining is normal work: reporting it
+/// as "backpressure … exceeded high watermark" made a healthy 80-minute GPU
+/// run look like a fault.
+fn queue_is_growing(depth: u64) -> bool {
+    static SAMPLE: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+        std::sync::Mutex::new(None);
+    queue_is_growing_at(&SAMPLE, std::time::Instant::now(), depth)
+}
+
+fn queue_is_growing_at(
+    sample: &std::sync::Mutex<Option<(std::time::Instant, u64)>>,
     now: std::time::Instant,
-    done: u64,
-    window: std::time::Duration,
-) -> f64 {
-    if samples.back().is_some_and(|&(_, d)| done < d) {
-        samples.clear();
-    }
-    samples.push_back((now, done));
-    while samples.len() > 2
-        && samples
-            .front()
-            .is_some_and(|&(t, _)| now.duration_since(t) > window)
-    {
-        samples.pop_front();
-    }
-    match samples.front() {
-        Some(&(t0, d0)) if done > d0 => {
-            let elapsed = now.duration_since(t0).as_secs_f64();
-            if elapsed > 0.0 {
-                (done - d0) as f64 / elapsed
-            } else {
-                0.0
-            }
+    depth: u64,
+) -> bool {
+    const MIN_SPAN: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut g = sample.lock().unwrap_or_else(|e| e.into_inner());
+    let growing = match *g {
+        Some((t, prev)) if now.duration_since(t) >= MIN_SPAN => {
+            *g = Some((now, depth));
+            depth > prev
         }
-        _ => 0.0,
-    }
+        Some((_, prev)) => depth > prev,
+        None => {
+            *g = Some((now, depth));
+            false
+        }
+    };
+    growing && depth >= QUEUE_BACKPRESSURE_DEPTH
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3068,8 +3463,27 @@ fn handle_status(
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
 
+    // Same live decision the enricher makes each iteration: how host-RAM
+    // pressure gates embedding on the backend that is actually serving.
+    let embedding_class = phase8.semantic.map(|s| {
+        attic_semantic::embedding_memory_class(
+            s.provider.as_ref(),
+            GPU_UNIFIED_MEMORY.get().copied().unwrap_or(false),
+        )
+    });
+    let gpu_embedding = embedding_class.is_some_and(|c| c.host_floor_mib().is_some());
+
     // Resource pressure state — Phase 7 foreground/background priority.
     if let Some(monitor) = resource_monitor {
+        let class = embedding_class
+            .unwrap_or(attic_storage::resource_manager::EmbeddingMemoryClass::HostRam);
+        let embedding_gate = match (class.host_floor_mib(), monitor.embedding_parked(class)) {
+            (None, _) => "host_ram_tiers".to_string(),
+            (Some(_), true) => format!("{}_parked_host_ram_floor", class.as_str()),
+            (Some(_), false) => format!("{}_exempt_from_tiers", class.as_str()),
+        };
+        let embedding_limit = monitor.embedding_limit_for(class);
+        let embedding_batch = monitor.embedding_batch_for(class);
         payload["resource_pressure"] = json!({
             "level": monitor.pressure().to_string().to_lowercase(),
             // Phase 1 extension: hysteresis-smoothed tier (stable_tier_pressure)
@@ -3090,9 +3504,15 @@ fn handle_status(
             "effective_indexing_heavy_limit": monitor.effective_indexing_heavy_limit(),
             "max_indexing_heavy": monitor.max_indexing_heavy(),
             "active_indexing_heavy": monitor.indexing_heavy_active(),
-            "effective_embedding_limit": monitor.effective_embedding_limit(),
+            "effective_embedding_limit": embedding_limit,
             "active_embedding_heavy": monitor.embedding_heavy_active(),
-            "effective_embedding_batch": monitor.current_embedding_batch(),
+            "effective_embedding_batch": embedding_batch,
+            // Which admission rule governs embedding right now, and the
+            // inputs to the dedicated-GPU host floor.
+            "embedding_gate": embedding_gate,
+            "embedding_memory_class": class.as_str(),
+            "system_available_mib": monitor.system_available_mib(),
+            "embedding_host_floor_mib": class.host_floor_mib(),
             "mcp_pressure_rejections": monitor.mcp_pressure_rejections(),
             "daemon_reconnect_count": monitor.daemon_reconnect_count.load(
                 std::sync::atomic::Ordering::Relaxed
@@ -3111,6 +3531,7 @@ fn handle_status(
     // "I changed attic.toml, did Attic actually use it?" — `effective_resources`
     // is the ACTUAL EffectiveResourceConfig the running components received,
     // not just which mode was selected.
+    payload["knowledge"] = phase8.knowledge.clone();
     payload["resource_mode"] = json!(phase8.resource_mode.as_str());
     payload["resource_mode_source"] = json!(phase8.resource_mode_source.as_str());
     payload["effective_resources"] = json!({
@@ -3217,24 +3638,13 @@ fn handle_status(
             "loading"
         };
 
-        // Wall-clock chunks/sec over the last couple of minutes of `status`
-        // polls. A delta between consecutive polls alternated between 0 and a
-        // per-batch burst rate, which overstated and understated real speed.
-        let now = std::time::Instant::now();
-        let chunks_per_sec = {
-            let mut samples = SEMANTIC_PROGRESS_SAMPLES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            windowed_progress_rate(&mut samples, now, done, PROGRESS_RATE_WINDOW)
-        };
-        // batch_latency_ms is derived (not independently measured): the
-        // configured batch size divided by the real chunks/sec rate above.
-        let batch_size = phase8.effective_resources.embedding_batch_size.max(1) as f64;
-        let batch_latency_ms = if chunks_per_sec > 0.0 {
-            (batch_size / chunks_per_sec) * 1000.0
-        } else {
-            0.0
-        };
+        // Throughput measured by the enricher on every committed batch over
+        // a 5-minute window (idle gaps included), so the rate and ETA do not
+        // depend on how often a client polls `status`. `batch_latency_ms` is
+        // the measured mean claim-to-commit time of one batch.
+        let measured = attic_semantic::throughput::snapshot();
+        let chunks_per_sec = measured.chunks_per_sec;
+        let batch_latency_ms = measured.batch_latency_ms;
         let progress = attic_semantic::SemanticProgressSnapshot::compute(
             pending,
             inflight,
@@ -3265,7 +3675,12 @@ fn handle_status(
                 LAST_ADVANCE_SECS.store(now_secs, Ordering::SeqCst);
             }
             let last_advance = LAST_ADVANCE_SECS.load(Ordering::SeqCst);
-            let secs_since_advance = now_secs.saturating_sub(last_advance);
+            // Prefer the enricher's own commit clock; fall back to the
+            // poll-observed advance before the first commit of this process.
+            let secs_since_advance = measured
+                .secs_since_last_commit
+                .filter(|_| inflight > 0 || pending > 0)
+                .unwrap_or_else(|| now_secs.saturating_sub(last_advance));
             let stall = attic_semantic::diagnostics::assess_stall(
                 inflight,
                 done,
@@ -3292,10 +3707,14 @@ fn handle_status(
                     .collect();
                 payload["semantic_selection"] = json!({
                     "scanned": sel.scanned,
+                    "scan_truncated": sel.scan_truncated,
                     "selected": sel.selected,
                     "excluded": breakdown,
                     "top_exclusion_reason": excluded.first().map(|(k, _)| *k),
                 });
+            }
+            if let Some(eff) = SELECTION_EFFECTIVE.get() {
+                payload["semantic_selection_effective"] = eff.clone();
             }
         }
 
@@ -3308,18 +3727,27 @@ fn handle_status(
                     attic_storage::resource_manager::ResourceAdvisory::Restricted
                 )
             }),
+            // Real sampled availability; `min_free_memory_mib` is a configured
+            // reserve (e.g. 400), which made this read as "constrained" always.
             available_ram_mib: resource_monitor
-                .map(|m| m.min_free_memory_mib())
+                .and_then(|m| m.system_available_mib())
                 .unwrap_or(4096),
             queue_depth: pending + inflight,
-            queue_backpressure_active: (pending + inflight) >= 5000,
+            queue_backpressure_active: queue_is_growing(pending + inflight),
             canonical_indexing_active: resource_monitor
                 .is_some_and(|m| m.indexing_heavy_active() > 0),
-            semantic_inference_active: resource_monitor
-                .is_some_and(|m| m.embedding_heavy_active() > 0),
+            // Work is queued and the model is ready: embedding is running (the
+            // permit is only held inside a drive slice, so sampling it made
+            // the verdict flicker to "nominal" between slices).
+            semantic_inference_active: (pending + inflight) > 0,
             model_loading_or_warmup: !stack.provider.available(),
             mcp_high_latency: false,
             user_caps_active: false,
+            gpu_embedding,
+            host_ram_floor_breached: gpu_embedding
+                && resource_monitor
+                    .zip(embedding_class)
+                    .is_some_and(|(m, c)| m.embedding_parked(c)),
         };
         let why_slow = attic_semantic::diagnose_why_slow(&diag_ctx);
         payload["diagnostics"] = json!({
@@ -3368,7 +3796,7 @@ fn handle_status(
     let mut disabled = 0u64;
     for rs in &active_stats {
         let (state, watcher_json) = match (incremental.get(&rs.id), watch_mode.get(&rs.id)) {
-            (Some(svc), Some(mode)) => match svc.status_snapshot(pool) {
+            (Some(svc), Some(mode)) => match svc.status_snapshot(pool, &rs.id) {
                 Ok(snap) => {
                     let state = if snap.reconciliation_required {
                         "RECONCILIATION_REQUIRED"
@@ -3498,6 +3926,7 @@ fn handle_status(
 /// assembled context, verified claims and result/confidence verdicts; raw
 /// RetrievalPlan internals stay in `ops_retrieval_log`, not in the tool
 /// surface.
+#[allow(clippy::too_many_arguments)]
 fn handle_context(
     semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     pool: &DbPool,
@@ -3506,6 +3935,7 @@ fn handle_context(
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
     resource_advisory: attic_storage::resource_manager::ResourceAdvisory,
+    knowledge_repository_id: Option<String>,
 ) -> Result<CallToolResult, ServerError> {
     let query = args
         .get("query")
@@ -3545,6 +3975,7 @@ fn handle_context(
         // (§25/§26): historical/inactive repositories never feed retrieval.
         request.repository_ids = active_ids.iter().cloned().collect();
     }
+    request.knowledge_repository_id = knowledge_repository_id;
 
     let service = attic_retrieval::RetrievalService {
         readers: pool.clone(),
@@ -3629,14 +4060,17 @@ fn make_tools() -> Vec<Tool> {
             "search",
             "Hybrid search across indexed repositories: full-text (FTS5 query syntax) fused \
              with semantic nearest-neighbour candidates via reciprocal-rank fusion. Degrades \
-             to lexical-only while semantic embeddings are unavailable or disabled.",
+             to lexical-only while semantic embeddings are unavailable or disabled. Each \
+             result has a source_type (knowledge/documentation/code/config/test); \
+             scope=\"knowledge\" returns only project knowledge.",
             json_schema(json!({
                 "type": "object",
                 "properties": {
                     "query":         {"type":"string","description":"FTS5 query (max 512 chars)"},
                     "repository_id": {"type":"string","description":"Limit results to this repository UUID"},
                     "file_type":     {"type":"string","description":"Filter by file extension (max 32)"},
-                    "language":      {"type":"string","description":"Filter by detected language (max 64)"}
+                    "language":      {"type":"string","description":"Filter by detected language (max 64)"},
+                    "scope":         {"type":"string","enum":["all","knowledge"],"description":"\"knowledge\" = only project knowledge (central knowledge folder first, then repository knowledge/ folders). Default \"all\""}
                 },
                 "required": ["query"]
             })),
@@ -3660,13 +4094,15 @@ fn make_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "logging",
-            "Instant runtime kill switch for the persistent file log (<db-dir>/logs/attic.log.*). \
+            "Runtime control of the persistent file log (<home>/logs/attic.log.*): \
+             action=on (level defaults to info), off, level (requires level), or status. \
              Takes effect immediately in the already-running server — never requires a restart. \
              stderr output is unaffected and always on.",
             json_schema(json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type":"string","enum":["on","off","status"],"description":"Enable, disable, or query file logging"}
+                    "action": {"type":"string","enum":["on","off","level","status"],"description":"Enable, disable, change the level of, or query file logging"},
+                    "level": {"type":"string","enum":["error","warn","info","debug","trace"],"description":"File log verbosity for action=on|level (default info)"}
                 },
                 "required": ["action"]
             })),
@@ -3878,7 +4314,13 @@ impl ServerHandler for AtticServer {
                     .into());
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
-                "search" => handle_search(&pool, semantic.as_deref(), &args, &active_ids),
+                "search" => handle_search(
+                    &pool,
+                    semantic.as_deref(),
+                    &args,
+                    &active_ids,
+                    self.knowledge_repository_id().as_deref(),
+                ),
                 "repo_map" => {
                     let discovery_counters = lock_or_call_err!(
                         self.last_discovery_counters.read(),
@@ -3944,6 +4386,11 @@ impl ServerHandler for AtticServer {
                             effective_resources: self.effective_resources,
                             semantic: semantic.as_deref(),
                             attic_config: &self.attic_config,
+                            knowledge: self
+                                .knowledge
+                                .read()
+                                .map(|k| k.to_json())
+                                .unwrap_or(Value::Null),
                         },
                     )
                 }
@@ -3955,6 +4402,7 @@ impl ServerHandler for AtticServer {
                     &args,
                     &active_ids,
                     advisory,
+                    self.knowledge_repository_id(),
                 ),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
@@ -4339,6 +4787,12 @@ fn main() {
     if std::env::args().any(|a| a == "inference-worker") {
         std::process::exit(inference_worker::run_inference_worker());
     }
+    // `attic-server setup-models`: install-time model download (setup.ps1 /
+    // setup.sh). Runs before any runtime/logging setup; never starts a server.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("setup-models") {
+        std::process::exit(setup_models::run(&argv[2..]));
+    }
 
     // Configure global thread ceilings once at process startup before runtime initialization (§21)
     let max_threads = std::thread::available_parallelism()
@@ -4383,9 +4837,12 @@ async fn run() -> anyhow::Result<()> {
     // real "instant kill switch." The writer initializes the rolling file
     // appender lazily, so the `logs/` directory is not created while file
     // logging is OFF.
-    let file_log_writer = LazyFileLogWriter::new(db_path.with_file_name("logs"));
+    let file_log_writer = LazyFileLogWriter::new(attic_core::sibling(db_path, "logs"));
+    // `[logging] file_level` in attic.toml makes the level survive restarts
+    // (previously every launch started with the file log OFF, so a session
+    // could not be diagnosed afterwards unless someone re-enabled it first).
     let (file_level, log_reload_handle) =
-        tracing_subscriber::reload::Layer::new(tracing_subscriber::filter::LevelFilter::OFF);
+        tracing_subscriber::reload::Layer::new(configured_file_log_level(db_path));
     LOG_RELOAD_HANDLE
         .set(log_reload_handle)
         .map_err(|_| anyhow::anyhow!("log reload handle already initialized"))?;
@@ -4462,7 +4919,9 @@ async fn run() -> anyhow::Result<()> {
         db_path.display(),
         paths.home.display()
     );
-    if db_path.parent() != Some(paths.home.as_path()) {
+    if db_path.parent() != Some(paths.home.as_path())
+        && db_path.parent() != Some(paths.home.join("data").as_path())
+    {
         tracing::warn!(
             "ATTIC_HOME ({}) and ATTIC_DB_PATH's directory ({}) disagree; attic.toml/config.toml/\
              semantic.db/models will be colocated with the database at {}, not under ATTIC_HOME",
@@ -4586,31 +5045,46 @@ pub(crate) fn build_server_and_enricher(
                     max_file_bytes = defaults.max_file_bytes,
                     "semantic selection defaults (attic.toml values override)"
                 );
-                attic_semantic::SelectionConfig {
-                    exclude_globs: server.attic_config.semantic.exclude_globs.clone(),
-                    max_file_bytes: server
-                        .attic_config
-                        .semantic
-                        .max_file_bytes
-                        .unwrap_or(defaults.max_file_bytes),
-                    min_score: server
-                        .attic_config
-                        .semantic
-                        .min_score
-                        .unwrap_or(defaults.min_score),
-                    max_units_per_repo: server
-                        .attic_config
-                        .semantic
+                let sem = &server.attic_config.semantic;
+                let effective = attic_semantic::SelectionConfig {
+                    exclude_globs: sem.exclude_globs.clone(),
+                    max_file_bytes: sem.max_file_bytes.unwrap_or(defaults.max_file_bytes),
+                    min_score: sem.min_score.unwrap_or(defaults.min_score),
+                    max_units_per_repo: sem
                         .max_units_per_repo
                         .unwrap_or(defaults.max_units_per_repo),
-                    max_units_total: server
-                        .attic_config
-                        .semantic
-                        .max_units_total
-                        .unwrap_or(defaults.max_units_total),
+                    max_units_total: sem.max_units_total.unwrap_or(defaults.max_units_total),
                     ..defaults
-                }
+                };
+                // Record what reconcile will actually use, with the origin of
+                // each value, so `status` answers "which defaults am I on?"
+                // without anyone reverse-engineering it from attic.toml.
+                let defaults_label = if gpu_backend {
+                    "gpu_defaults"
+                } else {
+                    "cpu_defaults"
+                };
+                let src = |set: bool| if set { "attic.toml" } else { defaults_label };
+                let _ = SELECTION_EFFECTIVE.set(json!({
+                    "profile": defaults_label,
+                    "min_score": effective.min_score,
+                    "max_units_per_repo": effective.max_units_per_repo,
+                    "max_file_bytes": effective.max_file_bytes,
+                    "max_units_total": effective.max_units_total,
+                    "source": {
+                        "min_score": src(sem.min_score.is_some()),
+                        "max_units_per_repo": src(sem.max_units_per_repo.is_some()),
+                        "max_file_bytes": src(sem.max_file_bytes.is_some()),
+                        "max_units_total": src(sem.max_units_total.is_some()),
+                    },
+                }));
+                effective
             },
+            // Integrated GPUs share host RAM, so they stay under the host-RAM
+            // pressure gate; a dedicated GPU is exempt (see enrich.rs).
+            gpu_unified_memory: *GPU_UNIFIED_MEMORY.get_or_init(|| {
+                attic_storage::gpu_telemetry::query_adapter_info().is_some_and(|a| a.integrated)
+            }),
             ..attic_semantic::EnrichmentConfig::default()
         };
         semantic_enricher = Some(attic_semantic::BackgroundEnricher::spawn(
@@ -4678,6 +5152,24 @@ pub(crate) fn build_server_and_enricher(
         root_count = roots.len(),
         "workspace configuration resolved"
     );
+    for root in &roots {
+        info!(root = %root.display(), source = ?config_source, "startup workspace root");
+    }
+
+    // Repository-removal data eviction (STALE_EVICTION tasks). Started only
+    // now — after recovery, the integrity check and with `active_roots`
+    // populated — so a leftover task for a root that is configured again is
+    // recognised as re-added and cancelled instead of deleting live data.
+    eviction::spawn_evictor(
+        server.pool.clone(),
+        server.writer.clone(),
+        server.semantic.clone(),
+        server.active_roots.clone(),
+    );
+
+    // Central knowledge folder: independent of workspace roots, so it is
+    // indexed even when no repository is configured yet.
+    server.start_central_knowledge();
 
     if !roots.is_empty() {
         let startup_server = server.clone();
@@ -5048,10 +5540,7 @@ pub(crate) async fn run_shutdown_sequence(
 
             if let Err(e) = attic_storage::connection::backup_database(
                 &db_path,
-                &db_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(attic_core::resources::BACKUP_RELATIVE_DIR),
+                &attic_core::sibling(&db_path, attic_core::resources::BACKUP_RELATIVE_DIR),
             ) {
                 warn!("shutdown backup failed (best-effort): {e}");
             }
@@ -5103,29 +5592,54 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn progress_rate_is_wall_clock_over_the_window_not_per_poll() {
+    fn file_log_level_comes_from_attic_toml() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("attic.db");
+        assert_eq!(configured_file_log_level(&db), LevelFilter::OFF);
+        fs::write(
+            tmp.path().join("attic.toml"),
+            "[logging]\nfile_level = \"debug\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured_file_log_level(&db), LevelFilter::DEBUG);
+        assert_eq!(level_filter_from_name("TRACE"), Some(LevelFilter::TRACE));
+        assert_eq!(level_filter_from_name("verbose"), None);
+    }
+
+    #[test]
+    fn backpressure_only_when_a_large_queue_grows() {
         use std::time::{Duration, Instant};
-        let mut s = std::collections::VecDeque::new();
+        let sample = std::sync::Mutex::new(None);
         let t0 = Instant::now();
-        let w = Duration::from_secs(120);
-        assert_eq!(windowed_progress_rate(&mut s, t0, 0, w), 0.0);
-        // A 128-chunk batch every 20 s, polled every 10 s: the per-poll delta
-        // flipped 0 / 12.8; the windowed rate is the true 6.4.
-        let mut done = 0;
-        let mut last = 0.0;
-        for i in 1..=12u64 {
-            if i % 2 == 0 {
-                done += 128;
-            }
-            last = windowed_progress_rate(&mut s, t0 + Duration::from_secs(i * 10), done, w);
-        }
-        assert!((last - 6.4).abs() < 0.01, "rate {last}");
-        // Going backwards (queue reset) restarts the window instead of
-        // producing a negative/garbage rate.
-        assert_eq!(
-            windowed_progress_rate(&mut s, t0 + Duration::from_secs(130), 0, w),
-            0.0
+        assert!(
+            !queue_is_growing_at(&sample, t0, 36_000),
+            "first sample has no trend"
         );
+        // Draining (the normal case during a long GPU run).
+        assert!(!queue_is_growing_at(
+            &sample,
+            t0 + Duration::from_secs(40),
+            33_000
+        ));
+        assert!(!queue_is_growing_at(
+            &sample,
+            t0 + Duration::from_secs(80),
+            30_000
+        ));
+        // Growing and large: backpressure.
+        assert!(queue_is_growing_at(
+            &sample,
+            t0 + Duration::from_secs(120),
+            34_000
+        ));
+        // Growing but small: not backpressure.
+        let small = std::sync::Mutex::new(None);
+        queue_is_growing_at(&small, t0, 100);
+        assert!(!queue_is_growing_at(
+            &small,
+            t0 + Duration::from_secs(40),
+            900
+        ));
     }
 
     fn make_server(tmp: &TempDir) -> AtticServer {
@@ -5152,6 +5666,7 @@ mod tests {
             .apply_fallback_safety_limits(),
             semantic: None,
             attic_config: Box::leak(Box::new(attic_core::AtticConfig::default())),
+            knowledge: KnowledgeState::default().to_json(),
         }
     }
 
@@ -6078,6 +6593,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashSet::new(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -6089,7 +6605,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut a = HashMap::new();
         a.insert("query".into(), json!("x".repeat(513)));
-        assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new()).is_err());
+        assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).is_err());
     }
 
     #[test]
@@ -6098,7 +6614,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello"));
         a.insert("repository_id".into(), json!("bad!id"));
-        assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new()).is_err());
+        assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).is_err());
     }
 
     #[test]
@@ -6106,10 +6622,238 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello"));
-        let r = handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new()).unwrap();
+        let r = handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).unwrap();
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert!(v["results"].is_array());
+    }
+
+    // ── central knowledge folder ([knowledge] dir) ─────────────────────────
+
+    #[test]
+    fn knowledge_dir_resolution_reports_reasons_and_never_panics() {
+        let tmp = TempDir::new().unwrap();
+        let default_dir = tmp.path().join("home-knowledge");
+
+        // Default: on, folder created.
+        let none = attic_core::KnowledgeConfig::default();
+        let got = resolve_knowledge_dir(&none, &default_dir).unwrap().unwrap();
+        assert!(default_dir.is_dir(), "default folder must be created");
+        assert_eq!(got, std::fs::canonicalize(&default_dir).unwrap());
+
+        // Turned off: nothing resolved.
+        let off = attic_core::KnowledgeConfig {
+            enabled: false,
+            dir: None,
+        };
+        assert_eq!(resolve_knowledge_dir(&off, &default_dir), Ok(None));
+
+        // A configured dir is never created.
+        let missing_path = tmp.path().join("nope");
+        let missing = attic_core::KnowledgeConfig {
+            enabled: true,
+            dir: Some(missing_path.display().to_string()),
+        };
+        assert!(
+            resolve_knowledge_dir(&missing, &default_dir)
+                .unwrap_err()
+                .contains("not accessible")
+        );
+        assert!(!missing_path.exists(), "configured dir must not be created");
+
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "x").unwrap();
+        let not_dir = attic_core::KnowledgeConfig {
+            enabled: true,
+            dir: Some(file.display().to_string()),
+        };
+        assert!(
+            resolve_knowledge_dir(&not_dir, &default_dir)
+                .unwrap_err()
+                .contains("not a directory")
+        );
+
+        let ok = attic_core::KnowledgeConfig {
+            enabled: true,
+            dir: Some(tmp.path().display().to_string()),
+        };
+        assert_eq!(
+            resolve_knowledge_dir(&ok, &default_dir).unwrap(),
+            Some(std::fs::canonicalize(tmp.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_knowledge_dir_is_reported_in_status_state_without_failing() {
+        let tmp = TempDir::new().unwrap();
+        let mut srv = make_server(&tmp);
+        srv.attic_config.knowledge.dir = Some(tmp.path().join("missing").display().to_string());
+        srv.start_central_knowledge();
+        let k = srv.knowledge.read().unwrap().to_json();
+        assert_eq!(k["state"], "failed", "{k}");
+        assert!(
+            k["reason"].as_str().unwrap().contains("not accessible"),
+            "{k}"
+        );
+        assert!(srv.knowledge_repository_id().is_none());
+    }
+
+    #[test]
+    fn disabled_knowledge_reports_off() {
+        let tmp = TempDir::new().unwrap();
+        let mut srv = make_server(&tmp);
+        srv.attic_config.knowledge.enabled = false;
+        srv.start_central_knowledge();
+        assert_eq!(srv.knowledge.read().unwrap().to_json()["state"], "off");
+        assert!(srv.knowledge_repository_id().is_none());
+        assert!(
+            !attic_core::sibling(&srv.db_path, "knowledge").exists(),
+            "a disabled feature must not create the folder"
+        );
+    }
+
+    /// With no `[knowledge]` table the default folder next to the database
+    /// is created and indexed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_knowledge_folder_is_created_and_indexed() {
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        srv.start_central_knowledge();
+        let expected = attic_core::sibling(&srv.db_path, "knowledge");
+        assert!(expected.is_dir(), "default folder must exist");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let kid = loop {
+            if let Some(id) = srv.knowledge_repository_id() {
+                break id;
+            }
+            let k = srv.knowledge.read().unwrap().to_json();
+            assert_ne!(k["state"], "failed", "{k}");
+            assert!(std::time::Instant::now() < deadline, "never indexed");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let k = srv.knowledge.read().unwrap().to_json();
+        assert_eq!(k["state"], "ready", "{k}");
+        assert_eq!(
+            k["dir"],
+            std::fs::canonicalize(&expected)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        srv.stop_watcher(&kid);
+    }
+
+    /// End to end through the server: the folder is indexed at startup
+    /// without joining the workspace, `context` about ANOTHER repository
+    /// serves its note, and `search` labels and scopes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn central_knowledge_folder_serves_context_and_search() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let mut srv = make_server(&tmp);
+        let code = tmp.path().join("code");
+        fs::create_dir_all(code.join("src")).unwrap();
+        fs::write(
+            code.join("src/billing.py"),
+            "def refund_window():\n    return 'refund window refund window'\n",
+        )
+        .unwrap();
+        let notes = tmp.path().join("knowledge");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(
+            notes.join("billing.md"),
+            "# Billing\n\nThe refund window is 30 days, set by finance.\n",
+        )
+        .unwrap();
+        fs::write(notes.join("README.md"), "Put refund window notes here.\n").unwrap();
+        srv.attic_config.knowledge.dir = Some(notes.display().to_string());
+
+        let code_id = srv.bootstrap_workspace(&code).unwrap();
+        srv.start_central_knowledge();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let kid = loop {
+            if let Some(id) = srv.knowledge_repository_id() {
+                break id;
+            }
+            let k = srv.knowledge.read().unwrap().to_json();
+            assert_ne!(k["state"], "failed", "{k}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "knowledge never indexed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(srv.knowledge.read().unwrap().to_json()["state"], "ready");
+        let active: HashSet<String> = [code_id.clone()].into();
+        assert!(
+            !active.contains(&kid),
+            "knowledge must not be a workspace member"
+        );
+
+        // context about the CODE repository serves the central note.
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("What is the refund window?"));
+        a.insert("repository_id".into(), json!(code_id));
+        let r = handle_context(
+            None,
+            &srv.pool,
+            &srv.writer,
+            false,
+            &a,
+            &active,
+            attic_storage::resource_manager::ResourceAdvisory::Ok,
+            Some(kid.clone()),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let ev = v["evidence"].as_array().unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| e["repository_id"] == kid.as_str() && e["path"] == "billing.md"),
+            "central note missing: {v}"
+        );
+        assert!(
+            !ev.iter().any(|e| e["path"] == "README.md"),
+            "folder README must be skipped: {v}"
+        );
+
+        // search: default results unchanged (no central hits) but labelled.
+        let mut s = HashMap::new();
+        s.insert("query".into(), json!("refund"));
+        let r = handle_search(&srv.pool, None, &s, &active, Some(&kid)).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let res = v["results"].as_array().unwrap();
+        assert!(!res.is_empty());
+        assert!(
+            res.iter().all(|x| x["repository_id"] == code_id.as_str()),
+            "{v}"
+        );
+        assert!(res.iter().all(|x| x["source_type"] == "code"), "{v}");
+
+        // scope=knowledge: only knowledge, central note first, no README.
+        s.insert("scope".into(), json!("knowledge"));
+        let r = handle_search(&srv.pool, None, &s, &active, Some(&kid)).unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        let res = v["results"].as_array().unwrap();
+        assert!(!res.is_empty(), "{v}");
+        assert!(res.iter().all(|x| x["source_type"] == "knowledge"), "{v}");
+        assert_eq!(res[0]["path"], "billing.md", "{v}");
+        assert!(!res.iter().any(|x| x["path"] == "README.md"), "{v}");
+
+        // Shutdown hygiene: stop the folder watcher this test started.
+        srv.stop_watcher(&kid);
+    }
+
+    #[test]
+    fn search_rejects_unknown_scope() {
+        let tmp = TempDir::new().unwrap();
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("x"));
+        a.insert("scope".into(), json!("docs"));
+        let e = handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("scope must be"), "{e}");
     }
 
     // handle_status
@@ -6133,6 +6877,10 @@ mod tests {
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(v["status"], "ok");
+        assert_eq!(
+            v["knowledge"]["state"], "off",
+            "status must report knowledge: {v}"
+        );
     }
 
     /// A repository row can exist before its watcher is registered (the
@@ -6272,7 +7020,19 @@ mod tests {
         assert_eq!(v["semantic_progress"]["total_queue_depth"], 2);
         assert!(v.get("diagnostics").is_some());
         assert!(v["diagnostics"]["why_slow"].is_string());
-        assert_eq!(v["diagnostics"]["bottleneck_code"], "nominal");
+        // Queued work on a ready provider is reported as embedding in
+        // progress (CPU here), with the queue size, not as "nominal".
+        assert_eq!(
+            v["diagnostics"]["bottleneck_code"], "semantic_cpu_inference",
+            "{}",
+            v["diagnostics"]
+        );
+        assert!(
+            v["diagnostics"]["why_slow"]
+                .as_str()
+                .unwrap()
+                .contains("2 queued chunks")
+        );
     }
 
     /// The residual case (no bootstrap in progress, no recorded watcher
@@ -6703,7 +7463,7 @@ mod tests {
         let mut a = HashMap::new();
         a.insert("query".into(), json!("hello_world"));
         a.insert("repository_id".into(), json!(repo_id.clone()));
-        let r2 = handle_search(&srv.pool, None, &a, &ids(&srv)).unwrap();
+        let r2 = handle_search(&srv.pool, None, &a, &ids(&srv), None).unwrap();
         let v2: Value = serde_json::from_str(&text_of(&r2)).unwrap();
         let results = v2["results"].as_array().expect("results array");
         assert!(

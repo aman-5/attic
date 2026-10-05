@@ -98,9 +98,10 @@ fn reindexed_unchanged_content_is_reused_not_re_embedded() {
     )
     .expect("re-index");
 
-    // Second pass: same content under new identities. Reconcile enqueues the
-    // new units; drive must satisfy every one of them from the canonical
-    // vectors — the provider sees nothing new.
+    // Second pass: same content under new identities. Reconcile recognises
+    // every canonical body as already embedded: nothing is queued for
+    // inference, and the new units are projected from the stored vectors
+    // during reconcile itself.
     {
         let conn = fx.read_conn();
         let report = attic_semantic::reconcile(
@@ -110,11 +111,12 @@ fn reindexed_unchanged_content_is_reused_not_re_embedded() {
             &SelectionConfig::default(),
         )
         .unwrap();
+        assert_eq!(report.newly_enqueued, 0, "{report:?}");
         assert!(
-            report.enqueued > 0,
-            "the new generation's units must be enqueued: {report:?}"
+            report.reused > 0,
+            "the new generation's units must be written via reuse: {report:?}"
         );
-        let stats = attic_semantic::drive(
+        attic_semantic::drive(
             &conn,
             &store,
             provider.as_ref(),
@@ -122,10 +124,6 @@ fn reindexed_unchanged_content_is_reused_not_re_embedded() {
             &CancelFlag::new(),
         )
         .unwrap();
-        assert!(
-            stats.embedded > 0,
-            "the new generation's units must still be written, via reuse"
-        );
     }
 
     let seen_after_second = provider.seen_texts.lock().unwrap().len();

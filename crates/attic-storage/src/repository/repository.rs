@@ -65,6 +65,21 @@ pub fn upsert_repository(
     Ok(())
 }
 
+/// Stored display name of a repository, or `None` if it does not exist.
+pub fn get_repository_display_name(
+    conn: &Connection,
+    id: &RepositoryId,
+) -> Result<Option<String>, StorageError> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT display_name FROM core_repositories WHERE id = ?1",
+            [id.to_string_repr()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Return per-repository file and unit counts for all indexed repositories.
 ///
 /// Counts only the **latest, still-`present`** occurrence per path — not

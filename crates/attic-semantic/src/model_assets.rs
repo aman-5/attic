@@ -245,12 +245,34 @@ impl ModelAssetManager {
             fs::create_dir_all(parent)?;
         }
 
-        if target_dir.exists() {
-            fs::remove_dir_all(&target_dir)?;
-        }
+        // Never delete the active snapshot before its replacement is in
+        // place: move it aside, rename staging in, then drop the backup. A
+        // failed rename restores the backup; a crash in between leaves the
+        // previous snapshot recoverable beside the target (`.previous-*`).
+        let backup = if target_dir.exists() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let backup = target_dir.with_file_name(format!(
+                "{}.previous-{stamp}",
+                self.manifest.pinned_revision
+            ));
+            fs::rename(&target_dir, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
 
-        // Atomic directory rename
-        fs::rename(staging, &target_dir)?;
+        if let Err(e) = fs::rename(staging, &target_dir) {
+            if let Some(b) = &backup {
+                let _ = fs::rename(b, &target_dir);
+            }
+            return Err(e.into());
+        }
+        if let Some(b) = backup {
+            let _ = fs::remove_dir_all(b);
+        }
 
         // Update refs/main pointer
         let repo_root = self.base_dir.join(format!(

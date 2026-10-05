@@ -155,8 +155,26 @@ pub struct IndexingStore<'a> {
 // Public options / result
 // ---------------------------------------------------------------------------
 
+/// Placeholder `IndexOptions::repository_name`. When a caller keeps it, the
+/// repository is named after its root folder instead.
+pub const DEFAULT_REPOSITORY_NAME: &str = "default";
+
+/// Name stored for the repository at `root`: an explicitly configured
+/// `repository_name`, else the root folder's own name.
+pub fn repository_display_name(root: &Path, opts: &IndexOptions) -> String {
+    if opts.repository_name != DEFAULT_REPOSITORY_NAME {
+        return opts.repository_name.clone();
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
+    /// Display name for the repository; [`DEFAULT_REPOSITORY_NAME`] means
+    /// "use the root folder's name".
     pub repository_name: String,
     pub max_units_per_file: usize,
     pub refresh_existing: bool,
@@ -224,7 +242,7 @@ const ANALYSIS_STRIPE_MIN_FILES: usize = 32;
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
-            repository_name: "default".to_owned(),
+            repository_name: DEFAULT_REPOSITORY_NAME.to_owned(),
             // Fail-closed per-file unit ceiling (r01). Sized from the measured
             // worst case in the target corpora (~9,700 units for a 4.5 MiB
             // JSON export) with ~10x headroom. Exceeding it aborts the run
@@ -690,9 +708,21 @@ pub fn index_repository_with_cancellation(
         Some(id) => id,
         None => RepositoryId::new_v4(),
     };
+    // Display name: an explicit `repository_name`, else the root folder's
+    // name. Every server-indexed repository used to be stored as "default",
+    // so the status of a 21-repository workspace was unreadable. Existing
+    // rows still carrying a different name are renamed on their next run.
+    let display_name = repository_display_name(root, opts);
+    let stored_name: Option<String> = match existing_repo_id {
+        Some(id) => store
+            .readers
+            .with_reader(|c| attic_storage::get_repository_display_name(c, &id))
+            .map_err(IndexError::Storage)?,
+        None => None,
+    };
     let repo_upsert = match existing_repo_id {
-        None => Some((root_str.to_string(), opts.repository_name.clone())),
-        Some(_) => None,
+        Some(_) if stored_name.as_deref() == Some(display_name.as_str()) => None,
+        _ => Some((root_str.to_string(), display_name)),
     };
 
     // PR-7: persist the repository row now, before analysis, rather than
@@ -2130,11 +2160,14 @@ mod tests {
     /// Mirrors exactly how `attic-server` constructs its endpoints; there is
     /// no way to obtain a raw write connection through this helper's output.
     struct StoreFixture {
-        _dir: TempDir,
         db_path: std::path::PathBuf,
         pool: DbPool,
         _queue: WriterQueue,
         handle: WriterQueueHandle,
+        /// Declared LAST: fields drop in order, so the directory is removed only
+        /// after every SQLite handle above is closed (Windows cannot delete open
+        /// files, which silently leaked one temp dir per test).
+        _dir: TempDir,
     }
 
     fn make_store() -> StoreFixture {
@@ -2441,6 +2474,47 @@ mod tests {
     // -----------------------------------------------------------------------
     // E2E: real data actually reaches the database
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn repositories_are_named_after_their_folder_and_renamed_from_default() {
+        let fx = make_store();
+        let root = fx._dir.path().join("HDFC_FormsCommon");
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "a.rs", "fn named_repo_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let s = store(&fx);
+        let name_of = |id: &str| -> String {
+            fx.pool
+                .with_reader(|c| {
+                    Ok(c.query_row(
+                        "SELECT display_name FROM core_repositories WHERE id = ?1",
+                        [id],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+
+        let r = index_repository(&s, &root, &policy, &IndexOptions::default()).unwrap();
+        assert_eq!(name_of(&r.repository_id), "HDFC_FormsCommon");
+
+        // A row left over as "default" by an older build is renamed on the
+        // next run; an explicit name still wins.
+        fx.handle
+            .send(|c| {
+                c.execute("UPDATE core_repositories SET display_name = 'default'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        index_repository(&s, &root, &policy, &IndexOptions::default()).unwrap();
+        assert_eq!(name_of(&r.repository_id), "HDFC_FormsCommon");
+        let named = IndexOptions {
+            repository_name: "forms-common".into(),
+            ..Default::default()
+        };
+        index_repository(&s, &root, &policy, &named).unwrap();
+        assert_eq!(name_of(&r.repository_id), "forms-common");
+    }
 
     #[test]
     fn e2e_repository_scoped_search() {

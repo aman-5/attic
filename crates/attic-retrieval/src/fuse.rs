@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::candidates::{Candidate, RetrieverKind};
+use crate::candidates::Candidate;
 
 /// Fuse candidates by their evidence `fusion_key`.
 ///
@@ -30,15 +30,25 @@ pub fn fuse(candidates: Vec<Candidate>) -> Vec<crate::candidates::Candidate> {
 
     let mut out = Vec::with_capacity(fused.len());
     for mut group in fused {
+        // Non-finite confidence is treated as 0 so it can neither win the
+        // representative slot nor make the ordering input-dependent.
+        for c in group.iter_mut() {
+            if !c.evidence.confidence.is_finite() {
+                c.evidence.confidence = 0.0;
+            }
+        }
         // Deterministic representative: highest confidence, then lowest id.
         group.sort_by(|a, b| {
             b.evidence
                 .confidence
-                .partial_cmp(&a.evidence.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.evidence.confidence)
                 .then_with(|| a.evidence.id.cmp(&b.evidence.id))
         });
-        let mut rep = group.swap_remove(0).evidence;
+        let rep_candidate = group.swap_remove(0);
+        // Keep the representative's real origin; it used to be relabelled
+        // as FTS whatever retriever actually produced it.
+        let kind = rep_candidate.kind;
+        let mut rep = rep_candidate.evidence;
         for other in &group {
             rep.signals.merge_max(&other.evidence.signals);
             for src in &other.evidence.retrieval_sources {
@@ -56,7 +66,7 @@ pub fn fuse(candidates: Vec<Candidate>) -> Vec<crate::candidates::Candidate> {
         let origins = rep.retrieval_sources.len().min(3) as f64;
         rep.confidence = (rep.confidence * 0.85 + origins * 0.05).clamp(0.0, 0.99);
         out.push(Candidate {
-            kind: RetrieverKind::Fts,
+            kind,
             evidence: rep,
         });
     }
@@ -66,8 +76,24 @@ pub fn fuse(candidates: Vec<Candidate>) -> Vec<crate::candidates::Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidates::RetrieverKind;
     use attic_core::SourceSpan;
     use attic_evidence::{Evidence, EvidenceSourceType};
+
+    #[test]
+    fn fused_candidate_keeps_representative_kind_and_ignores_nan() {
+        let mut a = cand("e1", EvidenceSourceType::SourceCode, "fo-1", 10, f64::NAN);
+        a.kind = RetrieverKind::Fts;
+        let mut b = cand("e2", EvidenceSourceType::SourceCode, "fo-1", 10, 0.7);
+        b.kind = RetrieverKind::Symbol;
+        b.evidence.retrieval_sources[0].retriever_type = "SYMBOL".to_owned();
+        for input in [vec![a.clone(), b.clone()], vec![b, a]] {
+            let fused = fuse(input);
+            assert_eq!(fused.len(), 1);
+            assert_eq!(fused[0].kind, RetrieverKind::Symbol, "origin preserved");
+            assert!(fused[0].evidence.confidence.is_finite());
+        }
+    }
 
     fn cand(id: &str, st: EvidenceSourceType, src_id: &str, line: u32, conf: f64) -> Candidate {
         let mut ev = Evidence::new(id, "repo");

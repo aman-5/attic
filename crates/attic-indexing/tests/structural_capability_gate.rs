@@ -62,7 +62,6 @@ const SEED: &[(&str, &str)] = &[
 ];
 
 struct Bench {
-    _dir: TempDir,
     #[allow(dead_code)]
     root: PathBuf,
     pool: attic_storage::DbPool,
@@ -71,6 +70,10 @@ struct Bench {
     writer: WriterQueueHandle,
     #[allow(dead_code)]
     repo_id: String,
+    /// Declared LAST: fields drop in order, so the directory is removed only
+    /// after every SQLite handle above is closed (Windows cannot delete open
+    /// files, which silently leaked one temp dir per test).
+    _dir: TempDir,
 }
 
 impl Bench {

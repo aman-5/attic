@@ -54,6 +54,10 @@ pub struct SemanticUnitRow {
     /// the analyzer produced a decorated retrieval unit, else
     /// `retrieval_text`. Occurrence headers/metadata are never embedded.
     pub canonical_text: String,
+    /// Byte length of `canonical_text` as read. Kept separately so a
+    /// selection pass can drop the text itself after hashing (bounded memory
+    /// over workspaces with hundreds of thousands of units).
+    pub canonical_len: usize,
 }
 
 const SEMANTIC_UNIT_SQL: &str = r"
@@ -75,6 +79,15 @@ SELECT u.id, u.repository_id, u.file_occurrence_id, u.index_generation_id,
    AND o.existence_state  != 'deleted'
    AND o.existence_state  != 'excluded'
    AND o.freshness_state  != 'INVALID'
+   -- A repository removed from the workspace is never (re)selected for
+   -- embedding while its data is being evicted.
+   AND u.repository_id NOT IN (
+       SELECT json_extract(t.checkpoint_json, '$.repository_id')
+         FROM ops_tasks t
+        WHERE t.task_type = 'STALE_EVICTION'
+          AND t.state IN ('PENDING', 'RUNNING')
+          AND json_extract(t.checkpoint_json, '$.repository_id') IS NOT NULL)
+   AND u.id > ?2
  ORDER BY u.id ASC
  LIMIT ?1
 ";
@@ -84,33 +97,49 @@ pub fn semantic_unit_rows(
     conn: &Connection,
     max_rows: u32,
 ) -> Result<Vec<SemanticUnitRow>, StorageError> {
-    let mut stmt = conn.prepare(SEMANTIC_UNIT_SQL)?;
-    let mut rows = stmt.query(params![max_rows as i64])?;
+    semantic_unit_rows_after(conn, "", max_rows)
+}
+
+/// One page of selectable units with `unit_id > after_unit_id`, ordered by
+/// unit id (keyset pagination: pass the last id of the previous page).
+pub fn semantic_unit_rows_after(
+    conn: &Connection,
+    after_unit_id: &str,
+    max_rows: u32,
+) -> Result<Vec<SemanticUnitRow>, StorageError> {
+    let mut stmt = conn.prepare_cached(SEMANTIC_UNIT_SQL)?;
+    let mut rows = stmt.query(params![max_rows as i64, after_unit_id])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
-        out.push(SemanticUnitRow {
-            unit_id: r.get(0)?,
-            repository_id: r.get(1)?,
-            file_occurrence_id: r.get(2)?,
-            index_generation_id: r.get(3)?,
-            retrieval_text: r.get(4)?,
-            lexical_state: r.get(5)?,
-            freshness_state: r.get(6)?,
-            is_redacted: r.get::<_, i64>(7)? != 0,
-            path: r.get(8)?,
-            source_revision_id: r.get(9)?,
-            content_hash: r.get(10)?,
-            file_type: r.get(11)?,
-            discovery_class: r.get(12)?,
-            last_indexed_at_us: r.get(13)?,
-            unit_node_count: r.get(14)?,
-            file_symbol_defs: r.get(15)?,
-            size_bytes: r.get(16)?,
-            canonical_hash: r.get(17)?,
-            canonical_text: r.get(18)?,
-        });
+        out.push(semantic_unit_row(r)?);
     }
     Ok(out)
+}
+
+fn semantic_unit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SemanticUnitRow> {
+    let canonical_text: String = r.get(18)?;
+    Ok(SemanticUnitRow {
+        unit_id: r.get(0)?,
+        repository_id: r.get(1)?,
+        file_occurrence_id: r.get(2)?,
+        index_generation_id: r.get(3)?,
+        retrieval_text: r.get(4)?,
+        lexical_state: r.get(5)?,
+        freshness_state: r.get(6)?,
+        is_redacted: r.get::<_, i64>(7)? != 0,
+        path: r.get(8)?,
+        source_revision_id: r.get(9)?,
+        content_hash: r.get(10)?,
+        file_type: r.get(11)?,
+        discovery_class: r.get(12)?,
+        last_indexed_at_us: r.get(13)?,
+        unit_node_count: r.get(14)?,
+        file_symbol_defs: r.get(15)?,
+        size_bytes: r.get(16)?,
+        canonical_hash: r.get(17)?,
+        canonical_len: canonical_text.len(),
+        canonical_text,
+    })
 }
 
 /// The same rows restricted to an explicit id set (enrichment input build).
@@ -150,27 +179,7 @@ pub fn semantic_units_by_ids(
             chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt.query(paramslice.as_slice())?;
         while let Some(r) = rows.next()? {
-            out.push(SemanticUnitRow {
-                unit_id: r.get(0)?,
-                repository_id: r.get(1)?,
-                file_occurrence_id: r.get(2)?,
-                index_generation_id: r.get(3)?,
-                retrieval_text: r.get(4)?,
-                lexical_state: r.get(5)?,
-                freshness_state: r.get(6)?,
-                is_redacted: r.get::<_, i64>(7)? != 0,
-                path: r.get(8)?,
-                source_revision_id: r.get(9)?,
-                content_hash: r.get(10)?,
-                file_type: r.get(11)?,
-                discovery_class: r.get(12)?,
-                last_indexed_at_us: r.get(13)?,
-                unit_node_count: r.get(14)?,
-                file_symbol_defs: r.get(15)?,
-                size_bytes: r.get(16)?,
-                canonical_hash: r.get(17)?,
-                canonical_text: r.get(18)?,
-            });
+            out.push(semantic_unit_row(r)?);
         }
     }
     Ok(out)

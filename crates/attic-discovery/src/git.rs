@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 
 use crate::error::DiscoveryError;
 
+/// Dependency / build-output directory names never searched for nested
+/// repositories (a subset of the default discovery exclusions).
+const NESTED_REPO_PRUNE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "out",
+    "coverage",
+    "__pycache__",
+    "venv",
+    "_site",
+];
+
 /// Metadata extracted from a Git repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRepoMeta {
@@ -56,7 +70,18 @@ pub fn discover_nested_git_roots(
         .hidden(true)
         .follow_links(false)
         .threads(1)
-        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
+        // Never descend into `.git` or dependency/build-output trees: a
+        // repository root is never inside them, and walking them (a single
+        // `node_modules` can hold 100k+ entries) made adding a container
+        // root take minutes before any indexing started.
+        .filter_entry(|entry| {
+            let name = entry.file_name();
+            name != std::ffi::OsStr::new(".git")
+                && !(entry.file_type().is_some_and(|t| t.is_dir())
+                    && NESTED_REPO_PRUNE_DIRS
+                        .iter()
+                        .any(|d| name == std::ffi::OsStr::new(d)))
+        });
 
     for entry in builder.build() {
         if cancellation.is_cancelled() {
@@ -379,6 +404,22 @@ mod tests {
                 repo_b.canonicalize().unwrap()
             ],
         );
+    }
+
+    #[test]
+    fn discover_nested_git_roots_skips_dependency_and_build_trees() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let real = root.join("svc");
+        let vendored = root.join("web/node_modules/pkg");
+        let built = root.join("target/checkout");
+        for d in [&real, &vendored, &built] {
+            fs::create_dir_all(d).unwrap();
+            make_bare_repo(d);
+        }
+        let roots =
+            discover_nested_git_roots(root, &attic_core::CancellationToken::default()).unwrap();
+        assert_eq!(roots, vec![real.canonicalize().unwrap()]);
     }
 
     #[test]

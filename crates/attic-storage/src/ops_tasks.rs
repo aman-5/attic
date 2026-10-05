@@ -17,6 +17,11 @@ use crate::error::StorageError;
 pub const TASK_INCREMENTAL_INDEX: &str = "INCREMENTAL_INDEX";
 /// Authoritative bounded rescan task type.
 pub const TASK_RECONCILIATION: &str = "RECONCILIATION";
+/// Repository-removal data eviction. Claimed ONLY by the dedicated evictor
+/// (`claim_next_pending_task_of_type`), never by the indexing scheduler.
+/// `repository_id` is NULL (the row must not pin `core_repositories`); the
+/// target repository id lives in `checkpoint_json` as `{"repository_id": ..}`.
+pub const TASK_STALE_EVICTION: &str = "STALE_EVICTION";
 
 /// Outcome of an idempotent enqueue attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +154,27 @@ pub fn claim_next_pending_task(
     conn: &Connection,
     now_us: i64,
 ) -> Result<Option<ClaimedTask>, StorageError> {
+    claim_pending(conn, now_us, None)
+}
+
+/// Claim the next PENDING task of exactly `task_type` (used by dedicated
+/// workers such as the repository evictor).
+pub fn claim_next_pending_task_of_type(
+    conn: &Connection,
+    task_type: &str,
+    now_us: i64,
+) -> Result<Option<ClaimedTask>, StorageError> {
+    claim_pending(conn, now_us, Some(task_type))
+}
+
+/// `only_type = None` claims any type EXCEPT the dedicated-worker types
+/// (`STALE_EVICTION`), so the indexing scheduler never takes — and fails —
+/// work it has no handler for.
+fn claim_pending(
+    conn: &Connection,
+    now_us: i64,
+    only_type: Option<&str>,
+) -> Result<Option<ClaimedTask>, StorageError> {
     use rusqlite::OptionalExtension;
     let claimed_id: Option<String> = conn
         .query_row(
@@ -157,11 +183,12 @@ pub fn claim_next_pending_task(
               WHERE id = (
                   SELECT id FROM ops_tasks
                    WHERE state = 'PENDING'
+                     AND ((?2 IS NULL AND task_type != ?3) OR task_type = ?2)
                    ORDER BY priority DESC, created_at ASC, id ASC
                    LIMIT 1
               )
               RETURNING id",
-            rusqlite::params![now_us],
+            rusqlite::params![now_us, only_type, TASK_STALE_EVICTION],
             |r| r.get(0),
         )
         .optional()?;
@@ -271,6 +298,17 @@ pub fn cancel_pending_task(
 // Recovery + status counts
 // ---------------------------------------------------------------------------
 
+/// Return one task left `RUNNING` (its outcome could not be recorded) to
+/// `PENDING` without counting a retry. Returns whether a row changed.
+pub fn reset_running_task(conn: &Connection, task_id: &str) -> Result<bool, StorageError> {
+    let n = conn.execute(
+        "UPDATE ops_tasks SET state = 'PENDING', started_at = NULL
+          WHERE id = ?1 AND state = 'RUNNING'",
+        rusqlite::params![task_id],
+    )?;
+    Ok(n > 0)
+}
+
 /// Reset tasks left `RUNNING` by a crash back to `PENDING`.
 ///
 /// Returns the number of rows reset.  Idempotent: a second call resets zero
@@ -352,6 +390,30 @@ pub fn get_task_counts(conn: &Connection) -> Result<TaskCounts, StorageError> {
              COALESCE(SUM(CASE WHEN state = 'FAILED'   THEN 1 ELSE 0 END), 0)
            FROM ops_tasks",
         [],
+        |r| {
+            Ok(TaskCounts {
+                pending: r.get(0)?,
+                running: r.get(1)?,
+                failed: r.get(2)?,
+            })
+        },
+    )?;
+    Ok(counts)
+}
+
+/// Task counts for ONE repository (tasks are keyed by `repository_id`).
+pub fn get_task_counts_for_repo(
+    conn: &Connection,
+    repository_id: &str,
+) -> Result<TaskCounts, StorageError> {
+    let counts = conn.query_row(
+        "SELECT
+             COALESCE(SUM(CASE WHEN state = 'PENDING'  THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN state = 'RUNNING'  THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN state = 'FAILED'   THEN 1 ELSE 0 END), 0)
+           FROM ops_tasks
+          WHERE repository_id = ?1",
+        [repository_id],
         |r| {
             Ok(TaskCounts {
                 pending: r.get(0)?,
@@ -566,6 +628,70 @@ mod tests {
             .unwrap();
         assert_eq!(state, "PENDING");
         assert_eq!(started, None);
+    }
+
+    #[test]
+    fn task_counts_for_repo_are_scoped() {
+        let conn = migrated_conn();
+        conn.execute_batch(
+            "INSERT INTO core_repositories (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at)
+               VALUES ('ra','/a','a',1,1,0,0), ('rb','/b','b',1,1,0,0);",
+        )
+        .unwrap();
+        enqueue_task(
+            &conn,
+            "t1",
+            Some("ra"),
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"1\"}",
+            1,
+        )
+        .unwrap();
+        enqueue_task(
+            &conn,
+            "t2",
+            Some("ra"),
+            TASK_INCREMENTAL_INDEX,
+            50,
+            "{\"dedup_key\":\"2\"}",
+            2,
+        )
+        .unwrap();
+        let a = get_task_counts_for_repo(&conn, "ra").unwrap();
+        let b = get_task_counts_for_repo(&conn, "rb").unwrap();
+        assert_eq!(a.pending, 2);
+        assert_eq!(b.pending, 0);
+        assert_eq!(get_task_counts(&conn).unwrap().pending, 2);
+    }
+
+    #[test]
+    fn reset_running_task_returns_only_that_task_to_pending() {
+        let conn = migrated_conn();
+        for id in ["t-a", "t-b"] {
+            enqueue_task(
+                &conn,
+                id,
+                None,
+                TASK_INCREMENTAL_INDEX,
+                50,
+                &format!("{{\"dedup_key\":\"{id}\"}}"),
+                1,
+            )
+            .unwrap();
+        }
+        let a = claim_next_pending_task(&conn, 10).unwrap().unwrap();
+        let b = claim_next_pending_task(&conn, 11).unwrap().unwrap();
+        assert!(reset_running_task(&conn, &a.id).unwrap());
+        assert!(!reset_running_task(&conn, &a.id).unwrap(), "idempotent");
+        let state = |id: &str| -> String {
+            conn.query_row("SELECT state FROM ops_tasks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(state(&a.id), "PENDING");
+        assert_eq!(state(&b.id), "RUNNING");
     }
 
     #[test]

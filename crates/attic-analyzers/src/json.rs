@@ -78,24 +78,62 @@ impl Analyzer for JsonAnalyzer {
         let bytes: Vec<u8> = match input.content {
             AnalyzerContent::FullBytes(b) | AnalyzerContent::RedactedBytes(b) => b,
             AnalyzerContent::StreamingHandle(mut stream) => {
-                // LargeFileStream is chunked, not std::io::Read — drain it.
+                // LargeFileStream is chunked, not std::io::Read — drain it,
+                // but never past the memory budget or time budget, and
+                // honour cancellation between chunks. Exceeding a limit is an
+                // ERROR so dispatch falls back to GenericAnalyzer, which
+                // streams the file and still indexes every byte.
+                // A parsed serde_json::Value costs several times its source
+                // size, so the raw document may use a quarter of the budget.
+                let max_bytes = usize::try_from(input.resource_budget.max_memory_bytes / 4)
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                let max_ms = input.resource_budget.max_time_ms;
                 let mut buf = Vec::new();
-                let mut read_failed = false;
+                let mut abort: Option<AnalyzerDiagnostic> = None;
                 loop {
+                    if input.cancellation_token.is_cancelled() {
+                        abort = Some(AnalyzerDiagnostic::warning(
+                            diagnostic_codes::CANCELLED,
+                            "JSON analysis cancelled while reading the stream",
+                        ));
+                        break;
+                    }
+                    if max_ms > 0 && start.elapsed().as_millis() as u64 > max_ms {
+                        abort = Some(AnalyzerDiagnostic::error(
+                            diagnostic_codes::RESOURCE_EXHAUSTED,
+                            format!(
+                                "JSON stream read exceeded the {max_ms} ms time budget; falling back to plain-text chunking"
+                            ),
+                        ));
+                        break;
+                    }
                     match stream.next_chunk() {
-                        Some(Ok(chunk)) => buf.extend_from_slice(chunk.redacted.as_bytes()),
+                        Some(Ok(chunk)) => {
+                            let bytes = chunk.redacted.as_bytes();
+                            if buf.len().saturating_add(bytes.len()) > max_bytes {
+                                abort = Some(AnalyzerDiagnostic::error(
+                                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                                    format!(
+                                        "JSON document exceeds the {max_bytes}-byte memory budget; falling back to plain-text chunking"
+                                    ),
+                                ));
+                                break;
+                            }
+                            buf.extend_from_slice(bytes);
+                        }
                         Some(Err(e)) => {
-                            diagnostics.push(AnalyzerDiagnostic::error(
+                            abort = Some(AnalyzerDiagnostic::error(
                                 diagnostic_codes::MALFORMED_INPUT,
                                 format!("failed to read JSON stream: {e}"),
                             ));
-                            read_failed = true;
                             break;
                         }
                         None => break,
                     }
                 }
-                if read_failed {
+                if let Some(d) = abort {
+                    diagnostics.push(d);
                     return self.empty_output(file_occurrence_id, diagnostics);
                 }
                 buf
@@ -146,6 +184,9 @@ impl Analyzer for JsonAnalyzer {
             env: env_label.as_deref(),
             cancelled: false,
             budget_reported: false,
+            depth: 0,
+            max_depth: input.resource_budget.max_recursion_depth.max(1),
+            depth_reported: false,
         };
         chunk_value(&value, "", &mut state, 0, &input.cancellation_token);
 
@@ -226,6 +267,10 @@ struct ChunkState<'a> {
     /// unit budget — the budget can be hit at many recursion levels; the
     /// diagnostic must appear exactly once, not once per aborted node.
     budget_reported: bool,
+    /// Current / maximum subtree recursion depth (`max_recursion_depth`).
+    depth: u32,
+    max_depth: u32,
+    depth_reported: bool,
 }
 
 impl ChunkState<'_> {
@@ -300,6 +345,26 @@ fn chunk_value(
     }
 
     let body = canonical(value);
+    if state.depth >= state.max_depth {
+        // Too deep to keep decomposing: emit this subtree as text pieces
+        // (every byte still represented) instead of recursing further.
+        if !state.depth_reported {
+            state.depth_reported = true;
+            // Every byte is still indexed, so this is UNIT_TRUNCATED (unit
+            // boundaries are synthetic), not RESOURCE_EXHAUSTED, which would
+            // mark the output incomplete and block publication.
+            state.diagnostics.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::UNIT_TRUNCATED,
+                format!(
+                    "JSON nesting exceeds max_recursion_depth ({}); deeper subtrees are chunked as text",
+                    state.max_depth
+                ),
+            ));
+        }
+        let header = format!("// json-pointer: {}\n", pointer);
+        push_text_pieces(state, &header, &body, ordinal_start, pointer);
+        return;
+    }
     let header = match state.env {
         Some(env) => format!("// json-pointer: {} (env: {})\n", pointer, env),
         None => format!("// json-pointer: {}\n", pointer),
@@ -318,7 +383,9 @@ fn chunk_value(
             keys.sort();
             for k in keys {
                 let child_ptr = format!("{}/{}", pointer, escape_pointer(k));
+                state.depth += 1;
                 chunk_value(&map[k], &child_ptr, state, ordinal_start, cancel);
+                state.depth -= 1;
                 if state.cancelled {
                     return;
                 }
@@ -331,7 +398,9 @@ fn chunk_value(
         serde_json::Value::Array(arr) => {
             for (i, item) in arr.iter().enumerate() {
                 let child_ptr = format!("{}/{}", pointer, i);
+                state.depth += 1;
                 chunk_value(item, &child_ptr, state, ordinal_start, cancel);
+                state.depth -= 1;
                 if state.cancelled {
                     return;
                 }
@@ -345,31 +414,46 @@ fn chunk_value(
         // base64 blob): split the canonical BODY at char boundaries rather
         // than drop it — every byte stays represented, and the header only
         // decorates the first piece's retrieval_text.
-        _ => {
-            let mut offset = 0usize;
-            let mut first = true;
-            while offset < body.len() && state.units.len() < state.max_units {
-                let mut end = (offset + TARGET_CHUNK_CHARS).min(body.len());
-                // MSRV 1.89 has no str::floor_char_boundary — walk back to
-                // the nearest UTF-8 char boundary manually.
-                while !body.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let piece_header = if first { header.clone() } else { String::new() };
-                push_unit(
-                    state,
-                    piece_header,
-                    &body[offset..end],
-                    ordinal_start,
-                    pointer,
-                );
-                first = false;
-                offset = end;
-            }
-            if offset < body.len() {
-                state.report_budget_exhausted();
-            }
+        _ => push_text_pieces(state, &header, &body, ordinal_start, pointer),
+    }
+}
+
+/// Emit `body` as consecutive char-boundary-safe pieces of at most
+/// `TARGET_CHUNK_CHARS` (header on the first piece only), stopping at the
+/// unit budget.
+fn push_text_pieces(
+    state: &mut ChunkState,
+    header: &str,
+    body: &str,
+    ordinal_start: u32,
+    pointer: &str,
+) {
+    let mut offset = 0usize;
+    let mut first = true;
+    while offset < body.len() && state.units.len() < state.max_units {
+        let mut end = (offset + TARGET_CHUNK_CHARS).min(body.len());
+        // MSRV 1.89 has no str::floor_char_boundary — walk back to
+        // the nearest UTF-8 char boundary manually.
+        while !body.is_char_boundary(end) {
+            end -= 1;
         }
+        let piece_header = if first {
+            header.to_string()
+        } else {
+            String::new()
+        };
+        push_unit(
+            state,
+            piece_header,
+            &body[offset..end],
+            ordinal_start,
+            pointer,
+        );
+        first = false;
+        offset = end;
+    }
+    if offset < body.len() {
+        state.report_budget_exhausted();
     }
 }
 
@@ -425,6 +509,41 @@ mod tests {
             cancellation_token: crate::cancellation::CancellationToken::default(),
             resource_budget: ResourceBudget::default(),
         }
+    }
+
+    #[test]
+    fn nesting_beyond_recursion_budget_is_chunked_as_text_not_recursed() {
+        // Oversized at every level so decomposition would otherwise recurse.
+        let big = "x".repeat(TARGET_CHUNK_CHARS);
+        let mut doc = format!("{{\"leaf\":\"{big}\",\"pad\":\"{big}\"}}");
+        for _ in 0..6 {
+            doc = format!("{{\"k\":{doc},\"pad\":\"{big}\"}}");
+        }
+        let mut input = input_for(&doc, "deep.json");
+        input.resource_budget.max_recursion_depth = 2;
+        let out = JsonAnalyzer::new().analyze(input);
+        assert!(!out.retrieval_units.is_empty());
+        assert!(out.diagnostics.iter().any(|d| {
+            d.code == diagnostic_codes::UNIT_TRUNCATED && d.message.contains("max_recursion_depth")
+        }));
+        let max_ptr_depth = out
+            .retrieval_units
+            .iter()
+            .filter_map(|u| u.occurrence_metadata.as_deref())
+            .map(|m| m.matches('/').count())
+            .max()
+            .unwrap();
+        assert!(
+            max_ptr_depth <= 2,
+            "recursed past the budget: {max_ptr_depth}"
+        );
+        // Every byte of the deep subtree is still represented.
+        let total: usize = out
+            .retrieval_units
+            .iter()
+            .map(|u| u.canonical_text.as_deref().unwrap_or_default().len())
+            .sum();
+        assert!(total >= doc.len() - 200);
     }
 
     #[test]

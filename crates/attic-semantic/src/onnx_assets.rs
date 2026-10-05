@@ -115,25 +115,40 @@ pub fn ensure_onnx_assets(
     }
 
     let revision = revision.unwrap_or(DEFAULT_ONNX_REVISION);
-    let client = hf_hub::HFClient::builder()
-        .cache_dir(cache_dir.to_path_buf())
-        .build_sync()
-        .map_err(|e| SemanticError::ProviderUnavailable {
-            provider: ONNX_PROVIDER_ID.into(),
-            reason: format!("failed to build hf-hub client for ONNX assets: {e}"),
-        })?;
-    let repo = client.model(HF_ONNX_OWNER.to_string(), HF_ONNX_REPO.to_string());
-
-    let model = fetch_required(&repo, REPO_MODEL_PATH, revision)?;
-    let tokenizer = fetch_required(&repo, TOKENIZER_FILE, revision)?;
-    // Required, not optional. The pinned revision demonstrably publishes
-    // this companion, and ORT resolves it relative to the graph at load
-    // time. Treating a failed fetch as "this export must be inline" would
-    // promote a directory that passes the readiness check and only fails
-    // much later, inside the worker, as an opaque missing-external-data
-    // error -- precisely the half-complete state the staging dance exists
-    // to prevent.
-    let model_data = fetch_required(&repo, REPO_MODEL_DATA_PATH, revision)?;
+    // The three files are independent: fetch them in parallel (one client
+    // each, so no shared-state assumptions about the hf-hub client).
+    let fetch = |path: &'static str| -> Result<PathBuf, SemanticError> {
+        let client = hf_hub::HFClient::builder()
+            .cache_dir(cache_dir.to_path_buf())
+            .build_sync()
+            .map_err(|e| SemanticError::ProviderUnavailable {
+                provider: ONNX_PROVIDER_ID.into(),
+                reason: format!("failed to build hf-hub client for ONNX assets: {e}"),
+            })?;
+        let repo = client.model(HF_ONNX_OWNER.to_string(), HF_ONNX_REPO.to_string());
+        fetch_required(&repo, path, revision)
+    };
+    let (model, tokenizer, model_data) = std::thread::scope(|s| {
+        let m = s.spawn(|| fetch(REPO_MODEL_PATH));
+        let t = s.spawn(|| fetch(TOKENIZER_FILE));
+        // Required, not optional. The pinned revision publishes this
+        // companion, and ORT resolves it relative to the graph at load time.
+        // Treating a failed fetch as "this export must be inline" would
+        // promote a directory that passes the readiness check and only fails
+        // much later, inside the worker, as an opaque missing-external-data
+        // error.
+        let d = s.spawn(|| fetch(REPO_MODEL_DATA_PATH));
+        let join = |h: std::thread::ScopedJoinHandle<'_, Result<PathBuf, SemanticError>>| {
+            h.join().unwrap_or_else(|_| {
+                Err(SemanticError::ProviderUnavailable {
+                    provider: ONNX_PROVIDER_ID.into(),
+                    reason: "ONNX download thread panicked".into(),
+                })
+            })
+        };
+        (join(m), join(t), join(d))
+    });
+    let (model, tokenizer, model_data) = (model?, tokenizer?, model_data?);
 
     materialise(&target, &model, Some(&model_data), &tokenizer)?;
     Ok(target)
@@ -154,6 +169,18 @@ fn fetch_required(
                 "failed to fetch {filename} from {HF_ONNX_OWNER}/{HF_ONNX_REPO}@{revision}: {e}"
             ),
         })
+}
+
+/// Place `src` at `dst` without a second full write when possible: a hard
+/// link to the resolved cache blob (following any cache symlink first so the
+/// link never points at a relative symlink), falling back to a copy when
+/// linking is impossible (different volume, filesystem without links).
+fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let resolved = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+    match std::fs::hard_link(&resolved, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(&resolved, dst).map(|_| ()),
+    }
 }
 
 /// Copy the resolved files into a flat directory using stage-then-rename so
@@ -187,12 +214,12 @@ fn materialise(
     std::fs::create_dir_all(&staging)
         .map_err(|e| io("failed to create the ONNX staging directory", e))?;
 
-    std::fs::copy(model, staging.join(MODEL_FILE))
+    link_or_copy(model, &staging.join(MODEL_FILE))
         .map_err(|e| io("failed to stage the ONNX graph", e))?;
-    std::fs::copy(tokenizer, staging.join(TOKENIZER_FILE))
+    link_or_copy(tokenizer, &staging.join(TOKENIZER_FILE))
         .map_err(|e| io("failed to stage the ONNX tokenizer", e))?;
     if let Some(data) = model_data {
-        std::fs::copy(data, staging.join(MODEL_DATA_FILE))
+        link_or_copy(data, &staging.join(MODEL_DATA_FILE))
             .map_err(|e| io("failed to stage the ONNX external-data file", e))?;
     }
 
@@ -219,6 +246,19 @@ fn materialise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_or_copy_places_identical_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob");
+        std::fs::write(&src, "weights").unwrap();
+        let dst = tmp.path().join("placed");
+        link_or_copy(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "weights");
+        // Removing the placed file must never remove the cache blob.
+        std::fs::remove_file(&dst).unwrap();
+        assert!(src.exists());
+    }
 
     fn write(p: &Path, body: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

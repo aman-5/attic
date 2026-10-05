@@ -18,7 +18,6 @@ use attic_storage::{DbPool, WriterQueue, WriterQueueHandle, open_db, run_migrati
 use tempfile::TempDir;
 
 pub struct Fixture {
-    pub _dir: TempDir,
     pub repo_dir: PathBuf,
     pub db_path: PathBuf,
     pub pool: DbPool,
@@ -26,6 +25,10 @@ pub struct Fixture {
     pub writer: WriterQueueHandle,
     /// Repository UUID string after bootstrap.
     pub repo_id: String,
+    /// Declared LAST: fields drop in order, so the directory is removed only
+    /// after every SQLite handle above is closed (Windows cannot delete open
+    /// files, which silently leaked one temp dir per test).
+    pub _dir: TempDir,
 }
 
 impl Fixture {

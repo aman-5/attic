@@ -35,7 +35,7 @@ const PROVIDER_UNREADY_MAX_SHIFT: u32 = 6;
 
 /// Ensure an active or building generation is ready to receive vectors for this fingerprint.
 /// Returns the generation ID to tag the batch with.
-fn ensure_generation_for_fingerprint(
+pub(crate) fn ensure_generation_for_fingerprint(
     store: &SemanticStore,
     fp: &EmbeddingFingerprint,
 ) -> Result<i64, SemanticError> {
@@ -96,6 +96,12 @@ pub struct EnrichmentConfig {
     /// Carried here so the server's `[semantic]` config reaches the one place
     /// reconcile is driven from.
     pub selection: SelectionConfig,
+    /// True when the GPU adapter shares host RAM (integrated GPU allowed via
+    /// `allow_integrated_gpu`). Together with the live backend this selects
+    /// the embedding memory class: dedicated GPUs ignore host-RAM tiers,
+    /// unified-memory GPUs (this, or Apple Metal) park only below a 2 GiB
+    /// floor with a shrinking batch, and CPU keeps the full tier gate.
+    pub gpu_unified_memory: bool,
 }
 
 impl EnrichmentConfig {
@@ -114,6 +120,7 @@ impl EnrichmentConfig {
             embedding_worker_count,
             cpu_threads: 2,
             selection: SelectionConfig::baseline(),
+            gpu_unified_memory: false,
         }
     }
 }
@@ -128,6 +135,7 @@ impl Default for EnrichmentConfig {
             embedding_worker_count: 1,
             cpu_threads: 2,
             selection: SelectionConfig::default(),
+            gpu_unified_memory: false,
         }
     }
 }
@@ -300,10 +308,6 @@ fn drive_leased(
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_millis(cfg.budget_ms.max(1));
     let mut stats = EnrichStats::default();
-    // r07 OOM-adaptive cap: after a provider BudgetExhausted (GPU/native
-    // OOM), batches are retried at half size (floor 1) instead of failing
-    // items. Clears only when the process restarts — conservative by design.
-    let mut oom_batch_cap: Option<usize> = None;
 
     // Crash/restart hygiene: a lease abandoned by a killed worker or a
     // server that died mid-batch surfaces here as retryable PENDING before
@@ -337,10 +341,137 @@ fn drive_leased(
         std::process::id(),
         OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
     );
+
+    // GPU backends pipeline the commit: batch N is written to the semantic
+    // store on a scoped thread while batch N+1 is claimed and embedded, so
+    // the device is not idle for the length of every SQLite transaction.
+    // The channel holds at most one pending commit (bounded memory, commits
+    // stay in order), and every commit is joined before the orphan pass and
+    // before stats are returned. CPU backends keep the inline commit: there
+    // the commit would compete with inference for the same cores.
+    let pipelined = provider
+        .fingerprint()
+        .is_some_and(|f| f.execution_backend.is_gpu());
+    std::thread::scope(|scope| {
+        let (commit_tx, committer) = if pipelined {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommitJob>(1);
+            let owner = owner.as_str();
+            let handle = scope.spawn(move || {
+                rx.into_iter()
+                    .map(|job| run_commit(store, owner, job))
+                    .sum::<u64>()
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
+        let res = claim_embed_loop(
+            conn,
+            store,
+            provider,
+            cfg,
+            cancel,
+            &owner,
+            deadline,
+            &mut stats,
+            commit_tx.as_ref(),
+        );
+        drop(commit_tx);
+        if let Some(handle) = committer {
+            match handle.join() {
+                Ok(n) => stats.embedded += n,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        res
+    })?;
+
+    if let Some(ref fp) = fp_for_orphans
+        && let Ok(gen_id) = ensure_generation_for_fingerprint(store, fp)
+    {
+        let _ = store.project_resolved_orphan_occurrences(
+            gen_id,
+            provider.id(),
+            provider.model_id(),
+            SEMANTIC_SELECTION_VERSION,
+        );
+    }
+
+    stats.elapsed_ms = t0.elapsed().as_millis() as u64;
+    stats.queue_remaining = store.queue_counts().map(|c| c.pending).unwrap_or(0);
+    Ok(stats)
+}
+
+/// One embedded batch ready to be written: everything [`run_commit`] needs,
+/// owned, so it can cross to the commit thread.
+struct CommitJob {
+    entries: Vec<crate::store::CommitEntry>,
+    target_gen_id: i64,
+    /// (occurrence id, fencing token) for every entry, to release on failure.
+    tokens: Vec<(String, i64)>,
+    claimed: usize,
+    input_bytes: usize,
+    prep_ms: u64,
+    embed_ms: u64,
+}
+
+/// Commit one batch in a single transaction; on failure return its items to
+/// PENDING (never leaked INFLIGHT). Returns the number committed.
+fn run_commit(store: &SemanticStore, owner: &str, job: CommitJob) -> u64 {
+    let commit_started = Instant::now();
+    match store.commit_batch(&job.entries, job.target_gen_id, SEMANTIC_SELECTION_VERSION) {
+        Ok(committed) => {
+            let commit_ms = commit_started.elapsed().as_millis() as u64;
+            crate::throughput::record_commit(
+                committed.len() as u64,
+                Duration::from_millis(job.prep_ms + job.embed_ms + commit_ms),
+            );
+            tracing::debug!(
+                claimed = job.claimed,
+                embedded = committed.len(),
+                input_bytes = job.input_bytes,
+                prep_ms = job.prep_ms,
+                embed_ms = job.embed_ms,
+                commit_ms,
+                "semantic batch"
+            );
+            committed.len() as u64
+        }
+        Err(e) => {
+            tracing::warn!("failed to commit embedding batch: {e}");
+            for (occ_id, token) in &job.tokens {
+                let _ = store.queue_reset(occ_id, owner, *token);
+            }
+            0
+        }
+    }
+}
+
+/// The claim → load → embed → commit loop of one drive slice. With
+/// `commit_tx` set, commits are handed to the pipelined commit thread
+/// instead of running inline.
+#[allow(clippy::too_many_arguments)]
+fn claim_embed_loop(
+    conn: &Connection,
+    store: &SemanticStore,
+    provider: &dyn SemanticProvider,
+    cfg: &EnrichmentConfig,
+    cancel: &CancelFlag,
+    owner: &str,
+    deadline: Instant,
+    stats: &mut EnrichStats,
+    commit_tx: Option<&std::sync::mpsc::SyncSender<CommitJob>>,
+) -> Result<(), SemanticError> {
     // Generous relative to EMBED_DEADLINE-class batch latency; a drive loop
     // that outlives this without completing would need heartbeating, which
     // single-shot `drive()` calls (bounded by `cfg.budget_ms`) don't reach.
     const LEASE_MS: i64 = 300_000;
+    // r07 OOM-adaptive cap: after a provider BudgetExhausted (GPU/native
+    // OOM), batches are retried at half size (floor 1) instead of failing
+    // items. Scoped to this drive slice.
+    let mut oom_batch_cap: Option<usize> = None;
+    // Owned so the loop body keeps its original `&owner` call sites.
+    let owner = owner.to_string();
 
     loop {
         if cancel.is_cancelled() || Instant::now() >= deadline {
@@ -679,38 +810,37 @@ fn drive_leased(
                 // [FIX] The commit itself is fallible (canonical/semantic DB
                 // contention, disk errors). Previously a bare `?` here threw
                 // away already-computed embeddings AND left the batch
-                // permanently INFLIGHT. Reset on failure so it's retried
-                // instead of leaked. Insertion, occurrence completion, and
-                // the generation unit-count bump all happen in ONE
+                // permanently INFLIGHT. `run_commit` resets on failure so it's
+                // retried instead of leaked. Insertion, occurrence completion,
+                // and the generation unit-count bump all happen in ONE
                 // transaction (`commit_batch`).
-                let committed_ids: std::collections::HashSet<String> = commit_entries
+                let tokens: Vec<(String, i64)> = commit_entries
                     .iter()
-                    .map(|e| e.occurrence_id.clone())
+                    .filter_map(|e| {
+                        token_of
+                            .get(&e.occurrence_id)
+                            .map(|t| (e.occurrence_id.clone(), *t))
+                    })
                     .collect();
-                let embed_ms = embed_started.elapsed().as_millis() as u64;
-                let commit_started = Instant::now();
-                match store.commit_batch(&commit_entries, target_gen_id, SEMANTIC_SELECTION_VERSION)
-                {
-                    Ok(committed) => {
-                        stats.embedded += committed.len() as u64;
-                        tracing::debug!(
-                            claimed = claims.len(),
-                            embedded = committed.len(),
-                            input_bytes = to_embed.iter().map(|i| i.text.len()).sum::<usize>(),
-                            prep_ms = (embed_started - batch_started).as_millis() as u64,
-                            embed_ms,
-                            commit_ms = commit_started.elapsed().as_millis() as u64,
-                            "semantic batch"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to commit embedding batch: {e}");
-                        for occ_id in &committed_ids {
-                            if let Some(token) = token_of.get(occ_id) {
-                                let _ = store.queue_reset(occ_id, &owner, *token);
-                            }
+                let job = CommitJob {
+                    entries: commit_entries,
+                    target_gen_id,
+                    tokens,
+                    claimed: claims.len(),
+                    input_bytes: to_embed.iter().map(|i| i.text.len()).sum::<usize>(),
+                    prep_ms: (embed_started - batch_started).as_millis() as u64,
+                    embed_ms: embed_started.elapsed().as_millis() as u64,
+                };
+                match commit_tx {
+                    // Pipelined (GPU): hand off and start the next batch now.
+                    // A closed channel can only mean the committer is gone;
+                    // commit inline rather than drop computed vectors.
+                    Some(tx) => {
+                        if let Err(std::sync::mpsc::SendError(job)) = tx.send(job) {
+                            stats.embedded += run_commit(store, &owner, job);
                         }
                     }
+                    None => stats.embedded += run_commit(store, &owner, job),
                 }
                 if stop_unready {
                     stats.provider_unready = true;
@@ -769,21 +899,7 @@ fn drive_leased(
             }
         }
     }
-
-    if let Some(ref fp) = fp_for_orphans
-        && let Ok(gen_id) = ensure_generation_for_fingerprint(store, fp)
-    {
-        let _ = store.project_resolved_orphan_occurrences(
-            gen_id,
-            provider.id(),
-            provider.model_id(),
-            SEMANTIC_SELECTION_VERSION,
-        );
-    }
-
-    stats.elapsed_ms = t0.elapsed().as_millis() as u64;
-    stats.queue_remaining = store.queue_counts().map(|c| c.pending).unwrap_or(0);
-    Ok(stats)
+    Ok(())
 }
 
 /// Release every claimed occurrence back to PENDING without incrementing
@@ -891,6 +1007,19 @@ fn jittered(base: Duration) -> Duration {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     base + Duration::from_millis((nanos % 41) as u64)
+}
+
+/// How host-RAM pressure gates the provider right now, read from its LIVE
+/// fingerprint (so a runtime demotion to CPU is honoured). A provider with no
+/// fingerprint is treated as host-RAM (the conservative gate).
+pub fn embedding_memory_class(
+    provider: &dyn SemanticProvider,
+    unified_memory: bool,
+) -> attic_storage::resource_manager::EmbeddingMemoryClass {
+    provider.fingerprint().map_or(
+        attic_storage::resource_manager::EmbeddingMemoryClass::HostRam,
+        |f| f.execution_backend.memory_class(unified_memory),
+    )
 }
 
 impl BackgroundEnricher {
@@ -1002,7 +1131,31 @@ impl BackgroundEnricher {
                 // backoff so a not-yet-warm provider is waited out instead of
                 // being hammered, WITHOUT burning per-item attempts.
                 let mut infra_backoff_streak: u32 = 0;
+                // Last logged gate class, so a GPU<->CPU flip (runtime
+                // demotion or recovery) is visible in the log exactly once.
+                let mut last_class: Option<attic_storage::resource_manager::EmbeddingMemoryClass> =
+                    None;
                 while !stop2.is_cancelled() {
+                    // Evaluated per iteration from the LIVE fingerprint: a
+                    // FallbackCoordinator demotion to CPU flips this to
+                    // HostRam and the full tier gate applies immediately.
+                    let mem_class =
+                        embedding_memory_class(provider.as_ref(), cfg.gpu_unified_memory);
+                    if last_class != Some(mem_class) {
+                        use attic_storage::resource_manager::EmbeddingMemoryClass as C;
+                        tracing::info!(
+                            class = mem_class.as_str(),
+                            "semantic embedding pressure gate: {}",
+                            match mem_class {
+                                C::DedicatedGpu =>
+                                    "dedicated GPU — host-RAM tiers ignored, parks only below the 512 MiB host floor",
+                                C::UnifiedGpu =>
+                                    "unified-memory GPU — parks only below the 2 GiB host floor, batch shrinks under pressure",
+                                C::HostRam => "host-RAM tiers apply (CPU)",
+                            }
+                        );
+                        last_class = Some(mem_class);
+                    }
                     if let Some(monitor) = resource_monitor.as_ref() {
                         // Only a genuine Emergency halts enrichment outright.
                         //
@@ -1022,7 +1175,14 @@ impl BackgroundEnricher {
                         // limit/batch; Emergency (limit 0, batch 0) still
                         // parks, and `acquire_embedding_heavy_blocking`
                         // remains the authoritative admission gate below.
-                        if monitor.is_emergency() {
+                        //
+                        // GPUs are gated by memory class instead: a dedicated
+                        // GPU's work lives in VRAM, so parking it on host-RAM
+                        // tiers only idles it — it parks below a 512 MiB
+                        // floor. A unified-memory GPU (Apple Metal,
+                        // integrated) does draw on system RAM, so it parks
+                        // below the 2 GiB reserve and shrinks its batch.
+                        if monitor.embedding_parked(mem_class) {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
                         }
@@ -1065,15 +1225,31 @@ impl BackgroundEnricher {
                         let sel_cfg = cfg.selection.clone().for_provider_capacity(
                             crate::windowed::windowed_capacity(provider.max_input_bytes()),
                         );
+                        let reconcile_started = Instant::now();
                         match reconcile(&conn, &store, provider.as_ref(), &sel_cfg) {
-                            Ok(report) if report.enqueued > 0 => {
+                            Ok(report)
+                                if report.newly_enqueued > 0
+                                    || report.reused > 0
+                                    || report.invalidated_stale > 0
+                                    || report.pruned_occurrences > 0 =>
+                            {
                                 tracing::info!(
-                                    enqueued = report.enqueued,
+                                    newly_enqueued = report.newly_enqueued,
+                                    reused = report.reused,
+                                    awaiting_embedding = report.enqueued,
                                     invalidated = report.invalidated_stale,
+                                    pruned_occurrences = report.pruned_occurrences,
+                                    scanned = report.selection.scanned,
+                                    selected = report.selection.selected,
+                                    elapsed_ms = reconcile_started.elapsed().as_millis() as u64,
                                     "semantic reconcile"
                                 );
                             }
-                            Ok(_) => {}
+                            Ok(report) => tracing::debug!(
+                                awaiting_embedding = report.enqueued,
+                                elapsed_ms = reconcile_started.elapsed().as_millis() as u64,
+                                "semantic reconcile: no changes"
+                            ),
                             Err(e) => tracing::warn!("semantic reconcile failed: {e}"),
                         }
                         // _release_gate drops here (and on any unwind out of
@@ -1094,35 +1270,41 @@ impl BackgroundEnricher {
                     // skipping the advisory check entirely.
                     let _embed_permit;
                     let effective_cfg;
-                    let drive_cfg: &EnrichmentConfig = if let Some(monitor) =
-                        resource_monitor.as_ref()
-                    {
-                        let dynamic_batch = monitor.current_embedding_batch();
-                        match monitor.acquire_embedding_heavy_blocking(|| stop2.is_cancelled()) {
-                            Some(permit) => {
-                                _embed_permit = Some(permit);
-                                effective_cfg = EnrichmentConfig {
-                                    batch_size: dynamic_batch,
-                                    ..cfg.clone()
-                                };
-                                &effective_cfg
+                    let drive_cfg: &EnrichmentConfig =
+                        if let Some(monitor) = resource_monitor.as_ref() {
+                            let permit = monitor
+                                .acquire_embedding_heavy_blocking_for(mem_class, || {
+                                    stop2.is_cancelled()
+                                });
+                            // Read after admission so a long wait for a permit
+                            // cannot hand drive() a batch size from before the
+                            // pressure changed.
+                            let dynamic_batch = monitor.embedding_batch_for(mem_class);
+                            match permit {
+                                Some(permit) => {
+                                    _embed_permit = Some(permit);
+                                    effective_cfg = EnrichmentConfig {
+                                        batch_size: dynamic_batch,
+                                        ..cfg.clone()
+                                    };
+                                    &effective_cfg
+                                }
+                                None => {
+                                    // Cancelled (stop2) or Emergency — sleep
+                                    // and retry rather than driving with no
+                                    // permit.
+                                    _embed_permit = None;
+                                    std::thread::sleep(jittered(Duration::from_millis(200)));
+                                    continue;
+                                }
                             }
-                            None => {
-                                // Cancelled (stop2) or Emergency — sleep
-                                // and retry rather than driving with no
-                                // permit.
-                                _embed_permit = None;
-                                std::thread::sleep(jittered(Duration::from_millis(200)));
-                                continue;
-                            }
-                        }
-                    } else {
-                        // No resource monitor (tests / no-daemon mode) —
-                        // use the static config unchanged.
-                        _embed_permit = None;
-                        effective_cfg = cfg.clone();
-                        &effective_cfg
-                    };
+                        } else {
+                            // No resource monitor (tests / no-daemon mode) —
+                            // use the static config unchanged.
+                            _embed_permit = None;
+                            effective_cfg = cfg.clone();
+                            &effective_cfg
+                        };
 
                     match drive(&conn, &store, provider.as_ref(), drive_cfg, &stop2) {
                         Ok(s) if s.provider_unready => {

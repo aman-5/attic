@@ -358,6 +358,44 @@ contradictions. The boundary is the `knowledge/` path prefix only —
 filenames are never special-cased outside it. See `knowledge/README.md` in
 this repository for the end-user-facing explanation and template.
 
+### Central knowledge folder (`[knowledge]`)
+
+One folder of notes serves every repository. It is **on by default**: with
+no `[knowledge]` table the folder is `<ATTIC_HOME>/knowledge` (created on
+first start, `attic_core::sibling(db, "knowledge")`). `dir` points elsewhere
+(never created); `enabled = false` turns it off. The server indexes and
+watches the folder as a hidden repository
+(`AtticServer::start_central_knowledge`). It is never a workspace member, so
+it never appears in `workspace`, default `search` results or cross-repo sync.
+
+```mermaid
+flowchart LR
+  Q[context question] --> G["Normal generators<br/>(workspace repos)"]
+  Q --> K["CentralKnowledgeGenerator<br/>(knowledge repo only, ≤ 8)"]
+  G --> R[rank + validate]
+  K --> R
+  R --> C[context assembly]
+```
+
+- **Own search, own budget:** `CentralKnowledgeGenerator`
+  (`candidates.rs`) runs on every `context` question with a
+  `repository_id` filter on the knowledge repository and a separate
+  `BudgetAccountant` (`pipeline.rs::run_db_phases`). Code matches elsewhere
+  cannot crowd it out, and no trigger words are needed.
+- **Bounded, not filtered:** up to `CENTRAL_KNOWLEDGE_LIMIT` (8) notes skip
+  the candidate cut, score floor and per-section caps
+  (`build_context_and_claims`). They are not counted in those caps, so the
+  code evidence served is unchanged.
+- Every file there is `Knowledge` / `ProjectKnowledge`, except the folder's
+  root `README.md`, which is never served.
+- `search` adds `source_type` to every result. `scope: "knowledge"` returns
+  central notes first, then repository `knowledge/` hits.
+- `status.knowledge` reports `state` (`off` / `indexing` / `ready` /
+  `failed`), `dir`, `repository_id` and `reason`. A bad path never stops
+  startup.
+- Tests: `crates/attic-retrieval/tests/central_knowledge.rs` and the
+  `central_knowledge_*` / `knowledge_dir_*` tests in `attic-server`.
+
 ## Known design limitations
 
 Honest statements about current gaps between the schema/contracts and the
@@ -593,9 +631,9 @@ falls back to CPU after startup, the startup selection defaults remain.
 | Selection key | GPU (DirectML / Metal / CUDA) | CPU |
 |---|---:|---:|
 | `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `100000` | `2560` |
+| `max_units_per_repo` | `500000` | `2560` |
 | `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `100000` | `100000` |
+| `max_units_total` | `500000` | `500000` |
 
 The reason for backend-specific defaults is cost: full coverage is minutes on
 the measured GPU but would be about one hour per repository on CPU
@@ -659,8 +697,11 @@ mixing incompatible vectors.
 
 ### Progress, diagnostics and failure policy
 
-`status` → `semantic_progress.chunks_per_sec` is a wall-clock rate over the
-last **120 s**. `status.semantic_identity` reports the active backend and
+`status` → `semantic_progress.chunks_per_sec` is measured from committed
+enrichment batches over the last **300 s** (`attic_semantic::throughput`).
+Model cache cleanup (`attic_semantic::model_cache`) removes the ONNX download
+cache once `onnx-fp16/` is complete and hard-links duplicate Windows blob
+copies; `setup-models` and server start run it. `status.semantic_identity` reports the active backend and
 fallback reason, and `diagnostics.why_slow` summarizes bottlenecks.
 
 With `ATTIC_LOG=debug`, the parent logs:
@@ -725,7 +766,7 @@ above for the recovery guarantees this implements.
 ONE Attic MCP process serves ONE persistent logical workspace made of
 ZERO/ONE/MANY arbitrary repository roots. The workspace is configured
 through MCP itself (the `workspace` tool: `inspect`/`add`/`remove`/`set`),
-persisted atomically to `<ATTIC_HOME>/config.toml`, and reloaded on every
+persisted atomically to `<ATTIC_HOME>/config/config.toml`, and reloaded on every
 subsequent launch. Historical repositories left in storage after membership
 changes never leak into active retrieval, status, WorkspaceSnapshot, or
 cross-repo intelligence.
@@ -734,7 +775,7 @@ cross-repo intelligence.
 flowchart TD
     AI[AI / MCP Client]
     MCP[Attic MCP]
-    CFG["~/.attic/config.toml"]
+    CFG["~/.attic/config/config.toml"]
     W[Logical Workspace]
     A["Repository A<br/>C:\..."]
     B["Repository B<br/>D:\..."]
@@ -755,7 +796,7 @@ flowchart TD
     CR --> MCP
 ```
 
-Configuration precedence: `ATTIC_CONFIG` → `<ATTIC_HOME>/config.toml` →
+Configuration precedence: `ATTIC_CONFIG` → `<ATTIC_HOME>/config/config.toml` →
 `ATTIC_WORKSPACE_ROOT` → UNCONFIGURED. `ATTIC_HOME` (default `~/.attic`)
 pins the entire application home: config + database + backups + scratch.
 

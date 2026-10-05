@@ -55,6 +55,12 @@ pub fn build(
     primary: Option<ST>,
 ) -> ContextDocument {
     let budget_bytes = (max_context_tokens as usize) * 4;
+    // The contradiction disclosure is mandatory, so its bytes are reserved
+    // up front — evidence blocks fill only what is left, and the finished
+    // document never exceeds the budget. Lines that cannot fit at all are
+    // cut, with a count of what was omitted.
+    let disclosure = contradiction_disclosure(contradictions, budget_bytes / 2);
+    let block_budget = budget_bytes.saturating_sub(disclosure.len());
     let mut text = String::new();
     let mut refs = Vec::new();
     let mut dropped = Vec::new();
@@ -163,7 +169,7 @@ pub fn build(
         }
 
         // Budget guard on the assembled bytes.
-        if text.len() + block.len() > budget_bytes {
+        if text.len() + block.len() > block_budget {
             dropped.push(DroppedEvidence {
                 evidence_id: ev.id.clone(),
                 source_type: ev.source_type.as_str().to_owned(),
@@ -185,12 +191,7 @@ pub fn build(
     }
 
     // Contradiction disclosure section - never silently resolved.
-    if !contradictions.is_empty() {
-        text.push_str("\n## Contradictions detected\n\n");
-        for c in contradictions.iter().take(10) {
-            text.push_str(&format!("- [{}] {}\n", c.kind.as_str(), c.description));
-        }
-    }
+    text.push_str(&disclosure);
 
     // ── SECRET-SAFETY PASS (fail-closed, whole document) ───────────────────
     // Defense in depth: every block was already scanned individually; this
@@ -218,12 +219,7 @@ pub fn build(
         text.clear();
         text.push_str(&header);
         text.push_str("[content withheld by secret-safety policy]\n");
-        if !contradictions.is_empty() {
-            text.push_str("\n## Contradictions detected\n\n");
-            for c in contradictions.iter().take(10) {
-                text.push_str(&format!("- [{}] {}\n", c.kind.as_str(), c.description));
-            }
-        }
+        text.push_str(&disclosure);
     }
 
     let tokens = approx_tokens(text.len());
@@ -233,6 +229,30 @@ pub fn build(
         refs,
         dropped,
     }
+}
+
+/// Contradiction disclosure text (at most 10 entries) within `max_bytes`.
+fn contradiction_disclosure(
+    contradictions: &[attic_evidence::Contradiction],
+    max_bytes: usize,
+) -> String {
+    if contradictions.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Contradictions detected\n\n");
+    let shown = contradictions.iter().take(10).collect::<Vec<_>>();
+    for (i, c) in shown.iter().enumerate() {
+        let line = format!("- [{}] {}\n", c.kind.as_str(), c.description);
+        let omitted = format!("- … {} more omitted (context budget)\n", shown.len() - i);
+        if out.len() + line.len() + omitted.len() > max_bytes {
+            if out.len() + omitted.len() <= max_bytes {
+                out.push_str(&omitted);
+            }
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
 }
 
 fn hash_line(l: &str) -> u64 {

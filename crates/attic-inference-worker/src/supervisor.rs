@@ -179,6 +179,7 @@ impl WorkerSupervisor {
             .map_err(|e| SupervisorError::Spawn(format!("{e}")))?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(SupervisorError::Spawn(
                 "worker stdin/stdout were not captured".into(),
             ));
@@ -187,7 +188,7 @@ impl WorkerSupervisor {
         let mut stdout = BufReader::new(stdout);
 
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("attic-worker-reader".into())
             .spawn(move || {
                 loop {
@@ -197,8 +198,13 @@ impl WorkerSupervisor {
                         return;
                     }
                 }
-            })
-            .map_err(|e| SupervisorError::Spawn(format!("reader thread: {e}")))?;
+            });
+        if let Err(e) = spawned {
+            // Never leave a worker process running without a reader.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SupervisorError::Spawn(format!("reader thread: {e}")));
+        }
 
         Ok(LiveChild {
             child,
