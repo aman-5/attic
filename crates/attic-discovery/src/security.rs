@@ -56,7 +56,13 @@ const FORBIDDEN_SCAN_EXEMPT_PREFIXES: &[&str] =
 ///
 /// Returns `true` iff the path must NEVER be indexed regardless of any rule.
 pub fn is_security_forbidden(repo_relative_path: &str) -> bool {
-    let path = repo_relative_path;
+    let path_lower;
+    let path = if cfg!(windows) {
+        path_lower = repo_relative_path.to_ascii_lowercase();
+        path_lower.as_str()
+    } else {
+        repo_relative_path
+    };
 
     // --- Forbidden directory segments anywhere in path ---
     for component in path.split('/') {
@@ -326,6 +332,14 @@ mod tests {
         assert!(is_security_forbidden(".git/config"));
         assert!(is_security_forbidden(".git/objects/ab/cd"));
         assert!(is_security_forbidden("subdir/.git/config"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_dir_match_is_case_insensitive() {
+        assert!(is_security_forbidden("sub/.GIT/config"));
+        assert!(is_security_forbidden("fixtures/.SSH/id_rsa"));
+        assert!(is_security_forbidden("keys/.GNUPG/pubring.gpg"));
     }
 
     #[test]

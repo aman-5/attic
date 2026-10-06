@@ -13,7 +13,7 @@
 //!   is never persisted separately.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::SemanticError;
@@ -368,6 +368,54 @@ impl SemanticStore {
         self.conn
             .lock()
             .map_err(|_| SemanticError::StoreUnavailable("store mutex poisoned".into()))
+    }
+
+    fn normalize_workspace_root_key(path: &Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        let s = s
+            .trim_start_matches("//?/")
+            .trim_end_matches('/')
+            .to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    }
+
+    fn ensure_workspace_membership_table(conn: &Connection) -> Result<(), SemanticError> {
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS sem_workspace_active_roots
+                (root_key TEXT PRIMARY KEY);",
+        )?;
+        Ok(())
+    }
+
+    fn workspace_membership_contains(
+        conn: &Connection,
+        root_path: &Path,
+    ) -> Result<bool, SemanticError> {
+        Self::ensure_workspace_membership_table(conn)?;
+        let root_key = Self::normalize_workspace_root_key(root_path);
+        let mut stmt = conn.prepare("SELECT root_key FROM temp.sem_workspace_active_roots")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let configured_key: String = row.get(0)?;
+            if root_key == configured_key || root_key.starts_with(&format!("{configured_key}/")) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Replace the semantic-store snapshot of active workspace roots.
+    pub fn sync_workspace_membership(&self, active_roots: &[PathBuf]) -> Result<(), SemanticError> {
+        let conn = self.guard()?;
+        Self::ensure_workspace_membership_table(&conn)?;
+        conn.execute("DELETE FROM temp.sem_workspace_active_roots", [])?;
+        let mut insert = conn.prepare(
+            "INSERT OR REPLACE INTO temp.sem_workspace_active_roots (root_key) VALUES (?1)",
+        )?;
+        for root in active_roots {
+            insert.execute(params![Self::normalize_workspace_root_key(root)])?;
+        }
+        Ok(())
     }
 
     /// TEST SUPPORT ONLY: deliberately poisons the internal mutex by panicking
@@ -1373,66 +1421,8 @@ impl SemanticStore {
     /// Returns the number of rows deleted.
     pub fn evict_repository(&self, repository_id: &str) -> Result<usize, SemanticError> {
         let mut conn = self.guard()?;
-        // One transaction, and every statement scoped to this repository's
-        // rows (no whole-table scans), so the store mutex is held briefly and
-        // a crash leaves either nothing or everything deleted. Deleting the
-        // queue rows also fences out any batch for this repo already
-        // in flight: `commit_batch` only completes a queue row that still
-        // exists with the presented fencing token.
         let tx = conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS evict_hashes
-                (vector_space_id TEXT NOT NULL, canonical_hash TEXT NOT NULL,
-                 PRIMARY KEY (vector_space_id, canonical_hash));
-             CREATE TEMP TABLE IF NOT EXISTS evict_generations
-                (generation_id INTEGER PRIMARY KEY);
-             DELETE FROM evict_hashes;
-             DELETE FROM evict_generations;",
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO evict_hashes
-                SELECT vector_space_id, canonical_hash
-                  FROM sem_embedding_occurrences WHERE repository_id = ?1",
-            params![repository_id],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO evict_generations
-                SELECT DISTINCT generation_id FROM sem_embeddings
-                 WHERE repository_id = ?1 AND generation_id IS NOT NULL",
-            params![repository_id],
-        )?;
-        let mut n = tx.execute(
-            "DELETE FROM sem_queue_v2 WHERE occurrence_id IN
-                (SELECT occurrence_id FROM sem_embedding_occurrences WHERE repository_id = ?1)",
-            params![repository_id],
-        )?;
-        n += tx.execute(
-            "DELETE FROM sem_embedding_occurrences WHERE repository_id = ?1",
-            params![repository_id],
-        )?;
-        let projections = tx.execute(
-            "DELETE FROM sem_embeddings WHERE repository_id = ?1",
-            params![repository_id],
-        )?;
-        n += projections;
-        tx.execute(
-            "UPDATE sem_generations SET unit_count =
-                (SELECT COUNT(*) FROM sem_embeddings e
-                  WHERE e.generation_id = sem_generations.generation_id)
-              WHERE generation_id IN (SELECT generation_id FROM evict_generations)",
-            [],
-        )?;
-        n += tx.execute(
-            "DELETE FROM sem_embeddings_v2
-              WHERE (vector_space_id, canonical_hash) IN
-                    (SELECT vector_space_id, canonical_hash FROM evict_hashes)
-                AND NOT EXISTS
-                    (SELECT 1 FROM sem_embedding_occurrences o
-                      WHERE o.vector_space_id = sem_embeddings_v2.vector_space_id
-                        AND o.canonical_hash  = sem_embeddings_v2.canonical_hash)",
-            [],
-        )?;
-        tx.execute_batch("DELETE FROM evict_hashes; DELETE FROM evict_generations;")?;
+        let (n, projections) = Self::evict_repository_tx(&tx, repository_id)?;
         tx.commit()?;
         drop(conn);
         if projections > 0 {
@@ -1444,6 +1434,97 @@ impl SemanticStore {
                 .clear();
         }
         Ok(n)
+    }
+
+    /// Delete semantic rows for `repository_id` only when `root_path` is not
+    /// active in the current semantic-store membership snapshot. Returns
+    /// `None` when a re-add raced in before this transaction began.
+    pub fn evict_repository_if_inactive(
+        &self,
+        repository_id: &str,
+        root_path: &Path,
+    ) -> Result<Option<usize>, SemanticError> {
+        let mut conn = self.guard()?;
+        let tx = conn.transaction()?;
+        if Self::workspace_membership_contains(&tx, root_path)? {
+            return Ok(None);
+        }
+        let (n, projections) = Self::evict_repository_tx(&tx, repository_id)?;
+        tx.commit()?;
+        drop(conn);
+        if projections > 0 {
+            self.candidate_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        Ok(Some(n))
+    }
+
+    fn evict_repository_tx(
+        conn: &Connection,
+        repository_id: &str,
+    ) -> Result<(usize, usize), SemanticError> {
+        // One transaction, and every statement scoped to this repository's
+        // rows (no whole-table scans), so the store mutex is held briefly and
+        // a crash leaves either nothing or everything deleted. Deleting the
+        // queue rows also fences out any batch for this repo already
+        // in flight: `commit_batch` only completes a queue row that still
+        // exists with the presented fencing token.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS evict_hashes
+                (vector_space_id TEXT NOT NULL, canonical_hash TEXT NOT NULL,
+                 PRIMARY KEY (vector_space_id, canonical_hash));
+             CREATE TEMP TABLE IF NOT EXISTS evict_generations
+                (generation_id INTEGER PRIMARY KEY);
+             DELETE FROM evict_hashes;
+             DELETE FROM evict_generations;",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO evict_hashes
+                SELECT vector_space_id, canonical_hash
+                  FROM sem_embedding_occurrences WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO evict_generations
+                SELECT DISTINCT generation_id FROM sem_embeddings
+                 WHERE repository_id = ?1 AND generation_id IS NOT NULL",
+            params![repository_id],
+        )?;
+        let mut n = conn.execute(
+            "DELETE FROM sem_queue_v2 WHERE occurrence_id IN
+                (SELECT occurrence_id FROM sem_embedding_occurrences WHERE repository_id = ?1)",
+            params![repository_id],
+        )?;
+        n += conn.execute(
+            "DELETE FROM sem_embedding_occurrences WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        let projections = conn.execute(
+            "DELETE FROM sem_embeddings WHERE repository_id = ?1",
+            params![repository_id],
+        )?;
+        n += projections;
+        conn.execute(
+            "UPDATE sem_generations SET unit_count =
+                (SELECT COUNT(*) FROM sem_embeddings e
+                  WHERE e.generation_id = sem_generations.generation_id)
+              WHERE generation_id IN (SELECT generation_id FROM evict_generations)",
+            [],
+        )?;
+        n += conn.execute(
+            "DELETE FROM sem_embeddings_v2
+              WHERE (vector_space_id, canonical_hash) IN
+                    (SELECT vector_space_id, canonical_hash FROM evict_hashes)
+                AND NOT EXISTS
+                    (SELECT 1 FROM sem_embedding_occurrences o
+                      WHERE o.vector_space_id = sem_embeddings_v2.vector_space_id
+                        AND o.canonical_hash  = sem_embeddings_v2.canonical_hash)",
+            [],
+        )?;
+        conn.execute_batch("DELETE FROM evict_hashes; DELETE FROM evict_generations;")?;
+        Ok((n, projections))
     }
 
     /// Delete everything for one model (full semantic-layer reset).
@@ -2193,6 +2274,65 @@ mod tests {
             1,
             "exactly one completion, not two"
         );
+    }
+
+    #[test]
+    fn guarded_repository_eviction_preserves_active_repo_vectors() {
+        let s = SemanticStore::open_in_memory().unwrap();
+        let configured_root = PathBuf::from(r"C:\workspace");
+        let repo_root = configured_root.join("repo");
+        let fp = EmbeddingFingerprint {
+            provider: "qwen3".into(),
+            model_id: "m".into(),
+            model_revision: "r".into(),
+            dimension: 2,
+            pooling_version: "p".into(),
+            normalization_version: "n".into(),
+            tokenizer_version: "t".into(),
+            chunking_version: "c".into(),
+            query_instruction_version: "q".into(),
+            execution_backend: ExecutionBackend::CandleCpu,
+            quantization: "test-none".to_string(),
+        };
+        let vsid = fp.vector_space_id();
+        let cgid = fp.content_generation_id("sel");
+        let hash = crate::identity::content_hash("body");
+        assert!(
+            s.put_canonical_embedding(&vsid, &hash, &[1.0, 0.0])
+                .unwrap()
+        );
+        s.add_occurrence(
+            "occ-1", "unit-1", &vsid, &hash, "repo-a", "rev", "gen", &cgid, "{}",
+        )
+        .unwrap();
+        s.queue_enqueue("occ-1", 0.5).unwrap();
+
+        s.sync_workspace_membership(&[configured_root]).unwrap();
+        let skipped = s
+            .evict_repository_if_inactive("repo-a", &repo_root)
+            .unwrap();
+        assert!(
+            skipped.is_none(),
+            "an active root must cancel semantic eviction before deleting vectors"
+        );
+        assert!(
+            s.embedding_for_canonical(&vsid, &hash).unwrap().is_some(),
+            "active repository vectors must survive the cancelled eviction"
+        );
+        assert_eq!(s.queue_counts().unwrap().pending, 1);
+
+        s.sync_workspace_membership(&[]).unwrap();
+        let deleted = s
+            .evict_repository_if_inactive("repo-a", &repo_root)
+            .unwrap()
+            .expect("inactive root must delete semantic rows");
+        assert!(deleted > 0);
+        assert!(
+            s.embedding_for_canonical(&vsid, &hash).unwrap().is_none(),
+            "inactive repository vectors must be removed"
+        );
+        assert_eq!(s.occurrence_count_for_canonical(&vsid, &hash).unwrap(), 0);
+        assert_eq!(s.queue_counts().unwrap().pending, 0);
     }
 
     fn rec(unit: &str, vec: Vec<f32>) -> EmbeddingRecord {

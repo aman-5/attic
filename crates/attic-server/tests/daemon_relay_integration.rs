@@ -1114,10 +1114,10 @@ async fn warning_reduces_heavy_admission() {
 
 /// §17 item 14: Critical pressure reduces heavy-work admission further
 /// (indexing limit = 2 = 25% of 8, embedding limit = 1, batch = 16),
-/// and expensive MCP operations (e.g. `context`) are rejected with `server_busy`
-/// while lightweight MCP operations (`status`) remain responsive.
+/// but `context` must still reach its own downgrade path rather than being
+/// rejected outright at the admission gate.
 #[tokio::test]
-async fn critical_reduces_heavy_admission_further() {
+async fn critical_reduces_heavy_admission_without_rejecting_context() {
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1145,26 +1145,25 @@ async fn critical_reduces_heavy_admission_further() {
     assert_eq!(rp["effective_embedding_limit"], 1);
     assert_eq!(rp["effective_embedding_batch"], 16);
 
-    // Expensive MCP tool (`context`) must be rejected under Critical
+    // `context` must pass admission at Critical and reach the normal
+    // workspace-configured validation path instead of being rejected as busy.
     let ctx_res = call_tool_text(&mut srv, "context", serde_json::json!({"query": "test"})).await;
     let err_str = ctx_res.unwrap_or_else(|e| e);
     assert!(
-        err_str.contains("server_busy") || err_str.contains("memory pressure"),
-        "expected server_busy rejection for expensive MCP call under Critical, got: {err_str}"
+        err_str.contains("workspace not configured"),
+        "expected the usual workspace error once admitted under Critical, got: {err_str}"
+    );
+    assert!(
+        !err_str.contains("server_busy"),
+        "Critical must not reject context at admission anymore: {err_str}"
     );
 
-    // Verify mcp_pressure_rejections counter incremented
+    // Critical admission should not count this as a pressure rejection.
     let res2 = call_tool_text(&mut srv, "status", serde_json::json!({}))
         .await
         .expect("status call");
     let v2: Value = serde_json::from_str(&res2).expect("json");
-    assert!(
-        v2["resource_pressure"]["mcp_pressure_rejections"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1,
-        "expected mcp_pressure_rejections >= 1"
-    );
+    assert_eq!(v2["resource_pressure"]["mcp_pressure_rejections"], 0);
 }
 
 /// §17 item 15: Emergency pressure zeroes out new heavy indexing and embedding permits,
@@ -1199,7 +1198,7 @@ async fn emergency_starts_no_new_heavy_work() {
     assert_eq!(rp["effective_embedding_limit"], 0);
     assert_eq!(rp["effective_embedding_batch"], 0);
 
-    // Mutation tool (`workspace`) is rejected under Emergency
+    // Mutation tool (`workspace`) is rejected under Emergency.
     let ws_res = call_tool_text(
         &mut srv,
         "workspace",
@@ -1210,6 +1209,14 @@ async fn emergency_starts_no_new_heavy_work() {
     assert!(
         err_str.contains("server_busy") || err_str.contains("memory pressure"),
         "expected server_busy rejection for mutation MCP call under Emergency, got: {err_str}"
+    );
+
+    // Expensive reads (`context`) are also rejected only at genuine Emergency.
+    let ctx_res = call_tool_text(&mut srv, "context", serde_json::json!({"query": "test"})).await;
+    let err_str = ctx_res.unwrap_or_else(|e| e);
+    assert!(
+        err_str.contains("server_busy") || err_str.contains("memory pressure"),
+        "expected server_busy rejection for context under Emergency, got: {err_str}"
     );
 }
 

@@ -7,7 +7,7 @@
 //! the child and surfaces as a typed failure the enrichment layer can retry
 //! against a freshly restarted worker.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +45,11 @@ pub(crate) fn embed_deadline() -> std::time::Duration {
     EMBED_DEADLINE
 }
 
+/// Poll interval while a foreground query waits for the single worker turn.
+const FOREGROUND_QUERY_WAIT_POLL: Duration = Duration::from_millis(10);
+const CONTEXT_QUERY_UNIT_KEY: &str = "__query__";
+const SEARCH_QUERY_UNIT_KEY: &str = "__search_query__";
+
 pub struct SupervisedWorkerProvider {
     supervisor: WorkerSupervisor,
     fingerprint: EmbeddingFingerprint,
@@ -63,6 +68,14 @@ pub struct SupervisedWorkerProvider {
     claim_items: Option<usize>,
     /// Stall watchdog; set only for backends whose engine reports progress.
     stall_limit: Option<Duration>,
+    /// Serializes the single child-process turn. Without this, a foreground
+    /// query can sit behind a long enrichment batch inside the supervisor's
+    /// state lock with no deadline check until that whole batch finishes.
+    call_gate: Mutex<()>,
+    /// Number of interactive query embeddings currently waiting to run.
+    /// Background enrichment yields between batches while this is non-zero so
+    /// a queued query is blocked by at most one in-flight batch.
+    pending_foreground_queries: AtomicUsize,
     /// Held shared by every embed call and exclusively by the idle reaper,
     /// so a worker can never be unloaded underneath a running batch.
     gate: RwLock<()>,
@@ -153,6 +166,8 @@ impl SupervisedWorkerProvider {
             load_failed: AtomicBool::new(false),
             claim_items,
             stall_limit,
+            call_gate: Mutex::new(()),
+            pending_foreground_queries: AtomicUsize::new(0),
             gate: RwLock::new(()),
             life: Mutex::new(LifeState {
                 phase: Phase::NotLoaded,
@@ -247,6 +262,49 @@ impl SupervisedWorkerProvider {
         life.last_used_wall = Some(SystemTime::now());
     }
 
+    fn acquire_call_turn<'a>(
+        &'a self,
+        is_query: bool,
+        cancel: &CancelFlag,
+        deadline: Option<Instant>,
+        total: usize,
+    ) -> Result<std::sync::MutexGuard<'a, ()>, SemanticError> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(SemanticError::Cancelled {
+                    completed: 0,
+                    total,
+                });
+            }
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                return Err(SemanticError::Cancelled {
+                    completed: 0,
+                    total,
+                });
+            }
+            if !is_query && self.pending_foreground_queries.load(Ordering::Acquire) > 0 {
+                std::thread::sleep(FOREGROUND_QUERY_WAIT_POLL);
+                continue;
+            }
+            match self.call_gate.try_lock() {
+                Ok(guard) => {
+                    if !is_query && self.pending_foreground_queries.load(Ordering::Acquire) > 0 {
+                        drop(guard);
+                        std::thread::sleep(FOREGROUND_QUERY_WAIT_POLL);
+                        continue;
+                    }
+                    return Ok(guard);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(FOREGROUND_QUERY_WAIT_POLL);
+                }
+                Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            }
+        }
+    }
+
     /// Handshake and load if needed. Returns how long a load took, or zero
     /// when the worker was already ready.
     fn ensure_ready(&self) -> Result<Duration, SemanticError> {
@@ -255,6 +313,10 @@ impl SupervisedWorkerProvider {
         }
         let started = Instant::now();
         self.set_phase(Phase::Loading { since: started });
+        tracing::info!(
+            backend = self.fingerprint.execution_backend.as_str(),
+            "starting semantic worker"
+        );
         let result = self
             .supervisor
             .handshake()
@@ -280,9 +342,30 @@ impl SupervisedWorkerProvider {
             Err(e) => {
                 self.set_phase(Phase::NotLoaded);
                 self.load_failed.store(true, Ordering::Release);
+                tracing::warn!("semantic worker failed to load: {e}");
                 Err(e)
             }
         }
+    }
+}
+
+fn is_foreground_query(inputs: &[EmbeddingInput]) -> bool {
+    matches!(
+        inputs,
+        [EmbeddingInput { unit_key, .. }]
+            if unit_key == CONTEXT_QUERY_UNIT_KEY || unit_key == SEARCH_QUERY_UNIT_KEY
+    )
+}
+
+struct PendingForegroundQuery<'a> {
+    provider: &'a SupervisedWorkerProvider,
+}
+
+impl Drop for PendingForegroundQuery<'_> {
+    fn drop(&mut self) {
+        self.provider
+            .pending_foreground_queries
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -430,6 +513,13 @@ impl SemanticProvider for SupervisedWorkerProvider {
                 total: inputs.len(),
             });
         }
+        let is_query = is_foreground_query(inputs);
+        let _pending_query = is_query.then(|| {
+            self.pending_foreground_queries
+                .fetch_add(1, Ordering::AcqRel);
+            PendingForegroundQuery { provider: self }
+        });
+        let _call_turn = self.acquire_call_turn(is_query, cancel, deadline, inputs.len())?;
         let _shared = self.gate.read().unwrap_or_else(|e| e.into_inner());
         self.touch();
         let result = self.embed_batch_gated(inputs, usage, deadline);
@@ -509,6 +599,20 @@ impl SupervisedWorkerProvider {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    match &e {
+                        SupervisorError::WorkerTimeout(d) => tracing::warn!(
+                            ?d,
+                            "semantic worker exceeded its batch deadline and was killed"
+                        ),
+                        SupervisorError::WorkerStalled(d) => tracing::warn!(
+                            ?d,
+                            "semantic worker stopped reporting progress and was killed"
+                        ),
+                        SupervisorError::WorkerDied => {
+                            tracing::warn!("semantic worker died mid-batch")
+                        }
+                        _ => {}
+                    }
                     // `ready` only reflects the state as of the last successful
                     // `ensure_ready()` and is otherwise never touched — without
                     // this, one successful load at startup would make
@@ -999,6 +1103,39 @@ mod expected_fingerprint_tests {
         let s = p.worker_status().unwrap();
         assert_eq!(s.state, "not_loaded");
         assert!(s.last_used_unix_ms.is_some());
+    }
+
+    #[test]
+    fn foreground_query_times_out_before_waiting_for_a_busy_batch_forever() {
+        let p = idle_test_provider(Duration::from_secs(900));
+        let _busy = p.call_gate.lock().unwrap();
+        let mut usage = ResourceUsage::default();
+        let inputs = [EmbeddingInput {
+            unit_key: SEARCH_QUERY_UNIT_KEY.into(),
+            text: "hello".into(),
+        }];
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let started = Instant::now();
+        let err = p.embed_batch(&inputs, &CancelFlag::new(), &mut usage, Some(deadline));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                err,
+                Err(SemanticError::Cancelled {
+                    completed: 0,
+                    total: 1
+                })
+            ),
+            "unexpected foreground timeout result: {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "foreground query waited too long for the worker turn: {elapsed:?}"
+        );
+        assert!(
+            p.worker_pid().is_none(),
+            "the timeout must happen before any spawn/load attempt"
+        );
     }
 
     #[test]

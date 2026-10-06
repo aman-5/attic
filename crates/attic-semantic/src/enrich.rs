@@ -158,6 +158,9 @@ pub struct EnrichStats {
     /// returned to PENDING WITHOUT burning an attempt; the caller should
     /// back off and retry rather than treat the queue as failed.
     pub provider_unready: bool,
+    /// Last provider/load error that caused the queue to be returned to
+    /// PENDING and retried with backoff.
+    pub provider_unready_reason: Option<String>,
 }
 
 /// Classify a provider error as transient infrastructure trouble (the
@@ -685,6 +688,7 @@ fn claim_embed_loop(
         // (worker trouble never burns an attempt) and — claims being oldest
         // first — re-claimed forever: a silent zero-throughput livelock.
         let mut stop_unready = false;
+        let mut stop_unready_reason: Option<String> = None;
         let embed_res = match embed_res {
             Err(e) if is_isolatable_failure(&e) && (to_embed.len() > 1 || is_worker_crash(&e)) => {
                 tracing::warn!(
@@ -763,6 +767,9 @@ fn claim_embed_loop(
                             // content's fault — release without an attempt.
                             if is_transient_provider_error(&err) {
                                 stop_unready = true;
+                                if stop_unready_reason.is_none() {
+                                    stop_unready_reason = Some(err.to_string());
+                                }
                             }
                             release(&mut handled);
                         }
@@ -844,6 +851,7 @@ fn claim_embed_loop(
                 }
                 if stop_unready {
                     stats.provider_unready = true;
+                    stats.provider_unready_reason = stop_unready_reason.clone();
                     break;
                 }
             }
@@ -891,6 +899,7 @@ fn claim_embed_loop(
                     );
                     reset_all(store, &owner, &token_of);
                     stats.provider_unready = true;
+                    stats.provider_unready_reason = Some(e.to_string());
                     break;
                 }
                 tracing::warn!("embedding batch failed: {e}");
@@ -1131,6 +1140,8 @@ impl BackgroundEnricher {
                 // backoff so a not-yet-warm provider is waited out instead of
                 // being hammered, WITHOUT burning per-item attempts.
                 let mut infra_backoff_streak: u32 = 0;
+                let mut last_progress_log = Instant::now() - Duration::from_secs(60);
+                let mut queue_was_active = false;
                 // Last logged gate class, so a GPU<->CPU flip (runtime
                 // demotion or recovery) is visible in the log exactly once.
                 let mut last_class: Option<attic_storage::resource_manager::EmbeddingMemoryClass> =
@@ -1316,6 +1327,12 @@ impl BackgroundEnricher {
                             let delay_ms = PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
                                 1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
                             );
+                            crate::diagnostics::note_provider_backoff(
+                                infra_backoff_streak,
+                                delay_ms,
+                                s.provider_unready_reason
+                                    .unwrap_or_else(|| "provider not ready".to_string()),
+                            );
                             tracing::info!(
                                 streak = infra_backoff_streak,
                                 delay_ms,
@@ -1325,6 +1342,7 @@ impl BackgroundEnricher {
                         }
                         Ok(s) if s.embedded == 0 && !s.cancelled => {
                             infra_backoff_streak = 0;
+                            crate::diagnostics::clear_provider_backoff();
                             // Queue drained; idle-poll so we stay responsive to
                             // new enqueues without spinning hot.
                             std::thread::sleep(jittered(Duration::from_millis(50)));
@@ -1341,6 +1359,11 @@ impl BackgroundEnricher {
                             let delay_ms = PROVIDER_UNREADY_BASE_BACKOFF_MS.saturating_mul(
                                 1u64 << infra_backoff_streak.min(PROVIDER_UNREADY_MAX_SHIFT),
                             );
+                            crate::diagnostics::note_provider_backoff(
+                                infra_backoff_streak,
+                                delay_ms,
+                                "semantic drive cancelled with zero progress",
+                            );
                             tracing::warn!(
                                 streak = infra_backoff_streak,
                                 delay_ms,
@@ -1351,11 +1374,39 @@ impl BackgroundEnricher {
                         }
                         Ok(_) => {
                             infra_backoff_streak = 0;
+                            crate::diagnostics::clear_provider_backoff();
                         }
                         Err(e) => {
+                            crate::diagnostics::clear_provider_backoff();
                             tracing::warn!("background enrichment error: {e}");
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                         }
+                    }
+                    let counts = store.queue_counts().unwrap_or_default();
+                    let active = counts.pending + counts.inflight > 0;
+                    if active {
+                        if last_progress_log.elapsed() >= Duration::from_secs(30) {
+                            let measured = crate::throughput::snapshot();
+                            tracing::info!(
+                                pending = counts.pending,
+                                inflight = counts.inflight,
+                                done = counts.done,
+                                failed = counts.failed,
+                                chunks_per_sec = measured.chunks_per_sec,
+                                batch_latency_ms = measured.batch_latency_ms,
+                                "semantic progress summary"
+                            );
+                            last_progress_log = Instant::now();
+                        }
+                        queue_was_active = true;
+                    } else if queue_was_active {
+                        tracing::info!(
+                            done = counts.done,
+                            failed = counts.failed,
+                            "semantic queue drained"
+                        );
+                        queue_was_active = false;
+                        last_progress_log = Instant::now() - Duration::from_secs(60);
                     }
                 }
             });

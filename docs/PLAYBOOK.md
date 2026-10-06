@@ -274,14 +274,20 @@ source.
 ## Adding a language or platform
 
 Every language or platform is an **analyzer plugin**
-(`crates/attic-analyzers/src/plugin.rs`). Indexing, storage, retrieval and the
-server never change when you add one. Pick the smallest path that fits:
+(`crates/attic-analyzers/src/plugin.rs`). Pick the smallest path that fits.
+Paths A and C leave indexing, storage, retrieval and the server untouched; a
+full analyzer (path B) also adds one import-resolver arm to `resolve_import` in
+`crates/attic-indexing/src/structural_pipeline.rs` so its imports resolve to
+repository files:
 
 | Path | Effort | You get | Example |
 |---|---|---|---|
-| **A · Tags query** | ~30 lines | Symbol definitions + in-file references | Kotlin, Swift, Rust |
-| **B · Full analyzer** | A few hundred lines | Symbols, imports, relationships | Java, Python, Go |
+| **A · Tags query** | ~30 lines | Symbol definitions + in-file references | A language not yet covered |
+| **B · Full analyzer** | A few hundred lines + a resolver arm | Symbols, imports, inheritance, calls | Java, Python, Go, Kotlin, Rust, C++ (all 16 full languages) |
 | **C · Platform plugin** | Your own `AnalyzerPlugin` | Path-aware classification + custom structure | AEM |
+
+> The worked example in path A below uses Kotlin to show the tags-query
+> mechanism; Kotlin itself now has a full analyzer (path B).
 
 <details open>
 <summary><b>A · A language with a tree-sitter grammar (worked example: Kotlin)</b></summary>

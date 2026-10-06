@@ -40,14 +40,43 @@
 //! (see [`migrate_legacy_layout`]).
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// The `data/` directory of the structured home chosen by
 /// [`AtticPaths::resolve`] in this process, if any. Only a database directly
 /// inside it uses the structured layout; the decision is explicit rather than
 /// inferred from a directory name.
 static STRUCTURED_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Create `path` and restrict its permissions to the Attic owner on Unix.
+pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Restrict a file Attic created to the Attic owner on Unix.
+pub fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if path.exists() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Write a file and then apply Attic's private-file mode on Unix.
+pub fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    std::fs::write(path, contents)?;
+    set_private_file_permissions(path)
+}
 
 /// Location of Attic file `name` relative to the database `db_path`, for the
 /// layout this process resolved (see [`sibling_in`]).
@@ -159,6 +188,9 @@ pub fn migrate_legacy_layout(home: &Path) -> LayoutMigration {
         Ok(f) => f,
         Err(e) => return LayoutMigration::Failed(format!("open legacy lock: {e}")),
     };
+    if let Err(e) = set_private_file_permissions(&lock_path) {
+        return LayoutMigration::Failed(format!("harden legacy lock: {e}"));
+    }
     if lock.try_lock().is_err() {
         return LayoutMigration::DeferredLegacyRunning;
     }
@@ -169,7 +201,7 @@ pub fn migrate_legacy_layout(home: &Path) -> LayoutMigration {
         let (from, to) = mv;
         let res = to
             .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_or(Ok(()), ensure_private_dir)
             .and_then(|()| std::fs::rename(from, to));
         if let Err(e) = res {
             // All-or-nothing: put back what this attempt moved, newest first.
@@ -286,12 +318,21 @@ impl AtticPaths {
             ));
         }
 
-        std::fs::create_dir_all(&home).map_err(|e| {
-            PathResolutionError::new(format!(
-                "failed to create Attic home directory {:?}: {}",
-                home, e
-            ))
-        })?;
+        if db_override.is_none() {
+            ensure_private_dir(&home).map_err(|e| {
+                PathResolutionError::new(format!(
+                    "failed to create Attic home directory {:?}: {}",
+                    home, e
+                ))
+            })?;
+        } else {
+            std::fs::create_dir_all(&home).map_err(|e| {
+                PathResolutionError::new(format!(
+                    "failed to create Attic home directory {:?}: {}",
+                    home, e
+                ))
+            })?;
+        }
 
         let database = match db_override {
             Some(raw) => PathBuf::from(raw),
@@ -332,7 +373,7 @@ impl AtticPaths {
                         );
                     }
                     for d in ["data", "config", "run"] {
-                        std::fs::create_dir_all(home.join(d)).map_err(|e| {
+                        ensure_private_dir(&home.join(d)).map_err(|e| {
                             PathResolutionError::new(format!(
                                 "failed to create {:?}: {e}",
                                 home.join(d)
@@ -513,6 +554,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_helper_sets_0700() {
+        let tmp = TmpDir::new();
+        let dir = tmp.path().join("run");
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_helper_sets_0600() {
+        let tmp = TmpDir::new();
+        let file = tmp.path().join("attic.ipc");
+        write_private_file(&file, "socket").unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

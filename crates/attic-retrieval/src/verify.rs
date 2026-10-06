@@ -59,15 +59,28 @@ fn read_span_text(
     end_line: u32,
     max_bytes: usize,
 ) -> Result<SpanRead, RetrievalError> {
+    let repo_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
     let joined = repo_root.join(rel_path);
-    let abs = attic_discovery::canonicalize_within_root(&joined, repo_root).map_err(|e| {
+    let abs = attic_discovery::canonicalize_within_root(&joined, &repo_root).map_err(|e| {
         tracing::debug!(path = %rel_path, error = %e, "verification path rejected");
         RetrievalError::InvalidQuery(format!("path rejected for verification: {e}"))
     })?;
 
-    // .git internals forbidden at this layer too (server does the same).
-    let rel_norm = rel_path.replace('\\', "/");
-    if rel_norm == ".git" || rel_norm.starts_with(".git/") {
+    // Security-forbidden paths are rejected at this layer too (server does
+    // the same) so live verification never bypasses discovery's exclusions.
+    // Derive the checked path from the CANONICALIZED `abs` — a symlink inside
+    // the repo (e.g. `docs/leak -> .git/config`) has a non-forbidden lexical
+    // path but resolves into a forbidden target, and `canonicalize_within_root`
+    // only enforces containment, not the forbidden list. Checking `rel_path`
+    // before canonicalization would let that symlink bypass the policy.
+    let rel_norm = abs
+        .strip_prefix(&repo_root)
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if attic_discovery::security::is_security_forbidden(&rel_norm) {
         return Ok(SpanRead {
             text: String::new(),
             bytes_consumed: 0,
@@ -267,4 +280,61 @@ fn text_of(r: &SpanRead) -> &str {
 /// Whitespace-normalized form used for containment checks.
 fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(repo_root: &Path, rel: &str, body: &str) {
+        let path = repo_root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn read_span_text_blocks_nested_security_forbidden_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "vendor/nested/.git/config",
+            "[core]\nrepositoryformatversion = 0\n",
+        );
+        write(tmp.path(), "fixtures/.ssh/id_rsa", "PRIVATE KEY\n");
+        write(tmp.path(), "keys/.gnupg/pubring.gpg", "gpg\n");
+        let root = tmp.path().canonicalize().unwrap();
+
+        for rel in [
+            "vendor/nested/.git/config",
+            "fixtures/.ssh/id_rsa",
+            "keys/.gnupg/pubring.gpg",
+        ] {
+            let read = read_span_text(root.as_path(), rel, 1, 5, 1024).expect("read");
+            assert!(read.text.is_empty(), "{rel} should be blocked");
+            assert_eq!(read.bytes_consumed, 0, "{rel} should not charge bytes");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_span_text_blocks_windows_case_variant_git_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "sub/.GIT/config", "[core]\n");
+        let root = tmp.path().canonicalize().unwrap();
+
+        let read = read_span_text(root.as_path(), "sub/.GIT/config", 1, 3, 256).expect("read");
+        assert!(read.text.is_empty());
+        assert_eq!(read.bytes_consumed, 0);
+    }
+
+    #[test]
+    fn read_span_text_still_reads_normal_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "src/lib.rs", "line1\nline2\nline3\n");
+        let root = tmp.path().canonicalize().unwrap();
+
+        let read = read_span_text(root.as_path(), "src/lib.rs", 2, 2, 256).expect("read");
+        assert_eq!(read.text, "line2\n");
+        assert!(read.bytes_consumed > 0);
+    }
 }

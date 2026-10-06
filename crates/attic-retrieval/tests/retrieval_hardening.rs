@@ -101,31 +101,95 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
         "provider ignored its deadline: {elapsed:?}"
     );
 
-    // Pipeline-level: NORMAL's 250 ms semantic budget bounds the step; the
-    // canonical answer still returns promptly with recorded degradation.
+    // Pipeline-level: NORMAL's 250 ms semantic budget bounds the query-time
+    // embedding step; background-enriched coverage must still fall back
+    // promptly when the query itself cannot get an embedding in time.
+    struct QuerySlowHashing {
+        inner: HashingEmbedder,
+        delay_ms: u64,
+    }
+
+    impl SemanticProvider for QuerySlowHashing {
+        fn id(&self) -> &'static str {
+            self.inner.id()
+        }
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dimensions(&self) -> usize {
+            self.inner.dimensions()
+        }
+        fn max_input_bytes(&self) -> usize {
+            self.inner.max_input_bytes()
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn fingerprint(&self) -> Option<attic_semantic::EmbeddingFingerprint> {
+            self.inner.fingerprint()
+        }
+        fn embed_batch(
+            &self,
+            inputs: &[EmbeddingInput],
+            cancel: &CancelFlag,
+            usage: &mut ResourceUsage,
+            deadline: Option<std::time::Instant>,
+        ) -> Result<Vec<attic_semantic::EmbeddingOutput>, attic_semantic::SemanticError> {
+            if inputs.iter().any(|input| input.unit_key == "__query__") {
+                let mut remaining = self.delay_ms;
+                while remaining > 0 {
+                    if cancel.is_cancelled()
+                        || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                    {
+                        return Err(attic_semantic::SemanticError::Cancelled {
+                            completed: 0,
+                            total: inputs.len(),
+                        });
+                    }
+                    let step = remaining.min(5);
+                    std::thread::sleep(std::time::Duration::from_millis(step));
+                    remaining -= step;
+                }
+            }
+            self.inner.embed_batch(inputs, cancel, usage, deadline)
+        }
+    }
+
     let fx = Fixture::bootstrap();
-    let stack = SemanticStack::in_memory(Arc::new(SlowProvider { delay_ms: 120 }))
+    let enriched = SemanticStack::in_memory(Arc::new(HashingEmbedder::new()))
         .map(Arc::new)
         .unwrap();
     {
         let conn = fx.read_conn();
         attic_semantic::reconcile(
             &conn,
-            &stack.store,
-            stack.provider.as_ref(),
+            &enriched.store,
+            enriched.provider.as_ref(),
             &attic_semantic::SelectionConfig::default(),
         )
         .unwrap();
         attic_semantic::drive(
             &conn,
-            &stack.store,
-            stack.provider.as_ref(),
+            &enriched.store,
+            enriched.provider.as_ref(),
             &EnrichmentConfig::standalone(4, 3, 300, 1),
             &CancelFlag::new(),
         )
         .unwrap();
     }
-    let svc = fx.service_with_semantic(stack.provider.clone()).unwrap();
+    let slow_stack = Arc::new(SemanticStack {
+        store: enriched.store.clone(),
+        provider: Arc::new(QuerySlowHashing {
+            inner: HashingEmbedder::new(),
+            delay_ms: 400,
+        }),
+    });
+    let svc = RetrievalService {
+        readers: fx.pool.clone(),
+        writer: fx.writer.clone(),
+        semantic: Some(slow_stack),
+        crossrepo_degraded: false,
+    };
     let t1 = std::time::Instant::now();
     let out = svc
         .answer(&AnswerRequest::new(
@@ -135,6 +199,10 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
         .expect("answer under slow provider");
     let wall = t1.elapsed();
     assert!(out.context_text.is_some(), "canonical path must serve");
+    assert_eq!(
+        out.plan.policy_trace.semantic_fallback_reason,
+        "SEMANTIC_QUERY_TIMED_OUT"
+    );
     assert!(
         wall < std::time::Duration::from_millis(2_000),
         "NORMAL answer waited too long on a slow provider: {wall:?}"

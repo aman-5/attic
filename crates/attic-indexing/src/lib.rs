@@ -736,14 +736,31 @@ pub fn index_repository_with_cancellation(
     //     idempotent — `submit_index_publication`'s own upsert later is a
     //     harmless no-op re-write of the same row.
     if let Some((ref root, ref display_name)) = repo_upsert {
+        #[cfg(test)]
+        fire_indexing_test_hook(IndexingTestHookPoint::BeforeRepositoryUpsert);
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         let root = root.clone();
         let display_name = display_name.clone();
+        let cancellation = cancellation.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
         store
             .writer
             .send(move |conn| {
-                attic_storage::upsert_repository(conn, &repo_id, &root, &display_name)
+                if cancellation.is_cancelled() {
+                    let _ = tx.send(false);
+                    return Ok(());
+                }
+                attic_storage::upsert_repository(conn, &repo_id, &root, &display_name)?;
+                let _ = tx.send(true);
+                Ok(())
             })
             .map_err(IndexError::Storage)?;
+        let wrote_row = rx.try_recv().unwrap_or(false);
+        if !wrote_row {
+            return Err(IndexError::Cancelled);
+        }
     }
 
     // 3. Source revision: real Phase 1B manifest hash + real policy hash.
@@ -1327,6 +1344,11 @@ pub fn index_repository_with_cancellation(
     timings.resolve_ms = stage_start.elapsed().as_millis() as u64;
     rss.sample();
     stage_start = std::time::Instant::now();
+    #[cfg(test)]
+    fire_indexing_test_hook(IndexingTestHookPoint::BeforePublication);
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
 
     let stats: IndexPublicationStats = submit_index_publication(
         store.writer,
@@ -1762,6 +1784,49 @@ fn add_analyze_single_file_calls(n: usize) {
     ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(c.get() + n));
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingTestHookPoint {
+    BeforeRepositoryUpsert,
+    BeforePublication,
+}
+
+#[cfg(test)]
+type IndexingTestHook = std::sync::Arc<dyn Fn(IndexingTestHookPoint) + Send + Sync>;
+
+#[cfg(test)]
+static INDEXING_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<IndexingTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct IndexingTestHookGuard;
+
+#[cfg(test)]
+impl Drop for IndexingTestHookGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = INDEXING_TEST_HOOK.get() {
+            *slot.lock().unwrap() = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_indexing_test_hook(hook: IndexingTestHook) -> IndexingTestHookGuard {
+    let slot = INDEXING_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap() = Some(hook);
+    IndexingTestHookGuard
+}
+
+#[cfg(test)]
+fn fire_indexing_test_hook(point: IndexingTestHookPoint) {
+    let hook = INDEXING_TEST_HOOK
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()));
+    if let Some(hook) = hook {
+        hook(point);
+    }
+}
+
 /// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return
 /// the retrieval units (with structural anchors) and, when a specialized
 /// structural analyzer produced output, its capturable payload.
@@ -1886,10 +1951,13 @@ fn analyze_single_file(
         AnalyzerContent::StreamingHandle(_) => rec.size_bytes.max(0) as u64,
     };
 
-    let budget = ResourceBudget {
+    let mut budget = ResourceBudget {
         max_retrieval_units: opts.max_units_per_file as u64,
         ..Default::default()
     };
+    budget.max_ast_nodes = budget
+        .max_ast_nodes
+        .max((opts.max_units_per_file as u64).saturating_mul(8));
 
     let file_occ_id: FileOccurrenceId = fo_id_str.parse().map_err(|_| IndexError::Io {
         path: rec.repo_relative.clone(),
@@ -2368,6 +2436,69 @@ mod tests {
         let r1 = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
         let r2 = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
         assert_eq!(r1.repository_id, r2.repository_id, "stable repository_id");
+    }
+
+    #[test]
+    fn cancelled_bootstrap_after_eviction_does_not_recreate_repository_row() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "late.rs", "fn late() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let first = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+
+        let evicted_repo = first.repository_id.clone();
+        fx.handle
+            .send(move |conn| {
+                loop {
+                    let step =
+                        attic_storage::repo_eviction::evict_repository_step(conn, &evicted_repo)?;
+                    if step.complete {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let root_path = fx._dir.path().to_string_lossy().to_string();
+        assert!(
+            !verify_conn(&fx)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM core_repositories WHERE root_path = ?1)",
+                    rusqlite::params![root_path],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "precondition: eviction must remove the repository row before the late bootstrap"
+        );
+
+        let cancellation = CancellationToken::new();
+        let hook_cancellation = cancellation.clone();
+        let _hook = install_indexing_test_hook(std::sync::Arc::new(move |point| {
+            if point == IndexingTestHookPoint::BeforeRepositoryUpsert {
+                hook_cancellation.cancel();
+            }
+        }));
+
+        let err = index_repository_with_cancellation(
+            &store(&fx),
+            fx._dir.path(),
+            &policy,
+            &opts,
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(matches!(err, IndexError::Cancelled));
+        assert!(
+            !verify_conn(&fx)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM core_repositories WHERE root_path = ?1)",
+                    rusqlite::params![fx._dir.path().to_string_lossy().to_string()],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a cancelled late bootstrap must not recreate the evicted repository row"
+        );
     }
 
     // -----------------------------------------------------------------------

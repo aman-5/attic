@@ -12,7 +12,7 @@ mod setup_models;
 
 use attic_discovery::{
     DiscoveryPolicy, GlobRule, SecretScanDecision, canonicalize_within_root,
-    preprocess_file_content,
+    preprocess_file_content, security::is_security_forbidden,
 };
 #[cfg(test)]
 use attic_indexing::index_repository;
@@ -1666,7 +1666,29 @@ impl AtticServer {
 
                         let outcome = self
                             .bootstrap_workspace_cancellable(&root, cancellation)
-                            .map(|id| (root, id));
+                            .map(|id| (root.clone(), id));
+                        if matches!(outcome, Err(ServerError::Indexing(IndexError::Cancelled))) {
+                            let configured_root_active =
+                                self.active_roots.read().ok().is_some_and(|roots| {
+                                    roots.iter().any(|r| {
+                                        root_identity_key(r) == root_identity_key(configured_root)
+                                    })
+                                });
+                            if !configured_root_active
+                                && let Some(repo_id) = self
+                                    .pool
+                                    .with_reader(|c| {
+                                        lookup_repository_by_root_path(c, &root.to_string_lossy())
+                                    })
+                                    .ok()
+                                    .flatten()
+                                    .map(|id| id.to_string())
+                                && let Err(e) =
+                                    eviction::enqueue_eviction(&self.writer, &repo_id, &root)
+                            {
+                                tracing::warn!(repository_id = %repo_id, root = %root.display(), "could not queue cleanup for cancelled bootstrap residue: {e}");
+                            }
+                        }
                         // Container roots: publish each nested repository the
                         // moment it is indexed, so it shows in `status` and is
                         // searchable while its siblings are still running
@@ -1926,7 +1948,16 @@ impl AtticServer {
                                 .any(|r| root_identity_key(r) == root_identity_key(&root))
                         });
                         if !still_active {
-                            tracing::info!(root = %root.display(), "bootstrap completed after removal; watcher not started");
+                            for (effective_root, repo_id) in &repo_roots {
+                                if let Err(e) = eviction::enqueue_eviction(
+                                    &server.writer,
+                                    repo_id,
+                                    effective_root,
+                                ) {
+                                    tracing::warn!(repository_id = %repo_id, root = %effective_root.display(), "could not queue cleanup for obsolete bootstrap result: {e}");
+                                }
+                            }
+                            tracing::info!(root = %root.display(), "bootstrap completed after removal; cleanup re-queued and watcher not started");
                             return;
                         }
                         if let Ok(mut g) = server.pending_index_failed.lock() {
@@ -1958,7 +1989,23 @@ impl AtticServer {
                         }
                         tracing::warn!(root = %root.display(), "background workspace bootstrap task failed: {e}");
                     }
-                    Ok(Ok(_)) => {
+                    Ok(Ok(repo_roots)) => {
+                        let still_active = server.active_roots.read().ok().is_some_and(|roots| {
+                            roots
+                                .iter()
+                                .any(|r| root_identity_key(r) == root_identity_key(&root))
+                        });
+                        if !still_active {
+                            for (effective_root, repo_id) in &repo_roots {
+                                if let Err(e) = eviction::enqueue_eviction(
+                                    &server.writer,
+                                    repo_id,
+                                    effective_root,
+                                ) {
+                                    tracing::warn!(repository_id = %repo_id, root = %effective_root.display(), "could not queue cleanup for obsolete cancelled bootstrap result: {e}");
+                                }
+                            }
+                        }
                         tracing::info!(root = %root.display(), "background workspace bootstrap cancelled before watcher startup");
                     }
                 }
@@ -2171,6 +2218,20 @@ impl AtticServer {
             *active_guard = new_active.clone();
             self.workspace_configured
                 .store(!new_active.is_empty(), std::sync::atomic::Ordering::SeqCst);
+            let writer_roots = new_active.clone();
+            self.writer.send(move |conn| {
+                attic_storage::repo_eviction::sync_workspace_membership(conn, &writer_roots)
+            })?;
+            if let Some(semantic) = &self.semantic {
+                semantic
+                    .store
+                    .sync_workspace_membership(&new_active)
+                    .map_err(|e| {
+                        ServerError::Retrieval(format!(
+                            "semantic workspace membership sync failed: {e}"
+                        ))
+                    })?;
+            }
 
             (new_active, added, removed)
             // `active_guard` drops here, going out of scope before the `.await`
@@ -2975,10 +3036,12 @@ fn enforce_response_limit(mut body: String) -> String {
 enum McpWorkClass {
     /// Health, status, logging — always admitted even under Emergency pressure.
     Cheap,
-    /// Ordinary search, file reads, repo_map — admitted unless Emergency.
+    /// Ordinary search, file reads, repo_map — always admitted here; deeper
+    /// handlers can still degrade their own optional heavy modes.
     Normal,
-    /// Context assembly, large result expansion — rejected under
-    /// Critical / Emergency.
+    /// Context assembly or any fail-safe unknown tool. Admitted at Critical so
+    /// handlers such as `context` can downgrade optional expensive work, and
+    /// rejected only under genuine Emergency pressure.
     Expensive,
     /// Workspace-mutating operations — rejected under Emergency only.
     Mutation,
@@ -3010,7 +3073,9 @@ fn classify_mcp_tool(name: &str) -> McpWorkClass {
         // Normal: read-heavy but bounded — safe to admit under Warning/Critical.
         "file" | "search" | "repo_map" => McpWorkClass::Normal,
 
-        // Expensive: memory-heavy assembly — rejected under Critical/Emergency.
+        // Expensive: may do more assembly than ordinary reads, but at Critical
+        // it must still reach its own DEEP→NORMAL downgrade path. Emergency
+        // remains a hard stop.
         "context" => McpWorkClass::Expensive,
 
         // Mutation: workspace-state changes — rejected only under Emergency.
@@ -3064,15 +3129,19 @@ fn handle_file(
         .to_string_lossy()
         .replace('\\', "/");
 
-    // Block access to git-internal paths at the server layer regardless of
-    // what preprocess_file_content decides, to ensure consistent policy.
-    {
-        let rr = repo_relative.as_str();
-        if rr == ".git" || rr.starts_with(".git/") || rr.starts_with(".git\\") {
-            return Err(ServerError::InvalidArg(
-                "path rejected: .git internals are forbidden".into(),
-            ));
-        }
+    // Block security-forbidden paths at the server layer regardless of what
+    // preprocess_file_content decides, to ensure consistent policy.
+    if is_security_forbidden(&repo_relative) {
+        let detail = if repo_relative.eq_ignore_ascii_case(".git")
+            || repo_relative
+                .split('/')
+                .any(|component| component.eq_ignore_ascii_case(".git"))
+        {
+            ".git internals are forbidden"
+        } else {
+            "security-forbidden content is not readable"
+        };
+        return Err(ServerError::InvalidArg(format!("path rejected: {detail}")));
     }
 
     // preprocess handles Excluded/Redacted/secrets internally via the secrets scan layer
@@ -3230,6 +3299,9 @@ fn handle_search(
         serde_json::to_string_pretty(&json!({
             "results": results,
             "semantic_degraded": response.semantic_degraded,
+            "semantic_degraded_reason_text": response
+                .semantic_degraded
+                .map(|reason| reason.description()),
         }))?,
     )]))
 }
@@ -3570,6 +3642,93 @@ fn handle_status(
         }
     };
     payload["semantic_health"] = json!(semantic_health);
+    payload["semantic_availability"] = match phase8.semantic {
+        Some(stack) => {
+            let class = embedding_class
+                .unwrap_or(attic_storage::resource_manager::EmbeddingMemoryClass::HostRam);
+            let embedding_parked = resource_monitor.map(|m| m.embedding_parked(class));
+            let embedding_parked_reason = resource_monitor.and_then(|monitor| {
+                if !monitor.embedding_parked(class) {
+                    return None;
+                }
+                Some(match class.host_floor_mib() {
+                    Some(floor) => format!(
+                        "available system memory is below the {floor} MiB {} host floor",
+                        class.as_str()
+                    ),
+                    None => {
+                        "host-RAM embedding is parked because the stable pressure tier is emergency"
+                            .to_string()
+                    }
+                })
+            });
+            let coverage = stack.store.queue_counts().ok();
+            let embedded_units = stack
+                .store
+                .count(stack.provider.id(), stack.provider.model_id(), None)
+                .ok();
+            let search_reason = if !stack.provider.available() {
+                Some(attic_retrieval::SemanticDegradationReason::ProviderUnavailable)
+            } else {
+                match stack.store.get_active_generation() {
+                    Err(_) => Some(attic_retrieval::SemanticDegradationReason::StoreUnavailable),
+                    Ok(None) => Some(attic_retrieval::SemanticDegradationReason::NoEmbeddings),
+                    Ok(Some(_)) => match embedded_units {
+                        None => Some(attic_retrieval::SemanticDegradationReason::StoreUnavailable),
+                        Some(0) => Some(attic_retrieval::SemanticDegradationReason::NoEmbeddings),
+                        Some(_) => None,
+                    },
+                }
+            };
+            let search_reason_code = search_reason.map(|reason| match reason {
+                attic_retrieval::SemanticDegradationReason::ProviderUnavailable => {
+                    "PROVIDER_UNAVAILABLE"
+                }
+                attic_retrieval::SemanticDegradationReason::NoEmbeddings => "NO_EMBEDDINGS",
+                attic_retrieval::SemanticDegradationReason::QueryTimedOut => "QUERY_TIMED_OUT",
+                attic_retrieval::SemanticDegradationReason::EmbeddingFailed => "EMBEDDING_FAILED",
+                attic_retrieval::SemanticDegradationReason::StoreUnavailable => "STORE_UNAVAILABLE",
+            });
+            json!({
+                "pressure_tier": resource_monitor
+                    .map(|m| format!("{:?}", m.stable_tier_pressure()).to_lowercase()),
+                "system_available_mib": resource_monitor.and_then(|m| m.system_available_mib()),
+                "embedding_memory_class": class.as_str(),
+                "embedding_parked": embedding_parked,
+                "embedding_parked_reason": embedding_parked_reason,
+                "coverage": {
+                    "embedded_units": embedded_units,
+                    "eligible_units": coverage
+                        .as_ref()
+                        .map(|q| q.pending + q.inflight + q.done + q.failed),
+                    "pending_units": coverage.as_ref().map(|q| q.pending),
+                    "inflight_units": coverage.as_ref().map(|q| q.inflight),
+                    "failed_units": coverage.as_ref().map(|q| q.failed),
+                },
+                "search_uses_semantic": search_reason.is_none(),
+                "search_semantic_reason": search_reason_code,
+                "search_semantic_reason_text": search_reason.map(|reason| reason.description()),
+            })
+        }
+        None => json!({
+            "pressure_tier": resource_monitor
+                .map(|m| format!("{:?}", m.stable_tier_pressure()).to_lowercase()),
+            "system_available_mib": resource_monitor.and_then(|m| m.system_available_mib()),
+            "embedding_memory_class": serde_json::Value::Null,
+            "embedding_parked": serde_json::Value::Null,
+            "embedding_parked_reason": serde_json::Value::Null,
+            "coverage": {
+                "embedded_units": serde_json::Value::Null,
+                "eligible_units": serde_json::Value::Null,
+                "pending_units": serde_json::Value::Null,
+                "inflight_units": serde_json::Value::Null,
+                "failed_units": serde_json::Value::Null,
+            },
+            "search_uses_semantic": false,
+            "search_semantic_reason": "SEMANTIC_DISABLED",
+            "search_semantic_reason_text": "semantic search is disabled because the semantic layer is not configured",
+        }),
+    };
     if let Some(stack) = phase8.semantic {
         if let Some(lifecycle) = stack.provider.model_lifecycle() {
             payload["model_lifecycle"] = json!(lifecycle);
@@ -3660,38 +3819,70 @@ fn handle_status(
 
         // Phase 5 stall detection: flag a hung inference worker (the
         // 2026-09 incident: 16 in-flight, 0 done for 20+ min reported as
-        // merely "slow"). Track the last time `done` advanced.
+        // merely "slow"). The clock resets when new work arrives after an
+        // idle spell, and the verdict distinguishes load/backoff from an
+        // actual hung batch.
         {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static LAST_DONE_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
-            static LAST_ADVANCE_SECS: AtomicU64 = AtomicU64::new(0);
+            static WORK_AVAILABLE_CLOCK: std::sync::Mutex<
+                attic_semantic::diagnostics::WorkAvailabilityClock,
+            > = std::sync::Mutex::new(attic_semantic::diagnostics::WorkAvailabilityClock {
+                active_since_secs: None,
+            });
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let prev_done = LAST_DONE_COUNT.swap(done, Ordering::SeqCst);
-            if prev_done == u64::MAX || done > prev_done {
-                // First sample or progress — reset the clock.
-                LAST_ADVANCE_SECS.store(now_secs, Ordering::SeqCst);
-            }
-            let last_advance = LAST_ADVANCE_SECS.load(Ordering::SeqCst);
-            // Prefer the enricher's own commit clock; fall back to the
-            // poll-observed advance before the first commit of this process.
-            let secs_since_advance = measured
-                .secs_since_last_commit
-                .filter(|_| inflight > 0 || pending > 0)
-                .unwrap_or_else(|| now_secs.saturating_sub(last_advance));
+            let work_clock = {
+                let mut clock = WORK_AVAILABLE_CLOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *clock = attic_semantic::diagnostics::observe_work_availability(
+                    *clock, now_secs, pending, inflight,
+                );
+                *clock
+            };
+            let secs_since_advance = attic_semantic::diagnostics::secs_since_meaningful_progress(
+                work_clock,
+                now_secs,
+                measured.secs_since_last_commit,
+            )
+            .unwrap_or(0);
+            let provider_backoff = attic_semantic::diagnostics::provider_backoff_snapshot();
+            let progress_heartbeat_supported =
+                stack.provider.fingerprint().is_some_and(|fingerprint| {
+                    matches!(
+                        fingerprint.execution_backend,
+                        attic_semantic::ExecutionBackend::OrtDirectMl
+                    )
+                });
             let stall = attic_semantic::diagnostics::assess_stall(
-                inflight,
-                done,
-                chunks_per_sec,
-                secs_since_advance,
+                &attic_semantic::diagnostics::StallContext {
+                    queue_depth: pending + inflight,
+                    inflight,
+                    done,
+                    chunks_per_sec,
+                    secs_since_last_progress: secs_since_advance,
+                    loading_or_warmup: !stack.provider.available(),
+                    provider_backoff: provider_backoff.clone(),
+                    progress_heartbeat_supported,
+                },
             );
             payload["semantic_stall"] = json!({
                 "stalled": stall.stalled,
                 "verdict": stall.verdict,
                 "secs_since_last_completed_batch": secs_since_advance,
+                "secs_since_last_meaningful_progress": secs_since_advance,
+                "detection_mode": stall.detection_mode,
+                "heartbeat_watchdog_supported": progress_heartbeat_supported,
+                "deadline_secs": attic_semantic::diagnostics::EMBED_DEADLINE_SECS,
             });
+            if let Some(backoff) = provider_backoff {
+                payload["semantic_provider_backoff"] = json!({
+                    "last_error": backoff.last_error,
+                    "consecutive_failures": backoff.consecutive_failures,
+                    "next_retry_unix_ms": backoff.next_retry_unix_ms,
+                });
+            }
 
             // Why the embedded count is what it is. Selection can reject the
             // vast majority of an index for entirely legitimate reasons
@@ -3705,12 +3896,87 @@ fn handle_status(
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), json!(v)))
                     .collect();
+                let repo_cap_excluded = sel
+                    .excluded
+                    .get(attic_semantic::EX_CAP_REPO)
+                    .copied()
+                    .unwrap_or(0);
+                let total_cap_excluded = sel
+                    .excluded
+                    .get(attic_semantic::EX_CAP_TOTAL)
+                    .copied()
+                    .unwrap_or(0);
+                let eligible_before_caps = sel.selected + repo_cap_excluded + total_cap_excluded;
+                let cap_reason = |limit: usize, scope: &str, source_key: &str| {
+                    if let Some(eff) = SELECTION_EFFECTIVE.get() {
+                        let source = eff
+                            .get("source")
+                            .and_then(|s| s.get(source_key))
+                            .and_then(|v| v.as_str());
+                        let profile = eff.get("profile").and_then(|v| v.as_str());
+                        match source {
+                            Some("attic.toml") => {
+                                format!("cap reached (attic.toml {limit}/{scope})")
+                            }
+                            _ => match profile {
+                                Some("gpu_defaults") => {
+                                    format!("cap reached (GPU default {limit}/{scope})")
+                                }
+                                Some("cpu_defaults") => {
+                                    format!("cap reached (CPU default {limit}/{scope})")
+                                }
+                                _ => format!("cap reached ({limit}/{scope})"),
+                            },
+                        }
+                    } else {
+                        format!("cap reached ({limit}/{scope})")
+                    }
+                };
+                let configured_total_cap = SELECTION_EFFECTIVE
+                    .get()
+                    .and_then(|eff| eff.get("max_units_total"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(
+                        attic_semantic::SelectionConfig::for_backend(gpu_embedding).max_units_total
+                            as u64,
+                    ) as usize;
+                let configured_repo_cap = SELECTION_EFFECTIVE
+                    .get()
+                    .and_then(|eff| eff.get("max_units_per_repo"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(
+                        attic_semantic::SelectionConfig::for_backend(gpu_embedding)
+                            .max_units_per_repo as u64,
+                    ) as usize;
+                let coverage_reason = if total_cap_excluded > 0 {
+                    Some(cap_reason(
+                        configured_total_cap,
+                        "workspace",
+                        "max_units_total",
+                    ))
+                } else if repo_cap_excluded > 0 {
+                    Some(cap_reason(
+                        configured_repo_cap,
+                        "repo",
+                        "max_units_per_repo",
+                    ))
+                } else {
+                    None
+                };
                 payload["semantic_selection"] = json!({
                     "scanned": sel.scanned,
                     "scan_truncated": sel.scan_truncated,
                     "selected": sel.selected,
                     "excluded": breakdown,
                     "top_exclusion_reason": excluded.first().map(|(k, _)| *k),
+                });
+                payload["semantic_selection_coverage"] = json!({
+                    "eligible_before_caps": eligible_before_caps,
+                    "selected": sel.selected,
+                    "per_repository_cap_excluded": repo_cap_excluded,
+                    "global_cap_excluded": total_cap_excluded,
+                    "cap_reached": coverage_reason.is_some(),
+                    "reason": coverage_reason,
                 });
             }
             if let Some(eff) = SELECTION_EFFECTIVE.get() {
@@ -3794,6 +4060,7 @@ fn handle_status(
     let mut indexing = 0u64;
     let mut reconciliation_required = 0u64;
     let mut disabled = 0u64;
+    let mut stuck_tasks = Vec::new();
     for rs in &active_stats {
         let (state, watcher_json) = match (incremental.get(&rs.id), watch_mode.get(&rs.id)) {
             (Some(svc), Some(mode)) => match svc.status_snapshot(pool, &rs.id) {
@@ -3805,6 +4072,18 @@ fn handle_status(
                     } else {
                         "CURRENT"
                     };
+                    if !snap.tasks.stuck_tasks.is_empty() {
+                        for task in &snap.tasks.stuck_tasks {
+                            stuck_tasks.push(json!({
+                                "repository_id": rs.id,
+                                "repository": &rs.display_name,
+                                "task_id": &task.task_id,
+                                "task_type": &task.task_type,
+                                "task_repository": &task.repository,
+                                "age_seconds": task.age_seconds,
+                            }));
+                        }
+                    }
                     (
                         state,
                         json!({
@@ -3868,6 +4147,7 @@ fn handle_status(
             "watcher": watcher_json,
         }));
     }
+    payload["incremental_stuck_tasks"] = json!(stuck_tasks);
     // Configured roots can be indexing before their repository row exists.
     // Surface them explicitly instead of reporting configured_repository_count=0.
     for root in active_roots {
@@ -3986,6 +4266,12 @@ fn handle_context(
     let outcome = service
         .answer(&request)
         .map_err(|e| ServerError::Retrieval(e.to_string()))?;
+    let semantic_fallback_reason = (!outcome
+        .plan
+        .policy_trace
+        .semantic_fallback_reason
+        .is_empty())
+    .then_some(outcome.plan.policy_trace.semantic_fallback_reason.clone());
 
     let payload = json!({
         "result": outcome.result.as_str(),
@@ -3993,6 +4279,10 @@ fn handle_context(
         "insufficient_reason": outcome.insufficient_reason,
         "plan_id": outcome.plan.plan_id,
         "evidence_used": outcome.plan.evidence_used.len(),
+        "semantic_fallback_reason": semantic_fallback_reason,
+        "semantic_fallback_reason_text": semantic_fallback_reason
+            .as_deref()
+            .and_then(attic_retrieval::semantic::semantic_fallback_reason_text),
         // RP-INV-4: every piece of considered evidence must be accounted
         // for — this is the "excluded" half (evidence_used above is the
         // "included" half), each with a deterministic drop_reason so a
@@ -4246,10 +4536,7 @@ impl ServerHandler for AtticServer {
                     match work_class {
                         McpWorkClass::Cheap => false,
                         McpWorkClass::Normal => false,
-                        McpWorkClass::Expensive => matches!(
-                            tier,
-                            ResourcePressure::Critical | ResourcePressure::Emergency
-                        ),
+                        McpWorkClass::Expensive => matches!(tier, ResourcePressure::Emergency),
                         McpWorkClass::Mutation => matches!(tier, ResourcePressure::Emergency),
                     }
                 } else {
@@ -4764,6 +5051,72 @@ enum Ownership {
     },
 }
 
+/// Format one panic report exactly once for tracing/stderr.
+pub(crate) fn render_panic_diagnostic(
+    message: &str,
+    location: Option<(&str, u32, u32)>,
+    backtrace: Option<&str>,
+) -> String {
+    let where_ = location
+        .map(|(file, line, column)| format!("{file}:{line}:{column}"))
+        .unwrap_or_else(|| "unknown location".to_string());
+    let mut rendered = format!("panic at {where_}: {message}");
+    if let Some(bt) = backtrace.map(str::trim).filter(|bt| !bt.is_empty()) {
+        rendered.push_str("\nbacktrace:\n");
+        rendered.push_str(bt);
+    }
+    rendered
+}
+
+pub(crate) fn emit_panic_diagnostic_with<E, C>(
+    message: &str,
+    location: Option<(&str, u32, u32)>,
+    backtrace: Option<&str>,
+    emit: E,
+    chain: C,
+) where
+    E: FnOnce(&str),
+    C: FnOnce(),
+{
+    let rendered = render_panic_diagnostic(message, location, backtrace);
+    emit(&rendered);
+    chain();
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic payload is not a string".to_string());
+        let location = info
+            .location()
+            .map(|loc| (loc.file(), loc.line(), loc.column()));
+        let backtrace = std::backtrace::Backtrace::capture();
+        let backtrace_text = matches!(
+            backtrace.status(),
+            std::backtrace::BacktraceStatus::Captured
+        )
+        .then(|| backtrace.to_string());
+        emit_panic_diagnostic_with(
+            &message,
+            location,
+            backtrace_text.as_deref(),
+            |rendered| {
+                if tracing::dispatcher::has_been_set() {
+                    tracing::error!(target: "attic::panic", "{rendered}");
+                } else {
+                    eprintln!("{rendered}");
+                }
+            },
+            || default_hook(info),
+        );
+    }));
+}
+
 /// Real process entry point. Deliberately NOT `#[tokio::main] async fn main()`:
 /// that expansion builds a `Runtime`, runs `run()` on it, then drops the
 /// `Runtime` before the process exits — and dropping a multi-threaded tokio
@@ -4781,6 +5134,7 @@ enum Ownership {
 /// immediately, running no destructors at all, so the runtime's blocking drop
 /// (and whatever it might be stuck waiting on) never gets a chance to run.
 fn main() {
+    install_panic_hook();
     // r06: `attic inference-worker` runs the supervised embedding worker
     // loop on stdin/stdout — BEFORE any tokio runtime or logging setup, so
     // stdout stays a clean protocol channel.
@@ -5146,6 +5500,21 @@ pub(crate) fn build_server_and_enricher(
         config_source != ConfigSource::Unconfigured,
         std::sync::atomic::Ordering::SeqCst,
     );
+    let startup_writer_roots = roots.clone();
+    server
+        .writer
+        .send(move |conn| {
+            attic_storage::repo_eviction::sync_workspace_membership(conn, &startup_writer_roots)
+        })
+        .map_err(|e| anyhow::anyhow!("startup workspace membership sync failed: {e}"))?;
+    if let Some(semantic) = &server.semantic {
+        semantic
+            .store
+            .sync_workspace_membership(&roots)
+            .map_err(|e| {
+                anyhow::anyhow!("startup semantic workspace membership sync failed: {e}")
+            })?;
+    }
     info!(
         configured = config_source != ConfigSource::Unconfigured,
         source = ?config_source,
@@ -5604,6 +5973,26 @@ mod tests {
         assert_eq!(configured_file_log_level(&db), LevelFilter::DEBUG);
         assert_eq!(level_filter_from_name("TRACE"), Some(LevelFilter::TRACE));
         assert_eq!(level_filter_from_name("verbose"), None);
+    }
+
+    #[test]
+    fn panic_diagnostic_helpers_render_and_chain() {
+        let mut rendered = String::new();
+        let mut chained = false;
+        emit_panic_diagnostic_with(
+            "boom",
+            Some(("src/main.rs", 10, 7)),
+            Some("stack line"),
+            |line| rendered = line.to_string(),
+            || chained = true,
+        );
+        assert!(
+            rendered.contains("panic at src/main.rs:10:7: boom"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("backtrace:"), "{rendered}");
+        assert!(rendered.contains("stack line"), "{rendered}");
+        assert!(chained, "default hook must still be chained");
     }
 
     #[test]
@@ -6463,6 +6852,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_rejects_nested_security_forbidden_paths() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("r3");
+        fs::create_dir_all(repo.join("vendor").join("nested").join(".git")).unwrap();
+        fs::create_dir_all(repo.join("fixtures").join(".ssh")).unwrap();
+        fs::create_dir_all(repo.join("keys").join(".gnupg")).unwrap();
+        fs::write(
+            repo.join("vendor")
+                .join("nested")
+                .join(".git")
+                .join("config"),
+            "[core]",
+        )
+        .unwrap();
+        fs::write(repo.join("fixtures").join(".ssh").join("id_rsa"), "PRIVATE").unwrap();
+        fs::write(repo.join("keys").join(".gnupg").join("pubring.gpg"), "gpg").unwrap();
+        let id = srv.bootstrap_workspace(&repo).unwrap();
+
+        for rel in [
+            "vendor/nested/.git/config",
+            "fixtures/.ssh/id_rsa",
+            "keys/.gnupg/pubring.gpg",
+        ] {
+            let mut args = HashMap::new();
+            args.insert("repository_id".into(), json!(id.clone()));
+            args.insert("path".into(), json!(rel));
+            let err = handle_file(&srv.pool, &args, &ids(&srv))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("path rejected"), "{rel}: {err}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_rejects_windows_case_variant_git_dirs() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("r4");
+        fs::create_dir_all(repo.join("sub").join(".GIT")).unwrap();
+        fs::write(repo.join("sub").join(".GIT").join("config"), "[core]").unwrap();
+        let id = srv.bootstrap_workspace(&repo).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("repository_id".into(), json!(id));
+        args.insert("path".into(), json!("sub/.GIT/config"));
+        let err = handle_file(&srv.pool, &args, &ids(&srv))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(".git") || err.contains("path rejected"),
+            "{err}"
+        );
+    }
+
     // ── LARGE-file genuinely bounded retrieval ───────────────────────────────
 
     /// Build a deterministic LARGE-tier file (>4 MiB, ≤50 MiB) with unique
@@ -6626,6 +7074,34 @@ mod tests {
         let t = text_of(&r);
         let v: Value = serde_json::from_str(&t).unwrap();
         assert!(v["results"].is_array());
+    }
+
+    #[test]
+    fn search_reports_semantic_degraded_reason_text() {
+        let tmp = TempDir::new().unwrap();
+        let stack = attic_retrieval::semantic::SemanticStack::in_memory(std::sync::Arc::new(
+            attic_semantic::testing::HashingEmbedder::new(),
+        ))
+        .unwrap();
+        let mut a = HashMap::new();
+        a.insert("query".into(), json!("hello"));
+        let r = handle_search(
+            &make_server(&tmp).pool,
+            Some(&stack),
+            &a,
+            &HashSet::new(),
+            None,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["semantic_degraded"], "NO_EMBEDDINGS");
+        assert!(
+            v["semantic_degraded_reason_text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no embeddings exist"),
+            "{v}"
+        );
     }
 
     // ── central knowledge folder ([knowledge] dir) ─────────────────────────
@@ -6806,6 +7282,14 @@ mod tests {
         )
         .unwrap();
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["semantic_fallback_reason"], "SEMANTIC_DISABLED");
+        assert!(
+            v["semantic_fallback_reason_text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("disabled"),
+            "{v}"
+        );
         let ev = v["evidence"].as_array().unwrap();
         assert!(
             ev.iter()
@@ -6962,7 +7446,70 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_incremental_stuck_tasks() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("f.txt"), "data").unwrap();
+        let canonical_root = repo.canonicalize().unwrap();
+        let repo_id = srv.bootstrap_workspace(&canonical_root).unwrap();
+
+        let repo_id_for_task = repo_id.clone();
+        srv.writer
+            .send(move |conn| {
+                attic_storage::enqueue_task(
+                    conn,
+                    "t-stuck",
+                    Some(&repo_id_for_task),
+                    attic_storage::TASK_INCREMENTAL_INDEX,
+                    50,
+                    "{\"dedup_key\":\"stuck\"}",
+                    1,
+                )?;
+                let _ = attic_storage::claim_next_pending_task(conn, 2)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut incremental = HashMap::new();
+        incremental.insert(
+            repo_id.clone(),
+            Arc::new(attic_incremental::IncrementalService::new(
+                &canonical_root,
+                srv.discovery_policy(),
+            )),
+        );
+        let mut watch_mode = HashMap::new();
+        watch_mode.insert(repo_id.clone(), attic_incremental::WatchMode::NativeWatcher);
+
+        let r = handle_status(
+            &srv.pool,
+            &incremental,
+            &watch_mode,
+            None,
+            true,
+            std::slice::from_ref(&canonical_root),
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &test_resource_status(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["incremental_stuck_tasks"][0]["task_id"], "t-stuck");
+        assert_eq!(v["incremental_stuck_tasks"][0]["repository_id"], repo_id);
+        assert_eq!(
+            v["workspace"]["repositories"][0]["watcher"]["tasks"]["stuck_tasks"][0]["task_id"],
+            "t-stuck"
+        );
+    }
+
+    #[test]
     fn status_reports_semantic_progress_and_diagnostics() {
+        attic_semantic::diagnostics::clear_provider_backoff();
         let tmp = TempDir::new().unwrap();
         let srv = make_server(&tmp);
         let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
@@ -7017,6 +7564,21 @@ mod tests {
         let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
         assert!(v.get("semantic_progress").is_some());
         assert_eq!(v["semantic_progress"]["queue_pending"], 2);
+        assert_eq!(v["semantic_availability"]["coverage"]["embedded_units"], 0);
+        assert_eq!(v["semantic_availability"]["coverage"]["eligible_units"], 2);
+        assert_eq!(v["semantic_availability"]["search_uses_semantic"], false);
+        assert_eq!(
+            v["semantic_availability"]["search_semantic_reason"],
+            "NO_EMBEDDINGS"
+        );
+        assert!(
+            v["semantic_availability"]["search_semantic_reason_text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no embeddings exist"),
+            "{}",
+            v["semantic_availability"]
+        );
         assert_eq!(v["semantic_progress"]["total_queue_depth"], 2);
         assert!(v.get("diagnostics").is_some());
         assert!(v["diagnostics"]["why_slow"].is_string());
@@ -7037,6 +7599,75 @@ mod tests {
 
     /// The residual case (no bootstrap in progress, no recorded watcher
     /// failure) must still carry an honest label, not silence.
+    #[test]
+    fn status_reports_semantic_provider_backoff_and_selection_coverage() {
+        attic_semantic::diagnostics::clear_provider_backoff();
+        let tmp = TempDir::new().unwrap();
+        let srv = make_server(&tmp);
+        let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
+        let provider = Arc::new(attic_semantic::testing::HashingEmbedder::new());
+        let fp = attic_semantic::testing::test_fingerprint(provider.as_ref());
+        let vector_space = fp.vector_space_id();
+        let content_generation = fp.content_generation_id("sel");
+        let hash = attic_semantic::content_hash("unit");
+        store
+            .add_occurrence(
+                "occ1",
+                "unit1",
+                &vector_space,
+                &hash,
+                "repo",
+                "rev",
+                "gen",
+                &content_generation,
+                "{}",
+            )
+            .unwrap();
+        store.queue_enqueue("occ1", 1.0).unwrap();
+
+        let mut excluded = HashMap::new();
+        excluded.insert(attic_semantic::EX_CAP_REPO, 3usize);
+        attic_semantic::publish_selection_report(&attic_semantic::SelectionReport {
+            scanned: 9,
+            scan_truncated: false,
+            selected: 2,
+            excluded,
+            per_repo_selected: HashMap::new(),
+        });
+        attic_semantic::diagnostics::note_provider_backoff(2, 1_500, "synthetic load failure");
+
+        let stack = attic_retrieval::semantic::SemanticStack { store, provider };
+        let mut res_status = test_resource_status();
+        res_status.semantic = Some(&stack);
+
+        let r = handle_status(
+            &srv.pool,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &res_status,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(v["semantic_provider_backoff"]["consecutive_failures"], 2);
+        assert_eq!(v["semantic_selection_coverage"]["eligible_before_caps"], 5);
+        assert_eq!(v["semantic_selection_coverage"]["selected"], 2);
+        assert!(
+            v["semantic_selection_coverage"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("cap reached")),
+            "{}",
+            v["semantic_selection_coverage"]
+        );
+        attic_semantic::diagnostics::clear_provider_backoff();
+    }
+
     #[test]
     fn status_reports_watcher_not_registered_reason() {
         use std::fs;
@@ -7916,6 +8547,10 @@ mod tests {
         assert!(
             v.get("semantic_health").is_some(),
             "semantic_health missing from status: {v}"
+        );
+        assert!(
+            v.get("semantic_availability").is_some(),
+            "semantic_availability missing from status: {v}"
         );
         child.kill().ok();
         child.wait().ok();

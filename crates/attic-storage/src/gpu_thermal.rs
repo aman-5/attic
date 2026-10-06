@@ -177,6 +177,9 @@ fn read_sensor(nvidia_smi_ok: bool) -> (Option<u32>, bool) {
 }
 
 fn read_nvidia_smi() -> Option<u32> {
+    // Safe on Rust 1.98+: std::process::Command resolves bare executables
+    // from PATH without searching the repository CWD first on Windows, so a
+    // repo-local `nvidia-smi.cmd` / `nvidia-smi.exe` cannot hijack this spawn.
     let mut cmd = std::process::Command::new("nvidia-smi");
     cmd.args([
         "--query-gpu=temperature.gpu",

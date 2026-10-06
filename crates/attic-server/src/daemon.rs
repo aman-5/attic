@@ -46,11 +46,16 @@ const RELAY_RECOVERY_BACKOFFS_MS: &[u64] = &[100, 250, 500, 1_000];
 /// rather than letting the outer election loop spin endlessly.
 const RELAY_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
 
+#[cfg(windows)]
 use interprocess::local_socket::{
     GenericNamespaced, ListenerOptions,
     tokio::{Listener as IpcListener, Stream as IpcStream, prelude::*},
 };
 use rmcp::ServiceExt;
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener as IpcListener, UnixStream as IpcStream};
 use tracing::{debug, info, trace, warn};
 
 use crate::{AtticServer, ShutdownHandles, run_shutdown_sequence};
@@ -89,12 +94,25 @@ fn idle_timeout() -> Duration {
 /// `attic.ipc` address file it published (removed best-effort on shutdown).
 /// `ipc` is `None` when socket/IPC setup failed: the daemon then serves only
 /// its own stdio client.
+struct PendingIpc {
+    listener: IpcListener,
+    published_address: String,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+}
+
+struct BoundIpc {
+    listener: IpcListener,
+    ipc_path: PathBuf,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+}
+
 pub(crate) struct DaemonHandle {
-    // Field order is drop order: the listener (which unlinks its socket file
-    // on macOS/BSD) must be dropped BEFORE the lock is released, or a
-    // replacement daemon that wins the lock in between would have its fresh
-    // socket unlinked by our late drop.
-    ipc: Option<(IpcListener, PathBuf)>,
+    // Field order is drop order: the listener must be dropped BEFORE the
+    // lock is released, or a replacement daemon that wins the lock in
+    // between could observe the previous listener still holding the address.
+    ipc: Option<BoundIpc>,
     _lock_guard: std::fs::File,
 }
 
@@ -221,23 +239,98 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn bind_listener(socket_name: &str) -> io::Result<IpcListener> {
-    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
-    // Only the process holding `attic.lock` binds (see `try_become_daemon`),
-    // so an existing socket is a dead daemon's leftover. On macOS/BSD the
-    // namespaced socket is a real file that outlives a killed process (Linux
-    // uses the abstract namespace, Windows named pipes), and without
-    // overwriting it every replacement daemon failed with AddrInUse.
-    ListenerOptions::new()
-        .name(name)
-        .try_overwrite(true)
-        .max_spin_time(Duration::from_secs(2))
-        .create_tokio()
+#[cfg(unix)]
+fn derive_socket_path(db_path: &Path) -> PathBuf {
+    attic_core::sibling(db_path, "attic.ipc").with_file_name(derive_socket_name(db_path))
 }
 
-async fn connect_stream(socket_name: &str) -> io::Result<IpcStream> {
-    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
+fn published_ipc_address(db_path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        return format!("fs:{}", derive_socket_path(db_path).display());
+    }
+    #[cfg(windows)]
+    {
+        derive_socket_name(db_path)
+    }
+}
+
+#[cfg(unix)]
+fn bind_listener(db_path: &Path) -> io::Result<PendingIpc> {
+    let socket_path = derive_socket_path(db_path);
+    if let Some(parent) = socket_path.parent()
+        && parent.file_name().is_some_and(|name| name == "run")
+    {
+        attic_core::ensure_private_dir(parent)?;
+    }
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+    listener.set_nonblocking(true)?;
+    attic_core::set_private_file_permissions(&socket_path)?;
+    Ok(PendingIpc {
+        listener: IpcListener::from_std(listener)?,
+        published_address: format!("fs:{}", socket_path.display()),
+        socket_path,
+    })
+}
+
+#[cfg(windows)]
+fn bind_listener(db_path: &Path) -> io::Result<PendingIpc> {
+    let socket_name = derive_socket_name(db_path);
+    let name = socket_name.clone().to_ns_name::<GenericNamespaced>()?;
+    Ok(PendingIpc {
+        listener: ListenerOptions::new()
+            .name(name)
+            .try_overwrite(true)
+            .max_spin_time(Duration::from_secs(2))
+            .create_tokio()?,
+        published_address: socket_name,
+    })
+}
+
+#[cfg(unix)]
+async fn connect_stream(address: &str) -> io::Result<IpcStream> {
+    if let Some(path) = address.strip_prefix("fs:") {
+        return IpcStream::connect(path).await;
+    }
+    if Path::new(address).is_absolute() {
+        return IpcStream::connect(address).await;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(address.as_bytes())?;
+        let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+        stream.set_nonblocking(true)?;
+        return IpcStream::from_std(stream);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported legacy IPC address '{address}'"),
+        ))
+    }
+}
+
+#[cfg(windows)]
+async fn connect_stream(address: &str) -> io::Result<IpcStream> {
+    let name = address.to_ns_name::<GenericNamespaced>()?;
     IpcStream::connect(name).await
+}
+
+#[cfg(unix)]
+async fn accept_ipc(listener: &IpcListener) -> io::Result<IpcStream> {
+    listener.accept().await.map(|(stream, _)| stream)
+}
+
+#[cfg(windows)]
+async fn accept_ipc(listener: &IpcListener) -> io::Result<IpcStream> {
+    listener.accept().await
 }
 
 /// Outcome of one [`try_become_daemon`] attempt.
@@ -284,14 +377,30 @@ fn try_become_daemon(
         }
     }
 
-    let socket_name = derive_socket_name(db_path);
-    let ipc = match bind_listener(&socket_name) {
-        Ok(listener) => match std::fs::write(ipc_path, &socket_name) {
-            Ok(()) => Some((listener, ipc_path.to_path_buf())),
+    if let Some(parent) = lock_path.parent()
+        && parent.file_name().is_some_and(|name| name == "run")
+    {
+        attic_core::ensure_private_dir(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create run directory '{}': {e}", parent.display())
+        })?;
+    }
+    attic_core::set_private_file_permissions(lock_path).map_err(|e| {
+        anyhow::anyhow!("failed to harden lock file '{}': {e}", lock_path.display())
+    })?;
+
+    let ipc = match bind_listener(db_path) {
+        Ok(bound) => match attic_core::write_private_file(ipc_path, &bound.published_address) {
+            Ok(()) => Some(BoundIpc {
+                listener: bound.listener,
+                ipc_path: ipc_path.to_path_buf(),
+                #[cfg(unix)]
+                socket_path: bound.socket_path,
+            }),
             Err(e) => {
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(&bound.socket_path);
                 warn!(
-                    "attic: daemon failed to write IPC address file '{}' ({e}); serving this \
-                     client only — other launches for this database cannot share it",
+                    "attic: daemon failed to write IPC address file '{}' ({e}); serving this                      client only — other launches for this database cannot share it",
                     ipc_path.display()
                 );
                 None
@@ -299,8 +408,8 @@ fn try_become_daemon(
         },
         Err(e) => {
             warn!(
-                "attic: daemon failed to bind IPC listener '{socket_name}' ({e}); serving this \
-                 client only — other launches for this database cannot share it"
+                "attic: daemon failed to bind IPC listener '{}' ({e}); serving this                  client only — other launches for this database cannot share it",
+                published_ipc_address(db_path)
             );
             None
         }
@@ -964,7 +1073,7 @@ async fn recover_daemon(
                     "relay: won daemon election during recovery; starting replacement daemon inline"
                 );
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                let socket_name = derive_socket_name(db_path);
+                let address = published_ipc_address(db_path);
                 let daemon_task = starter(handle, ready_tx)
                     .map_err(|e| anyhow::anyhow!("failed to start replacement daemon: {e}"))?;
 
@@ -985,8 +1094,10 @@ async fn recover_daemon(
                 }
 
                 *owned_daemon = Some(OwnedDaemon { task: daemon_task });
-                let stream = connect_stream(&socket_name).await.map_err(|e| {
-                    anyhow::anyhow!("failed to connect to newly started replacement daemon at '{socket_name}': {e}")
+                let stream = connect_stream(&address).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to connect to newly started replacement daemon at '{address}': {e}"
+                    )
                 })?;
                 Ok(RecoveredTarget::Connected(stream))
             } else {
@@ -1262,16 +1373,15 @@ pub(crate) async fn resume_relay_after_promotion(
     // Connect to the replacement daemon using the same IPC mechanism as
     // a normal relay. The daemon was already started and signaled readiness
     // before this function is called.
-    let socket_name = derive_socket_name(db_path);
+    let address = published_ipc_address(db_path);
     info!(
-        socket = %socket_name,
+        socket = %address,
         "relay promotion: connecting to replacement daemon via local IPC"
     );
 
-    let mut stream = connect_stream(&socket_name).await.map_err(|e| {
+    let mut stream = connect_stream(&address).await.map_err(|e| {
         anyhow::anyhow!(
-            "relay promotion: failed to connect to replacement daemon \
-             at socket '{socket_name}': {e}"
+            "relay promotion: failed to connect to replacement daemon              at address '{address}': {e}"
         )
     })?;
 
@@ -1432,7 +1542,7 @@ pub(crate) async fn run_daemon_accept_loop(
 
         let accept_future = async {
             match handle.ipc.as_ref() {
-                Some((listener, _)) => listener.accept().await,
+                Some(ipc) => accept_ipc(&ipc.listener).await,
                 None => std::future::pending().await,
             }
         };
@@ -1471,8 +1581,10 @@ pub(crate) async fn run_daemon_accept_loop(
     }
 
     // Remove the IPC address file so stale relays get a clean election.
-    if let Some((_, ipc_path)) = handle.ipc.as_ref() {
-        let _ = std::fs::remove_file(ipc_path);
+    if let Some(ipc) = handle.ipc.as_ref() {
+        let _ = std::fs::remove_file(&ipc.ipc_path);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&ipc.socket_path);
     }
     info!("daemon: accept loop exited");
 
@@ -1618,22 +1730,14 @@ mod tests {
     async fn test_inflight_request_retried_at_most_once_invariant() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("attic.db");
-        let socket_name = derive_socket_name(&db_path);
+        let address = published_ipc_address(&db_path);
 
         // Stand up a test listener
-        let listener = ListenerOptions::new()
-            .name(
-                socket_name
-                    .as_str()
-                    .to_ns_name::<GenericNamespaced>()
-                    .expect("ns name"),
-            )
-            .create_tokio()
-            .expect("create listener");
+        let listener = bind_listener(&db_path).expect("create listener");
+        let handle =
+            tokio::spawn(async move { accept_ipc(&listener.listener).await.expect("accept") });
 
-        let handle = tokio::spawn(async move { listener.accept().await.expect("accept") });
-
-        let mut client_stream = connect_stream(&socket_name).await.expect("connect");
+        let mut client_stream = connect_stream(&address).await.expect("connect");
         let _server_stream = handle.await.expect("server stream");
 
         let cache = RelaySessionCache::default();

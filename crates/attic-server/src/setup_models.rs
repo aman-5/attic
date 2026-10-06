@@ -9,7 +9,8 @@
 //! cache, Windows blob copies) are removed (`attic_semantic::model_cache`).
 //!
 //! Exit codes: 0 ready (or semantic disabled), 1 usage error, 2 a download
-//! failed (the server still downloads on first use).
+//! failed (the server still downloads on first use), 3 model-cache directory
+//! creation failed.
 
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,10 @@ struct Opts {
     quiet: bool,
 }
 
+const EXIT_USAGE: i32 = 1;
+const EXIT_DOWNLOAD_FAILED: i32 = 2;
+const EXIT_MODELS_DIR_ERROR: i32 = 3;
+
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts::default();
     for a in args {
@@ -45,8 +50,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
 }
 
 /// Which assets to fetch, in order: the GPU model first so an eligible
-/// machine is GPU-ready as early as possible; safetensors are the CPU
-/// fallback target (and the only model elsewhere).
+/// machine is DirectML-ready as early as possible; safetensors remain the
+/// Candle model (CPU, CUDA, or Metal) everywhere else.
 pub(crate) fn plan(gpu_eligible: bool, cpu_only: bool, gpu_only: bool) -> Vec<Asset> {
     match (gpu_eligible, cpu_only, gpu_only) {
         (_, true, _) => vec![Asset::Safetensors],
@@ -154,15 +159,50 @@ fn download(asset: Asset, models: &Path) -> Result<(), String> {
     }
 }
 
+fn asset_label(asset: Asset) -> &'static str {
+    match asset {
+        Asset::Onnx => "DirectML GPU model (ONNX fp16)",
+        Asset::Safetensors => "Qwen3 safetensors model (Candle backend)",
+    }
+}
+
+fn ensure_models_dir(models: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(models).map_err(|e| {
+        format!(
+            "attic setup-models: cannot create {}: {e}",
+            models.display()
+        )
+    })
+}
+
 fn fetch(asset: Asset, models: &Path, quiet: bool) -> Result<&'static str, String> {
-    let label = match asset {
-        Asset::Onnx => "GPU model (ONNX fp16, DirectML)",
-        Asset::Safetensors => "CPU model (Qwen3 safetensors)",
-    };
-    let present = match asset {
-        Asset::Onnx => attic_semantic::onnx_assets::assets_present(
+    let label = asset_label(asset);
+    if asset == Asset::Onnx {
+        let present = attic_semantic::onnx_assets::assets_present(
             &attic_semantic::onnx_assets::onnx_dir(models),
-        ),
+        );
+        if !present && !quiet {
+            println!("Downloading {label} into {} ...", models.display());
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reporter =
+            (!quiet && !present).then(|| progress(models.to_path_buf(), label, done.clone()));
+        let result = download(asset, models);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(r) = reporter {
+            let _ = r.join();
+        }
+        return result.map(|()| {
+            if present {
+                "already installed and verified"
+            } else {
+                "installed and verified"
+            }
+        });
+    }
+
+    let present = match asset {
+        Asset::Onnx => unreachable!("handled above"),
         Asset::Safetensors => safetensors_present(models),
     };
     if present {
@@ -198,21 +238,21 @@ pub(crate) fn run(args: &[String]) -> i32 {
             eprintln!(
                 "attic setup-models: {e}\nusage: attic-server setup-models [--cpu-only|--gpu-only] [--quiet]"
             );
-            return 1;
+            return EXIT_USAGE;
         }
     };
     let db_path = match attic_core::AtticPaths::resolve() {
         Ok(p) => p.db_path().clone(),
         Err(e) => {
             eprintln!("attic setup-models: {e}");
-            return 1;
+            return EXIT_USAGE;
         }
     };
     let cfg = match load_config(&db_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("attic setup-models: {e}");
-            return 1;
+            return EXIT_USAGE;
         }
     };
     if !cfg.semantic.enabled {
@@ -222,12 +262,9 @@ pub(crate) fn run(args: &[String]) -> i32 {
     let models = std::env::var("ATTIC_MODEL_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| attic_core::sibling(&db_path, "models"));
-    if let Err(e) = std::fs::create_dir_all(&models) {
-        eprintln!(
-            "attic setup-models: cannot create {}: {e}",
-            models.display()
-        );
-        return 2;
+    if let Err(e) = ensure_models_dir(&models) {
+        eprintln!("{e}");
+        return EXIT_MODELS_DIR_ERROR;
     }
 
     let eligible = gpu_eligible(&cfg);
@@ -236,7 +273,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
             "attic setup-models: --gpu-only, but this machine/build is not eligible for the \
              DirectML GPU backend (see `status` -> semantic_identity.gpu); nothing downloaded"
         );
-        return 2;
+        return EXIT_DOWNLOAD_FAILED;
     }
     let steps = plan(eligible, opts.cpu_only, opts.gpu_only);
     if !opts.quiet {
@@ -274,7 +311,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
             "Some models could not be downloaded. Attic still works (text search) and retries \
              the download automatically when it starts."
         );
-        return 2;
+        return EXIT_DOWNLOAD_FAILED;
     }
     if !opts.quiet {
         println!("Models ready.");
@@ -310,12 +347,37 @@ mod tests {
     fn present_onnx_is_skipped_without_network() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = attic_semantic::onnx_assets::onnx_dir(tmp.path());
+        let graph = "g".repeat(1_024);
+        let tokenizer = "t".repeat(1_024);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(attic_semantic::onnx_assets::MODEL_FILE), "g").unwrap();
-        std::fs::write(dir.join(attic_semantic::onnx_assets::TOKENIZER_FILE), "t").unwrap();
-        assert_eq!(
-            fetch(Asset::Onnx, tmp.path(), true),
-            Ok("already installed")
+        std::fs::write(dir.join(attic_semantic::onnx_assets::MODEL_FILE), &graph).unwrap();
+        std::fs::write(
+            dir.join(attic_semantic::onnx_assets::TOKENIZER_FILE),
+            &tokenizer,
+        )
+        .unwrap();
+        let err = fetch(Asset::Onnx, tmp.path(), true).unwrap_err();
+        assert!(
+            err.contains("failed verification") || err.contains("verification"),
+            "{err}"
         );
+    }
+
+    #[test]
+    fn safetensors_label_is_backend_neutral() {
+        assert_eq!(
+            asset_label(Asset::Safetensors),
+            "Qwen3 safetensors model (Candle backend)"
+        );
+    }
+
+    #[test]
+    fn ensure_models_dir_reports_creation_failures_distinctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let err = ensure_models_dir(&file).unwrap_err();
+        assert!(err.contains("cannot create"), "{err}");
+        assert_eq!(EXIT_MODELS_DIR_ERROR, 3);
     }
 }

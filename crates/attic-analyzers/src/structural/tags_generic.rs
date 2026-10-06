@@ -9,8 +9,8 @@
 //!
 //! ## Coverage
 //!
-//! C, C++, Ruby, C#, Scala, PHP, Swift, Lua, Rust — 9 off-the-shelf grammars —
-//! plus Dockerfile and Kotlin via hand-authored queries (11 languages total).
+//! C, C++, Ruby, Scala, PHP, Swift and Lua — 7 off-the-shelf grammars —
+//! plus Kotlin via a hand-authored query (8 languages total).
 //! See [`tier2_table`] for the exact table.
 //!
 //! **Kotlin.** The pinned grammar (`tree-sitter-kotlin-ng` 1.1.0) ships no
@@ -76,22 +76,6 @@ use crate::generic::GenericAnalyzer;
 const TAGS_ENTITY_CAP: usize = 20_000;
 /// Amortized cancellation/deadline poll interval (tags processed between checks).
 const CHECK_EVERY: u32 = 256;
-
-// ---------------------------------------------------------------------------
-// Hand-authored Dockerfile tags query
-// ---------------------------------------------------------------------------
-
-/// `camdencheek/tree-sitter-dockerfile` (published as `tree-sitter-containerfile`)
-/// ships no `tags.scm` upstream (confirmed: its `queries/` directory contains
-/// only `highlights.scm`/`injections.scm`). Dockerfile's grammar is simple
-/// enough that the only meaningful definition/reference pair — multi-stage
-/// build stage names (`FROM x AS name` / `--from=name`) — can be authored
-/// directly. Verified against a real multi-stage sample; see
-/// `tests/structural_tags_tier2.rs`.
-const DOCKERFILE_TAGS_QUERY: &str = r#"
-(from_instruction as: (image_alias) @name) @definition.module
-(from_instruction (image_spec) @name) @reference.module
-"#;
 
 // ---------------------------------------------------------------------------
 // Scala tags query — inlined verbatim from the pinned crate's own source
@@ -189,6 +173,7 @@ const SCALA_TAGS_QUERY: &str = r#"
 /// verbatim from the crate's exact bundled query, minus only that one
 /// trailing (invalid, redundant) pattern — not a hand-authored query, and no
 /// coverage is lost since the duplicate capture is dropped, not the data.
+#[allow(dead_code)]
 const CSHARP_TAGS_QUERY: &str = r#"
 (class_declaration name: (identifier) @name) @definition.class
 
@@ -258,25 +243,6 @@ struct TagsLanguageSpec {
 fn tier2_table() -> Vec<TagsLanguageSpec> {
     vec![
         TagsLanguageSpec {
-            analyzer_id: "c-tags",
-            language_tag: "c",
-            description: "tree-sitter-tags structural analyzer for C: symbols via the \
-                grammar's bundled tags.scm (structs/unions, functions, typedefs, enums).",
-            grammar: tree_sitter_c::LANGUAGE,
-            tags_query: tree_sitter_c::TAGS_QUERY,
-            locals_query: "",
-        },
-        TagsLanguageSpec {
-            analyzer_id: "cpp-tags",
-            language_tag: "cpp",
-            description: "tree-sitter-tags structural analyzer for C++: symbols via the \
-                grammar's bundled tags.scm (structs/unions/classes, functions, methods, \
-                typedefs, enums).",
-            grammar: tree_sitter_cpp::LANGUAGE,
-            tags_query: tree_sitter_cpp::TAGS_QUERY,
-            locals_query: "",
-        },
-        TagsLanguageSpec {
             analyzer_id: "ruby-tags",
             language_tag: "ruby",
             description: "tree-sitter-tags structural analyzer for Ruby: symbols via the \
@@ -284,15 +250,6 @@ fn tier2_table() -> Vec<TagsLanguageSpec> {
             grammar: tree_sitter_ruby::LANGUAGE,
             tags_query: tree_sitter_ruby::TAGS_QUERY,
             locals_query: tree_sitter_ruby::LOCALS_QUERY,
-        },
-        TagsLanguageSpec {
-            analyzer_id: "csharp-tags",
-            language_tag: "csharp",
-            description: "tree-sitter-tags structural analyzer for C#: symbols via the \
-                grammar's bundled tags.scm (classes, interfaces, methods, namespaces).",
-            grammar: tree_sitter_c_sharp::LANGUAGE,
-            tags_query: CSHARP_TAGS_QUERY,
-            locals_query: "",
         },
         TagsLanguageSpec {
             analyzer_id: "scala-tags",
@@ -343,26 +300,6 @@ fn tier2_table() -> Vec<TagsLanguageSpec> {
             grammar: tree_sitter_lua::LANGUAGE,
             tags_query: tree_sitter_lua::TAGS_QUERY,
             locals_query: tree_sitter_lua::LOCALS_QUERY,
-        },
-        TagsLanguageSpec {
-            analyzer_id: "rust-tags",
-            language_tag: "rust",
-            description: "tree-sitter-tags structural analyzer for Rust: symbols via the \
-                grammar's bundled tags.scm (structs/enums/unions, functions, methods, \
-                traits, modules, macros).",
-            grammar: tree_sitter_rust::LANGUAGE,
-            tags_query: tree_sitter_rust::TAGS_QUERY,
-            locals_query: "",
-        },
-        TagsLanguageSpec {
-            analyzer_id: "dockerfile-tags",
-            language_tag: "dockerfile",
-            description: "tree-sitter-tags structural analyzer for Dockerfile/Containerfile: \
-                multi-stage build stage names, via a hand-authored tags query (see module \
-                docs — no upstream tags.scm exists for this grammar).",
-            grammar: tree_sitter_containerfile::LANGUAGE,
-            tags_query: DOCKERFILE_TAGS_QUERY,
-            locals_query: "",
         },
         TagsLanguageSpec {
             analyzer_id: "kotlin-tags",

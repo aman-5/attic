@@ -257,23 +257,42 @@ fn unique_bytes(dir: &Path) -> u64 {
 mod tests {
     use super::*;
 
+    const READY_BYTES: usize = 1_024;
+
     fn write(p: &Path, body: &[u8]) {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, body).unwrap();
+    }
+
+    fn ready_graph() -> Vec<u8> {
+        let mut graph = vec![b'g'; READY_BYTES];
+        graph.extend_from_slice(onnx_assets::MODEL_DATA_FILE.as_bytes());
+        graph
+    }
+
+    fn ready_weights() -> Vec<u8> {
+        vec![b'w'; READY_BYTES]
+    }
+
+    fn ready_tokenizer() -> Vec<u8> {
+        vec![b't'; READY_BYTES]
     }
 
     /// Layout as the Windows Hugging Face client leaves it: blob + separate
     /// snapshot copy, and onnx-fp16 hard-linked to the snapshot copy.
     fn windows_layout(models: &Path) {
         let repo = onnx_download_cache_dir(models);
-        write(&repo.join("blobs/aaa"), b"weights-weights");
-        write(&repo.join("blobs/bbb"), b"tok");
+        let weights = ready_weights();
+        let tokenizer = ready_tokenizer();
+        let graph = ready_graph();
+        write(&repo.join("blobs/aaa"), &weights);
+        write(&repo.join("blobs/bbb"), &tokenizer);
         write(
             &repo.join("snapshots/rev/onnx/model_fp16.onnx_data"),
-            b"weights-weights",
+            &weights,
         );
-        write(&repo.join("snapshots/rev/onnx/model_fp16.onnx"), b"graph");
-        write(&repo.join("snapshots/rev/tokenizer.json"), b"tok");
+        write(&repo.join("snapshots/rev/onnx/model_fp16.onnx"), &graph);
+        write(&repo.join("snapshots/rev/tokenizer.json"), &tokenizer);
         let target = onnx_assets::onnx_dir(models);
         fs::create_dir_all(&target).unwrap();
         for (src, dst) in [
@@ -314,7 +333,7 @@ mod tests {
         assert!(onnx_assets::assets_present(&target));
         assert_eq!(
             fs::read(target.join(onnx_assets::MODEL_DATA_FILE)).unwrap(),
-            b"weights-weights"
+            ready_weights()
         );
         assert!(r.bytes_freed > 0, "{r:?}");
         // Idempotent.

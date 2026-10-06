@@ -94,6 +94,48 @@ impl ModelManifest {
             provenance: "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B".to_string(),
         }
     }
+
+    /// Canonical manifest for the pinned ONNX fp16 export used by DirectML.
+    pub fn qwen3_onnx_default() -> Self {
+        Self {
+            model_id: "qwen3-embedding-0.6b-onnx-fp16".to_string(),
+            repo_owner: crate::onnx_assets::HF_ONNX_OWNER.to_string(),
+            repo_name: crate::onnx_assets::HF_ONNX_REPO.to_string(),
+            pinned_revision: crate::onnx_assets::DEFAULT_ONNX_REVISION.to_string(),
+            // Verified from the Hugging Face tree API at
+            // onnx-community/Qwen3-Embedding-0.6B-ONNX@c25a394dd583836952667c12f008335071b3f43d
+            // (`lfs.oid` = SHA-256, `size` = expected byte size).
+            files: vec![
+                ModelFileSpec {
+                    filename: crate::onnx_assets::MODEL_FILE.to_string(),
+                    expected_sha256: Some(
+                        "f376cf065d912675dd559270e19361367ebc28c938b9811dd61d5834c78d0834"
+                            .to_string(),
+                    ),
+                    expected_size_bytes: Some(583_522),
+                },
+                ModelFileSpec {
+                    filename: crate::onnx_assets::MODEL_DATA_FILE.to_string(),
+                    expected_sha256: Some(
+                        "06fbfded30166e3a33fe5252d7002ed1c370a4ec1bf45aba778cdf6cf7d31439"
+                            .to_string(),
+                    ),
+                    expected_size_bytes: Some(1_199_927_296),
+                },
+                ModelFileSpec {
+                    filename: crate::onnx_assets::TOKENIZER_FILE.to_string(),
+                    expected_sha256: Some(
+                        "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+                            .to_string(),
+                    ),
+                    expected_size_bytes: Some(11_423_705),
+                },
+            ],
+            license: "Apache-2.0".to_string(),
+            provenance: "https://huggingface.co/onnx-community/Qwen3-Embedding-0.6B-ONNX"
+                .to_string(),
+        }
+    }
 }
 
 /// Status of model assets on local disk.
@@ -192,37 +234,52 @@ impl ModelAssetManager {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    /// Validate all files in the staging directory against the manifest.
-    pub fn validate_staging(&self, staging: &Path) -> Result<(), ModelAssetError> {
-        for file_spec in &self.manifest.files {
-            let path = staging.join(&file_spec.filename);
-            if !path.is_file() {
-                return Err(ModelAssetError::MissingFile(file_spec.filename.clone()));
-            }
+    /// Validate one file against its manifest entry.
+    pub fn validate_file(path: &Path, file_spec: &ModelFileSpec) -> Result<(), ModelAssetError> {
+        if !path.is_file() {
+            return Err(ModelAssetError::MissingFile(file_spec.filename.clone()));
+        }
 
-            if let Some(expected_size) = file_spec.expected_size_bytes {
-                let meta = fs::metadata(&path)?;
-                if meta.len() != expected_size {
-                    return Err(ModelAssetError::ValidationFailed(format!(
-                        "size mismatch for {}: expected {}, got {}",
-                        file_spec.filename,
-                        expected_size,
-                        meta.len()
-                    )));
-                }
-            }
-
-            if let Some(ref expected_hash) = file_spec.expected_sha256 {
-                let computed = Self::compute_file_sha256(&path)?;
-                if &computed != expected_hash {
-                    return Err(ModelAssetError::ChecksumMismatch {
-                        filename: file_spec.filename.clone(),
-                        expected: expected_hash.clone(),
-                        computed,
-                    });
-                }
+        if let Some(expected_size) = file_spec.expected_size_bytes {
+            let meta = fs::metadata(path)?;
+            if meta.len() != expected_size {
+                return Err(ModelAssetError::ValidationFailed(format!(
+                    "size mismatch for {}: expected {}, got {}",
+                    file_spec.filename,
+                    expected_size,
+                    meta.len()
+                )));
             }
         }
+
+        if let Some(ref expected_hash) = file_spec.expected_sha256 {
+            let computed = Self::compute_file_sha256(path)?;
+            if &computed != expected_hash {
+                return Err(ModelAssetError::ChecksumMismatch {
+                    filename: file_spec.filename.clone(),
+                    expected: expected_hash.clone(),
+                    computed,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a directory against a flat list of manifest entries.
+    pub fn validate_directory_files(
+        dir: &Path,
+        files: &[ModelFileSpec],
+    ) -> Result<(), ModelAssetError> {
+        for file_spec in files {
+            Self::validate_file(&dir.join(&file_spec.filename), file_spec)?;
+        }
+        Ok(())
+    }
+
+    /// Validate all files in the staging directory against the manifest.
+    pub fn validate_staging(&self, staging: &Path) -> Result<(), ModelAssetError> {
+        Self::validate_directory_files(staging, &self.manifest.files)?;
 
         // Validate basic integrity of config.json if present
         let config_path = staging.join("config.json");

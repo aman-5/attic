@@ -50,8 +50,8 @@ pub use domain::{
 };
 pub use error::CoreError;
 pub use paths::{
-    AtticPaths, LayoutMigration, PathResolutionError, migrate_legacy_layout,
-    resolve_data_root_from, sibling, sibling_in,
+    AtticPaths, LayoutMigration, PathResolutionError, ensure_private_dir, migrate_legacy_layout,
+    resolve_data_root_from, set_private_file_permissions, sibling, sibling_in, write_private_file,
 };
 
 pub use cancellation::CancellationToken;

@@ -645,7 +645,7 @@ pub fn run_next_task_synchronously(
 }
 
 /// Serialize-friendly snapshot for MCP status.
-#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct QueueStatus {
     /// PENDING task count.
     pub pending: i64,
@@ -653,6 +653,9 @@ pub struct QueueStatus {
     pub running: i64,
     /// FAILED task count.
     pub failed: i64,
+    /// RUNNING tasks older than the conservative stuck-task threshold.
+    #[serde(default)]
+    pub stuck_tasks: Vec<attic_storage::ops_tasks::StuckTask>,
 }
 
 /// Read current queue counts (status tool support).
@@ -662,6 +665,12 @@ pub fn queue_status(pool: &DbPool) -> Result<QueueStatus, IncrementalError> {
         pending: c.pending,
         running: c.running,
         failed: c.failed,
+        stuck_tasks: pool.with_reader(|conn| {
+            attic_storage::ops_tasks::list_stuck_running_tasks(
+                conn,
+                attic_storage::ops_tasks::DEFAULT_STUCK_TASK_AGE_SECS,
+            )
+        })?,
     })
 }
 
@@ -676,5 +685,12 @@ pub fn queue_status_for_repo(
         pending: c.pending,
         running: c.running,
         failed: c.failed,
+        stuck_tasks: pool.with_reader(|conn| {
+            attic_storage::ops_tasks::list_stuck_running_tasks_for_repo(
+                conn,
+                repository_id,
+                attic_storage::ops_tasks::DEFAULT_STUCK_TASK_AGE_SECS,
+            )
+        })?,
     })
 }

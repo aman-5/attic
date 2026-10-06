@@ -247,7 +247,10 @@ exclude_globs = ["**/__snapshots__/**"]
 <details>
 <summary><b>🧩 Everything else</b></summary>
 
-- **Symbols:** C, C++, C#, Ruby, PHP, Scala, Swift, Lua, Rust, Dockerfile.
+- **Symbols, imports, inheritance and calls:** C, C++, C#, Ruby, PHP, Scala,
+  Swift, Lua, Rust, Kotlin and Dockerfile get the same full analysis as Java.
+  Where a language cannot be resolved exactly (Rust macros, C++ templates,
+  Ruby/PHP dynamic calls) results are marked partial, never guessed.
 - **JSON:** canonical subtree chunks with JSON-pointer addresses, so
   near-identical environment exports are stored and searched once.
 - **Any other text** (YAML, SQL, Markdown, shell, …): full-text and semantic
@@ -284,7 +287,8 @@ ready before the first session (GPU model first on an eligible GPU; skip with
 present models are skipped, and download leftovers Attic never reads are removed
 (about 2.3 GB stays on disk on a GPU machine). If models are still missing at start, Attic downloads
 in the background and embeds that session on CPU; the GPU backend is used from
-the next start.
+the next start. `setup-models` exit codes: `0` ready · `1` usage error ·
+`2` download failed · `3` could not create the models directory.
 
 ### Files in `~/.attic`
 
@@ -569,8 +573,7 @@ Test-only fault-injection and benchmark variables are listed in
 
 | Tier | Languages | You get |
 |---|---|---|
-| **Full** (hand-written tree-sitter) | Java · Python · Go · JavaScript · TypeScript (incl. TSX) | Symbols, definitions, imports, relationships |
-| **Symbols** (tags queries) | C · C++ · C# · Ruby · PHP · Scala · Swift · Lua · Rust · Kotlin · Dockerfile | Definitions and in-file references |
+| **Full** (hand-written tree-sitter) | Java · Python · Go · JavaScript · TypeScript (incl. TSX) · Kotlin · Scala · Lua · Ruby · PHP · Swift · C · C++ · C# · Rust · Dockerfile | Symbols, definitions, imports, inheritance, calls. Partial (and marked so) where exact resolution is impossible: Rust macros, C++ templates, Ruby/PHP dynamic calls; Lua has no inheritance; Dockerfile has build stages instead of calls |
 | **Platform** | AEM · JSON | JCR/HTL/OSGi structure and imports · canonical JSON subtrees |
 | **Search** | Everything else | Full-text and semantic search |
 

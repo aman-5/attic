@@ -59,10 +59,22 @@ use crate::api::{
 use crate::cancellation::CancellationToken;
 use crate::registry::AnalyzerRegistry;
 
+pub mod c;
+pub mod cpp;
+pub mod csharp;
+pub mod dockerfile;
 pub mod go;
 pub mod java;
 pub mod javascript;
+pub mod kotlin;
+pub mod lua;
+pub mod php;
 pub mod python;
+pub mod ruby;
+pub mod rust;
+pub mod scala;
+pub mod swift;
+#[cfg(test)]
 pub mod tags_generic;
 pub mod typescript;
 
@@ -72,6 +84,25 @@ pub mod typescript;
 const STREAM_PREFIX_CAP_BYTES: usize = 4 * 1024 * 1024;
 /// Tail-unit granularity for the streaming remainder.
 const TAIL_UNIT_BYTES: usize = 64 * 1024;
+/// Tree-sitter grammars that use recursive productions for "trivia" can blow
+/// the default test-thread stack on multi-megabyte flat comment files long
+/// before extraction begins. Scan only a small prefix for that pattern and
+/// fall back to lexical chunking when it is detected.
+const LARGE_FLAT_SCAN_BYTES: usize = 256 * 1024;
+/// Flat-file parse guard only applies once the retained prefix is already
+/// large enough that skipping structural detail is preferable to aborting the
+/// whole analysis with a process-level stack overflow.
+const LARGE_FLAT_PARSE_GUARD_BYTES: usize = 1024 * 1024;
+/// Sample at most this many physical lines when classifying a large flat file.
+const LARGE_FLAT_SCAN_MAX_LINES: usize = 8_192;
+/// Ignore tiny samples; a handful of comment lines at the top of a normal file
+/// must not disable structural parsing.
+const LARGE_FLAT_MIN_NON_EMPTY_LINES: usize = 256;
+/// Minimum dominant-comment ratio that triggers the flat-file guard.
+const LARGE_FLAT_MIN_COMMENT_PERCENT: usize = 98;
+/// Keep a little headroom for a small declaration header before the flood of
+/// flat filler lines begins.
+const LARGE_FLAT_MAX_CODE_LINES: usize = 16;
 /// Budget/deadline/cancellation checks are amortized: perform the relatively
 /// expensive clock/atomic reads once per this many bookkeeping operations.
 const CHECK_EVERY: u32 = 512;
@@ -479,55 +510,56 @@ pub(crate) mod engine {
         // ── 1. Acquire bounded content ──────────────────────────────────────
         let mut streamed_tail: Option<Vec<String>> = None;
         let mut prefix_truncated = false;
-        let bytes: Vec<u8> =
-            match std::mem::replace(&mut input.content, AnalyzerContent::FullBytes(Vec::new())) {
-                AnalyzerContent::FullBytes(b) => b,
-                AnalyzerContent::RedactedBytes(b) => b,
-                AnalyzerContent::StreamingHandle(ref mut stream) => {
-                    // Bounded prefix for structural parsing…
-                    let mut prefix: Vec<u8> = Vec::with_capacity(64 * 1024);
-                    loop {
-                        if input.cancellation_token.is_cancelled() || Instant::now() >= deadline {
-                            break;
-                        }
-                        match stream.next_chunk() {
-                            None => break,
-                            Some(Err(_)) => break,
-                            Some(Ok(chunk)) => {
-                                prefix.extend_from_slice(chunk.redacted.as_bytes());
-                                if prefix.len() >= STREAM_PREFIX_CAP_BYTES {
-                                    // …and the remainder becomes lexical units.
-                                    let mut tail = Vec::new();
-                                    let mut buf = String::new();
-                                    while let Some(next) = stream.next_chunk() {
-                                        match next {
-                                            Err(_) => break,
-                                            Ok(c) => {
-                                                buf.push_str(&c.redacted);
-                                                if buf.len() >= TAIL_UNIT_BYTES {
-                                                    tail.push(std::mem::take(&mut buf));
-                                                }
+        let bytes: Vec<u8> = match std::mem::replace(
+            &mut input.content,
+            AnalyzerContent::FullBytes(Vec::new()),
+        ) {
+            AnalyzerContent::FullBytes(b) => b,
+            AnalyzerContent::RedactedBytes(b) => b,
+            AnalyzerContent::StreamingHandle(ref mut stream) => {
+                // Bounded prefix for structural parsing…
+                let mut prefix: Vec<u8> = Vec::with_capacity(64 * 1024);
+                loop {
+                    if input.cancellation_token.is_cancelled() || Instant::now() >= deadline {
+                        break;
+                    }
+                    match stream.next_chunk() {
+                        None => break,
+                        Some(Err(_)) => break,
+                        Some(Ok(chunk)) => {
+                            prefix.extend_from_slice(chunk.redacted.as_bytes());
+                            if prefix.len() >= STREAM_PREFIX_CAP_BYTES {
+                                // …and the remainder becomes lexical units.
+                                let mut tail = Vec::new();
+                                let mut buf = String::new();
+                                while let Some(next) = stream.next_chunk() {
+                                    match next {
+                                        Err(_) => break,
+                                        Ok(c) => {
+                                            buf.push_str(&c.redacted);
+                                            if buf.len() >= TAIL_UNIT_BYTES {
+                                                tail.push(std::mem::take(&mut buf));
                                             }
                                         }
                                     }
-                                    if !buf.is_empty() {
-                                        tail.push(buf);
-                                    }
-                                    streamed_tail = Some(tail);
-                                    prefix_truncated = true;
-                                    diags.push(AnalyzerDiagnostic::warning(
-                                        "STRUCTURAL_TRUNCATED",
-                                        "LARGE file: structural analysis covered the first \
-                                     ~4 MiB; remaining content indexed as lexical units.",
-                                    ));
-                                    break;
                                 }
+                                if !buf.is_empty() {
+                                    tail.push(buf);
+                                }
+                                streamed_tail = Some(tail);
+                                prefix_truncated = true;
+                                diags.push(AnalyzerDiagnostic::warning(
+                                        "STRUCTURAL_TRUNCATED",
+                                        "LARGE file: retained the first ~4 MiB for bounded analysis; remaining content indexed as lexical units.",
+                                    ));
+                                break;
                             }
                         }
                     }
-                    prefix
                 }
-            };
+                prefix
+            }
+        };
         if input.cancellation_token.is_cancelled() {
             return partial_output(
                 spec,
@@ -540,7 +572,13 @@ pub(crate) mod engine {
         }
 
         let src = SourceText::new(&bytes);
-
+        if should_skip_large_flat_parse(spec.language_tag(), &src) {
+            diags.push(AnalyzerDiagnostic::warning(
+                "STRUCTURAL_TRUNCATED",
+                "Large flat comment-dominated file: skipped structural parsing to avoid parser stack overflow; content indexed lexically.",
+            ));
+            return lexical_only_output(spec, &input, &src, diags, &streamed_tail);
+        }
         // ── 2. Parse ─────────────────────────────────────────────────────────
         let mut parser = match make_parser(spec.grammar()) {
             Ok(p) => p,
@@ -781,6 +819,38 @@ pub(crate) mod engine {
         }
     }
 
+    fn lexical_only_output(
+        spec: &dyn TreeSitterLanguageSpec,
+        input: &AnalyzerInput,
+        src: &SourceText<'_>,
+        mut diags: Vec<AnalyzerDiagnostic>,
+        tail: &Option<Vec<String>>,
+    ) -> AnalyzerOutput {
+        let mut units = lexical_units_only(src, tail);
+        let max_units = input.resource_budget.max_retrieval_units.max(1);
+        if units.len() as u64 > max_units {
+            units.truncate(max_units as usize);
+            diags.push(AnalyzerDiagnostic::warning(
+                diagnostic_codes::RESOURCE_EXHAUSTED,
+                "retrieval-unit cap reached; output truncated",
+            ));
+        }
+        AnalyzerOutput {
+            analyzer_id: spec.analyzer_id().to_string(),
+            analyzer_version: env!("CARGO_PKG_VERSION").to_string(),
+            file_occurrence_id: input.file_occurrence_id,
+            structural_nodes: vec![],
+            symbols: vec![],
+            imports: vec![],
+            relationships: vec![],
+            retrieval_units: units,
+            diagnostics: diags,
+            fallback_used: false,
+            structurally_complete: false,
+            capability_used: CapabilityKind::Lexical,
+        }
+    }
+
     /// Fatal failure output: carries `Error` diagnostics so the dispatcher
     /// routes to `GenericAnalyzer` (file remains fully searchable).
     fn fatal(
@@ -894,6 +964,92 @@ pub(crate) mod engine {
         }
 
         units
+    }
+
+    fn lexical_units_only(
+        src: &SourceText<'_>,
+        tail: &Option<Vec<String>>,
+    ) -> Vec<RetrievalUnitSpec> {
+        const CHUNK: usize = 400 * 80;
+        let mut units = Vec::new();
+        let total = src.len();
+        let mut ordinal: u32 = 0;
+        let mut pos = 0usize;
+        while pos < total {
+            let end = (pos + CHUNK).min(total);
+            let text = src.text(pos, end);
+            if !text.trim().is_empty() {
+                units.push(RetrievalUnitSpec {
+                    span: span_for_bytes(pos, end, src),
+                    retrieval_text: text,
+                    canonical_text: None,
+                    occurrence_metadata: None,
+                    ordinal,
+                    structural_node_index: None,
+                });
+                ordinal += 1;
+            }
+            pos = end;
+        }
+        if let Some(tail_chunks) = tail {
+            for chunk_text in tail_chunks {
+                if chunk_text.trim().is_empty() {
+                    continue;
+                }
+                units.push(RetrievalUnitSpec {
+                    span: SourceSpan::new(0, 0, 0, 0),
+                    retrieval_text: chunk_text.clone(),
+                    canonical_text: None,
+                    occurrence_metadata: None,
+                    ordinal,
+                    structural_node_index: None,
+                });
+                ordinal += 1;
+            }
+        }
+        units
+    }
+
+    fn should_skip_large_flat_parse(language_tag: &str, src: &SourceText<'_>) -> bool {
+        if src.len() < LARGE_FLAT_PARSE_GUARD_BYTES {
+            return false;
+        }
+        let prefixes = line_comment_prefixes(language_tag);
+        if prefixes.is_empty() {
+            return false;
+        }
+        let sample = src.text(0, src.len().min(LARGE_FLAT_SCAN_BYTES));
+        let mut non_empty = 0usize;
+        let mut comment = 0usize;
+        let mut code = 0usize;
+        for line in sample.lines().take(LARGE_FLAT_SCAN_MAX_LINES) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            non_empty += 1;
+            if prefixes.iter().any(|prefix| trimmed.starts_with(prefix)) {
+                comment += 1;
+            } else {
+                code += 1;
+                if code > LARGE_FLAT_MAX_CODE_LINES {
+                    return false;
+                }
+            }
+        }
+        non_empty >= LARGE_FLAT_MIN_NON_EMPTY_LINES
+            && comment * 100 / non_empty >= LARGE_FLAT_MIN_COMMENT_PERCENT
+            && code <= LARGE_FLAT_MAX_CODE_LINES
+    }
+
+    fn line_comment_prefixes(language_tag: &str) -> &'static [&'static str] {
+        match language_tag {
+            "ruby" | "dockerfile" | "python" => &["#"],
+            "lua" => &["--"],
+            "c" | "cpp" | "csharp" | "go" | "java" | "javascript" | "kotlin" | "php" | "rust"
+            | "scala" | "swift" | "typescript" | "tsx" => &["//"],
+            _ => &[],
+        }
     }
 
     /// Approximate line span for a byte range without re-tokenizing.

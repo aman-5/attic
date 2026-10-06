@@ -155,15 +155,16 @@ fn reindexed_unchanged_content_is_reused_without_queueing_inference() {
         .unwrap();
 
     // A full re-index mints fresh unit ids for byte-identical content.
-    fx.writer
-        .send(|c| {
-            c.execute(
-                "UPDATE core_retrieval_units SET id = id || '-reindexed'",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    attic_indexing::index_repository(
+        &fx.store(),
+        &fx.root,
+        &attic_discovery::DiscoveryPolicy::default_git(),
+        &attic_indexing::IndexOptions {
+            repository_name: "phase4".into(),
+            ..Default::default()
+        },
+    )
+    .expect("re-index");
 
     let r = attic_semantic::reconcile(&conn, &stack.store, stack.provider.as_ref(), &selection())
         .unwrap();
