@@ -1166,8 +1166,10 @@ async fn critical_reduces_heavy_admission_without_rejecting_context() {
     assert_eq!(v2["resource_pressure"]["mcp_pressure_rejections"], 0);
 }
 
-/// §17 item 15: Emergency pressure zeroes out new heavy indexing and embedding permits,
-/// rejects mutations (`workspace`), while keeping cheap diagnostics (`status`) responsive.
+/// §17 item 15: Emergency pressure zeroes out new heavy indexing and embedding permits
+/// (background work), while foreground MCP calls — including mutations
+/// (`workspace`) and expensive reads (`context`) — are still admitted:
+/// memory pressure never refuses an interactive request.
 #[tokio::test]
 async fn emergency_starts_no_new_heavy_work() {
     let bin = require_bin();
@@ -1197,27 +1199,40 @@ async fn emergency_starts_no_new_heavy_work() {
     assert_eq!(rp["effective_indexing_heavy_limit"], 0);
     assert_eq!(rp["effective_embedding_limit"], 0);
     assert_eq!(rp["effective_embedding_batch"], 0);
+    assert_eq!(v["semantic_availability"]["pressure_tier"], "emergency");
 
-    // Mutation tool (`workspace`) is rejected under Emergency.
+    // Mutation tool (`workspace`) is admitted under Emergency.
     let ws_res = call_tool_text(
         &mut srv,
         "workspace",
         serde_json::json!({"action": "inspect"}),
     )
     .await;
-    let err_str = ws_res.unwrap_or_else(|e| e);
+    let ws_str = ws_res.unwrap_or_else(|e| e);
     assert!(
-        err_str.contains("server_busy") || err_str.contains("memory pressure"),
-        "expected server_busy rejection for mutation MCP call under Emergency, got: {err_str}"
+        !ws_str.contains("server_busy") && !ws_str.contains("memory pressure"),
+        "workspace must be admitted under Emergency, got: {ws_str}"
     );
 
-    // Expensive reads (`context`) are also rejected only at genuine Emergency.
+    // Expensive reads (`context`) are admitted too and reach the normal
+    // workspace-configured validation path.
     let ctx_res = call_tool_text(&mut srv, "context", serde_json::json!({"query": "test"})).await;
-    let err_str = ctx_res.unwrap_or_else(|e| e);
+    let ctx_str = ctx_res.unwrap_or_else(|e| e);
     assert!(
-        err_str.contains("server_busy") || err_str.contains("memory pressure"),
-        "expected server_busy rejection for context under Emergency, got: {err_str}"
+        ctx_str.contains("workspace not configured"),
+        "expected the usual workspace error once admitted under Emergency, got: {ctx_str}"
     );
+    assert!(
+        !ctx_str.contains("server_busy") && !ctx_str.contains("memory pressure"),
+        "context must be admitted under Emergency, got: {ctx_str}"
+    );
+
+    // No foreground request was refused for memory pressure.
+    let res2 = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        .await
+        .expect("status call");
+    let v2: Value = serde_json::from_str(&res2).expect("json");
+    assert_eq!(v2["resource_pressure"]["mcp_pressure_rejections"], 0);
 }
 
 /// §17 item 16: Embedding batch size shrinks monotonically with pressure:

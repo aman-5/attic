@@ -744,9 +744,12 @@ escalates a machine that still has plenty of free RAM: **Warning** at ≥75 %
 used; **Critical** at ≥82 % used *and* under 8 GiB available; **Emergency** at
 under 2 GiB available, or at ≥90 % used *and* under 4 GiB available.
 Hysteresis keeps a tier from flapping and ignores the percentage once
-available RAM is back above those headrooms. `search`, `file` and `status`
-stay available at every tier; `context` is rejected only in genuine
-Emergency. Background embedding on a CPU backend parks at Emergency; a
+available RAM is back above those headrooms. Foreground MCP calls are never
+refused for memory pressure — every tool (`search`, `file`, `status`,
+`context`, `workspace`) is admitted at every tier. Pressure only throttles
+background work and the optional depth of a foreground answer (`DEEP` →
+`NORMAL`); the sole hard refusal is the foreground concurrency-slot limit
+(flood protection, not memory policy). Background embedding on a CPU backend parks at Emergency; a
 dedicated GPU parks only below 512 MiB available host RAM. Semantic search
 over embeddings that already exist keeps working while background embedding is
 parked, a query embedding waits a bounded time behind a running batch and
