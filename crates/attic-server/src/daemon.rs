@@ -245,7 +245,7 @@ fn derive_socket_path(db_path: &Path) -> PathBuf {
 fn published_ipc_address(db_path: &Path) -> String {
     #[cfg(unix)]
     {
-        return format!("fs:{}", derive_socket_path(db_path).display());
+        format!("fs:{}", derive_socket_path(db_path).display())
     }
     #[cfg(windows)]
     {
@@ -304,7 +304,7 @@ async fn connect_stream(address: &str) -> io::Result<IpcStream> {
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(address.as_bytes())?;
         let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
         stream.set_nonblocking(true)?;
-        return IpcStream::from_std(stream);
+        IpcStream::from_std(stream)
     }
     #[cfg(not(target_os = "linux"))]
     {
