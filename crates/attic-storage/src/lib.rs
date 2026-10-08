@@ -19,6 +19,7 @@ pub mod indexing_publication;
 pub mod invalidation_ops;
 pub mod migration;
 pub mod ops_tasks;
+pub mod repo_eviction;
 pub mod repository;
 pub mod resource_manager;
 pub mod resource_policy;
@@ -54,13 +55,15 @@ pub use indexing_publication::{
 };
 pub use invalidation_ops::{
     FreshnessTotals, InvalidationCounts, close_pending_records_for_occurrence,
-    get_freshness_totals, invalidate_for_occurrences, record_invalidation, record_recomputed,
+    get_freshness_totals, get_freshness_totals_for_repo, invalidate_for_occurrences,
+    record_invalidation, record_recomputed,
 };
 pub use migration::run_migrations;
 pub use ops_tasks::{
     ClaimedTask, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
-    enqueue_task, finish_task, get_task_counts, recover_interrupted_tasks, set_task_checkpoint,
+    enqueue_task, finish_task, get_task_counts, get_task_counts_for_repo,
+    recover_interrupted_tasks, set_task_checkpoint,
 };
 pub use resource_manager::{
     EmbeddingHeavyPermit, IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig,
@@ -90,8 +93,8 @@ pub use repository::identity_links::{
 pub use repository::index_generation::insert_index_generation;
 pub use repository::publication::{PublicationItem, publish_file_batch};
 pub use repository::repository::{
-    DbStats, RepositoryStats, get_db_stats, get_repository_path, get_repository_stats,
-    lookup_repository_by_root_path, upsert_repository,
+    DbStats, RepositoryStats, get_db_stats, get_repository_display_name, get_repository_path,
+    get_repository_stats, lookup_repository_by_root_path, upsert_repository,
 };
 pub use repository::source_revision::{
     exists_source_revision, insert_source_revision, insert_source_revision_with_hashes,
@@ -105,5 +108,5 @@ pub use retrieval_reads::{
 };
 pub use semantic_reads::{
     SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, retrieval_unit_anchors, semantic_unit_rows,
-    semantic_units_by_ids,
+    semantic_unit_rows_after, semantic_units_by_ids,
 };

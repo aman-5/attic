@@ -81,9 +81,11 @@ impl WorkerEngine for NeuralEngine {
                 attic_semantic::device::set_process_preference(pref);
 
                 let cache = std::path::PathBuf::from(&spec.cache_dir);
-                let embedder = attic_semantic::Qwen3Embedder::new(
+                let pinned = attic_semantic::ModelManifest::qwen3_default().pinned_revision;
+                let embedder = attic_semantic::Qwen3Embedder::from_local_cache_pinned(
                     &cache,
                     spec.batch_size,
+                    &pinned,
                     spec.dimension,
                     attic_semantic::QwenPooling::LastToken,
                 )
@@ -189,4 +191,39 @@ pub fn run_inference_worker() -> i32 {
         backend: "unloaded".to_string(),
     };
     attic_inference_protocol::engine::run_worker_loop(engine, std::io::stdin(), std::io::stdout())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attic_inference_protocol::WorkerErrorClass;
+    use attic_inference_protocol::engine::{LoadSpec, WorkerEngine};
+
+    #[test]
+    fn candle_worker_fails_closed_when_the_pinned_cache_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = NeuralEngine {
+            provider: None,
+            backend: "unloaded".into(),
+        };
+
+        let err = engine
+            .load(&LoadSpec {
+                cache_dir: tmp.path().display().to_string(),
+                batch_size: 1,
+                dimension: Some(1024),
+                onnx_model_dir: None,
+                seq_len: None,
+                backend: "candle-cpu".into(),
+            })
+            .err()
+            .expect("a cache miss must fail closed");
+
+        assert_eq!(err.class, WorkerErrorClass::Artifact);
+        assert!(
+            err.message.contains("not found in local cache"),
+            "{}",
+            err.message
+        );
+    }
 }

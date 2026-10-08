@@ -85,7 +85,7 @@ fn ruby_fixture_extracts_class_and_method_symbols() {
     );
 }
 
-// ── C# ───────────────────────────────────────────────────────────────────
+// ── C# (kept as a registry smoke check after tier-1 promotion) ───────────
 
 #[test]
 fn csharp_fixture_extracts_class_and_method_symbols() {
@@ -121,15 +121,15 @@ fn scala_fixture_extracts_object_and_function_symbols() {
     assert!(
         out.symbols
             .iter()
-            .any(|s| s.short_name == "Hello" && s.kind == SymbolKind::Class),
-        "expected a 'Hello' object mapped to Class; got {:?}",
+            .any(|s| s.short_name == "Hello" && s.kind == SymbolKind::Module),
+        "expected a 'Hello' object mapped to Module; got {:?}",
         out.symbols
     );
     assert!(
         out.symbols
             .iter()
-            .any(|s| s.short_name == "main" && s.kind == SymbolKind::Function),
-        "expected a 'main' Function symbol; got {:?}",
+            .any(|s| s.short_name == "main" && s.kind == SymbolKind::Method),
+        "expected a 'main' Method symbol; got {:?}",
         out.symbols
     );
 }
@@ -149,14 +149,12 @@ fn php_fixture_extracts_class_and_method_symbols() {
         "expected a 'Widget' Class symbol; got {:?}",
         out.symbols
     );
-    // PHP's own tags.scm maps `method_declaration` to `@definition.function`
-    // (not `.method`) — asserting Function here is correct per that query,
-    // not a limitation of this engine.
+    // Tier-1 PHP now distinguishes class methods explicitly.
     assert!(
         out.symbols
             .iter()
-            .any(|s| s.short_name == "run" && s.kind == SymbolKind::Function),
-        "expected a 'run' Function symbol; got {:?}",
+            .any(|s| s.short_name == "run" && s.kind == SymbolKind::Method),
+        "expected a 'run' Method symbol; got {:?}",
         out.symbols
     );
 }
@@ -216,10 +214,10 @@ fun Order.total(): Long = lines.sumOf { it.price }
     assert!(!out.fallback_used, "diagnostics: {:?}", out.diagnostics);
     for (name, kind) in [
         ("OrderController", SymbolKind::Class),
-        ("OrderService", SymbolKind::Class),
+        ("OrderService", SymbolKind::Interface),
         ("OrderMetrics", SymbolKind::Class),
         ("Paths", SymbolKind::Class),
-        ("find", SymbolKind::Function),
+        ("find", SymbolKind::Method),
         ("total", SymbolKind::Function),
         ("OrderId", SymbolKind::TypeAlias),
     ] {
@@ -257,7 +255,7 @@ fn lua_fixture_extracts_function_symbol() {
     );
 }
 
-// ── Rust (new tier-2 coverage; no tier-1 hand-written Rust analyzer exists) ─
+// ── Rust (kept as a registry smoke check after tier-1 promotion) ──────────
 
 #[test]
 fn rust_fixture_extracts_struct_and_function_symbols() {
@@ -281,7 +279,7 @@ fn rust_fixture_extracts_struct_and_function_symbols() {
     );
 }
 
-// ── Dockerfile (hand-authored query; no upstream tags.scm exists) ──────────
+// ── Dockerfile (kept as a registry smoke check after tier-1 promotion) ────
 
 #[test]
 fn dockerfile_fixture_extracts_stage_names() {
@@ -301,12 +299,12 @@ fn dockerfile_fixture_extracts_stage_names() {
     );
 }
 
-// ── Honest capability declaration (not overclaimed) ────────────────────────
+// ── Promoted-language capability declaration ───────────────────────────────
 
 #[test]
-fn tier2_capabilities_match_the_honest_table() {
+fn promoted_languages_advertise_structural_capabilities() {
     let reg = default_registry();
-    let (analyzer, is_generic) = reg.select(FileType::Rust, Some("rust"));
+    let (analyzer, is_generic) = reg.select(FileType::Other, Some("csharp"));
     assert!(!is_generic);
     let caps = &analyzer.descriptor().capabilities;
 
@@ -316,23 +314,19 @@ fn tier2_capabilities_match_the_honest_table() {
     );
     assert_eq!(
         caps.level_for(CapabilityKind::SymbolExtraction),
-        CapabilityLevel::Basic
+        CapabilityLevel::Full
     );
     assert_eq!(
         caps.level_for(CapabilityKind::ImportExtraction),
-        CapabilityLevel::None
+        CapabilityLevel::Full
     );
-    // Deviation from the plan's suggested table, documented in
-    // `tags_generic`'s module docs: `ReferenceExtraction` is honestly `None`
-    // here because no reference-related artifact is ever populated in
-    // `AnalyzerOutput`, unlike the plan's original suggestion of `Basic`.
     assert_eq!(
         caps.level_for(CapabilityKind::ReferenceExtraction),
-        CapabilityLevel::None
+        CapabilityLevel::Basic
     );
     assert_eq!(
         caps.level_for(CapabilityKind::RelationshipResolution),
-        CapabilityLevel::None
+        CapabilityLevel::Basic
     );
 }
 

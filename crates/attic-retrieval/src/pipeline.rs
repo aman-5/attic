@@ -17,8 +17,9 @@ use rusqlite::Connection;
 
 use crate::budget::BudgetAccountant;
 use crate::candidates::{
-    CrossRepoGenerator, GeneratorEnv, KnowledgeGenerator, LexicalGenerator, PathExactGenerator,
-    RelationshipGenerator, StructuralGenerator, SymbolGenerator, retriever_from_str,
+    CENTRAL_KNOWLEDGE_LIMIT, CentralKnowledgeGenerator, CrossRepoGenerator, GeneratorEnv,
+    KnowledgeGenerator, LexicalGenerator, PathExactGenerator, RelationshipGenerator,
+    StructuralGenerator, SymbolGenerator, retriever_from_str,
 };
 use crate::context;
 use crate::contract::{FallbackStrategy, QueryEvidenceContract, contract_for};
@@ -66,6 +67,12 @@ pub struct AnswerRequest {
     /// Repository filter; empty = workspace-wide.
     pub repository_ids: Vec<String>,
     pub overrides: Option<PolicyOverrides>,
+    /// Central knowledge repository (`[knowledge] dir`). When set, every
+    /// answer runs its own knowledge-only search there, independent of
+    /// `repository_ids`, and those notes skip the score floor and section
+    /// caps (they are still bounded by `CENTRAL_KNOWLEDGE_LIMIT` and the
+    /// context token budget).
+    pub knowledge_repository_id: Option<String>,
 }
 
 impl AnswerRequest {
@@ -75,6 +82,7 @@ impl AnswerRequest {
             mode,
             repository_ids: Vec::new(),
             overrides: None,
+            knowledge_repository_id: None,
         }
     }
 }
@@ -326,6 +334,7 @@ impl RetrievalService {
         // ── DB-bound phases on one pooled read-only connection ──────────────
         let repo_filter = req.repository_ids.first().cloned();
         let single_repo = !req.repository_ids.is_empty();
+        let central_knowledge = req.knowledge_repository_id.as_deref();
 
         let phase: Result<DbPhaseOutcome, StorageError> = self.readers.with_reader(|conn| {
             self.run_db_phases(
@@ -337,6 +346,7 @@ impl RetrievalService {
                 &policy,
                 &repo_filter,
                 single_repo,
+                central_knowledge,
             )
         });
         let DbPhaseOutcome {
@@ -367,6 +377,7 @@ impl RetrievalService {
                 &policy,
                 &validated,
                 &contradictions,
+                central_knowledge,
             )
         };
 
@@ -419,10 +430,42 @@ impl RetrievalService {
         policy: &AnswerModePolicy,
         repo_filter: &Option<String>,
         single_repo: bool,
+        central_knowledge: Option<&str>,
     ) -> Result<DbPhaseOutcome, StorageError> {
         let qt = classification.query_type;
         let ex = &classification.extracted;
         let mut collected: Vec<crate::candidates::Candidate> = Vec::new();
+
+        // Central knowledge first, on its own budget: it searches only the
+        // knowledge repository, so neither the shared candidate budget nor
+        // stronger code matches elsewhere can leave it empty.
+        if let Some(kid) = central_knowledge
+            && !ex.terms.is_empty()
+        {
+            let mut kn_budget = BudgetAccountant::new(policy);
+            let s = plan.begin_step(
+                SubsystemTag::EvidenceAssembler,
+                "central_knowledge_lookup",
+                "knowledge dir",
+                now_us(),
+            );
+            let mut env = GeneratorEnv {
+                conn,
+                repository_id: Some(kid.to_owned()),
+                budget: &mut kn_budget,
+                limit: 48,
+            };
+            match CentralKnowledgeGenerator::run(&mut env, &ex.terms) {
+                Ok(cands) => {
+                    let n = cands.len() as u32;
+                    collected.extend(cands);
+                    plan.complete_step(s, StepStatus::Completed, "candidates", 0, n, now_us());
+                }
+                Err(e) => {
+                    plan.complete_step(s, StepStatus::Failed, &e.to_string(), 0, 0, now_us());
+                }
+            }
+        }
 
         {
             let mut ctx = GenCtx {
@@ -654,7 +697,14 @@ impl RetrievalService {
             })
             .collect();
         sort_ranked(&mut ranked);
+        // Central knowledge is already bounded by CENTRAL_KNOWLEDGE_LIMIT;
+        // keep it out of the general candidate cut so stronger code matches
+        // cannot truncate it away.
+        let (central_ranked, mut ranked): (Vec<Evidence>, Vec<Evidence>) = ranked
+            .into_iter()
+            .partition(|e| central_knowledge.is_some_and(|k| e.repository_id == k));
         ranked.truncate(policy.max_candidates as usize);
+        ranked.extend(central_ranked);
 
         // ── Validation ──────────────────────────────────────────────────────
         let s_val = plan.begin_step(
@@ -1091,7 +1141,9 @@ fn build_context_and_claims(
     policy: &AnswerModePolicy,
     validated: &[Evidence],
     contradictions: &[Contradiction],
+    central_knowledge: Option<&str>,
 ) -> (Option<String>, ServedClaims, Vec<Evidence>) {
+    let is_central = |e: &Evidence| central_knowledge.is_some_and(|k| e.repository_id == k);
     // ── §15 priority floor: context serves the strongest evidence, not a
     // dump of everything validated. Two tiers keep contract-PREFERRED
     // supporting slices (tests/config/knowledge/docs) while cutting noise:
@@ -1099,6 +1151,7 @@ fn build_context_and_claims(
     //   soft floor: 35% of top score (preferred source types only)
     let top = validated
         .iter()
+        .filter(|e| !is_central(e))
         .map(|e| e.signals.combined_score.unwrap_or(0.0))
         .fold(0.0f64, f64::max);
     let hard_floor = (top * 0.65).max(0.20);
@@ -1111,7 +1164,7 @@ fn build_context_and_claims(
         .collect();
     let (keep, weak): (Vec<Evidence>, Vec<Evidence>) = validated.iter().cloned().partition(|e| {
         let s = e.signals.combined_score.unwrap_or(0.0);
-        s >= hard_floor || (preferred.contains(&e.source_type) && s >= soft_floor)
+        is_central(e) || s >= hard_floor || (preferred.contains(&e.source_type) && s >= soft_floor)
     });
     for w in &weak {
         plan.evidence_dropped.push(DroppedEvidence {
@@ -1149,7 +1202,17 @@ fn build_context_and_claims(
                 })
                 .then_with(|| a.id.cmp(&b.id))
         });
+        let mut central_served = 0usize;
         for ev in ordered_keep {
+            // Central knowledge has its own bound and is not counted in
+            // `section_counts`, so it never tightens the caps of other sections.
+            if is_central(ev) {
+                if central_served < CENTRAL_KNOWLEDGE_LIMIT {
+                    central_served += 1;
+                    capped.push(ev.clone());
+                }
+                continue;
+            }
             let is_primary = primary_st.is_some_and(|p| p == ev.source_type);
             let sec = crate::context::section_rank_of(ev.source_type) as i32
                 + if is_primary { -100 } else { 0 };

@@ -83,6 +83,8 @@ pub enum SemanticFallback {
     NoEmbeddings,
     /// Provider reported itself unavailable.
     ProviderUnavailable,
+    /// The semantic query timed out waiting for or running an embedding batch.
+    QueryTimedOut,
     /// Time/candidate budget exhausted before any result.
     TimeBudget,
     /// Contributed candidates (no fallback).
@@ -98,10 +100,36 @@ impl SemanticFallback {
             Self::Disabled => "SEMANTIC_DISABLED",
             Self::NoEmbeddings => "NO_EMBEDDINGS_FOR_MODEL",
             Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
+            Self::QueryTimedOut => "SEMANTIC_QUERY_TIMED_OUT",
             Self::TimeBudget => "SEMANTIC_TIME_BUDGET",
             Self::StoreUnavailable => "SEMANTIC_STORE_UNAVAILABLE",
             Self::Contributed => "",
         }
+    }
+}
+
+pub fn semantic_fallback_reason_text(reason: &str) -> Option<&'static str> {
+    match reason {
+        "" => None,
+        "SEMANTIC_DISABLED" => Some(
+            "semantic retrieval is disabled for this answer mode, so canonical retrieval served the result",
+        ),
+        "NO_EMBEDDINGS_FOR_MODEL" => Some(
+            "no embeddings exist for the active model in this scope, so canonical retrieval served the result",
+        ),
+        "PROVIDER_UNAVAILABLE" => {
+            Some("the embedding provider is unavailable, so canonical retrieval served the result")
+        }
+        "SEMANTIC_QUERY_TIMED_OUT" => Some(
+            "the semantic query timed out waiting for or running an embedding batch, so canonical retrieval served the result",
+        ),
+        "SEMANTIC_TIME_BUDGET" => Some(
+            "the semantic step ran out of its query budget, so canonical retrieval served the result",
+        ),
+        "SEMANTIC_STORE_UNAVAILABLE" => {
+            Some("the semantic store is unavailable, so canonical retrieval served the result")
+        }
+        _ => None,
     }
 }
 
@@ -195,20 +223,31 @@ impl SemanticCandidateGenerator {
         }
         let mut usage = attic_semantic::ResourceUsage::default();
         let cancel = attic_semantic::CancelFlag::new();
-        let outs = stack
-            .provider
-            .embed_batch(
-                &[attic_semantic::EmbeddingInput {
-                    unit_key: "__query__".into(),
-                    text: q,
-                }],
-                &cancel,
-                &mut usage,
-                Some(deadline),
-            )
-            .map_err(|e| {
-                RetrievalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
-            })?;
+        let outs = match stack.provider.embed_batch(
+            &[attic_semantic::EmbeddingInput {
+                unit_key: "__query__".into(),
+                text: q,
+            }],
+            &cancel,
+            &mut usage,
+            Some(deadline),
+        ) {
+            Ok(outs) => outs,
+            Err(attic_semantic::SemanticError::Cancelled { .. }) => {
+                return Ok((
+                    Vec::new(),
+                    SemanticOutcome {
+                        candidates: 0,
+                        fallback: SemanticFallback::QueryTimedOut,
+                    },
+                ));
+            }
+            Err(e) => {
+                return Err(RetrievalError::Storage(
+                    attic_storage::StorageError::Worker(e.to_string()),
+                ));
+            }
+        };
         let Some(qv) = outs.into_iter().next().map(|o| o.vector) else {
             return Ok((
                 Vec::new(),

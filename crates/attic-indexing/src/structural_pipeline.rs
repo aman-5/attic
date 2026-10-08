@@ -486,15 +486,26 @@ fn resolve_import(
     language_tag: &str,
     importer_rel: &str,
     specifier: &str,
-    _kind: &str,
+    kind: &str,
     known_paths: &BTreeSet<String>,
     go_module_prefix: &Option<String>,
     symbols_known: &dyn Fn(&str) -> bool,
 ) -> Option<Upgrade> {
     match language_tag {
         "java" => resolve_java(importer_rel, specifier, known_paths, symbols_known),
+        "c" => resolve_c(importer_rel, specifier, kind, known_paths),
+        "cpp" => resolve_cpp(importer_rel, specifier, kind, known_paths),
+        "csharp" => resolve_csharp(importer_rel, specifier, known_paths),
+        "kotlin" => resolve_kotlin(specifier, known_paths, symbols_known),
+        "scala" => resolve_scala(specifier, known_paths, symbols_known),
         "go" => resolve_go(specifier, known_paths, go_module_prefix),
+        "lua" => resolve_lua(specifier, known_paths),
         "python" => resolve_python(importer_rel, specifier, known_paths),
+        "ruby" => resolve_ruby(importer_rel, specifier, kind, known_paths),
+        "php" => resolve_php(importer_rel, specifier, kind, known_paths),
+        "swift" => resolve_swift(specifier, known_paths),
+        "rust" => resolve_rust(importer_rel, specifier, kind, known_paths),
+        "dockerfile" => resolve_dockerfile(importer_rel, specifier, kind, known_paths),
         "javascript" | "typescript" => resolve_js_ts(importer_rel, specifier, known_paths),
         _ => {
             let _ = importer_rel;
@@ -551,6 +562,109 @@ fn resolve_java(
     })
 }
 
+fn resolve_kotlin(
+    specifier: &str,
+    known: &BTreeSet<String>,
+    symbols_known: &dyn Fn(&str) -> bool,
+) -> Option<Upgrade> {
+    let spec = specifier.strip_suffix(".*").unwrap_or(specifier);
+    let parts: Vec<&str> = spec.split(':').flat_map(|s| s.split('.')).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let rel = parts.join("/");
+    let prefixes = [
+        "",
+        "src/main/kotlin/",
+        "src/test/kotlin/",
+        "src/main/java/",
+        "src/test/java/",
+        "src/",
+    ];
+    let cands = prefixes.iter().flat_map(|p| {
+        [
+            format!("{p}{rel}.kt"),
+            format!("{p}{rel}.kts"),
+            format!("{p}{rel}.java"),
+        ]
+    });
+    first_known(cands, known).map(|path| {
+        if symbols_known(spec) {
+            Upgrade {
+                target: ResolvedTarget::Path(path),
+                resolution: ResolutionLevel::SymbolResolved,
+                basis: "IMPORT",
+                confidence: 0.95,
+            }
+        } else {
+            Upgrade {
+                target: ResolvedTarget::Path(path),
+                resolution: ResolutionLevel::PackageResolved,
+                basis: "IMPORT",
+                confidence: 0.85,
+            }
+        }
+    })
+}
+
+fn resolve_scala(
+    specifier: &str,
+    known: &BTreeSet<String>,
+    symbols_known: &dyn Fn(&str) -> bool,
+) -> Option<Upgrade> {
+    let spec = specifier.strip_suffix(".*").unwrap_or(specifier);
+    let parts: Vec<&str> = spec.split(':').flat_map(|s| s.split('.')).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let rel = parts.join("/");
+    let prefixes = [
+        "",
+        "src/main/scala/",
+        "src/test/scala/",
+        "src/main/java/",
+        "src/test/java/",
+        "src/",
+    ];
+    let cands = prefixes
+        .iter()
+        .flat_map(|p| [format!("{p}{rel}.scala"), format!("{p}{rel}.java")]);
+    first_known(cands, known).map(|path| {
+        if symbols_known(spec) {
+            Upgrade {
+                target: ResolvedTarget::Path(path),
+                resolution: ResolutionLevel::SymbolResolved,
+                basis: "IMPORT",
+                confidence: 0.95,
+            }
+        } else {
+            Upgrade {
+                target: ResolvedTarget::Path(path),
+                resolution: ResolutionLevel::PackageResolved,
+                basis: "IMPORT",
+                confidence: 0.85,
+            }
+        }
+    })
+}
+
+fn resolve_lua(specifier: &str, known: &BTreeSet<String>) -> Option<Upgrade> {
+    if specifier.is_empty() {
+        return None;
+    }
+    let rel = specifier.replace('.', "/");
+    let prefixes = ["", "lua/", "src/", "src/lua/"];
+    let cands = prefixes
+        .iter()
+        .flat_map(|p| [format!("{p}{rel}.lua"), format!("{p}{rel}/init.lua")]);
+    first_known(cands, known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: "IMPORT",
+        confidence: 0.8,
+    })
+}
+
 fn resolve_go(
     specifier: &str,
     known: &BTreeSet<String>,
@@ -579,6 +693,100 @@ fn resolve_go(
         basis: "GO_MODULE",
         confidence: 0.9,
     })
+}
+
+const C_LIKE_INCLUDE_ROOTS: [&str; 4] = ["include/", "inc/", "src/", ""];
+
+fn resolve_c(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    resolve_c_like(importer_rel, specifier, kind, known, false)
+}
+
+fn resolve_cpp(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    resolve_c_like(importer_rel, specifier, kind, known, true)
+}
+
+fn resolve_c_like(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+    cpp: bool,
+) -> Option<Upgrade> {
+    if specifier.is_empty() {
+        return None;
+    }
+
+    let variants = include_variants(specifier, cpp);
+    let mut candidates: Vec<(String, f64)> = Vec::new();
+
+    if kind == "INCLUDE_QUOTE" {
+        let importer_dir = Path::new(importer_rel)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        for variant in &variants {
+            candidates.push((join_rel(&importer_dir, variant), 0.9));
+        }
+    } else if kind != "INCLUDE_ANGLE" {
+        return None;
+    }
+
+    for root in C_LIKE_INCLUDE_ROOTS {
+        for variant in &variants {
+            candidates.push((
+                join_rel(root, variant),
+                if kind == "INCLUDE_QUOTE" { 0.85 } else { 0.8 },
+            ));
+        }
+    }
+
+    for (candidate, confidence) in candidates {
+        if path_occ(&candidate, known) {
+            return Some(Upgrade {
+                target: ResolvedTarget::Path(candidate),
+                resolution: ResolutionLevel::PackageResolved,
+                basis: "IMPORT",
+                confidence,
+            });
+        }
+    }
+    None
+}
+
+fn include_variants(specifier: &str, cpp: bool) -> Vec<String> {
+    let normalized = specifier
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
+    let mut out = vec![normalized.clone()];
+    if cpp && Path::new(&normalized).extension().is_none() {
+        for ext in [".hpp", ".hh", ".hxx", ".inl"] {
+            out.push(format!("{normalized}{ext}"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn join_rel(prefix: &str, specifier: &str) -> String {
+    let base = prefix.trim_end_matches('/');
+    let child = specifier.trim_start_matches('/');
+    if base.is_empty() {
+        child.to_string()
+    } else {
+        format!("{base}/{child}")
+    }
 }
 
 fn python_candidates(importer_rel: &str, module_part: &str) -> Vec<String> {
@@ -615,6 +823,317 @@ fn resolve_python(
         resolution: ResolutionLevel::PackageResolved,
         basis: "PYTHON_PACKAGE",
         confidence: 0.85,
+    })
+}
+
+fn resolve_csharp(
+    importer_rel: &str,
+    specifier: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    let spec = specifier
+        .trim()
+        .strip_suffix(".*")
+        .unwrap_or(specifier.trim());
+    if spec.is_empty() {
+        return None;
+    }
+    let rel = spec.replace("::", "/").replace('.', "/");
+    let mut cands = vec![format!("{rel}.cs"), format!("src/{rel}.cs")];
+    if let Some(project) = csharp_project_prefix(importer_rel, known) {
+        cands.push(normalize_rel(&format!("{project}/{rel}.cs")));
+        cands.push(normalize_rel(&format!("{project}/src/{rel}.cs")));
+    }
+    first_known(cands.into_iter().map(|c| normalize_rel(&c)), known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: "CSHARP_NAMESPACE",
+        confidence: 0.85,
+    })
+}
+
+fn csharp_project_prefix(importer_rel: &str, known: &BTreeSet<String>) -> Option<String> {
+    let mut dir = Path::new(importer_rel).parent()?.to_path_buf();
+    loop {
+        let prefix = dir.to_string_lossy().replace('\\', "/");
+        let probe = format!("{prefix}/");
+        if !prefix.is_empty()
+            && known
+                .iter()
+                .any(|p| p.starts_with(&probe) && p.ends_with(".csproj"))
+        {
+            return Some(prefix);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn rust_crate_src_root(importer_rel: &str) -> Option<String> {
+    let parts: Vec<&str> = importer_rel.split('/').collect();
+    let src_idx = parts.iter().rposition(|seg| *seg == "src")?;
+    Some(parts[..=src_idx].join("/"))
+}
+
+fn rust_current_module_dir(importer_rel: &str) -> String {
+    let parent = Path::new(importer_rel)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let file_name = Path::new(importer_rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if matches!(file_name, "lib.rs" | "main.rs" | "mod.rs") {
+        parent
+    } else {
+        let stem = Path::new(importer_rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        normalize_rel(&format!("{parent}/{stem}"))
+    }
+}
+
+fn rust_module_file_candidates(base: &str, segments: &[&str]) -> Vec<String> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let joined = if base.is_empty() {
+        segments.join("/")
+    } else {
+        format!("{base}/{}", segments.join("/"))
+    };
+    vec![
+        normalize_rel(&format!("{joined}.rs")),
+        normalize_rel(&format!("{joined}/mod.rs")),
+    ]
+}
+
+fn rust_use_candidates(importer_rel: &str, specifier: &str) -> Vec<String> {
+    let spec = specifier.strip_suffix("::*").unwrap_or(specifier);
+    let mut segments: Vec<&str> = spec.split("::").filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let base = match segments[0] {
+        "crate" => {
+            segments.remove(0);
+            rust_crate_src_root(importer_rel).unwrap_or_default()
+        }
+        "self" => {
+            segments.remove(0);
+            rust_current_module_dir(importer_rel)
+        }
+        "super" => {
+            let mut base = Path::new(&rust_current_module_dir(importer_rel)).to_path_buf();
+            while segments.first().copied() == Some("super") {
+                segments.remove(0);
+                base.pop();
+            }
+            base.to_string_lossy().replace('\\', "/")
+        }
+        _ => rust_crate_src_root(importer_rel).unwrap_or_default(),
+    };
+
+    let mut out = rust_module_file_candidates(&base, &segments);
+    if segments.len() > 1 {
+        out.extend(rust_module_file_candidates(
+            &base,
+            &segments[..segments.len() - 1],
+        ));
+    }
+    out
+}
+
+fn resolve_rust(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    if kind == "EXTERN_CRATE" {
+        return None;
+    }
+    let cands = if kind == "MOD" {
+        let base = rust_current_module_dir(importer_rel);
+        let rel = specifier.replace("::", "/");
+        vec![
+            normalize_rel(&format!("{base}/{rel}.rs")),
+            normalize_rel(&format!("{base}/{rel}/mod.rs")),
+        ]
+    } else {
+        rust_use_candidates(importer_rel, specifier)
+    };
+    first_known(cands.into_iter(), known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: "RUST_MODULE",
+        confidence: 0.85,
+    })
+}
+
+fn resolve_dockerfile(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    if kind != "COPY" && kind != "ADD" {
+        return None;
+    }
+    let spec = specifier.trim();
+    if spec.is_empty() || spec.contains('$') || spec.contains("://") || spec.starts_with('/') {
+        return None;
+    }
+    let base_dir = Path::new(importer_rel)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let joined = normalize_rel(&format!("{base_dir}/{spec}"));
+    first_known(std::iter::once(joined), known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: "DOCKER_CONTEXT",
+        confidence: 0.9,
+    })
+}
+
+fn resolve_ruby(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    let cands = ruby_candidates(importer_rel, specifier, kind);
+    first_known(cands.into_iter(), known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: if kind == "REQUIRE_RELATIVE" {
+            "RUBY_RELATIVE"
+        } else {
+            "RUBY_LOAD_PATH"
+        },
+        confidence: if kind == "REQUIRE_RELATIVE" { 0.9 } else { 0.8 },
+    })
+}
+
+fn ruby_candidates(importer_rel: &str, specifier: &str, kind: &str) -> Vec<String> {
+    let spec = specifier.replace('\\', "/");
+    if kind == "REQUIRE_RELATIVE" || spec.starts_with("./") || spec.starts_with("../") {
+        let base_dir = Path::new(importer_rel)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let joined = normalize_rel(&format!("{base_dir}/{spec}"));
+        return ruby_file_candidates(joined);
+    }
+
+    let normalized = normalize_rel(spec.trim_start_matches('/'));
+    let mut out = Vec::new();
+    for prefix in ["lib/", "", "app/", "src/"] {
+        out.extend(ruby_file_candidates(normalize_rel(&format!(
+            "{prefix}{normalized}"
+        ))));
+    }
+    out
+}
+
+fn ruby_file_candidates(path: String) -> Vec<String> {
+    if path.ends_with(".rb") {
+        vec![path]
+    } else {
+        vec![format!("{path}.rb")]
+    }
+}
+
+fn resolve_php(
+    importer_rel: &str,
+    specifier: &str,
+    kind: &str,
+    known: &BTreeSet<String>,
+) -> Option<Upgrade> {
+    let cands = if kind.starts_with("REQUIRE") || kind.starts_with("INCLUDE") {
+        php_include_candidates(importer_rel, specifier)
+    } else {
+        php_psr4_candidates(specifier)
+    };
+    first_known(cands.into_iter(), known).map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: if kind.starts_with("REQUIRE") || kind.starts_with("INCLUDE") {
+            "PHP_INCLUDE"
+        } else {
+            "PHP_PSR4"
+        },
+        confidence: if kind.starts_with("REQUIRE") || kind.starts_with("INCLUDE") {
+            0.9
+        } else {
+            0.82
+        },
+    })
+}
+
+fn php_include_candidates(importer_rel: &str, specifier: &str) -> Vec<String> {
+    let spec = specifier.replace('\\', "/");
+    let base = if spec.starts_with('/') {
+        normalize_rel(spec.trim_start_matches('/'))
+    } else {
+        let importer_dir = Path::new(importer_rel)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        normalize_rel(&format!("{importer_dir}/{spec}"))
+    };
+    if base.ends_with(".php") {
+        vec![base]
+    } else {
+        vec![base.clone(), format!("{base}.php")]
+    }
+}
+
+fn php_psr4_candidates(specifier: &str) -> Vec<String> {
+    let trimmed = specifier.trim_start_matches('\\');
+    let parts: Vec<&str> = trimmed
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let suffix = parts.join("/");
+    let mut lower_parts: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
+    lower_parts[0] = lower_parts[0].to_ascii_lowercase();
+    let lower_suffix = lower_parts.join("/");
+
+    let mut out = Vec::new();
+    for prefix in ["", "src/", "app/", "lib/"] {
+        out.push(format!("{prefix}{suffix}.php"));
+        if lower_suffix != suffix {
+            out.push(format!("{prefix}{lower_suffix}.php"));
+        }
+    }
+    out
+}
+
+fn resolve_swift(specifier: &str, known: &BTreeSet<String>) -> Option<Upgrade> {
+    let module = specifier.split('.').next().unwrap_or(specifier);
+    if module.is_empty() {
+        return None;
+    }
+    let dir_prefix = format!("Sources/{module}/");
+    let hit = known
+        .range(dir_prefix.clone()..)
+        .take_while(|path| path.starts_with(&dir_prefix))
+        .next()
+        .cloned();
+    hit.map(|path| Upgrade {
+        target: ResolvedTarget::Path(path),
+        resolution: ResolutionLevel::PackageResolved,
+        basis: "SWIFT_PACKAGE",
+        confidence: 0.8,
     })
 }
 

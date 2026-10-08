@@ -85,11 +85,12 @@ pub struct SemanticConfig {
     #[serde(default)]
     pub min_score: Option<f64>,
     /// Maximum units embedded per repository. `None` uses the backend
-    /// default: 100000 on a GPU, 2560 on CPU.
+    /// default: 500000 on a GPU, 2560 on CPU.
     #[serde(default)]
     pub max_units_per_repo: Option<usize>,
     /// Maximum units embedded across the whole workspace (bounds queue and
-    /// vector storage). `None` uses the built-in default (100000).
+    /// vector storage). Applies to selected units, after duplicates and
+    /// exclusions are removed. `None` uses the built-in default (500000).
     #[serde(default)]
     pub max_units_total: Option<usize>,
     /// Wall-clock budget for ONE background enrichment drive slice (ms).
@@ -223,11 +224,14 @@ impl Default for SemanticConfig {
 /// Default for `[semantic] gpu_idle_unload_secs`.
 pub const DEFAULT_GPU_IDLE_UNLOAD_SECS: u64 = 900;
 
+/// Upper bound for `[semantic] max_units_per_repo` / `max_units_total`.
+pub const MAX_SEMANTIC_UNITS_CAP: usize = 5_000_000;
+
 /// Upper bound for `[semantic] gpu_idle_unload_secs` (one week).
 pub const MAX_GPU_IDLE_UNLOAD_SECS: u64 = 7 * 24 * 3600;
 
 /// Default for `[semantic] gpu_min_vram_mb`.
-pub const DEFAULT_GPU_MIN_VRAM_MB: u64 = 4096;
+pub const DEFAULT_GPU_MIN_VRAM_MB: u64 = 3960;
 
 /// Upper bound for `[semantic] gpu_min_vram_mb` (1 TiB).
 pub const MAX_GPU_MIN_VRAM_MB: u64 = 1 << 20;
@@ -460,6 +464,38 @@ impl IndexingOverride {
     }
 }
 
+/// `[knowledge]` table: one central folder of Markdown notes that Attic
+/// serves as project knowledge for every repository in the workspace.
+///
+/// ON by default: with no `[knowledge]` table the folder is
+/// `<ATTIC_HOME>/knowledge`, created on first start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeConfig {
+    /// `false` turns the central knowledge folder off entirely.
+    #[serde(default = "default_knowledge_enabled")]
+    pub enabled: bool,
+    /// Use this folder instead of the default `<ATTIC_HOME>/knowledge`.
+    /// It is never created for you; a path that does not exist or is not a
+    /// directory turns the feature off with the reason shown in `status`,
+    /// and never fails startup.
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+fn default_knowledge_enabled() -> bool {
+    true
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+        }
+    }
+}
+
 /// Parsed `attic.toml` — resource/semantic/indexing tunables only.
 ///
 /// Never contains workspace-membership (`[[repositories]]`); that stays on
@@ -480,6 +516,35 @@ pub struct AtticConfig {
     /// default (no extra exclusions beyond the built-in ones).
     #[serde(default)]
     pub indexing: IndexingOverride,
+    /// `[knowledge]` table. Absent = default folder `<ATTIC_HOME>/knowledge`.
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
+    /// `[logging]` table. Absent = file logging off until the `logging`
+    /// tool turns it on.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+/// `[logging]` — persistent file-log level applied at every start. The
+/// `logging` MCP tool still changes it at runtime (not written back).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// `off` | `error` | `warn` | `info` | `debug` | `trace`. `None` = off.
+    #[serde(default)]
+    pub file_level: Option<String>,
+}
+
+/// Accepted `[logging] file_level` values.
+pub const FILE_LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
+
+impl LoggingConfig {
+    /// The configured level, lowercased; `None` when unset.
+    pub fn file_level(&self) -> Option<String> {
+        self.file_level
+            .as_ref()
+            .map(|l| l.trim().to_ascii_lowercase())
+    }
 }
 
 impl AtticConfig {
@@ -503,6 +568,24 @@ impl AtticConfig {
     /// depends on the other layers they are merged with.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.indexing.validate()?;
+        if let Some(level) = self.logging.file_level()
+            && !FILE_LOG_LEVELS.contains(&level.as_str())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[logging] file_level must be one of {} (got '{level}')",
+                FILE_LOG_LEVELS.join("|")
+            )));
+        }
+        if self
+            .knowledge
+            .dir
+            .as_deref()
+            .is_some_and(|d| d.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "[knowledge] dir must not be empty; remove the key to turn the feature off".into(),
+            ));
+        }
         if self.semantic.model.trim().is_empty() {
             return Err(ConfigError::Invalid(
                 "[semantic] model must not be empty".into(),
@@ -530,10 +613,17 @@ impl AtticConfig {
                 "[semantic] min_score must be within 0.0..=1.0".into(),
             ));
         }
-        if self.semantic.max_units_per_repo == Some(0) || self.semantic.max_units_total == Some(0) {
-            return Err(ConfigError::Invalid(
-                "[semantic] max_units_per_repo and max_units_total must be >= 1".into(),
-            ));
+        for (key, v) in [
+            ("max_units_per_repo", self.semantic.max_units_per_repo),
+            ("max_units_total", self.semantic.max_units_total),
+        ] {
+            if let Some(v) = v
+                && !(1..=MAX_SEMANTIC_UNITS_CAP).contains(&v)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "[semantic] {key} must be within 1..={MAX_SEMANTIC_UNITS_CAP} (got {v})"
+                )));
+            }
         }
         if self.semantic.gpu_batch_tokens == Some(0) {
             return Err(ConfigError::Invalid(
@@ -611,12 +701,21 @@ model = "qwen3-embedding-0.6b"
 
 # Admission policy for the embedding queue. Excluded content stays fully
 # lexical-searchable; it is simply never embedded.
-# Selection defaults depend on the embedding backend: full coverage on a
-# GPU (min_score 0.0, max_units_per_repo 100000, max_file_bytes 8 MiB), and
-# conservative on CPU (0.30 / 2560 / 256 KiB), where full coverage takes
-# about an hour per repository. Values set here override both.
+#
+# Leave these four keys UNSET to get defaults matched to the embedding
+# backend actually in use (`status` -> semantic_selection_effective shows the
+# values in force and where each came from):
+#
+#   key                  GPU default        CPU default
+#   max_file_bytes       8388608 (8 MiB)    262144 (256 KiB)
+#   min_score            0.0                0.30
+#   max_units_per_repo   500000             2560
+#   max_units_total      500000             500000
+#
+# CPU is conservative because full coverage there takes about an hour per
+# repository. Any value set here overrides the default on both backends.
 # Files larger than this are never embedded.
-# max_file_bytes = 262144
+# max_file_bytes = <backend default>
 # Additional paths to keep out of the embedding queue.
 # exclude_globs = ["**/*.min.js", "testdata/"]
 
@@ -624,13 +723,14 @@ model = "qwen3-embedding-0.6b"
 # (default: 60000 = 60s). This is NOT a per-batch inference deadline; a
 # claimed batch always runs to completion under its own hang timeout.
 # drive_budget_ms = 60000
-# Minimum selection score a unit needs to be embedded (GPU 0.0, CPU 0.30).
-# Lower it for more semantic coverage at the cost of more embedding work.
-# min_score = 0.30
-# Embedding caps: per repository (GPU 100000, CPU 2560) and workspace-wide
-# (default 100000).
-# max_units_per_repo = 2560
-# max_units_total = 100000
+# Minimum selection score a unit needs to be embedded. Lower it for more
+# semantic coverage at the cost of more embedding work.
+# min_score = <backend default>
+# Embedding caps: per repository and workspace-wide. They count unique,
+# selected chunks (after duplicates and generated files are removed); every
+# indexed chunk is always considered. Maximum accepted value: 5000000.
+# max_units_per_repo = <backend default>
+# max_units_total = <backend default>
 
 # GPU (ONNX/DirectML) tunables. Inputs are grouped into length buckets
 # (64/128/256/…) and each forward pass carries gpu_batch_tokens / bucket
@@ -648,10 +748,20 @@ model = "qwen3-embedding-0.6b"
 # GPU eligibility, decided once at startup (see `status` for the reason).
 # A GPU with less dedicated VRAM than this runs embedding on CPU instead;
 # a nominal 4 GB card qualifies. 0 = always try the GPU.
-# gpu_min_vram_mb = 4096
+# gpu_min_vram_mb = 3960
 # Integrated GPUs share system RAM with the desktop and are skipped unless
 # allowed here.
 # allow_integrated_gpu = false
+#
+# Memory-pressure gate for embedding (not configurable; shown in `status`
+# under resource_pressure.embedding_gate):
+#   dedicated GPU (DirectML/CUDA with its own VRAM): ignores host-RAM
+#     pressure tiers and pauses only below 512 MiB of available RAM.
+#   unified-memory GPU (Apple Silicon Metal, or an allowed integrated GPU):
+#     pauses below 2 GiB of available RAM; batch halves at Critical and
+#     quarters at Emergency pressure.
+#   CPU: follows the host-RAM tiers (reduced at 75/82%, paused at 90% or
+#     under 2 GiB available).
 
 [indexing]
 # Additional glob patterns to exclude from indexing, beyond .gitignore and
@@ -675,6 +785,24 @@ model = "qwen3-embedding-0.6b"
 # ruby, csharp, scala, php, swift, lua, rust, kotlin, dockerfile.
 # analyzers = ["java", "typescript", "aem"]
 # disabled_analyzers = ["php"]
+
+[knowledge]
+# Markdown notes served as project knowledge to EVERY repository (architecture,
+# conventions, runbooks...). ON by default: the folder is <ATTIC_HOME>/knowledge
+# (~/.attic/knowledge), created on first start. Drop .md files in and go.
+# The folder's own README.md is skipped.
+#
+# Use your own folder instead (must already exist):
+# dir = "C:\\path\\to\\attic\\knowledge"
+#
+# Turn the feature off:
+# enabled = false
+
+[logging]
+# Level of the file log in <ATTIC_HOME>/logs, applied at every start
+# (default: off). off | error | warn | info | debug | trace.
+# The `logging` MCP tool can still change it until the next restart.
+# file_level = "info"
 "#;
 
 #[cfg(test)]
@@ -757,6 +885,27 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_table_is_optional_and_parses_a_dir() {
+        let default = AtticConfig::default().knowledge;
+        assert!(default.enabled, "knowledge is on by default");
+        assert_eq!(default.dir, None);
+        let cfg =
+            AtticConfig::parse_str("[knowledge]\ndir = \"C:\\\\notes\\\\knowledge\"\n").unwrap();
+        assert_eq!(cfg.knowledge.dir.as_deref(), Some("C:\\notes\\knowledge"));
+        assert!(cfg.knowledge.enabled, "setting dir keeps it enabled");
+        let off = AtticConfig::parse_str("[knowledge]\nenabled = false\n").unwrap();
+        assert!(!off.knowledge.enabled);
+    }
+
+    #[test]
+    fn knowledge_rejects_blank_dir_and_unknown_keys() {
+        let err = AtticConfig::parse_str("[knowledge]\ndir = \"  \"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)), "got {err:?}");
+        let err = AtticConfig::parse_str("[knowledge]\nfolder = \"x\"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
     fn worker_and_embedding_tunables_parse() {
         let cfg = AtticConfig::parse_str(
             "[resources]\nscheduler_workers = 6\nembedding_batch_size = 32\nembedding_worker_count = 2\n",
@@ -776,6 +925,39 @@ mod tests {
         assert_eq!(cfg.indexing.analysis_threads, Some(4));
         assert_eq!(cfg.indexing.analyzers, ["swift", "aem"]);
         assert_eq!(cfg.indexing.disabled_analyzers, ["php"]);
+    }
+
+    #[test]
+    fn logging_file_level_parses_and_rejects_unknown_levels() {
+        let cfg = AtticConfig::parse_str("[logging]\nfile_level = \"Debug\"\n").unwrap();
+        assert_eq!(cfg.logging.file_level().as_deref(), Some("debug"));
+        assert_eq!(AtticConfig::default().logging.file_level(), None);
+        let err = AtticConfig::parse_str("[logging]\nfile_level = \"verbose\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file_level must be one of"), "{err}");
+        assert!(AtticConfig::parse_str(ATTIC_TOML_TEMPLATE).is_ok());
+    }
+
+    #[test]
+    fn semantic_unit_caps_accept_industry_scale_and_reject_absurd_values() {
+        let ok = AtticConfig::parse_str(
+            "[semantic]\nmax_units_total = 500000\nmax_units_per_repo = 500000\n",
+        )
+        .unwrap();
+        assert_eq!(ok.semantic.max_units_total, Some(500_000));
+        assert!(
+            AtticConfig::parse_str("[semantic]\nmax_units_total = 5000000\n").is_ok(),
+            "the documented maximum is accepted"
+        );
+        for toml in [
+            "[semantic]\nmax_units_total = 0\n",
+            "[semantic]\nmax_units_per_repo = 0\n",
+            "[semantic]\nmax_units_total = 5000001\n",
+        ] {
+            let err = AtticConfig::parse_str(toml).unwrap_err().to_string();
+            assert!(err.contains("must be within 1..=5000000"), "{toml}: {err}");
+        }
     }
 
     #[test]
@@ -826,7 +1008,7 @@ mod tests {
             cfg.gpu_eligibility(2048, false),
             GpuEligibility::TooLittleVram {
                 have_mb: 2048,
-                min_mb: 4096
+                min_mb: DEFAULT_GPU_MIN_VRAM_MB
             }
         );
         assert_eq!(cfg.gpu_eligibility(8192, true), GpuEligibility::Integrated);

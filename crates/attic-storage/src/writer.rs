@@ -523,6 +523,9 @@ fn flush_batch(
     // Execute each mutation in order; stop executing on first failure.
     let mut results: Vec<Result<(), StorageError>> = Vec::with_capacity(n);
     let mut failed_index: Option<usize> = None;
+    // Rows changed by this batch decide whether the commit is a real change
+    // of the canonical index (see the generation bump below).
+    let changes_before = conn.total_changes();
 
     for (i, (f, _tx)) in fns_and_txs.iter_mut().enumerate() {
         if failed_index.is_some() {
@@ -580,8 +583,14 @@ fn flush_batch(
             Ok(()) => {
                 // COMMIT succeeded: all results are already Ok(()). Bump the
                 // generation counter so consumers watching for canonical
-                // changes (e.g. the semantic enricher) see this batch.
-                generation.fetch_add(1, Ordering::Release);
+                // changes (e.g. the semantic enricher) see this batch — but
+                // only when a row actually changed. Read-only work routed
+                // through the writer (an idle task-claim poll finding
+                // nothing) used to bump it several times a second, making
+                // the enricher re-run its full reconcile after every slice.
+                if conn.total_changes() != changes_before {
+                    generation.fetch_add(1, Ordering::Release);
+                }
             }
             Err(commit_err) => {
                 // COMMIT failed.  Attempt ROLLBACK to restore known-clean state.
@@ -723,6 +732,49 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic execution
     // -----------------------------------------------------------------------
+
+    /// A batch that changes no row (an idle poll routed through the writer)
+    /// must not move the generation; a real write must.
+    #[test]
+    fn generation_moves_only_when_rows_change() {
+        let (_tmp, _path, writer_conn) = migrated_file_db();
+        let queue = WriterQueue::new(writer_conn).unwrap();
+        let handle = queue.handle();
+        let generation = handle.generation();
+        let g0 = generation.load(Ordering::Acquire);
+
+        handle
+            .send(|conn| {
+                conn.execute(
+                    "UPDATE core_repositories SET display_name = 'x' WHERE 0",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            g0,
+            "no-op must not bump"
+        );
+
+        handle
+            .send(|conn| {
+                conn.execute(
+                    "INSERT INTO core_repositories \
+                         (id, root_path, display_name, is_git, case_sensitive, created_at, updated_at) \
+                         VALUES ('g1', '/tmp/g1', 'g1', 1, 1, 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            generation.load(Ordering::Acquire) > g0,
+            "real write must bump"
+        );
+        drop(queue);
+    }
 
     #[test]
     fn writer_executes_mutation_and_returns_ok() {

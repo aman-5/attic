@@ -332,6 +332,30 @@ fn worker_loop(
             }
         }
 
+        // Look before claiming: an idle poll used to open a writer
+        // transaction 5x/s per worker for nothing. A reader check is free;
+        // the claim itself stays atomic in the writer.
+        let any_pending = pool
+            .with_reader(|c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ops_tasks
+                      WHERE state = 'PENDING' AND task_type != ?1)",
+                    [attic_storage::ops_tasks::TASK_STALE_EVICTION],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })
+            .unwrap_or(true);
+        if !any_pending {
+            if let Some(m) = monitor.as_ref() {
+                m.release_background_slot();
+            }
+            if shutdown.load(Ordering::SeqCst) {
+                continue;
+            }
+            wait_for_wake_or_timeout(&state, config.poll_interval);
+            continue;
+        }
+
         // Claim atomically through the coordinated writer queue.
         let claimed = run_on_writer(&writer, |conn| {
             claim_next_pending_task(conn, crate::now_micros())
@@ -341,12 +365,9 @@ fn worker_loop(
                 debug!(task = %task.id, kind = %task.task_type, "executing task");
                 let outcome =
                     execute_task(&pool, &writer, &policy, &config, &task, monitor.as_deref());
-                let task_id = task.id.clone();
-                let finished: Result<(), IncrementalError> = run_on_writer(&writer, move |conn| {
-                    finish_task(conn, &task_id, &outcome, crate::now_micros())
-                });
+                let finished = finish_task_with_retry(&writer, &task.id, &outcome);
                 if let Err(e) = finished {
-                    warn!(task = %task.id, error = %e, "finish_task failed");
+                    warn!(task = %task.id, error = %e, "finish_task failed after retries; task returned to PENDING");
                 }
                 // Release the background slot only after the task fully finished.
                 if let Some(m) = monitor.as_ref() {
@@ -372,6 +393,40 @@ fn worker_loop(
             }
         }
     }
+}
+
+/// Record a task's outcome, retrying transient writer failures (queue full,
+/// contention) with backoff. If it still cannot be recorded, return the task
+/// to PENDING so it is retried instead of sitting RUNNING until the next
+/// process restart (startup recovery is the only other path that resets it).
+fn finish_task_with_retry(
+    writer: &WriterQueueHandle,
+    task_id: &str,
+    outcome: &TaskOutcome,
+) -> Result<(), IncrementalError> {
+    const ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        let (id, out) = (task_id.to_string(), outcome.clone());
+        match run_on_writer(writer, move |conn| {
+            finish_task(conn, &id, &out, crate::now_micros())
+        }) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                debug!(task = %task_id, attempt, error = %e, "finish_task failed; retrying");
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(100 << attempt));
+            }
+        }
+    }
+    let id = task_id.to_string();
+    let reset: Result<(), IncrementalError> = run_on_writer(writer, move |conn| {
+        attic_storage::ops_tasks::reset_running_task(conn, &id).map(|_| ())
+    });
+    if let Err(e) = reset {
+        tracing::error!(task = %task_id, error = %e, "could not return task to PENDING; startup recovery will");
+    }
+    Err(last_err.expect("at least one attempt ran"))
 }
 
 fn execute_task(
@@ -590,7 +645,7 @@ pub fn run_next_task_synchronously(
 }
 
 /// Serialize-friendly snapshot for MCP status.
-#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct QueueStatus {
     /// PENDING task count.
     pub pending: i64,
@@ -598,6 +653,9 @@ pub struct QueueStatus {
     pub running: i64,
     /// FAILED task count.
     pub failed: i64,
+    /// RUNNING tasks older than the conservative stuck-task threshold.
+    #[serde(default)]
+    pub stuck_tasks: Vec<attic_storage::ops_tasks::StuckTask>,
 }
 
 /// Read current queue counts (status tool support).
@@ -607,5 +665,32 @@ pub fn queue_status(pool: &DbPool) -> Result<QueueStatus, IncrementalError> {
         pending: c.pending,
         running: c.running,
         failed: c.failed,
+        stuck_tasks: pool.with_reader(|conn| {
+            attic_storage::ops_tasks::list_stuck_running_tasks(
+                conn,
+                attic_storage::ops_tasks::DEFAULT_STUCK_TASK_AGE_SECS,
+            )
+        })?,
+    })
+}
+
+/// Queue counts of ONE repository (status tool support).
+pub fn queue_status_for_repo(
+    pool: &DbPool,
+    repository_id: &str,
+) -> Result<QueueStatus, IncrementalError> {
+    let c =
+        pool.with_reader(|conn| attic_storage::get_task_counts_for_repo(conn, repository_id))?;
+    Ok(QueueStatus {
+        pending: c.pending,
+        running: c.running,
+        failed: c.failed,
+        stuck_tasks: pool.with_reader(|conn| {
+            attic_storage::ops_tasks::list_stuck_running_tasks_for_repo(
+                conn,
+                repository_id,
+                attic_storage::ops_tasks::DEFAULT_STUCK_TASK_AGE_SECS,
+            )
+        })?,
     })
 }

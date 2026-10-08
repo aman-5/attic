@@ -27,6 +27,10 @@ pub const K_RRF: f64 = 60.0;
 
 /// Default per-ranker candidate depth before fusion (provisional tuning).
 const DEFAULT_CANDIDATE_DEPTH: usize = 100;
+/// One search query's semantic budget. If the worker is still occupied past
+/// this point, hybrid search degrades to lexical-only instead of waiting for a
+/// whole background batch to finish.
+const SEARCH_SEMANTIC_DEADLINE_MS: u64 = 1_500;
 
 /// Options controlling one hybrid search call.
 #[derive(Debug, Clone)]
@@ -90,10 +94,34 @@ pub enum SemanticDegradationReason {
     ProviderUnavailable,
     /// Active model has zero embeddings for the scope.
     NoEmbeddings,
+    /// The semantic query timed out waiting for or running an embedding batch.
+    QueryTimedOut,
     /// Query embedding failed.
     EmbeddingFailed,
     /// The disposable semantic store itself failed (poisoned/IO).
     StoreUnavailable,
+}
+
+impl SemanticDegradationReason {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => {
+                "the embedding provider is unavailable, so search fell back to lexical results"
+            }
+            Self::NoEmbeddings => {
+                "no embeddings exist for the active model in this search scope, so search fell back to lexical results"
+            }
+            Self::QueryTimedOut => {
+                "the semantic query timed out waiting for or running an embedding batch, so search fell back to lexical results"
+            }
+            Self::EmbeddingFailed => {
+                "the semantic query embedding failed, so search fell back to lexical results"
+            }
+            Self::StoreUnavailable => {
+                "the semantic store is unavailable, so search fell back to lexical results"
+            }
+        }
+    }
 }
 
 /// One fused search result.
@@ -237,6 +265,8 @@ impl<'a> HybridSearcher<'a> {
 
         let mut usage = attic_semantic::ResourceUsage::default();
         let cancel = attic_semantic::CancelFlag::new();
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(SEARCH_SEMANTIC_DEADLINE_MS);
         let qv = match stack.provider.embed_batch(
             &[attic_semantic::EmbeddingInput {
                 unit_key: "__search_query__".into(),
@@ -244,11 +274,14 @@ impl<'a> HybridSearcher<'a> {
             }],
             &cancel,
             &mut usage,
-            None,
+            Some(deadline),
         ) {
             Ok(mut outs) if !outs.is_empty() => outs.remove(0).vector,
             Ok(_) => {
                 return (Vec::new(), Some(SemanticDegradationReason::EmbeddingFailed));
+            }
+            Err(attic_semantic::SemanticError::Cancelled { .. }) => {
+                return (Vec::new(), Some(SemanticDegradationReason::QueryTimedOut));
             }
             Err(e) => {
                 tracing::warn!("hybrid search: query embedding failed: {e}");

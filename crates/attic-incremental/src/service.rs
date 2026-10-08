@@ -577,10 +577,18 @@ impl IncrementalService {
             .store(false, Ordering::SeqCst);
     }
 
-    /// Aggregate status snapshot for the MCP `status` tool.
-    pub fn status_snapshot(&self, pool: &DbPool) -> Result<ServiceStatus, IncrementalError> {
-        let freshness = pool.with_reader(attic_storage::get_freshness_totals)?;
-        let tasks = scheduler::queue_status(pool)?;
+    /// Status snapshot of ONE repository for the MCP `status` tool: its own
+    /// file freshness and task counts (never workspace-wide totals, which
+    /// made every repository report the same numbers and flipped all of them
+    /// to INDEXING whenever any one had a pending task).
+    pub fn status_snapshot(
+        &self,
+        pool: &DbPool,
+        repository_id: &str,
+    ) -> Result<ServiceStatus, IncrementalError> {
+        let freshness =
+            pool.with_reader(|c| attic_storage::get_freshness_totals_for_repo(c, repository_id))?;
+        let tasks = scheduler::queue_status_for_repo(pool, repository_id)?;
         Ok(ServiceStatus {
             events_ingested: self.metrics.events_ingested.load(Ordering::Relaxed),
             hints_dropped: self.metrics.hints_dropped.load(Ordering::Relaxed),

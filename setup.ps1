@@ -21,10 +21,15 @@
 
   Default:
       latest
+
+.PARAMETER SkipModels
+  Do not download the embedding models now. Attic then downloads them in
+  the background the first time it starts.
 #>
 
 param(
-    [string]$Version = "latest"
+    [string]$Version = "latest",
+    [switch]$SkipModels
 )
 
 $ErrorActionPreference = "Stop"
@@ -252,8 +257,8 @@ try {
         Select-Object -First 1
 
 
-    if ([string]::IsNullOrWhiteSpace($Expected)) {
-        Fail "Downloaded checksum file is invalid."
+    if ([string]::IsNullOrWhiteSpace($Expected) -or $Expected -notmatch '^[0-9A-Fa-f]{64}$') {
+        Fail "Downloaded checksum file is invalid (expected a 64-character SHA-256 hex digest)."
     }
 
 
@@ -318,9 +323,53 @@ try {
     }
 
 
+    # Runtime libraries shipped beside the exe (DirectML.dll for the GPU
+    # backend). Windows loads them from the exe's folder first.
+    $Libraries =
+        Get-ChildItem `
+            -Path (Join-Path $WorkDir $Name) `
+            -Filter "*.dll" `
+            -File `
+            -ErrorAction SilentlyContinue
+
+    foreach ($Library in $Libraries) {
+
+        try {
+
+            Copy-Item `
+                -Path $Library.FullName `
+                -Destination (Join-Path $AtticHome $Library.Name) `
+                -Force
+
+        } catch {
+
+            Fail "Could not install $($Library.Name) to '$AtticHome'. If Attic is currently running, stop the MCP server and run setup again."
+        }
+    }
+
+
     Write-Host "Attic installed successfully:"
     Write-Host "  $BinPath"
+    foreach ($Library in $Libraries) {
+        Write-Host "  $(Join-Path $AtticHome $Library.Name)"
+    }
     Write-Host ""
+
+
+    # -------------------------------------------------------------------------
+    # 10b. Download embedding models now (GPU model first when eligible), so
+    #      the first session starts on the right device. Never fails setup:
+    #      Attic retries the download itself on first start.
+    # -------------------------------------------------------------------------
+
+    if (-not $SkipModels) {
+        Write-Host "Downloading embedding models (about 1.2 GB per model, two on a GPU machine; download leftovers are removed afterwards; run with -SkipModels to defer)..."
+        & $BinPath setup-models
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Model download did not complete (exit $LASTEXITCODE). Attic will download the models automatically when it first starts."
+        }
+        Write-Host ""
+    }
 
 
     # -------------------------------------------------------------------------

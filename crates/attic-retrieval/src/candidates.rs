@@ -139,6 +139,21 @@ pub fn source_type_for_path(path: &str) -> EvidenceSourceType {
     EvidenceSourceType::SourceCode
 }
 
+/// Short type label for a `search` result path: `knowledge`,
+/// `documentation`, `code`, `config` or `test` (same classification
+/// `context` uses).
+pub fn search_label_for_path(path: &str) -> &'static str {
+    match source_type_for_path(path) {
+        EvidenceSourceType::Knowledge => "knowledge",
+        EvidenceSourceType::Documentation => "documentation",
+        EvidenceSourceType::Configuration => "config",
+        EvidenceSourceType::Test => "test",
+        EvidenceSourceType::SourceCode
+        | EvidenceSourceType::GeneratedSource
+        | EvidenceSourceType::Relationship => "code",
+    }
+}
+
 /// Authority mapping per source type (evidence.md AuthorityLevel).
 pub fn authority_for(st: EvidenceSourceType) -> AuthorityLevel {
     match st {
@@ -491,6 +506,47 @@ impl KnowledgeGenerator {
                     EvidenceSourceType::Knowledge => 1.0,
                     _ => 0.7,
                 });
+                c
+            })
+            .collect())
+    }
+}
+
+/// Most central-knowledge sections one `context` answer may carry.
+pub const CENTRAL_KNOWLEDGE_LIMIT: usize = 8;
+
+/// FTS rows read from the central knowledge repository per query. Wider than
+/// [`CENTRAL_KNOWLEDGE_LIMIT`] so the folder's own README chunks, which are
+/// filtered out, cannot use up the slots.
+const CENTRAL_KNOWLEDGE_READ: usize = 16;
+
+/// True for the central knowledge folder's own `README.md` (instructions
+/// for people, not project knowledge). Only the root-level file matches.
+pub fn is_central_knowledge_readme(path: &str) -> bool {
+    path.eq_ignore_ascii_case("readme.md")
+}
+
+/// Central knowledge generator (`[knowledge] dir`): searches ONLY the
+/// central knowledge repository, so code elsewhere can never crowd its
+/// notes out, and treats every file there as project knowledge.
+pub struct CentralKnowledgeGenerator;
+
+impl CentralKnowledgeGenerator {
+    pub fn run(
+        env: &mut GeneratorEnv<'_>,
+        terms: &[String],
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        env.limit = env.limit.min(CENTRAL_KNOWLEDGE_READ);
+        let lexical = LexicalGenerator::run(env, terms)?;
+        Ok(lexical
+            .into_iter()
+            .filter(|c| !is_central_knowledge_readme(&c.evidence.path))
+            .take(CENTRAL_KNOWLEDGE_LIMIT)
+            .map(|mut c| {
+                c.kind = RetrieverKind::Knowledge;
+                c.evidence.source_type = EvidenceSourceType::Knowledge;
+                c.evidence.authority = AuthorityLevel::ProjectKnowledge;
+                c.evidence.signals.knowledge_authority = Some(1.0);
                 c
             })
             .collect())

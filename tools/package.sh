@@ -6,6 +6,9 @@
 #
 #   attic-v<version>-<target>/
 #     attic-server[.exe]        the server binary (only executable)
+#     DirectML.dll              Windows only: DirectML runtime the GPU backend
+#                               loads from beside the exe (newer than the
+#                               copy Windows ships in System32)
 #     README.md                 product documentation
 #     LICENSE-MIT               license texts
 #     LICENSE-APACHE
@@ -71,6 +74,9 @@ if [[ "$MODE" == verify ]]; then
   BIN_COUNT=$(find "$DIR" -maxdepth 1 -type f \( -name 'attic-server' -o -name 'attic-server.exe' \) | wc -l)
   test "$BIN_COUNT" -eq 1 || { echo "FAIL: exactly one attic-server binary expected (found $BIN_COUNT)"; exit 1; }
   test -f "$DIR/README.md" || { echo "FAIL: README.md missing"; exit 1; }
+  if find "$DIR" -maxdepth 1 -type f -name 'attic-server.exe' -print -quit | grep -q .; then
+    test -f "$DIR/DirectML.dll" || { echo "FAIL: DirectML.dll missing from Windows archive"; exit 1; }
+  fi
   test -d "$DIR/docs" || { echo "FAIL: docs/ missing"; exit 1; }
   test -f "$DIR/LICENSE-MIT" || {
   echo "FAIL: LICENSE-MIT missing"
@@ -161,6 +167,11 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/docs"
 
 cp "$BIN" "$STAGE/$STAGED_EXE"
+if [[ "$TARGET" == *windows* ]]; then
+  DML="target/$TARGET/release/DirectML.dll"
+  test -f "$DML" || { echo "FAIL: $DML not found; the DirectML GPU backend needs it beside the exe" >&2; exit 1; }
+  cp "$DML" "$STAGE/"
+fi
 cp "$REPO_ROOT/README.md" "$STAGE/"
 for lic in LICENSE-MIT LICENSE-APACHE; do
   [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"

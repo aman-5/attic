@@ -162,12 +162,16 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   longer tied to "one process launch"; it is now tied to "one daemon per
   database". Every later `attic` launch against the same database fails
   that same `try_lock()` and instead becomes a thin relay: it discovers the
-  daemon's local-socket address (`interprocess::local_socket`, published to
-  a sibling `attic.ipc` file only after the daemon's listener is bound) and
+  daemon's local-socket address (published to a sibling `attic.ipc` file only
+  after the daemon's listener is bound) and
   splices its own MCP stdio transport to that socket byte-for-byte, so
   multiple windows on the same project run genuinely concurrently against
   the one shared live state — there is no second writer, watcher, or
-  recovery pass to reconcile. The daemon shuts down on an idle timeout once
+  recovery pass to reconcile. On Unix the socket is a pathname socket inside
+  `run/` (directory `0700`, socket `0600`) so only the owning user can
+  connect; on Windows it is a named pipe with the default DACL (cross-user
+  write access is already limited there). A stale Unix socket file is
+  removed only while this process holds the lock, before binding. The daemon shuts down on an idle timeout once
   every connection (its own original caller's included) has disconnected,
   or on SIGINT; a crashed daemon's `attic.lock` is released automatically
   by the OS, so the next launch re-elects cleanly. See
@@ -252,22 +256,26 @@ the lifetime of a long-running daemon.
 
 ## Language support
 
-Structural analysis is now a **three-tier model**. Tier 1 — full symbols,
-definitions, imports, and relationships — is hand-written per language via
-tree-sitter grammars, for **Java, Python, Go, JavaScript, and TypeScript**
+Structural analysis is a **tiered model**. Tier 1 — full symbols,
+definitions, imports, inheritance and calls — is hand-written per language via
+tree-sitter grammars, for **Java, Python, Go, JavaScript, TypeScript, Kotlin,
+Scala, Lua, Ruby, PHP, Swift, C, C++, C#, Rust, and Dockerfile**
 (`crates/attic-analyzers/src/structural/`; `.tsx` files specifically use the
 JSX-aware `LANGUAGE_TSX` grammar rather than the JSX-blind
-`LANGUAGE_TYPESCRIPT` one, a previously-existing bug fixed alongside this
-tier). Tier 2 — symbol definitions and intra-file references only, no
-import or relationship resolution — is a single generic engine
-(`crates/attic-analyzers/src/structural/tags_generic.rs`) driven by
-tree-sitter's `tags.scm` convention (the same mechanism GitHub/Neovim/Helix
-use for cross-language "go to definition"), covering **C, C++, Ruby, C#,
-Scala, PHP, Swift, Lua, Rust, Kotlin, and Dockerfile** without any hand-written
-per-language AST-walking code; the capability gap versus tier 1 is
-declared explicitly in code (`ImportExtraction=None`,
-`RelationshipResolution=None`), not silently overclaimed. Every other
-text-based language or format not on either list — config files, docs,
+`LANGUAGE_TYPESCRIPT` one). Imports are resolved to repository files by a
+per-language resolver in `crates/attic-indexing/src/structural_pipeline.rs`
+(`resolve_import`); a language without a resolver arm still reports its
+imports but they stay unresolved. Capabilities are declared honestly per
+analyzer: Rust macros, C++ templates and Ruby/PHP dynamic dispatch give
+partial, name-based call resolution; Lua has no inheritance; Dockerfile
+models build stages, `ARG`/`ENV` and `COPY` sources rather than calls. Very
+large flat inputs (1 MiB+ dominated by comments) skip the parser and are
+indexed lexically with a `STRUCTURAL_TRUNCATED` diagnostic.
+The generic `tags.scm` engine
+(`crates/attic-analyzers/src/structural/tags_generic.rs`) remains available
+for adding symbol-level support (definitions and intra-file references, no
+import or relationship resolution) to a further language cheaply. Every other
+text-based language or format — config files, docs,
 build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
 still makes it fully searchable via `search` and readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
@@ -318,8 +326,7 @@ no cross-file resolution.
 | Input | Analyzer | Result |
 |---|---|---|
 | Any text file | `GenericAnalyzer` | Full-text search, no symbols |
-| Java / Python / Go / JS / TS (incl. `.tsx`) | Tier 1 — hand-written tree-sitter | Full symbols, definitions, imports, relationships |
-| C / C++ / Ruby / C# / Scala / PHP / Swift / Lua / Rust / Kotlin / Dockerfile | Tier 2 — generic tags.scm | Symbol definitions + intra-file references only |
+| Java / Python / Go / JS / TS (incl. `.tsx`) / Kotlin / Scala / Lua / Ruby / PHP / Swift / C / C++ / C# / Rust / Dockerfile | Tier 1 — hand-written tree-sitter | Symbols, definitions, imports, inheritance, calls (partial where exact resolution is impossible, and marked so) |
 | JSON | `JsonAnalyzer` | Canonical subtree chunks with JSON-pointer addressing |
 | AEM (JCR content, HTL, OSGi configs, clientlibs) | `aem` platform plugin | Path-qualified nodes/symbols and imports; lexical units from `GenericAnalyzer` |
 | Everything else | Tier 3 — `GenericAnalyzer` | Full-text (and semantic) search; a dedicated analyzer can be added as a plugin without changing the pipeline (see `docs/PLAYBOOK.md`) |
@@ -357,6 +364,44 @@ doesn't carry the same weight when the evidence manager resolves
 contradictions. The boundary is the `knowledge/` path prefix only —
 filenames are never special-cased outside it. See `knowledge/README.md` in
 this repository for the end-user-facing explanation and template.
+
+### Central knowledge folder (`[knowledge]`)
+
+One folder of notes serves every repository. It is **on by default**: with
+no `[knowledge]` table the folder is `<ATTIC_HOME>/knowledge` (created on
+first start, `attic_core::sibling(db, "knowledge")`). `dir` points elsewhere
+(never created); `enabled = false` turns it off. The server indexes and
+watches the folder as a hidden repository
+(`AtticServer::start_central_knowledge`). It is never a workspace member, so
+it never appears in `workspace`, default `search` results or cross-repo sync.
+
+```mermaid
+flowchart LR
+  Q[context question] --> G["Normal generators<br/>(workspace repos)"]
+  Q --> K["CentralKnowledgeGenerator<br/>(knowledge repo only, ≤ 8)"]
+  G --> R[rank + validate]
+  K --> R
+  R --> C[context assembly]
+```
+
+- **Own search, own budget:** `CentralKnowledgeGenerator`
+  (`candidates.rs`) runs on every `context` question with a
+  `repository_id` filter on the knowledge repository and a separate
+  `BudgetAccountant` (`pipeline.rs::run_db_phases`). Code matches elsewhere
+  cannot crowd it out, and no trigger words are needed.
+- **Bounded, not filtered:** up to `CENTRAL_KNOWLEDGE_LIMIT` (8) notes skip
+  the candidate cut, score floor and per-section caps
+  (`build_context_and_claims`). They are not counted in those caps, so the
+  code evidence served is unchanged.
+- Every file there is `Knowledge` / `ProjectKnowledge`, except the folder's
+  root `README.md`, which is never served.
+- `search` adds `source_type` to every result. `scope: "knowledge"` returns
+  central notes first, then repository `knowledge/` hits.
+- `status.knowledge` reports `state` (`off` / `indexing` / `ready` /
+  `failed`), `dir`, `repository_id` and `reason`. A bad path never stops
+  startup.
+- Tests: `crates/attic-retrieval/tests/central_knowledge.rs` and the
+  `central_knowledge_*` / `knowledge_dir_*` tests in `attic-server`.
 
 ## Known design limitations
 
@@ -587,15 +632,19 @@ flowchart TD
 ```
 
 First start downloads the fp16 ONNX model (~1.2 GB) into `~/.attic/models`.
-Attic does not use Hugging Face's global `~/.cache/huggingface` cache. If a GPU
+Attic does not use Hugging Face's global `~/.cache/huggingface` cache. Every
+model artifact — safetensors and ONNX — is verified against a pinned
+SHA-256 manifest before it is used, and a mismatch quarantines the file; the
+inference worker never downloads an unpinned "latest" model on a cache miss,
+it fails closed and the parent re-provisions. If a GPU
 falls back to CPU after startup, the startup selection defaults remain.
 
 | Selection key | GPU (DirectML / Metal / CUDA) | CPU |
 |---|---:|---:|
 | `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `100000` | `2560` |
+| `max_units_per_repo` | `500000` | `2560` |
 | `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `100000` | `100000` |
+| `max_units_total` | `500000` | `500000` |
 
 The reason for backend-specific defaults is cost: full coverage is minutes on
 the measured GPU but would be about one hour per repository on CPU
@@ -659,8 +708,11 @@ mixing incompatible vectors.
 
 ### Progress, diagnostics and failure policy
 
-`status` → `semantic_progress.chunks_per_sec` is a wall-clock rate over the
-last **120 s**. `status.semantic_identity` reports the active backend and
+`status` → `semantic_progress.chunks_per_sec` is measured from committed
+enrichment batches over the last **300 s** (`attic_semantic::throughput`).
+Model cache cleanup (`attic_semantic::model_cache`) removes the ONNX download
+cache once `onnx-fp16/` is complete and hard-links duplicate Windows blob
+copies; `setup-models` and server start run it. `status.semantic_identity` reports the active backend and
 fallback reason, and `diagnostics.why_slow` summarizes bottlenecks.
 
 With `ATTIC_LOG=debug`, the parent logs:
@@ -684,8 +736,31 @@ RSS and enforces configurable budgets: total memory, foreground MCP query
 concurrency, and background worker concurrency. Foreground (interactive MCP
 calls) is never starved by background work (indexing, semantic enrichment) —
 background capacity is capped strictly below foreground capacity, and under
-memory pressure (`Pause`/`Emergency` advisories) expensive `DEEP` retrieval
-mode is automatically downgraded to `NORMAL` rather than failing outright.
+memory pressure expensive `DEEP` retrieval mode is automatically downgraded
+to `NORMAL` rather than failing outright.
+
+Whole-machine memory feeds the pressure tiers, but percentage alone never
+escalates a machine that still has plenty of free RAM: **Warning** at ≥75 %
+used; **Critical** at ≥82 % used *and* under 8 GiB available; **Emergency** at
+under 2 GiB available, or at ≥90 % used *and* under 4 GiB available.
+Hysteresis keeps a tier from flapping and ignores the percentage once
+available RAM is back above those headrooms. Foreground MCP calls are never
+refused for memory pressure — every tool (`search`, `file`, `status`,
+`context`, `workspace`) is admitted at every tier. Pressure only throttles
+background work and the optional depth of a foreground answer (`DEEP` →
+`NORMAL`); the sole hard refusal is the foreground concurrency-slot limit
+(flood protection, not memory policy). Background embedding on a CPU backend parks at Emergency; a
+dedicated GPU parks only below 512 MiB available host RAM. Semantic search
+over embeddings that already exist keeps working while background embedding is
+parked, a query embedding waits a bounded time behind a running batch and
+then falls back to lexical search with an explicit reason
+(`SEMANTIC_QUERY_TIMED_OUT`), and `status` → `semantic_availability` states
+the current tier, available RAM, whether enrichment is parked and why. Other
+`status` blocks: `semantic_provider_backoff` (provider not-ready streak, last
+error, next retry), `semantic_selection_coverage` (units eligible before caps
+vs selected, per-repo/global cap exclusions, plain `reason`), and
+`incremental_stuck_tasks` (tasks RUNNING past a generous bound, with task id,
+type, repository and age).
 
 Resource values resolve as environment variable > `attic.toml [resources]`
 > hardware-detected mode baseline, are range-validated
@@ -701,7 +776,10 @@ unknown `attic.toml` tables/keys fail startup rather than being ignored.
   (`canonicalize_within_root`).
 - A secrets-scanning layer redacts or excludes matched content before it can
   reach an MCP response, regardless of which tool requests it.
-- `.git` internals are blocked at the server layer unconditionally.
+- `.git` internals and every other security-forbidden path (`.ssh`, `.gnupg`,
+  key and credential files) are blocked at **any depth** by the `file` tool and
+  by evidence verification, using the same `is_security_forbidden` rule as the
+  indexing walk.
 - All MCP tool arguments are validated (length, character class, numeric
   bounds) before use; no raw string is interpolated into SQL — dynamic SQL
   uses compile-time-literal identifiers only.
@@ -725,7 +803,7 @@ above for the recovery guarantees this implements.
 ONE Attic MCP process serves ONE persistent logical workspace made of
 ZERO/ONE/MANY arbitrary repository roots. The workspace is configured
 through MCP itself (the `workspace` tool: `inspect`/`add`/`remove`/`set`),
-persisted atomically to `<ATTIC_HOME>/config.toml`, and reloaded on every
+persisted atomically to `<ATTIC_HOME>/config/config.toml`, and reloaded on every
 subsequent launch. Historical repositories left in storage after membership
 changes never leak into active retrieval, status, WorkspaceSnapshot, or
 cross-repo intelligence.
@@ -734,7 +812,7 @@ cross-repo intelligence.
 flowchart TD
     AI[AI / MCP Client]
     MCP[Attic MCP]
-    CFG["~/.attic/config.toml"]
+    CFG["~/.attic/config/config.toml"]
     W[Logical Workspace]
     A["Repository A<br/>C:\..."]
     B["Repository B<br/>D:\..."]
@@ -755,7 +833,7 @@ flowchart TD
     CR --> MCP
 ```
 
-Configuration precedence: `ATTIC_CONFIG` → `<ATTIC_HOME>/config.toml` →
+Configuration precedence: `ATTIC_CONFIG` → `<ATTIC_HOME>/config/config.toml` →
 `ATTIC_WORKSPACE_ROOT` → UNCONFIGURED. `ATTIC_HOME` (default `~/.attic`)
 pins the entire application home: config + database + backups + scratch.
 

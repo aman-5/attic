@@ -7,6 +7,7 @@
 //! - Best-effort "why_slow" diagnostic explanation (§62).
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
 
 /// Detailed snapshot of semantic background enrichment progress and throughput (§61).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +111,110 @@ impl SemanticProgressSnapshot {
     }
 }
 
+/// Tracks when semantic work most recently became available in this process.
+///
+/// The stall clock must reset when a previously idle queue receives new work,
+/// even if the last committed batch in this process happened hours ago.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkAvailabilityClock {
+    /// When the queue most recently transitioned from idle to active.
+    pub active_since_secs: Option<u64>,
+}
+
+/// Advance the queue-activity clock from one status observation.
+pub fn observe_work_availability(
+    clock: WorkAvailabilityClock,
+    now_secs: u64,
+    pending: u64,
+    inflight: u64,
+) -> WorkAvailabilityClock {
+    if pending + inflight == 0 {
+        WorkAvailabilityClock {
+            active_since_secs: None,
+        }
+    } else if clock.active_since_secs.is_some() {
+        clock
+    } else {
+        WorkAvailabilityClock {
+            active_since_secs: Some(now_secs),
+        }
+    }
+}
+
+/// Seconds since meaningful semantic progress for the CURRENT queue.
+///
+/// "Meaningful progress" is the later of:
+/// 1. the last committed batch recorded by the enricher itself; or
+/// 2. when the queue most recently became non-empty in this process.
+///
+/// This prevents a long-idle server from treating fresh work as already
+/// stalled before a single batch has had a chance to run.
+pub fn secs_since_meaningful_progress(
+    clock: WorkAvailabilityClock,
+    now_secs: u64,
+    secs_since_last_commit: Option<u64>,
+) -> Option<u64> {
+    let active_since = clock.active_since_secs?;
+    let last_progress_at = secs_since_last_commit
+        .map(|age| now_secs.saturating_sub(age))
+        .map_or(active_since, |commit_at| commit_at.max(active_since));
+    Some(now_secs.saturating_sub(last_progress_at))
+}
+
+/// Most recent provider-load/backoff state, surfaced in `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderBackoffStatus {
+    /// Consecutive transient provider failures driving the current backoff.
+    pub consecutive_failures: u32,
+    /// Human-readable last error from the provider or worker load path.
+    pub last_error: String,
+    /// Unix time in milliseconds when the next retry is scheduled.
+    pub next_retry_unix_ms: u64,
+}
+
+static PROVIDER_BACKOFF_STATUS: OnceLock<Mutex<Option<ProviderBackoffStatus>>> = OnceLock::new();
+
+fn provider_backoff_cell() -> &'static Mutex<Option<ProviderBackoffStatus>> {
+    PROVIDER_BACKOFF_STATUS.get_or_init(|| Mutex::new(None))
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record that semantic work is paused behind a provider/load backoff.
+pub fn note_provider_backoff(
+    consecutive_failures: u32,
+    delay_ms: u64,
+    last_error: impl Into<String>,
+) {
+    if let Ok(mut slot) = provider_backoff_cell().lock() {
+        *slot = Some(ProviderBackoffStatus {
+            consecutive_failures,
+            last_error: last_error.into(),
+            next_retry_unix_ms: unix_ms_now().saturating_add(delay_ms),
+        });
+    }
+}
+
+/// Clear any recorded provider backoff once work resumes normally.
+pub fn clear_provider_backoff() {
+    if let Ok(mut slot) = provider_backoff_cell().lock() {
+        *slot = None;
+    }
+}
+
+/// Current provider backoff snapshot, if the queue is intentionally paused.
+pub fn provider_backoff_snapshot() -> Option<ProviderBackoffStatus> {
+    provider_backoff_cell()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
 /// Stall detection (Phase 5): flags the exact failure mode observed in
 /// production — a batch claimed INFLIGHT but producing zero completions for
 /// longer than the threshold. Pure function over observable counters so it
@@ -119,6 +224,9 @@ pub struct StallAssessment {
     pub stalled: bool,
     /// Human-readable verdict for status output.
     pub verdict: String,
+    /// `progress_watchdog` for heartbeat-backed detection, `deadline_only`
+    /// for backends that cannot report in-batch progress.
+    pub detection_mode: &'static str,
 }
 
 /// Assess whether the enrichment pipeline is stalled.
@@ -138,48 +246,132 @@ pub const STALL_THRESHOLD_SECS: u64 = 120;
 /// same number the supervisor enforces.
 pub const EMBED_DEADLINE_SECS: u64 = 300;
 
-pub fn assess_stall(
-    inflight: u64,
-    done: u64,
-    chunks_per_sec: f64,
-    secs_since_last_completed_batch: u64,
-) -> StallAssessment {
-    let stalled = inflight > 0
-        && chunks_per_sec < 0.01
-        && secs_since_last_completed_batch > STALL_THRESHOLD_SECS;
+#[derive(Debug, Clone, PartialEq)]
+pub struct StallContext {
+    /// Total queue depth (`pending + inflight`).
+    pub queue_depth: u64,
+    /// Claimed items currently in-flight.
+    pub inflight: u64,
+    /// Completed items for the active vector space.
+    pub done: u64,
+    /// Measured committed throughput.
+    pub chunks_per_sec: f64,
+    /// Seconds since the later of "queue became active" and "last commit".
+    pub secs_since_last_progress: u64,
+    /// The provider is still loading or warming up and has not produced any
+    /// throughput yet.
+    pub loading_or_warmup: bool,
+    /// Current provider-load backoff, if the queue is intentionally paused.
+    pub provider_backoff: Option<ProviderBackoffStatus>,
+    /// Whether the active backend emits progress heartbeats inside a batch.
+    pub progress_heartbeat_supported: bool,
+}
+
+pub fn assess_stall(ctx: &StallContext) -> StallAssessment {
+    let detection_mode = if ctx.progress_heartbeat_supported {
+        "progress_watchdog"
+    } else {
+        "deadline_only"
+    };
+    if let Some(backoff) = ctx.provider_backoff.as_ref() {
+        return StallAssessment {
+            stalled: false,
+            verdict: format!(
+                "BACKING OFF: provider load failed {} consecutive time(s); queue is held \
+                 PENDING until the next retry. Last error: {}",
+                backoff.consecutive_failures, backoff.last_error
+            ),
+            detection_mode,
+        };
+    }
+    if ctx.loading_or_warmup && ctx.queue_depth > 0 && ctx.chunks_per_sec < 0.01 {
+        return StallAssessment {
+            stalled: false,
+            verdict: if ctx.progress_heartbeat_supported {
+                format!(
+                    "LOADING/WARMING: {0} queued item(s), no completed batch yet; the provider \
+                     is still loading or warming up, so stall timing starts only after it begins \
+                     serving work",
+                    ctx.queue_depth
+                )
+            } else {
+                format!(
+                    "LOADING/WARMING: {0} queued item(s), no completed batch yet; this backend \
+                     does not emit progress heartbeats, so hang detection is deadline-based at \
+                     {EMBED_DEADLINE_SECS}s",
+                    ctx.queue_depth
+                )
+            },
+            detection_mode,
+        };
+    }
+
+    let stall_threshold = if ctx.progress_heartbeat_supported {
+        STALL_THRESHOLD_SECS
+    } else {
+        EMBED_DEADLINE_SECS
+    };
+    let stalled = ctx.inflight > 0
+        && ctx.chunks_per_sec < 0.01
+        && ctx.secs_since_last_progress > stall_threshold;
     let verdict = if stalled {
-        // Past the detection threshold but still inside the supervisor's kill
-        // deadline, recovery is already scheduled and automatic. Telling an
-        // operator to "restart the embedding worker" here is wrong advice: it
-        // reads as "this is dead", when in fact the worker gets killed and
-        // restarted without intervention. Only once the deadline has passed
-        // without a restart is something genuinely wedged.
-        if secs_since_last_completed_batch <= EMBED_DEADLINE_SECS {
-            let secs_to_recovery = EMBED_DEADLINE_SECS - secs_since_last_completed_batch;
+        if ctx.progress_heartbeat_supported {
+            // Past the detection threshold but still inside the supervisor's kill
+            // deadline, recovery is already scheduled and automatic. Telling an
+            // operator to "restart the embedding worker" here is wrong advice: it
+            // reads as "this is dead", when in fact the worker gets killed and
+            // restarted without intervention. Only once the deadline has passed
+            // without a restart is something genuinely wedged.
+            if ctx.secs_since_last_progress <= EMBED_DEADLINE_SECS {
+                let secs_to_recovery = EMBED_DEADLINE_SECS - ctx.secs_since_last_progress;
+                format!(
+                    "STALLED: {0} items in-flight, 0 completed batches for {1}s (threshold \
+                     {STALL_THRESHOLD_SECS}s) — the supervisor kills and restarts a hung worker \
+                     at {EMBED_DEADLINE_SECS}s, so recovery is automatic in ~{2}s; no action \
+                     needed yet",
+                    ctx.inflight, ctx.secs_since_last_progress, secs_to_recovery
+                )
+            } else {
+                format!(
+                    "STALLED: {0} items in-flight, 0 completed batches for {1}s — past the \
+                     {EMBED_DEADLINE_SECS}s supervisor deadline without a restart, so the worker \
+                     is genuinely wedged; restart the embedding worker",
+                    ctx.inflight, ctx.secs_since_last_progress
+                )
+            }
+        } else {
             format!(
-                "STALLED: {inflight} items in-flight, 0 completed batches for \
-                 {secs_since_last_completed_batch}s (threshold {STALL_THRESHOLD_SECS}s) — the \
-                 supervisor kills and restarts a hung worker at {EMBED_DEADLINE_SECS}s, so \
-                 recovery is automatic in ~{secs_to_recovery}s; no action needed yet"
+                "STALLED: {0} items in-flight, 0 completed batches for {1}s — this backend does \
+                 not emit progress heartbeats, so hang detection is deadline-based; the batch is \
+                 past the {EMBED_DEADLINE_SECS}s hard deadline and should already have restarted",
+                ctx.inflight, ctx.secs_since_last_progress
+            )
+        }
+    } else if ctx.inflight > 0 && ctx.chunks_per_sec < 0.01 {
+        if ctx.progress_heartbeat_supported {
+            format!(
+                "SLOW: {0} items in-flight, no batch completed yet ({1}s) — within tolerance, \
+                 first batch may still be running",
+                ctx.inflight, ctx.secs_since_last_progress
             )
         } else {
             format!(
-                "STALLED: {inflight} items in-flight, 0 completed batches for \
-                 {secs_since_last_completed_batch}s — past the {EMBED_DEADLINE_SECS}s supervisor \
-                 deadline without a restart, so the worker is genuinely wedged; restart the \
-                 embedding worker"
+                "SLOW: {0} items in-flight, no batch completed yet ({1}s) — this backend does \
+                 not emit progress heartbeats, so hang detection is deadline-based at \
+                 {EMBED_DEADLINE_SECS}s",
+                ctx.inflight, ctx.secs_since_last_progress
             )
         }
-    } else if inflight > 0 && chunks_per_sec < 0.01 {
-        format!(
-            "SLOW: {inflight} items in-flight, no batch completed yet ({secs_since_last_completed_batch}s) — within tolerance, first batch may still be running"
-        )
-    } else if inflight == 0 && done > 0 {
+    } else if ctx.inflight == 0 && ctx.done > 0 {
         "IDLE: queue drained".to_string()
     } else {
         "HEALTHY".to_string()
     };
-    StallAssessment { stalled, verdict }
+    StallAssessment {
+        stalled,
+        verdict,
+        detection_mode,
+    }
 }
 
 /// Best-effort explanation of why Attic operations may be currently throttled or degraded (§62).
@@ -199,12 +391,20 @@ pub struct DiagnosticContext {
     pub resource_pressure_restricted: bool,
     pub available_ram_mib: u64,
     pub queue_depth: u64,
+    /// The queue is large AND growing faster than it drains (not merely
+    /// large: a 30k queue on a healthy GPU is normal work, not backpressure).
     pub queue_backpressure_active: bool,
     pub canonical_indexing_active: bool,
     pub semantic_inference_active: bool,
     pub model_loading_or_warmup: bool,
     pub mcp_high_latency: bool,
     pub user_caps_active: bool,
+    /// Embedding is running on a GPU (dedicated or unified-memory), which is
+    /// gated by its own host-RAM floor rather than the pressure tiers.
+    pub gpu_embedding: bool,
+    /// Available host RAM is below that GPU's floor, so GPU embedding is
+    /// paused.
+    pub host_ram_floor_breached: bool,
 }
 
 /// Determine the most critical reason why Attic is slow or throttled (§62).
@@ -215,11 +415,25 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
             explanation: "free disk space is below emergency reserve; semantic indexing is halted"
                 .to_string(),
         }
+    } else if ctx.gpu_embedding && ctx.host_ram_floor_breached {
+        WhySlowDiagnostic {
+            code: "host_ram_floor",
+            explanation: "available host RAM is below the GPU embedding safety floor; GPU \
+                          embedding is paused until memory is freed"
+                .to_string(),
+        }
     } else if ctx.resource_pressure_restricted {
         WhySlowDiagnostic {
             code: "resource_monitor_pressure",
-            explanation: "high host memory or CPU pressure; background work is throttled"
-                .to_string(),
+            explanation: if ctx.gpu_embedding {
+                "high host memory pressure; background indexing is throttled, while GPU \
+                 embedding is exempt from the pressure tiers and continues (it pauses only \
+                 below its host-RAM floor)"
+                    .to_string()
+            } else {
+                "high host memory pressure; background indexing and embedding are throttled"
+                    .to_string()
+            },
         }
     } else if ctx.mcp_high_latency {
         WhySlowDiagnostic {
@@ -237,7 +451,7 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
         WhySlowDiagnostic {
             code: "semantic_queue_backpressure",
             explanation: format!(
-                "enrichment queue depth ({}) exceeded high watermark",
+                "the embedding queue ({} chunks) is growing faster than it drains",
                 ctx.queue_depth
             ),
         }
@@ -247,11 +461,23 @@ pub fn diagnose_why_slow(ctx: &DiagnosticContext) -> WhySlowDiagnostic {
             explanation: "canonical file parsing and semantic embedding are actively sharing system resources".to_string(),
         }
     } else if ctx.semantic_inference_active {
-        WhySlowDiagnostic {
-            code: "semantic_cpu_inference",
-            explanation:
-                "neural embedding inference is actively executing on allocated CPU threads"
-                    .to_string(),
+        if ctx.gpu_embedding {
+            WhySlowDiagnostic {
+                code: "semantic_inference",
+                explanation: format!(
+                    "embedding {} queued chunks on the GPU; nothing is wrong, this is normal \
+                     background work",
+                    ctx.queue_depth
+                ),
+            }
+        } else {
+            WhySlowDiagnostic {
+                code: "semantic_cpu_inference",
+                explanation: format!(
+                    "embedding {} queued chunks on allocated CPU threads",
+                    ctx.queue_depth
+                ),
+            }
         }
     } else if ctx.available_ram_mib < 2048 {
         WhySlowDiagnostic {
@@ -403,6 +629,8 @@ mod tests {
             model_loading_or_warmup: false,
             mcp_high_latency: true,
             user_caps_active: false,
+            gpu_embedding: false,
+            host_ram_floor_breached: false,
         };
         assert_eq!(diagnose_why_slow(&ctx).code, "disk_pressure");
 
@@ -410,6 +638,52 @@ mod tests {
         let mut ctx2 = ctx.clone();
         ctx2.disk_emergency = false;
         assert_eq!(diagnose_why_slow(&ctx2).code, "resource_monitor_pressure");
+        assert!(
+            diagnose_why_slow(&ctx2)
+                .explanation
+                .contains("embedding are throttled")
+        );
+
+        // A GPU is exempt from the tiers, and the report says so.
+        let mut gpu = ctx2.clone();
+        gpu.gpu_embedding = true;
+        let d = diagnose_why_slow(&gpu);
+        assert_eq!(d.code, "resource_monitor_pressure");
+        assert!(d.explanation.contains("exempt"), "{}", d.explanation);
+
+        // Only the hard host floor pauses dedicated-GPU embedding.
+        gpu.host_ram_floor_breached = true;
+        assert_eq!(diagnose_why_slow(&gpu).code, "host_ram_floor");
+
+        // A large queue being worked through on a healthy GPU is normal
+        // work, reported as such — not as an error-sounding backpressure.
+        let working = DiagnosticContext {
+            disk_emergency: false,
+            disk_warning: false,
+            resource_pressure_restricted: false,
+            available_ram_mib: 8192,
+            queue_depth: 23_055,
+            queue_backpressure_active: false,
+            canonical_indexing_active: false,
+            semantic_inference_active: true,
+            model_loading_or_warmup: false,
+            mcp_high_latency: false,
+            user_caps_active: false,
+            gpu_embedding: true,
+            host_ram_floor_breached: false,
+        };
+        let d = diagnose_why_slow(&working);
+        assert_eq!(d.code, "semantic_inference");
+        assert!(
+            d.explanation.contains("23055 queued chunks on the GPU"),
+            "{}",
+            d.explanation
+        );
+        let cpu = DiagnosticContext {
+            gpu_embedding: false,
+            ..working.clone()
+        };
+        assert_eq!(diagnose_why_slow(&cpu).code, "semantic_cpu_inference");
 
         // Normal state
         let nominal_ctx = DiagnosticContext {
@@ -424,6 +698,8 @@ mod tests {
             model_loading_or_warmup: false,
             mcp_high_latency: false,
             user_caps_active: false,
+            gpu_embedding: false,
+            host_ram_floor_breached: false,
         };
         assert_eq!(diagnose_why_slow(&nominal_ctx).code, "nominal");
     }
@@ -433,12 +709,31 @@ mod tests {
 mod stall_tests {
     use super::*;
 
+    fn stall_ctx(
+        inflight: u64,
+        done: u64,
+        chunks_per_sec: f64,
+        secs_since_last_progress: u64,
+    ) -> StallContext {
+        StallContext {
+            queue_depth: inflight,
+            inflight,
+            done,
+            chunks_per_sec,
+            secs_since_last_progress,
+            loading_or_warmup: false,
+            provider_backoff: None,
+            progress_heartbeat_supported: true,
+        }
+    }
+
     #[test]
     fn inflight_with_zero_throughput_past_threshold_is_stalled() {
         // The exact 2026-09 incident signature: 16 in-flight, 0 done, 20 min.
-        let a = assess_stall(16, 0, 0.0, 1209);
+        let a = assess_stall(&stall_ctx(16, 0, 0.0, 1209));
         assert!(a.stalled);
         assert!(a.verdict.contains("STALLED"));
+        assert_eq!(a.detection_mode, "progress_watchdog");
     }
 
     #[test]
@@ -447,7 +742,7 @@ mod stall_tests {
         // is hung; restart the embedding worker" while the supervisor was
         // still 55s away from killing and restarting it automatically. The
         // stall is real, but the prescribed action was wrong.
-        let a = assess_stall(8, 0, 0.0, 245);
+        let a = assess_stall(&stall_ctx(8, 0, 0.0, 245));
         assert!(a.stalled, "245s with 8 in-flight is still a stall");
         assert!(
             !a.verdict.contains("restart the embedding worker"),
@@ -470,7 +765,7 @@ mod stall_tests {
     fn stall_past_the_supervisor_deadline_does_demand_a_manual_restart() {
         // Past the kill deadline with no restart, the supervisor itself has
         // failed — this is the only case where manual action is correct.
-        let a = assess_stall(8, 0, 0.0, EMBED_DEADLINE_SECS + 1);
+        let a = assess_stall(&stall_ctx(8, 0, 0.0, EMBED_DEADLINE_SECS + 1));
         assert!(a.stalled);
         assert!(
             a.verdict.contains("restart the embedding worker"),
@@ -494,22 +789,91 @@ mod stall_tests {
 
     #[test]
     fn first_batch_within_threshold_is_slow_not_stalled() {
-        let a = assess_stall(16, 0, 0.0, 45);
+        let a = assess_stall(&stall_ctx(16, 0, 0.0, 45));
         assert!(!a.stalled);
         assert!(a.verdict.contains("SLOW"));
     }
 
     #[test]
     fn completing_batches_is_healthy() {
-        let a = assess_stall(16, 500, 12.5, 3);
+        let a = assess_stall(&stall_ctx(16, 500, 12.5, 3));
         assert!(!a.stalled);
         assert_eq!(a.verdict, "HEALTHY");
     }
 
     #[test]
     fn drained_queue_is_idle() {
-        let a = assess_stall(0, 200, 0.0, 9999);
+        let a = assess_stall(&stall_ctx(0, 200, 0.0, 9999));
         assert!(!a.stalled);
         assert!(a.verdict.contains("IDLE"));
+    }
+
+    #[test]
+    fn deadline_only_backends_do_not_call_a_long_first_batch_stalled_early() {
+        let mut ctx = stall_ctx(8, 0, 0.0, 245);
+        ctx.progress_heartbeat_supported = false;
+        let a = assess_stall(&ctx);
+        assert!(
+            !a.stalled,
+            "deadline-only backends wait for the hard deadline"
+        );
+        assert!(
+            a.verdict.contains("deadline-based"),
+            "deadline-only wording must be explicit: {}",
+            a.verdict
+        );
+        assert_eq!(a.detection_mode, "deadline_only");
+    }
+
+    #[test]
+    fn loading_and_backoff_are_reported_distinctly_from_stalls() {
+        let mut loading = stall_ctx(0, 0, 0.0, 400);
+        loading.queue_depth = 12;
+        loading.loading_or_warmup = true;
+        let a = assess_stall(&loading);
+        assert!(!a.stalled);
+        assert!(a.verdict.contains("LOADING/WARMING"), "{}", a.verdict);
+
+        let mut backoff = stall_ctx(0, 0, 0.0, 400);
+        backoff.queue_depth = 12;
+        backoff.provider_backoff = Some(ProviderBackoffStatus {
+            consecutive_failures: 3,
+            last_error: "failed to load weights".into(),
+            next_retry_unix_ms: 1234,
+        });
+        let a = assess_stall(&backoff);
+        assert!(!a.stalled);
+        assert!(a.verdict.contains("BACKING OFF"), "{}", a.verdict);
+        assert!(
+            a.verdict.contains("failed to load weights"),
+            "{}",
+            a.verdict
+        );
+    }
+
+    #[test]
+    fn fresh_queue_work_resets_the_stall_clock_after_a_long_idle() {
+        let idle_clock = observe_work_availability(WorkAvailabilityClock::default(), 1_000, 0, 0);
+        assert_eq!(idle_clock.active_since_secs, None);
+
+        let active = observe_work_availability(idle_clock, 1_360, 9, 0);
+        assert_eq!(active.active_since_secs, Some(1_360));
+        assert_eq!(
+            secs_since_meaningful_progress(active, 1_360, Some(360)),
+            Some(0),
+            "the first status sample after new work arrives must not inherit an old commit clock"
+        );
+    }
+
+    #[test]
+    fn provider_backoff_snapshot_round_trips() {
+        clear_provider_backoff();
+        note_provider_backoff(2, 1_500, "provider unavailable");
+        let snap = provider_backoff_snapshot().expect("snapshot");
+        assert_eq!(snap.consecutive_failures, 2);
+        assert_eq!(snap.last_error, "provider unavailable");
+        assert!(snap.next_retry_unix_ms >= unix_ms_now());
+        clear_provider_backoff();
+        assert!(provider_backoff_snapshot().is_none());
     }
 }

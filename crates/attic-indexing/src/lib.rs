@@ -155,8 +155,26 @@ pub struct IndexingStore<'a> {
 // Public options / result
 // ---------------------------------------------------------------------------
 
+/// Placeholder `IndexOptions::repository_name`. When a caller keeps it, the
+/// repository is named after its root folder instead.
+pub const DEFAULT_REPOSITORY_NAME: &str = "default";
+
+/// Name stored for the repository at `root`: an explicitly configured
+/// `repository_name`, else the root folder's own name.
+pub fn repository_display_name(root: &Path, opts: &IndexOptions) -> String {
+    if opts.repository_name != DEFAULT_REPOSITORY_NAME {
+        return opts.repository_name.clone();
+    }
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
+    /// Display name for the repository; [`DEFAULT_REPOSITORY_NAME`] means
+    /// "use the root folder's name".
     pub repository_name: String,
     pub max_units_per_file: usize,
     pub refresh_existing: bool,
@@ -224,7 +242,7 @@ const ANALYSIS_STRIPE_MIN_FILES: usize = 32;
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
-            repository_name: "default".to_owned(),
+            repository_name: DEFAULT_REPOSITORY_NAME.to_owned(),
             // Fail-closed per-file unit ceiling (r01). Sized from the measured
             // worst case in the target corpora (~9,700 units for a 4.5 MiB
             // JSON export) with ~10x headroom. Exceeding it aborts the run
@@ -690,9 +708,21 @@ pub fn index_repository_with_cancellation(
         Some(id) => id,
         None => RepositoryId::new_v4(),
     };
+    // Display name: an explicit `repository_name`, else the root folder's
+    // name. Every server-indexed repository used to be stored as "default",
+    // so the status of a 21-repository workspace was unreadable. Existing
+    // rows still carrying a different name are renamed on their next run.
+    let display_name = repository_display_name(root, opts);
+    let stored_name: Option<String> = match existing_repo_id {
+        Some(id) => store
+            .readers
+            .with_reader(|c| attic_storage::get_repository_display_name(c, &id))
+            .map_err(IndexError::Storage)?,
+        None => None,
+    };
     let repo_upsert = match existing_repo_id {
-        None => Some((root_str.to_string(), opts.repository_name.clone())),
-        Some(_) => None,
+        Some(_) if stored_name.as_deref() == Some(display_name.as_str()) => None,
+        _ => Some((root_str.to_string(), display_name)),
     };
 
     // PR-7: persist the repository row now, before analysis, rather than
@@ -706,14 +736,31 @@ pub fn index_repository_with_cancellation(
     //     idempotent — `submit_index_publication`'s own upsert later is a
     //     harmless no-op re-write of the same row.
     if let Some((ref root, ref display_name)) = repo_upsert {
+        #[cfg(test)]
+        fire_indexing_test_hook(IndexingTestHookPoint::BeforeRepositoryUpsert);
+        if cancellation.is_cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         let root = root.clone();
         let display_name = display_name.clone();
+        let cancellation = cancellation.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
         store
             .writer
             .send(move |conn| {
-                attic_storage::upsert_repository(conn, &repo_id, &root, &display_name)
+                if cancellation.is_cancelled() {
+                    let _ = tx.send(false);
+                    return Ok(());
+                }
+                attic_storage::upsert_repository(conn, &repo_id, &root, &display_name)?;
+                let _ = tx.send(true);
+                Ok(())
             })
             .map_err(IndexError::Storage)?;
+        let wrote_row = rx.try_recv().unwrap_or(false);
+        if !wrote_row {
+            return Err(IndexError::Cancelled);
+        }
     }
 
     // 3. Source revision: real Phase 1B manifest hash + real policy hash.
@@ -1297,6 +1344,11 @@ pub fn index_repository_with_cancellation(
     timings.resolve_ms = stage_start.elapsed().as_millis() as u64;
     rss.sample();
     stage_start = std::time::Instant::now();
+    #[cfg(test)]
+    fire_indexing_test_hook(IndexingTestHookPoint::BeforePublication);
+    if cancellation.is_cancelled() {
+        return Err(IndexError::Cancelled);
+    }
 
     let stats: IndexPublicationStats = submit_index_publication(
         store.writer,
@@ -1732,6 +1784,49 @@ fn add_analyze_single_file_calls(n: usize) {
     ANALYZE_SINGLE_FILE_CALLS.with(|c| c.set(c.get() + n));
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingTestHookPoint {
+    BeforeRepositoryUpsert,
+    BeforePublication,
+}
+
+#[cfg(test)]
+type IndexingTestHook = std::sync::Arc<dyn Fn(IndexingTestHookPoint) + Send + Sync>;
+
+#[cfg(test)]
+static INDEXING_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<IndexingTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct IndexingTestHookGuard;
+
+#[cfg(test)]
+impl Drop for IndexingTestHookGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = INDEXING_TEST_HOOK.get() {
+            *slot.lock().unwrap() = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_indexing_test_hook(hook: IndexingTestHook) -> IndexingTestHookGuard {
+    let slot = INDEXING_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap() = Some(hook);
+    IndexingTestHookGuard
+}
+
+#[cfg(test)]
+fn fire_indexing_test_hook(point: IndexingTestHookPoint) {
+    let hook = INDEXING_TEST_HOOK
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()));
+    if let Some(hook) = hook {
+        hook(point);
+    }
+}
+
 /// Run Phase 1B preprocessing + Phase 1C dispatch for one file and return
 /// the retrieval units (with structural anchors) and, when a specialized
 /// structural analyzer produced output, its capturable payload.
@@ -1856,10 +1951,13 @@ fn analyze_single_file(
         AnalyzerContent::StreamingHandle(_) => rec.size_bytes.max(0) as u64,
     };
 
-    let budget = ResourceBudget {
+    let mut budget = ResourceBudget {
         max_retrieval_units: opts.max_units_per_file as u64,
         ..Default::default()
     };
+    budget.max_ast_nodes = budget
+        .max_ast_nodes
+        .max((opts.max_units_per_file as u64).saturating_mul(8));
 
     let file_occ_id: FileOccurrenceId = fo_id_str.parse().map_err(|_| IndexError::Io {
         path: rec.repo_relative.clone(),
@@ -2130,11 +2228,14 @@ mod tests {
     /// Mirrors exactly how `attic-server` constructs its endpoints; there is
     /// no way to obtain a raw write connection through this helper's output.
     struct StoreFixture {
-        _dir: TempDir,
         db_path: std::path::PathBuf,
         pool: DbPool,
         _queue: WriterQueue,
         handle: WriterQueueHandle,
+        /// Declared LAST: fields drop in order, so the directory is removed only
+        /// after every SQLite handle above is closed (Windows cannot delete open
+        /// files, which silently leaked one temp dir per test).
+        _dir: TempDir,
     }
 
     fn make_store() -> StoreFixture {
@@ -2337,6 +2438,69 @@ mod tests {
         assert_eq!(r1.repository_id, r2.repository_id, "stable repository_id");
     }
 
+    #[test]
+    fn cancelled_bootstrap_after_eviction_does_not_recreate_repository_row() {
+        let fx = make_store();
+        write_file(fx._dir.path(), "late.rs", "fn late() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let opts = IndexOptions::default();
+        let first = index_repository(&store(&fx), fx._dir.path(), &policy, &opts).unwrap();
+
+        let evicted_repo = first.repository_id.clone();
+        fx.handle
+            .send(move |conn| {
+                loop {
+                    let step =
+                        attic_storage::repo_eviction::evict_repository_step(conn, &evicted_repo)?;
+                    if step.complete {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let root_path = fx._dir.path().to_string_lossy().to_string();
+        assert!(
+            !verify_conn(&fx)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM core_repositories WHERE root_path = ?1)",
+                    rusqlite::params![root_path],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "precondition: eviction must remove the repository row before the late bootstrap"
+        );
+
+        let cancellation = CancellationToken::new();
+        let hook_cancellation = cancellation.clone();
+        let _hook = install_indexing_test_hook(std::sync::Arc::new(move |point| {
+            if point == IndexingTestHookPoint::BeforeRepositoryUpsert {
+                hook_cancellation.cancel();
+            }
+        }));
+
+        let err = index_repository_with_cancellation(
+            &store(&fx),
+            fx._dir.path(),
+            &policy,
+            &opts,
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(matches!(err, IndexError::Cancelled));
+        assert!(
+            !verify_conn(&fx)
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM core_repositories WHERE root_path = ?1)",
+                    rusqlite::params![fx._dir.path().to_string_lossy().to_string()],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a cancelled late bootstrap must not recreate the evicted repository row"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Coordinated-writer guarantees
     // -----------------------------------------------------------------------
@@ -2441,6 +2605,47 @@ mod tests {
     // -----------------------------------------------------------------------
     // E2E: real data actually reaches the database
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn repositories_are_named_after_their_folder_and_renamed_from_default() {
+        let fx = make_store();
+        let root = fx._dir.path().join("HDFC_FormsCommon");
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "a.rs", "fn named_repo_token() {}\n");
+        let policy = DiscoveryPolicy::default_git();
+        let s = store(&fx);
+        let name_of = |id: &str| -> String {
+            fx.pool
+                .with_reader(|c| {
+                    Ok(c.query_row(
+                        "SELECT display_name FROM core_repositories WHERE id = ?1",
+                        [id],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+
+        let r = index_repository(&s, &root, &policy, &IndexOptions::default()).unwrap();
+        assert_eq!(name_of(&r.repository_id), "HDFC_FormsCommon");
+
+        // A row left over as "default" by an older build is renamed on the
+        // next run; an explicit name still wins.
+        fx.handle
+            .send(|c| {
+                c.execute("UPDATE core_repositories SET display_name = 'default'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        index_repository(&s, &root, &policy, &IndexOptions::default()).unwrap();
+        assert_eq!(name_of(&r.repository_id), "HDFC_FormsCommon");
+        let named = IndexOptions {
+            repository_name: "forms-common".into(),
+            ..Default::default()
+        };
+        index_repository(&s, &root, &policy, &named).unwrap();
+        assert_eq!(name_of(&r.repository_id), "forms-common");
+    }
 
     #[test]
     fn e2e_repository_scoped_search() {

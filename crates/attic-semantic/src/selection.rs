@@ -104,7 +104,7 @@ impl SelectionConfig {
             // with few repos, since each would still stop at the old 512
             // long before the (now much higher) global cap is ever reached.
             max_units_per_repo: 2_560,
-            max_units_total: 100_000,
+            max_units_total: DEFAULT_MAX_UNITS_TOTAL,
             // Was a standalone 16_384, which sat far ABOVE what the provider
             // actually reads — so units between the provider ceiling and this
             // gate passed the check documented as "enrichment truncates
@@ -125,10 +125,17 @@ impl Default for SelectionConfig {
     }
 }
 
+/// Workspace-wide embedding cap (unique, selected units — applied AFTER
+/// dedup and exclusions, never to the raw scan). Sized for industry-scale
+/// multi-repository workspaces.
+pub const DEFAULT_MAX_UNITS_TOTAL: usize = 500_000;
+/// Upper bound accepted for either cap in `attic.toml`.
+pub const MAX_UNITS_CAP_LIMIT: usize = 5_000_000;
+
 /// Full-coverage `min_score` used when embedding runs on a GPU.
 pub const GPU_MIN_SCORE: f64 = 0.0;
 /// Full-coverage per-repository cap used when embedding runs on a GPU.
-pub const GPU_MAX_UNITS_PER_REPO: usize = 100_000;
+pub const GPU_MAX_UNITS_PER_REPO: usize = DEFAULT_MAX_UNITS_TOTAL;
 /// Full-coverage file-size ceiling used when embedding runs on a GPU (8 MiB).
 pub const GPU_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -218,6 +225,9 @@ pub struct SelectedUnit {
 #[derive(Debug, Default, Clone)]
 pub struct SelectionReport {
     pub scanned: usize,
+    /// True when the scan stopped at the safety bound before reading every
+    /// selectable unit (the remainder was not considered this pass).
+    pub scan_truncated: bool,
     pub selected: usize,
     /// exclusion reason → count
     pub excluded: HashMap<&'static str, usize>,
@@ -501,7 +511,7 @@ pub fn select_units(
             report.exclude(EX_FILE_TOO_BIG);
             continue;
         }
-        if r.canonical_text.len() > cfg.max_input_bytes {
+        if r.canonical_len > cfg.max_input_bytes {
             report.exclude(EX_TOO_LARGE);
             continue;
         }
@@ -526,7 +536,7 @@ pub fn select_units(
         let structural = (n * 0.25).min(1.0);
         let sdef = r.file_symbol_defs.max(0) as f64;
         let symbol_importance = (sdef * 0.2).min(1.0);
-        let size = size_fit(r.canonical_text.len());
+        let size = size_fit(r.canonical_len);
         let repo_n = repo_sizes
             .get(r.repository_id.as_str())
             .copied()
@@ -636,6 +646,7 @@ mod tests {
             size_bytes: 100,
             canonical_hash: None,
             canonical_text: text.to_owned(),
+            canonical_len: text.len(),
         }
     }
 
@@ -875,9 +886,10 @@ mod tests {
 
         let gpu = SelectionConfig::for_backend(true);
         assert_eq!(gpu.min_score, 0.0);
-        assert_eq!(gpu.max_units_per_repo, 100_000);
+        assert_eq!(gpu.max_units_per_repo, 500_000);
         assert_eq!(gpu.max_file_bytes, 8 * 1024 * 1024);
         assert_eq!(gpu.max_units_total, cpu.max_units_total);
+        assert_eq!(cpu.max_units_total, 500_000);
         assert_eq!(gpu.max_input_bytes, cpu.max_input_bytes);
     }
 

@@ -109,9 +109,9 @@ flowchart LR
 | Key | GPU (DirectML / Metal / CUDA) | CPU |
 |---|---:|---:|
 | `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `100000` | `2560` |
+| `max_units_per_repo` | `500000` | `2560` |
 | `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `100000` | `100000` |
+| `max_units_total` | `500000` | `500000` |
 
 Reason: on the measured GPU, full coverage costs minutes for typical
 repositories; on CPU it would be about **1 hour per repository** (**estimate**),
@@ -145,8 +145,8 @@ lexical-only.
   pauses at **90 °C** and resumes at **85 °C**.
 - **Failures.** Content errors such as too many tokens or too-large units never
   count toward GPU→CPU demotion and never force a model reload.
-- **Progress.** `status` → `semantic_progress.chunks_per_sec` is a wall-clock
-  rate over the last **120 s**, not a per-poll burst delta.
+- **Progress.** `status` → `semantic_progress.chunks_per_sec` is measured
+  from committed batches over the last **300 s**, not a per-poll burst delta.
 
 ### Measured results
 
@@ -212,7 +212,7 @@ measurements when sizing a production workspace.
 
 | I want… | Change… | Notes |
 |---|---|---|
-| Full semantic coverage on a GPU | Usually nothing | GPU defaults are `min_score = 0.0`, `max_units_per_repo = 100000`, `max_file_bytes = 8 MiB`, `max_units_total = 100000` |
+| Full semantic coverage on a GPU | Usually nothing | GPU defaults are `min_score = 0.0`, `max_units_per_repo = 500000`, `max_file_bytes = 8 MiB`, `max_units_total = 500000` |
 | Less embedding work | `[semantic] exclude_globs`, lower `max_file_bytes`, raise `min_score`, lower `max_units_per_repo` | Good for generated, vendored, snapshot or export data |
 | CPU to behave like GPU coverage | Set the GPU values explicitly under `[semantic]` | CPU time can be about 1 h per repository (**estimate**) |
 | Keep a 4 GB GPU out of shared memory | Keep `gpu_batch_tokens = 4096` | 8192 was slower on the measured 4 GB card |

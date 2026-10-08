@@ -26,8 +26,8 @@ pub mod error;
 pub mod paths;
 
 pub use config::{
-    ATTIC_TOML_TEMPLATE, AtticConfig, ConfigError, IndexingOverride, ResourceModeSetting,
-    ResourceOverrides, SemanticConfig,
+    ATTIC_TOML_TEMPLATE, AtticConfig, ConfigError, IndexingOverride, KnowledgeConfig,
+    ResourceModeSetting, ResourceOverrides, SemanticConfig,
 };
 pub use constants::{
     ANALYZER_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, resources,
@@ -49,6 +49,9 @@ pub use domain::{
     value_types::{ResourceBudgets, SourceSpan},
 };
 pub use error::CoreError;
-pub use paths::{AtticPaths, PathResolutionError, resolve_data_root_from};
+pub use paths::{
+    AtticPaths, LayoutMigration, PathResolutionError, ensure_private_dir, migrate_legacy_layout,
+    resolve_data_root_from, set_private_file_permissions, sibling, sibling_in, write_private_file,
+};
 
 pub use cancellation::CancellationToken;

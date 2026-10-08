@@ -68,8 +68,8 @@ impl Drop for ServerHandle {
 }
 
 /// Spawn an `attic` server using ONLY `ATTIC_HOME`; strip all other
-/// workspace/DB env vars so the server uses `<ATTIC_HOME>/config.toml` as its
-/// persistent workspace and `<ATTIC_HOME>/attic.db` as its database.
+/// workspace/DB env vars so the server uses `<ATTIC_HOME>/config/config.toml`
+/// as its persistent workspace and `<ATTIC_HOME>/data/attic.db` as its database.
 async fn connect_home(bin: &Path, home: &Path) -> ServerHandle {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.env("ATTIC_HOME", home)
@@ -198,7 +198,8 @@ async fn test_restart_reorder_preserves_ids() {
             body.push_str("[[repositories]]\n");
             body.push_str(&format!("path = \"{}\"\n", d.display()));
         }
-        std::fs::write(home.join("config.toml"), body).expect("write config.toml");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::write(home.join("config").join("config.toml"), body).expect("write config.toml");
     }
     write_config(&home, &[&dirs[0], &dirs[1], &dirs[2]]);
 
@@ -302,7 +303,9 @@ async fn test_restart_unavailable_repo_shows_degraded() {
         canon_b.display(),
         canon_c.display(),
     );
-    std::fs::write(home.join("config.toml"), &config_body).expect("write config.toml");
+    std::fs::create_dir_all(home.join("config")).unwrap();
+    std::fs::write(home.join("config").join("config.toml"), &config_body)
+        .expect("write config.toml");
 
     // ── Run 1: all three repos configured ────────────────────────────────
     {
@@ -557,7 +560,8 @@ async fn test_stale_db_repos_do_not_leak() {
             body.push_str("[[repositories]]\n");
             body.push_str(&format!("path = \"{}\"\n", p.display()));
         }
-        std::fs::write(home.join("config.toml"), body).expect("write config.toml");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::write(home.join("config").join("config.toml"), body).expect("write config.toml");
     };
 
     // Run 1: A, B, C all configured.
@@ -650,7 +654,9 @@ async fn test_restart_b_disappears() {
         canon_b.display(),
         canon_c.display(),
     );
-    std::fs::write(home.join("config.toml"), &config_body).expect("write config.toml");
+    std::fs::create_dir_all(home.join("config")).unwrap();
+    std::fs::write(home.join("config").join("config.toml"), &config_body)
+        .expect("write config.toml");
 
     // Run 1: index all three, then remove B via MCP.
     {

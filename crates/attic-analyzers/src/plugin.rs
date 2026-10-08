@@ -24,7 +24,10 @@ use std::sync::{Arc, OnceLock};
 use crate::api::Analyzer;
 use crate::generic::GenericAnalyzer;
 use crate::registry::AnalyzerRegistry;
-use crate::structural::{go, java, javascript, python, tags_generic, typescript};
+use crate::structural::{
+    c, cpp, csharp, dockerfile, go, java, javascript, kotlin, lua, php, python, ruby, rust, scala,
+    swift, typescript,
+};
 
 // ---------------------------------------------------------------------------
 // Path view handed to plugins
@@ -328,8 +331,6 @@ enum Registration {
     Specialized(fn() -> Arc<dyn Analyzer>),
     /// Arbitrary registration (TypeScript registers `.ts` and `.tsx`).
     Custom(fn(&mut AnalyzerRegistry)),
-    /// A tier-2 `tags.scm` analyzer, keyed by language tag.
-    Tier2(&'static str),
 }
 
 /// Data-driven built-in plugin: extension / file-name hint rules plus a
@@ -342,6 +343,16 @@ struct BuiltinPlugin {
     /// `(lowercase extension, tag)`.
     extensions: &'static [(&'static str, &'static str)],
     registration: Registration,
+}
+
+impl BuiltinPlugin {
+    fn hint_tags(&self) -> BTreeSet<&'static str> {
+        self.file_names
+            .iter()
+            .map(|(_, tag)| *tag)
+            .chain(self.extensions.iter().map(|(_, tag)| *tag))
+            .collect()
+    }
 }
 
 impl AnalyzerPlugin for BuiltinPlugin {
@@ -367,21 +378,14 @@ impl AnalyzerPlugin for BuiltinPlugin {
 
     fn register(&self, registry: &mut AnalyzerRegistry) {
         match &self.registration {
-            Registration::Specialized(make) => registry.register_specialized(make()),
-            Registration::Custom(register) => register(registry),
-            Registration::Tier2(tag) => {
-                match tags_generic::tier2_analyzers()
-                    .into_iter()
-                    .find(|(t, _)| t == tag)
-                {
-                    Some((tag, analyzer)) => registry.register_for_language(tag, analyzer),
-                    None => tracing::error!(
-                        plugin = self.id,
-                        language = *tag,
-                        "tier-2 analyzer failed to build; files fall back to generic lexical analysis"
-                    ),
+            Registration::Specialized(make) => {
+                let analyzer = make();
+                registry.register_specialized(Arc::clone(&analyzer));
+                for tag in self.hint_tags() {
+                    registry.register_for_language(tag, Arc::clone(&analyzer));
                 }
             }
+            Registration::Custom(register) => register(registry),
         }
     }
 }
@@ -397,25 +401,35 @@ fn register_typescript(registry: &mut AnalyzerRegistry) {
     registry.register_for_language("tsx", typescript::tsx_analyzer());
 }
 
+fn register_kotlin(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("kotlin", kotlin::analyzer());
+}
+
+fn register_ruby(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("ruby", ruby::analyzer());
+}
+
+fn register_lua(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("lua", lua::analyzer());
+}
+
+fn register_php(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("php", php::analyzer());
+}
+
+fn register_swift(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("swift", swift::analyzer());
+}
+
+fn register_scala(registry: &mut AnalyzerRegistry) {
+    registry.register_for_language("scala", scala::analyzer());
+}
+
 fn make_json() -> Arc<dyn Analyzer> {
     Arc::new(crate::json::JsonAnalyzer::new())
 }
 
-fn tier2(
-    id: &'static str,
-    description: &'static str,
-    file_names: &'static [(&'static str, &'static str)],
-    extensions: &'static [(&'static str, &'static str)],
-) -> Arc<dyn AnalyzerPlugin> {
-    Arc::new(BuiltinPlugin {
-        id,
-        description,
-        file_names,
-        extensions,
-        registration: Registration::Tier2(id),
-    })
-}
-
+#[allow(dead_code)]
 fn builtin_plugins() -> Vec<Arc<dyn AnalyzerPlugin>> {
     vec![
         // Path-specific platform plugins first: AEM claims `.html`, `.xml`
@@ -464,12 +478,18 @@ fn builtin_plugins() -> Vec<Arc<dyn AnalyzerPlugin>> {
             extensions: &[],
             registration: Registration::Specialized(make_json),
         }),
-        tier2("c", "C: tags.scm symbols", &[], &[("c", "c"), ("h", "c")]),
-        tier2(
-            "cpp",
-            "C++: tags.scm symbols",
-            &[],
-            &[
+        Arc::new(BuiltinPlugin {
+            id: "c",
+            description: "C: tree-sitter symbols, includes, macros and calls",
+            file_names: &[],
+            extensions: &[("c", "c"), ("h", "c")],
+            registration: Registration::Specialized(c::analyzer),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "cpp",
+            description: "C++: tree-sitter symbols, includes, heritage and calls",
+            file_names: &[],
+            extensions: &[
                 ("cpp", "cpp"),
                 ("cc", "cpp"),
                 ("cxx", "cpp"),
@@ -478,36 +498,71 @@ fn builtin_plugins() -> Vec<Arc<dyn AnalyzerPlugin>> {
                 ("h++", "cpp"),
                 ("hxx", "cpp"),
             ],
-        ),
-        tier2("ruby", "Ruby: tags.scm symbols", &[], &[("rb", "ruby")]),
-        tier2("csharp", "C#: tags.scm symbols", &[], &[("cs", "csharp")]),
-        tier2(
-            "scala",
-            "Scala: tags.scm symbols",
-            &[],
-            &[("scala", "scala"), ("sc", "scala")],
-        ),
-        tier2("php", "PHP: tags.scm symbols", &[], &[("php", "php")]),
-        tier2(
-            "swift",
-            "Swift: tags.scm symbols (classes, protocols, methods, properties, functions)",
-            &[],
-            &[("swift", "swift")],
-        ),
-        tier2("lua", "Lua: tags.scm symbols", &[], &[("lua", "lua")]),
-        tier2("rust", "Rust: tags.scm symbols", &[], &[("rs", "rust")]),
-        tier2(
-            "kotlin",
-            "Kotlin: classes, objects, functions and type aliases",
-            &[],
-            &[("kt", "kotlin"), ("kts", "kotlin")],
-        ),
-        tier2(
-            "dockerfile",
-            "Dockerfile: tags.scm symbols",
-            &[("dockerfile", "dockerfile")],
-            &[("dockerfile", "dockerfile")],
-        ),
+            registration: Registration::Specialized(cpp::analyzer),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "ruby",
+            description: "Ruby: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("rb", "ruby")],
+            registration: Registration::Custom(register_ruby),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "csharp",
+            description: "C#: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("cs", "csharp")],
+            registration: Registration::Specialized(csharp::analyzer),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "scala",
+            description: "Scala: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("scala", "scala"), ("sc", "scala")],
+            registration: Registration::Custom(register_scala),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "php",
+            description: "PHP: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("php", "php")],
+            registration: Registration::Custom(register_php),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "swift",
+            description: "Swift: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("swift", "swift")],
+            registration: Registration::Custom(register_swift),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "lua",
+            description: "Lua: tree-sitter symbols, require() imports and calls",
+            file_names: &[],
+            extensions: &[("lua", "lua")],
+            registration: Registration::Custom(register_lua),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "rust",
+            description: "Rust: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("rs", "rust")],
+            registration: Registration::Specialized(rust::analyzer),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "kotlin",
+            description: "Kotlin: tree-sitter symbols, imports, heritage and calls",
+            file_names: &[],
+            extensions: &[("kt", "kotlin"), ("kts", "kotlin")],
+            registration: Registration::Custom(register_kotlin),
+        }),
+        Arc::new(BuiltinPlugin {
+            id: "dockerfile",
+            description: "Dockerfile: tree-sitter stages, inputs and stage references",
+            file_names: &[("dockerfile", "dockerfile")],
+            extensions: &[("dockerfile", "dockerfile")],
+            registration: Registration::Specialized(dockerfile::analyzer),
+        }),
     ]
 }
 

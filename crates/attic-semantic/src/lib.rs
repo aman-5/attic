@@ -27,6 +27,7 @@ pub mod identity;
 pub mod instruction;
 pub mod invalidate;
 pub mod model_assets;
+pub mod model_cache;
 // Deliberately NOT feature-gated. The download and the ability to *use*
 // what it downloads are separate concerns: leaving acquisition available in
 // every build means a CPU-only binary can still report honestly on ONNX
@@ -40,6 +41,7 @@ pub mod qwen3_provider;
 pub mod selection;
 pub mod store;
 pub mod testing;
+pub mod throughput;
 pub mod windowed;
 pub mod worker_supervisor;
 
@@ -50,7 +52,9 @@ pub use diagnostics::{
     DiagnosticContext, SemanticLatencyBreakdown, SemanticProgressSnapshot, WhySlowDiagnostic,
     diagnose_why_slow,
 };
-pub use enrich::{BackgroundEnricher, EnrichStats, EnrichmentConfig, drive};
+pub use enrich::{
+    BackgroundEnricher, EnrichStats, EnrichmentConfig, drive, embedding_memory_class,
+};
 pub use error::SemanticError;
 pub use fallback::{FallbackConfig, FallbackCoordinator};
 pub use generation::{GenerationManager, GenerationRecord, GenerationStatus};

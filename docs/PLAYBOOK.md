@@ -121,9 +121,10 @@ editing. Tell your client *"add D:\new-service to Attic"*, or call it directly:
 | `{"action":"remove","path":"..."}` | Stop watching; the repository immediately disappears from search, context and status |
 | `{"action":"set","paths":[...]}` | Replace the whole membership |
 
-Membership is written atomically to `<ATTIC_HOME>/config.toml`. A removed
-repository's old index rows stay in storage until pruned but can never leak
-into results. A configured root that is temporarily unavailable (say, an
+Membership is written atomically to `<ATTIC_HOME>/config/config.toml`. A removed
+repository disappears from results immediately, and its stored data (index,
+embeddings) is deleted in the background; adding it back before that finishes
+cancels the deletion. A configured root that is temporarily unavailable (say, an
 unmounted drive) is reported under `workspace.unavailable_repositories` while
 the others keep working.
 
@@ -180,26 +181,39 @@ Selection defaults also depend on backend, unless explicitly set in
 | Key | GPU | CPU |
 |---|---:|---:|
 | `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `100000` | `2560` |
+| `max_units_per_repo` | `500000` | `2560` |
 | `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `100000` | `100000` |
+| `max_units_total` | `500000` | `500000` |
 
 The server logs `semantic selection defaults` at startup. If the GPU later
-falls back to CPU at runtime, the startup defaults remain. First start downloads
-the fp16 ONNX model (~1.2 GB) into `~/.attic/models` in the background; that
-session embeds on CPU and the GPU backend is used from the next start.
+falls back to CPU at runtime, the startup defaults remain. The installers run
+`attic-server setup-models`, which downloads the fp16 ONNX model (~1.2 GB, GPU
+first when eligible) into `~/.attic/models` before the first session. If it is
+still missing at start, Attic downloads it in the background; that session
+embeds on CPU and the GPU backend is used from the next start. Once the
+models are ready, `setup-models` and the server remove files they never read:
+the ONNX download cache (`models--onnx-community--…`, kept only until
+`onnx-fp16/` is complete) and, on Windows, duplicate `blobs/` copies (replaced
+by hard links). About 2.3 GB stays on disk instead of ~4.6 GB.
 
 > [!TIP]
-> `status.semantic_progress.chunks_per_sec` is a wall-clock rate over the last
-> 120 s. It no longer jumps between zero and a per-poll burst rate.
+> `status.semantic_progress.chunks_per_sec` is measured from committed
+> enrichment batches over the last 300 s, so it does not jump between zero and
+> a per-poll burst rate.
 
 ### Attic home layout
 
-`ATTIC_HOME` defaults to `~/.attic`. Startup creates the home directory, the
-main `attic.db*` files, and `attic.toml` when missing. Other directories are
+`ATTIC_HOME` defaults to `~/.attic`. Startup creates the home directory,
+`data/` (with `attic.db*`), `config/` (with `attic.toml` when missing) and
+`run/` (daemon lock/address). A legacy flat home is migrated into these folders
+once (skipped for a run while an older Attic still holds the lock). The move is
+all-or-nothing — databases travel with their `-wal`/`-shm` files, a failed
+attempt is rolled back, and an interrupted one is resumed on the next start.
+Other directories are
 lazy: `models/` is created only for model downloads, `logs/` only after the
-`logging` tool is turned on, and `backups/` only after the shutdown backup
-first succeeds.
+`logging` tool is turned on (`action=on`, optional `level=debug|trace|…`) or
+`[logging] file_level` is set in `attic.toml` (applied at every start), and
+`backups/` only after the shutdown backup first succeeds.
 Attic does not read from or write to `~/.cache/huggingface`; model assets live
 under `ATTIC_HOME`.
 
@@ -260,14 +274,20 @@ source.
 ## Adding a language or platform
 
 Every language or platform is an **analyzer plugin**
-(`crates/attic-analyzers/src/plugin.rs`). Indexing, storage, retrieval and the
-server never change when you add one. Pick the smallest path that fits:
+(`crates/attic-analyzers/src/plugin.rs`). Pick the smallest path that fits.
+Paths A and C leave indexing, storage, retrieval and the server untouched; a
+full analyzer (path B) also adds one import-resolver arm to `resolve_import` in
+`crates/attic-indexing/src/structural_pipeline.rs` so its imports resolve to
+repository files:
 
 | Path | Effort | You get | Example |
 |---|---|---|---|
-| **A · Tags query** | ~30 lines | Symbol definitions + in-file references | Kotlin, Swift, Rust |
-| **B · Full analyzer** | A few hundred lines | Symbols, imports, relationships | Java, Python, Go |
+| **A · Tags query** | ~30 lines | Symbol definitions + in-file references | A language not yet covered |
+| **B · Full analyzer** | A few hundred lines + a resolver arm | Symbols, imports, inheritance, calls | Java, Python, Go, Kotlin, Rust, C++ (all 16 full languages) |
 | **C · Platform plugin** | Your own `AnalyzerPlugin` | Path-aware classification + custom structure | AEM |
+
+> The worked example in path A below uses Kotlin to show the tags-query
+> mechanism; Kotlin itself now has a full analyzer (path B).
 
 <details open>
 <summary><b>A · A language with a tree-sitter grammar (worked example: Kotlin)</b></summary>
@@ -409,7 +429,10 @@ running local `attic-server` / `attic`, and installs the binary plus runtime
 libraries (for example `DirectML.dll`) into `$ATTIC_HOME` or `~/.attic`. It
 uses Cargo's JSON output to find the executable, so a configured `[build]`
 target is honoured, and replaces files via temp+rename so macOS code
-signatures remain valid.
+signatures remain valid. It then runs `attic-server setup-models`
+(`--skip-models` skips it). On Windows it builds for MSVC unless
+`CARGO_BUILD_TARGET` is set. `cargo xtask all` = `cargo fmt --all` + check +
+install.
 
 On Apple Silicon it automatically adds `--features candle-metal`, matching the
 `aarch64-apple-darwin` release packages. On Windows MSVC, DirectML is built in
@@ -427,8 +450,9 @@ The real-GPU end-to-end test runs automatically inside `cargo test` when
   Build Tools for Visual Studio with the C++ workload. DirectML is automatic;
   no feature flag is needed.
 
-  If a personal Cargo config forces GNU (`x86_64-pc-windows-gnu`), override it
-  before the same `cargo xtask` commands:
+  `cargo xtask` builds for MSVC automatically when `CARGO_BUILD_TARGET` is
+  unset. For plain `cargo` commands with a personal Cargo config that forces
+  GNU (`x86_64-pc-windows-gnu`), override it:
 
   ```powershell
   $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'

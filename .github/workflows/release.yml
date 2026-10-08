@@ -304,6 +304,11 @@ jobs:
               throw "Windows ZIP does not contain expected binary: $ExpectedBinary"
           }
 
+          $ExpectedDirectML = Join-Path $VerifyDir "$Name\DirectML.dll"
+          if (-not (Test-Path -LiteralPath $ExpectedDirectML -PathType Leaf)) {
+              throw "Windows ZIP does not contain DirectML.dll: $ExpectedDirectML"
+          }
+
           $Hash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
           $ArchiveFileName = Split-Path -Leaf $Archive
           "$Hash  $ArchiveFileName" | Set-Content -LiteralPath $Checksum -Encoding ascii

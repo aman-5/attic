@@ -90,7 +90,11 @@ impl EventCoalescer {
     pub fn push(&mut self, ev: &NormalizedEvent, now_ms: u64) -> bool {
         match ev.kind {
             FsEventKind::RenamedFrom => {
-                if self.renames_from.len() >= self.capacity {
+                // One bound for BOTH collections: `pending_count` is what the
+                // capacity contract promises callers.
+                if !self.renames_from.contains_key(&ev.rel_path)
+                    && self.pending_count() >= self.capacity
+                {
                     self.overflowed = true;
                     return false;
                 }
@@ -134,15 +138,19 @@ impl EventCoalescer {
                     return true;
                 }
                 // Unpaired To → plain upsert hint.
+                if !self.pending.contains_key(&ev.rel_path) && self.pending_count() >= self.capacity
+                {
+                    self.overflowed = true;
+                    return false;
+                }
                 self.touch_pending(&ev.rel_path, now_ms);
                 return true;
             }
             _ => {}
         }
 
-        let entry_len = self.pending.len();
         let is_new = !self.pending.contains_key(&ev.rel_path);
-        if is_new && entry_len >= self.capacity {
+        if is_new && self.pending_count() >= self.capacity {
             self.overflowed = true;
             return false;
         }
@@ -214,7 +222,14 @@ impl EventCoalescer {
             let Some(st) = self.pending.remove(&path) else {
                 continue;
             };
+            // A rename origin is consumed with its destination whatever the
+            // outcome. When the destination ends up removed/recreated rather
+            // than a clean rename, the ORIGIN still moved away, so it is
+            // reported removed — otherwise `a → b; delete b` would leave `a`
+            // indexed forever.
+            let origin = self.renamed_origins.remove(&path);
             if st.saw_create && st.saw_remove {
+                out.extend(origin.map(CoalescedChange::Remove));
                 if st.last_op_remove {
                     // create→delete inside the window: path vanished, no-op.
                     continue;
@@ -224,16 +239,32 @@ impl EventCoalescer {
                 continue;
             }
             if st.saw_remove && !st.saw_create {
+                out.extend(origin.map(CoalescedChange::Remove));
                 out.push(CoalescedChange::Remove(path));
                 continue;
             }
             if st.renamed_to
-                && let Some(origin) = self.renamed_origins.remove(&path)
+                && let Some(origin) = origin
             {
                 out.push(CoalescedChange::Rename(origin, path));
                 continue;
             }
+            out.extend(origin.map(CoalescedChange::Remove));
             out.push(CoalescedChange::Upsert(path));
+        }
+
+        // Origins whose destination entry vanished before draining (e.g. a
+        // create→remove pair folded away in `push`): the origin is gone too.
+        let orphaned: Vec<String> = self
+            .renamed_origins
+            .keys()
+            .filter(|dest| !self.pending.contains_key(*dest))
+            .cloned()
+            .collect();
+        for dest in orphaned {
+            if let Some(origin) = self.renamed_origins.remove(&dest) {
+                out.push(CoalescedChange::Remove(origin));
+            }
         }
         out.sort_by(|a, b| a.key().cmp(b.key()));
         out
@@ -252,5 +283,82 @@ impl CoalescedChange {
             CoalescedChange::Upsert(p) | CoalescedChange::Remove(p) => p,
             CoalescedChange::Rename(f, _) => f,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(path: &str, kind: FsEventKind) -> NormalizedEvent {
+        NormalizedEvent {
+            rel_path: path.to_owned(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn capacity_bounds_pending_and_rename_origins_together() {
+        let mut c = EventCoalescer::new(10, 2);
+        assert!(c.push(&ev("a", FsEventKind::Modified), 0));
+        assert!(c.push(&ev("old", FsEventKind::RenamedFrom), 0));
+        assert!(
+            !c.push(&ev("b", FsEventKind::Modified), 0),
+            "combined bound"
+        );
+        assert!(!c.push(&ev("old2", FsEventKind::RenamedFrom), 0));
+        assert!(c.overflowed());
+        assert_eq!(c.pending_count(), 2);
+        // Re-touching an already pending path is never shed.
+        assert!(c.push(&ev("a", FsEventKind::Modified), 1));
+    }
+
+    #[test]
+    fn rename_then_delete_removes_both_old_and_new_path() {
+        let mut c = EventCoalescer::new(10, 16);
+        c.push(&ev("a", FsEventKind::RenamedFrom), 0);
+        c.push(&ev("b", FsEventKind::RenamedTo), 1);
+        c.push(&ev("b", FsEventKind::Removed), 2);
+        let out = c.flush_all();
+        assert!(
+            out.contains(&CoalescedChange::Remove("a".into())),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&CoalescedChange::Remove("b".into())),
+            "{out:?}"
+        );
+        assert!(c.renamed_origins.is_empty());
+    }
+
+    #[test]
+    fn rename_then_recreate_upserts_new_and_removes_old() {
+        let mut c = EventCoalescer::new(10, 16);
+        c.push(&ev("a", FsEventKind::RenamedFrom), 0);
+        c.push(&ev("b", FsEventKind::RenamedTo), 1);
+        c.push(&ev("b", FsEventKind::Removed), 2);
+        c.push(&ev("b", FsEventKind::Created), 3);
+        let out = c.flush_all();
+        assert!(
+            out.contains(&CoalescedChange::Remove("a".into())),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&CoalescedChange::Upsert("b".into())),
+            "{out:?}"
+        );
+        assert!(c.renamed_origins.is_empty());
+    }
+
+    #[test]
+    fn clean_rename_still_reports_a_rename_pair() {
+        let mut c = EventCoalescer::new(10, 16);
+        c.push(&ev("a", FsEventKind::RenamedFrom), 0);
+        c.push(&ev("b", FsEventKind::RenamedTo), 1);
+        c.push(&ev("b", FsEventKind::Modified), 2);
+        assert_eq!(
+            c.flush_all(),
+            vec![CoalescedChange::Rename("a".into(), "b".into())]
+        );
     }
 }

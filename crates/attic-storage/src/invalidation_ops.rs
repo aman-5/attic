@@ -360,6 +360,45 @@ pub fn get_freshness_totals(conn: &Connection) -> Result<FreshnessTotals, Storag
     Ok(t)
 }
 
+/// Freshness counts for ONE repository, over each path's latest occurrence
+/// that is still present (historical rows and deletion tombstones are not
+/// files). `get_freshness_totals` counts the whole database and must not be
+/// reported per repository.
+pub fn get_freshness_totals_for_repo(
+    conn: &Connection,
+    repository_id: &str,
+) -> Result<FreshnessTotals, StorageError> {
+    let t = conn.query_row(
+        "WITH latest AS (
+             SELECT MAX(fo.occurrence_seq) AS seq
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fo.file_identity_id = fi.id
+              WHERE fi.repository_id = ?1
+              GROUP BY fo.path
+         )
+         SELECT
+             COALESCE(SUM(CASE WHEN fo.freshness_state = 'CURRENT'         THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN fo.freshness_state = 'STALE'           THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN fo.freshness_state = 'UNKNOWN'         THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN fo.freshness_state = 'INVALID'         THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN fo.freshness_state = 'PENDING_REFRESH' THEN 1 ELSE 0 END), 0)
+           FROM latest
+           JOIN core_file_occurrences fo ON fo.occurrence_seq = latest.seq
+          WHERE fo.existence_state = 'present'",
+        [repository_id],
+        |r| {
+            Ok(FreshnessTotals {
+                current: r.get(0)?,
+                stale: r.get(1)?,
+                unknown: r.get(2)?,
+                invalid: r.get(3)?,
+                pending_refresh: r.get(4)?,
+            })
+        },
+    )?;
+    Ok(t)
+}
+
 // ---------------------------------------------------------------------------
 // Pruning (bounded audit trail / tombstone lifecycle)
 // ---------------------------------------------------------------------------
@@ -496,11 +535,18 @@ mod tests {
 
     struct Seed {
         occ: String,
+        repo: String,
     }
 
     fn seed_repo_rev_occ(conn: &Connection) -> Seed {
         let repo = RepositoryId::new_v4();
-        upsert_repository(conn, &repo, "/repo", "test").unwrap();
+        upsert_repository(
+            conn,
+            &repo,
+            &format!("/repo/{}", repo.to_string_repr()),
+            "test",
+        )
+        .unwrap();
         let rev = SourceRevisionId::new_v4();
         insert_source_revision(
             conn,
@@ -557,6 +603,7 @@ mod tests {
 
         Seed {
             occ: occ.to_string_repr(),
+            repo: repo.to_string_repr(),
         }
     }
 
@@ -647,6 +694,27 @@ mod tests {
         let t = get_freshness_totals(&conn).unwrap();
         assert_eq!(t.unknown, 1);
         assert_eq!(t.current, 0);
+    }
+
+    #[test]
+    fn freshness_totals_for_repo_count_only_that_repo() {
+        let conn = migrated_conn();
+        let a = seed_repo_rev_occ(&conn);
+        let b = seed_repo_rev_occ(&conn);
+        invalidate_for_occurrences(
+            &conn,
+            std::slice::from_ref(&a.occ),
+            FreshnessState::Stale,
+            InvalidationCause::SourceChanged,
+            1000,
+        )
+        .unwrap();
+        let ta = get_freshness_totals_for_repo(&conn, &a.repo).unwrap();
+        let tb = get_freshness_totals_for_repo(&conn, &b.repo).unwrap();
+        assert_eq!((ta.stale, ta.current), (1, 0));
+        assert_eq!((tb.stale, tb.current), (0, 1));
+        let none = get_freshness_totals_for_repo(&conn, "no-such-repo").unwrap();
+        assert_eq!(none.current + none.stale, 0);
     }
 
     // -----------------------------------------------------------------------

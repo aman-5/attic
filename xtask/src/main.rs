@@ -44,7 +44,20 @@ fn run() -> XtaskResult<()> {
                 print_install_help();
                 Ok(())
             } else {
-                run_install(options.skip_build)
+                run_install(&options)
+            }
+        }
+        "all" => {
+            let options = parse_install_options(args.collect())?;
+            if options.help {
+                print_all_help();
+                Ok(())
+            } else if options.skip_build {
+                Err("`all` always builds; use `install --skip-build` instead".into())
+            } else {
+                run_cargo_step("fmt", &["fmt", "--all"])?;
+                run_check()?;
+                run_install(&options)
             }
         }
         "-h" | "--help" | "help" => {
@@ -57,7 +70,7 @@ fn run() -> XtaskResult<()> {
 
 fn print_help() {
     println!(
-        "Attic workspace tasks\n\nUSAGE:\n    cargo xtask <COMMAND>\n\nCOMMANDS:\n    check      Run fmt, clippy, and tests\n    install    Build and install the local attic-server binary\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
+        "Attic workspace tasks\n\nUSAGE:\n    cargo xtask <COMMAND>\n\nCOMMANDS:\n    check      Run fmt, clippy, and tests\n    install    Build and install attic-server, then download the models\n    all        Format, check, then install\n\nOn Windows the MSVC target (DirectML GPU) is used unless CARGO_BUILD_TARGET is set.\n\nRun `cargo xtask <COMMAND> --help` for command-specific options."
     );
 }
 
@@ -69,7 +82,13 @@ fn print_check_help() {
 
 fn print_install_help() {
     println!(
-        "Build and install the local attic-server binary.\n\nUSAGE:\n    cargo xtask install [--skip-build]\n\nOPTIONS:\n        --skip-build    Install the existing release artifact without rebuilding\n    -h, --help          Print help"
+        "Build and install the local attic-server binary, then run\n`attic-server setup-models` (downloads missing models, removes duplicate model files).\n\nUSAGE:\n    cargo xtask install [--skip-build] [--skip-models]\n\nOPTIONS:\n        --skip-build     Install the existing release artifact without rebuilding\n        --skip-models    Do not run setup-models after installing\n    -h, --help           Print help"
+    );
+}
+
+fn print_all_help() {
+    println!(
+        "Format, check, then install, stopping at the first failure.\n\nUSAGE:\n    cargo xtask all [--skip-models]\n\nSTEPS:\n    cargo fmt --all\n    cargo xtask check\n    cargo xtask install"
     );
 }
 
@@ -78,21 +97,21 @@ fn has_help_flag(args: &[OsString]) -> bool {
         .any(|arg| arg == OsStr::new("-h") || arg == OsStr::new("--help"))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
 struct InstallOptions {
     help: bool,
     skip_build: bool,
+    skip_models: bool,
 }
 
 fn parse_install_options(args: Vec<OsString>) -> XtaskResult<InstallOptions> {
-    let mut options = InstallOptions {
-        help: false,
-        skip_build: false,
-    };
+    let mut options = InstallOptions::default();
 
     for arg in args {
         match arg.to_string_lossy().as_ref() {
             "-h" | "--help" => options.help = true,
             "--skip-build" => options.skip_build = true,
+            "--skip-models" => options.skip_models = true,
             other => return Err(format!("unknown argument for `install`: {other}")),
         }
     }
@@ -124,12 +143,12 @@ fn run_check() -> XtaskResult<()> {
     Ok(())
 }
 
-fn run_install(skip_build: bool) -> XtaskResult<()> {
+fn run_install(options: &InstallOptions) -> XtaskResult<()> {
     // The artifact path comes from cargo itself, so `[build] target` or
     // `target-dir` set in any Cargo config file is honoured. Guessing it from
     // environment variables alone installed a stale binary whenever a user
     // config forced a different target.
-    let source_binary = if skip_build {
+    let source_binary = if options.skip_build {
         newest_existing_release_binary()?
     } else {
         build_release_binary()?
@@ -175,14 +194,34 @@ fn run_install(skip_build: bool) -> XtaskResult<()> {
         }
     }
 
+    if !options.skip_models {
+        run_setup_models(&installed_binary);
+    }
+
     Ok(())
+}
+
+/// Download missing models and remove duplicate model files. A failure is a
+/// warning, not an install error: the server retries the download itself.
+fn run_setup_models(installed_binary: &Path) {
+    println!("Running `{} setup-models`...", installed_binary.display());
+    match Command::new(installed_binary)
+        .arg("setup-models")
+        .stdin(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "warning: setup-models exited with {status}; Attic downloads missing models on first start"
+        ),
+        Err(error) => eprintln!("warning: could not run setup-models: {error}"),
+    }
 }
 
 fn run_cargo_step(step_name: &str, args: &[&str]) -> XtaskResult<()> {
     println!("Running `{}`...", command_line(cargo(), args));
-    let status = Command::new(cargo())
+    let status = cargo_command()
         .args(args)
-        .current_dir(workspace_root())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -204,6 +243,23 @@ fn command_line(program: OsString, args: &[&str]) -> String {
 
 fn cargo() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+}
+
+/// A cargo command for the workspace. On Windows it targets MSVC unless
+/// `CARGO_BUILD_TARGET` is already set: only the MSVC build has the DirectML
+/// GPU backend, and a user `~/.cargo/config.toml` may default to GNU.
+fn cargo_command() -> Command {
+    let mut command = Command::new(cargo());
+    command.current_dir(workspace_root());
+    if let Some(target) = default_build_target(env::var_os("CARGO_BUILD_TARGET"), cfg!(windows)) {
+        command.env("CARGO_BUILD_TARGET", target);
+    }
+    command
+}
+
+fn default_build_target(current: Option<OsString>, windows: bool) -> Option<&'static str> {
+    let unset = current.is_none_or(|value| value.is_empty());
+    (windows && unset).then_some("x86_64-pc-windows-msvc")
 }
 
 fn workspace_root() -> PathBuf {
@@ -230,9 +286,8 @@ fn build_release_binary() -> XtaskResult<PathBuf> {
         args.extend(["--features", "candle-metal"]);
     }
     println!("Running `{}`...", command_line(cargo(), &args));
-    let output = Command::new(cargo())
+    let output = cargo_command()
         .args(args)
-        .current_dir(workspace_root())
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
@@ -505,5 +560,42 @@ fn is_runtime_library(path: &Path) -> bool {
         file_name.ends_with(".dylib")
     } else {
         file_name.contains(".so")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn install_options_parse_and_reject_unknown() {
+        let options = parse_install_options(args(&["--skip-build", "--skip-models"])).unwrap();
+        assert!(options.skip_build && options.skip_models && !options.help);
+        assert_eq!(
+            parse_install_options(args(&[])).unwrap(),
+            InstallOptions::default()
+        );
+        assert!(parse_install_options(args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn msvc_is_the_windows_default_unless_a_target_is_set() {
+        assert_eq!(
+            default_build_target(None, true),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            default_build_target(Some(OsString::new()), true),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            default_build_target(Some("x86_64-pc-windows-gnu".into()), true),
+            None
+        );
+        assert_eq!(default_build_target(None, false), None);
     }
 }

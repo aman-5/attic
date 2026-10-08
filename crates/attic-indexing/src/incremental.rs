@@ -595,11 +595,14 @@ mod tests {
     use tempfile::TempDir;
 
     struct StoreFixture {
-        dir: TempDir,
         db_path: std::path::PathBuf,
         pool: DbPool,
         _queue: WriterQueue,
         handle: attic_storage::WriterQueueHandle,
+        /// Declared LAST: fields drop in order, so the directory is removed only
+        /// after every SQLite handle above is closed (Windows cannot delete open
+        /// files, which silently leaked one temp dir per test).
+        dir: TempDir,
     }
 
     fn make_store() -> StoreFixture {

@@ -56,7 +56,13 @@ const FORBIDDEN_SCAN_EXEMPT_PREFIXES: &[&str] =
 ///
 /// Returns `true` iff the path must NEVER be indexed regardless of any rule.
 pub fn is_security_forbidden(repo_relative_path: &str) -> bool {
-    let path = repo_relative_path;
+    let path_lower;
+    let path = if cfg!(windows) {
+        path_lower = repo_relative_path.to_ascii_lowercase();
+        path_lower.as_str()
+    } else {
+        repo_relative_path
+    };
 
     // --- Forbidden directory segments anywhere in path ---
     for component in path.split('/') {
@@ -117,11 +123,37 @@ pub fn assert_within_root(
     canonical_path: &Path,
     canonical_root: &Path,
 ) -> Result<(), DiscoveryError> {
-    if canonical_path.starts_with(canonical_root) {
+    if path_is_within(canonical_path, canonical_root) {
         Ok(())
     } else {
         Err(DiscoveryError::PathEscape(canonical_path.to_owned()))
     }
+}
+
+/// Component-safe containment test. On Windows, paths are compared without
+/// the verbatim (`\\?\`, `\\?\UNC\`) prefix, with `/` and `\` unified, and
+/// case-insensitively (NTFS semantics), so the same location spelt two ways
+/// is never mistaken for an escape.
+pub fn path_is_within(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    if !cfg!(windows) {
+        return false;
+    }
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('/', "\\");
+        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s
+        };
+        s.trim_end_matches('\\').to_lowercase()
+    }
+    let (p, r) = (norm(path), norm(root));
+    !r.is_empty() && (p == r || p.starts_with(&format!("{r}\\")))
 }
 
 /// Canonicalize `path`, then verify it stays within `allowed_root`.
@@ -268,10 +300,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn containment_is_component_safe() {
+        assert!(path_is_within(Path::new("/r/a/b"), Path::new("/r/a")));
+        assert!(!path_is_within(Path::new("/r/ab"), Path::new("/r/a")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_containment_ignores_case_and_verbatim_prefix() {
+        let root = Path::new(r"C:\Repos\Proj");
+        assert!(path_is_within(
+            Path::new(r"\\?\c:\repos\PROJ\src\x.rs"),
+            root
+        ));
+        assert!(path_is_within(
+            Path::new(r"C:\Repos\Proj"),
+            Path::new(r"\\?\C:\repos\proj\")
+        ));
+        assert!(!path_is_within(
+            Path::new(r"\\?\C:\Repos\Project\x.rs"),
+            root
+        ));
+        assert!(path_is_within(
+            Path::new(r"\\?\UNC\srv\share\r\f"),
+            Path::new(r"\\SRV\share\r")
+        ));
+    }
+
+    #[test]
     fn git_dir_is_forbidden() {
         assert!(is_security_forbidden(".git/config"));
         assert!(is_security_forbidden(".git/objects/ab/cd"));
         assert!(is_security_forbidden("subdir/.git/config"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_dir_match_is_case_insensitive() {
+        assert!(is_security_forbidden("sub/.GIT/config"));
+        assert!(is_security_forbidden("fixtures/.SSH/id_rsa"));
+        assert!(is_security_forbidden("keys/.GNUPG/pubring.gpg"));
     }
 
     #[test]

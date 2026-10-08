@@ -195,6 +195,38 @@ impl Qwen3Embedder {
         })
     }
 
+    /// Construct a `Qwen3Embedder` exclusively from one pinned local cache
+    /// snapshot. Fails immediately if that exact revision is absent, with
+    /// zero network calls.
+    pub fn from_local_cache_pinned(
+        cache_dir: &Path,
+        batch_size: usize,
+        revision: &str,
+        dimension_override: Option<usize>,
+        pooling: QwenPooling,
+    ) -> Result<Self, SemanticError> {
+        if let Some((config, tokenizer, weights, revision)) =
+            Self::try_local_cache(cache_dir, Some(revision))
+        {
+            return Self::build(
+                config,
+                tokenizer,
+                weights,
+                revision,
+                batch_size,
+                dimension_override,
+                pooling,
+            );
+        }
+        Err(SemanticError::ProviderUnavailable {
+            provider: QWEN_PROVIDER_ID.into(),
+            reason: format!(
+                "Qwen3 pinned revision {revision} not found in local cache '{}'",
+                cache_dir.display()
+            ),
+        })
+    }
+
     /// Construct a `Qwen3Embedder` pinned to an exact commit revision.
     pub fn new_pinned(
         cache_dir: &Path,
@@ -881,6 +913,29 @@ impl EmbeddingProvider for Qwen3Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_local_cache_constructor_fails_closed_without_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let revision = crate::model_assets::ModelManifest::qwen3_default().pinned_revision;
+
+        let err = match Qwen3Embedder::from_local_cache_pinned(
+            tmp.path(),
+            1,
+            &revision,
+            Some(1024),
+            QwenPooling::LastToken,
+        ) {
+            Ok(_) => panic!("missing pinned cache must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, SemanticError::ProviderUnavailable { .. }));
+        assert!(
+            err.to_string().contains("not found in local cache"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn expired_deadline_at_entry_cancels_without_invoking_embed() {

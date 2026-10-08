@@ -26,11 +26,14 @@ fn opts() -> IndexOptions {
 }
 
 struct Fixture {
-    _dir: TempDir,
     root: PathBuf,
     pool: DbPool,
     _queue: WriterQueue,
     writer: WriterQueueHandle,
+    /// Declared LAST: fields drop in order, so the directory is removed only
+    /// after every SQLite handle above is closed (Windows cannot delete open
+    /// files, which silently leaked one temp dir per test).
+    _dir: TempDir,
 }
 
 impl Fixture {
@@ -276,6 +279,445 @@ fn python_relative_import_resolves_to_layout() {
         )
     });
     assert_eq!(res, "PACKAGE_RESOLVED");
+}
+
+// ── C/C++ include resolution ────────────────────────────────────────────────
+
+#[test]
+fn c_relative_and_root_includes_upgrade_honestly() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "src/nested/main.c",
+            "#include \"helper.h\"\n#include <shared.h>\n#include <stdio.h>\nint main(void) { return helper(); }\n",
+        ),
+        ("src/nested/helper.h", "int helper(void);\n"),
+        ("include/shared.h", "#define SHARED 1\n"),
+    ]);
+
+    let helper_target = fx.query_str(|c| {
+        c.query_row(
+            "SELECT target_entity_id FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%helper.h%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    let helper_occ = fx.query_str(|c| {
+        c.query_row(
+            "SELECT id FROM core_file_occurrences
+              WHERE path = 'src/nested/helper.h'
+              ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        helper_target, helper_occ,
+        "quoted include must prefer sibling header"
+    );
+
+    let shared_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%shared.h%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(shared_res, "PACKAGE_RESOLVED");
+
+    let stdio_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%stdio.h%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(stdio_res, "SYNTACTIC");
+}
+
+#[test]
+fn cpp_extensionless_include_and_heritage_upgrade() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "include/widget.hpp",
+            "namespace app::core {\nclass Base {};\nclass Widget : public Base {};\n}\n",
+        ),
+        (
+            "src/widget.cpp",
+            "#include <widget>\n#include <vector>\nnamespace app::core {\nvoid ping() {}\n}\n",
+        ),
+    ]);
+
+    let widget_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%widget%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(widget_res, "PACKAGE_RESOLVED");
+
+    let vector_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%vector%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(vector_res, "SYNTACTIC");
+
+    let extends_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='EXTENDS'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(extends_res, "SYMBOL_RESOLVED");
+}
+
+// ── Ruby require/load-path resolution ───────────────────────────────────────
+
+#[test]
+fn ruby_require_relative_and_load_path_imports_resolve_honestly() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "app/services/greeter.rb",
+            "require \"net/http\"\nrequire_relative \"../support/helper\"\nload \"config/boot.rb\"\nautoload :WidgetBuilder, \"widgets/builder\"\n\nmodule Services\n  class Greeter\n  end\nend\n",
+        ),
+        ("app/support/helper.rb", "module Support\nend\n"),
+        ("config/boot.rb", "BOOT = true\n"),
+        ("lib/widgets/builder.rb", "class WidgetBuilder\nend\n"),
+    ]);
+
+    let (relative_res, relative_basis, relative_target) = fx.query_row3(|c| {
+        c.query_row(
+            "SELECT resolution, dependency_basis, target_entity_id
+               FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%../support/helper%'
+              LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    });
+    assert_eq!(relative_res, "PACKAGE_RESOLVED");
+    assert_eq!(relative_basis, "RUBY_RELATIVE");
+    let helper_occ: String = fx.query_str(|c| {
+        c.query_row(
+            "SELECT id FROM core_file_occurrences WHERE path = 'app/support/helper.rb'
+              ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(relative_target, helper_occ);
+
+    let (autoload_res, autoload_basis, autoload_target) = fx.query_row3(|c| {
+        c.query_row(
+            "SELECT resolution, dependency_basis, target_entity_id
+               FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%widgets/builder%'
+              LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    });
+    assert_eq!(autoload_res, "PACKAGE_RESOLVED");
+    assert_eq!(autoload_basis, "RUBY_LOAD_PATH");
+    let builder_occ: String = fx.query_str(|c| {
+        c.query_row(
+            "SELECT id FROM core_file_occurrences WHERE path = 'lib/widgets/builder.rb'
+              ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(autoload_target, builder_occ);
+
+    let load_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%config/boot.rb%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(load_res, "PACKAGE_RESOLVED");
+
+    let stdlib_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%net/http%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(stdlib_res, "SYNTACTIC");
+}
+
+// ── PHP namespace/import resolution ─────────────────────────────────────────
+
+#[test]
+fn php_namespace_and_include_imports_resolve_honestly() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "app/Services/Worker.php",
+            "<?php\nnamespace App\\Services;\n\nuse Vendor\\Package\\BaseWorker;\nuse Vendor\\Package\\{Formatter, LoggerTrait as Logger};\n\nrequire_once \"../bootstrap.php\";\ninclude \"helpers.php\";\n\nclass Worker extends BaseWorker {\n    public function run(): void {\n        Logger::boot();\n    }\n}\n",
+        ),
+        ("app/bootstrap.php", "<?php\nreturn true;\n"),
+        ("app/Services/helpers.php", "<?php\nfunction helper() {}\n"),
+        (
+            "src/Vendor/Package/BaseWorker.php",
+            "<?php\nclass BaseWorker {}\n",
+        ),
+        (
+            "lib/Vendor/Package/LoggerTrait.php",
+            "<?php\ntrait LoggerTrait {}\n",
+        ),
+    ]);
+
+    let base_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%BaseWorker%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(base_res, "PACKAGE_RESOLVED");
+
+    let logger_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%LoggerTrait%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(logger_res, "PACKAGE_RESOLVED");
+
+    let require_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%../bootstrap.php%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(require_res, "PACKAGE_RESOLVED");
+
+    let include_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%helpers.php%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(include_res, "PACKAGE_RESOLVED");
+
+    let formatter_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%Formatter%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(formatter_res, "SYNTACTIC");
+}
+
+// ── Swift package-layout import resolution ──────────────────────────────────
+
+#[test]
+fn swift_import_uses_sources_module_layout_only_when_present() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "Sources/App/Worker.swift",
+            "import Foundation\nimport SupportKit\n\nstruct Worker {\n    func run() {\n        helper()\n    }\n}\n\nfunc helper() {}\n",
+        ),
+        (
+            "Sources/SupportKit/Helper.swift",
+            "public func support() {}\n",
+        ),
+    ]);
+
+    let support_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%SupportKit%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(support_res, "PACKAGE_RESOLVED");
+
+    let foundation_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%Foundation%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(foundation_res, "SYNTACTIC");
+}
+
+// ── Kotlin package-path probing ─────────────────────────────────────────────
+
+#[test]
+fn kotlin_import_resolution_distinguishes_symbol_and_layout_matches() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "src/main/kotlin/com/acme/orders/OrderController.kt",
+            "package com.acme.orders\n\nimport com.acme.shared.SupportService\nimport com.acme.shared.SupportFile\n\nclass OrderController(private val service: SupportService) {\n    fun load(id: Long) = service.find(id)\n}\n",
+        ),
+        (
+            "src/main/kotlin/com/acme/shared/SupportService.kt",
+            "package com.acme.shared\n\ninterface SupportService {\n    fun find(id: Long): String\n}\n",
+        ),
+        (
+            "src/main/kotlin/com/acme/shared/SupportFile.kt",
+            "package com.acme.shared\n\nobject Helpers\n",
+        ),
+    ]);
+
+    let symbol_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%SupportService%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(symbol_res, "SYMBOL_RESOLVED");
+
+    let layout_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%SupportFile%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(layout_res, "PACKAGE_RESOLVED");
+}
+
+// ── Scala package-path probing ──────────────────────────────────────────────
+
+#[test]
+fn scala_import_resolution_distinguishes_symbol_and_layout_matches() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "src/main/scala/com/acme/app/Main.scala",
+            "package com.acme.app\n\nimport com.acme.shared.SupportService\nimport com.acme.shared.LayoutOnly\n\nclass Main extends SupportService\n",
+        ),
+        (
+            "src/main/scala/com/acme/shared/SupportService.scala",
+            "package com.acme.shared\n\ntrait SupportService\n",
+        ),
+        (
+            "src/main/scala/com/acme/shared/LayoutOnly.scala",
+            "package com.acme.shared\n\nobject Helpers\n",
+        ),
+    ]);
+
+    let symbol_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%SupportService%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(symbol_res, "SYMBOL_RESOLVED");
+
+    let layout_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%LayoutOnly%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(layout_res, "PACKAGE_RESOLVED");
+}
+
+// ── Lua require-path probing ────────────────────────────────────────────────
+
+#[test]
+fn lua_require_resolution_handles_module_and_init_layouts() {
+    let fx = Fixture::bootstrap(&[
+        (
+            "lua/app/main.lua",
+            "local shared = require(\"app.shared\")\nlocal pkg = require(\"app.layout_only\")\nlocal missing = require(\"missing.module\")\n\nfunction boot()\n  return shared.run() + pkg.start()\nend\n",
+        ),
+        (
+            "lua/app/shared.lua",
+            "local M = {}\nfunction M.run()\n  return 1\nend\nreturn M\n",
+        ),
+        (
+            "lua/app/layout_only/init.lua",
+            "local P = {}\nfunction P.start()\n  return 2\nend\nreturn P\n",
+        ),
+    ]);
+
+    let module_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%app.shared%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(module_res, "PACKAGE_RESOLVED");
+
+    let init_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%app.layout_only%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(init_res, "PACKAGE_RESOLVED");
+
+    let missing_res = fx.query_str(|c| {
+        c.query_row(
+            "SELECT resolution FROM core_relationships
+              WHERE rel_type='IMPORT' AND provenance_json LIKE '%missing.module%'
+              LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(missing_res, "SYNTACTIC");
 }
 
 // ── JS/TS relative specifier probing stays honest ────────────────────────────

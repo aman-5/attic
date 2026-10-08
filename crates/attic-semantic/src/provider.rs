@@ -237,6 +237,24 @@ impl ExecutionBackend {
             Self::CandleCuda | Self::CandleMetal | Self::OrtDirectMl
         )
     }
+
+    /// How host-RAM pressure should gate embedding on this backend.
+    ///
+    /// `unified_memory` is true when the active adapter shares system RAM (an
+    /// integrated GPU allowed via `allow_integrated_gpu`). Apple Silicon Metal
+    /// is always unified memory; CPU backends use host RAM directly.
+    pub fn memory_class(
+        &self,
+        unified_memory: bool,
+    ) -> attic_storage::resource_manager::EmbeddingMemoryClass {
+        use attic_storage::resource_manager::EmbeddingMemoryClass as C;
+        match self {
+            Self::OrtDirectMl | Self::CandleCuda if unified_memory => C::UnifiedGpu,
+            Self::OrtDirectMl | Self::CandleCuda => C::DedicatedGpu,
+            Self::CandleMetal => C::UnifiedGpu,
+            Self::CandleCpu | Self::Hashing | Self::Unknown => C::HostRam,
+        }
+    }
 }
 
 /// Comprehensive architectural fingerprint of an active embedding vector space (Final Master Plan V2 §51).

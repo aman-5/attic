@@ -156,23 +156,32 @@ pub fn apply_signals_and_rank(
     for (weight, value) in weights.iter().zip(vals) {
         if *weight > 0.0 {
             den += weight;
-            if let Some(v) = value {
+            // `clamp` passes NaN through; a non-finite signal contributes
+            // nothing instead of poisoning the combined score and ordering.
+            if let Some(v) = value.filter(|v| v.is_finite()) {
                 num += weight * v.clamp(0.0, 1.0);
             }
         }
     }
-    ev.signals.combined_score = Some(if den > 0.0 { num / den } else { 0.0 });
-    ev.confidence = ev.signals.combined_score.unwrap_or(0.0);
+    let combined = if den > 0.0 { num / den } else { 0.0 };
+    let combined = if combined.is_finite() { combined } else { 0.0 };
+    ev.signals.combined_score = Some(combined);
+    ev.confidence = combined;
     ev
+}
+
+/// Sort key for a score: non-finite values rank as 0 so NaN can never make
+/// the comparator inconsistent.
+fn finite_or_zero(v: Option<f64>) -> f64 {
+    v.filter(|v| v.is_finite()).unwrap_or(0.0)
 }
 
 /// Sort evidence by combined score with deterministic tie-breaks.
 pub fn sort_ranked(items: &mut [Evidence]) {
     items.sort_by(|a, b| {
-        let sa = a.signals.combined_score.unwrap_or(0.0);
-        let sb = b.signals.combined_score.unwrap_or(0.0);
-        sb.partial_cmp(&sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let sa = finite_or_zero(a.signals.combined_score);
+        let sb = finite_or_zero(b.signals.combined_score);
+        sb.total_cmp(&sa)
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| {
                 a.source_span

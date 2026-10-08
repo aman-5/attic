@@ -423,7 +423,8 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
     assert_eq!(v["configured"], true, "{inspect}");
 
     // Membership was durably persisted to <ATTIC_HOME>/config.toml.
-    let cfg = std::fs::read_to_string(home.join("config.toml")).expect("persistent config");
+    let cfg = std::fs::read_to_string(home.join("config").join("config.toml"))
+        .expect("persistent config");
     for p in &root_paths {
         assert!(cfg.contains(p), "config.toml must contain {p}: {cfg}");
     }
@@ -491,7 +492,8 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
     let v: Value = serde_json::from_str(&removed).unwrap();
     assert_eq!(v["membership_count"], 2, "{removed}");
 
-    let cfg = std::fs::read_to_string(home.join("config.toml")).expect("config after remove");
+    let cfg = std::fs::read_to_string(home.join("config").join("config.toml"))
+        .expect("config after remove");
     assert!(
         !cfg.contains(&root_paths[1]),
         "removed root must leave config: {cfg}"

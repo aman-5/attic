@@ -183,13 +183,14 @@ pub fn sync_workspace(
     // §14: workspace membership is authoritative. When active_repository_ids is
     // provided, restrict the sync to only those IDs. Repositories present in
     // storage but absent from the active set must not participate.
-    let repo_ids: Vec<String> = match &opts.active_repository_ids {
-        Some(active) => all_ids
-            .into_iter()
-            .filter(|id| active.contains(id))
-            .collect(),
-        None => all_ids,
+    let (repo_ids, inactive_ids): (Vec<String>, Vec<String>) = match &opts.active_repository_ids {
+        Some(active) => all_ids.into_iter().partition(|id| active.contains(id)),
+        None => (all_ids, Vec::new()),
     };
+    // Repositories whose existing edges are stale and must be dropped even
+    // though no fresh edges are computed for them: outside the active set,
+    // or skipped below (manifest scan failed / not indexed yet).
+    let mut stale_repo_ids: Vec<String> = inactive_ids;
     let total = repo_ids.len();
     let mut all_repo_data: Vec<RepoCatalogData> = Vec::with_capacity(total);
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
@@ -215,6 +216,7 @@ pub fn sync_workspace(
             Ok(s) => s,
             Err(e) => {
                 debug!("failed to scan repo {}: {e}", repo_id);
+                stale_repo_ids.push(repo_id.clone());
                 continue;
             }
         };
@@ -240,6 +242,7 @@ pub fn sync_workspace(
                     .diagnostics
                     .missing_targets
                     .push((repository_id.clone(), "no_source_revision".to_owned()));
+                stale_repo_ids.push(repo_id.clone());
                 continue;
             }
             Err(e) => return Err(e),
@@ -295,7 +298,14 @@ pub fn sync_workspace(
 
     // ── Pure computation: resolve cross-repo edges ────────────────────
     let (edges, diagnostics) = resolver::resolve_workspace(&all_repo_data, &proto_index);
+    // Keep the reader-phase diagnostics (e.g. no_source_revision) — the
+    // resolver's own report used to overwrite them.
+    let reader_missing = std::mem::take(&mut result.diagnostics.missing_targets);
     result.diagnostics = diagnostics;
+    result
+        .diagnostics
+        .missing_targets
+        .splice(0..0, reader_missing);
     let edges_len = edges.len();
 
     // Build (repo_id, source_revision_id) pairs for snapshot provenance.
@@ -364,7 +374,7 @@ pub fn sync_workspace(
             })?;
 
             // Delete all existing cross-repo DEPENDS_ON edges (clean replacement).
-            for repo_id in &repo_ids_for_persistence {
+            for repo_id in repo_ids_for_persistence.iter().chain(&stale_repo_ids) {
                 attic_storage::crossrepo_ops::delete_all_xrepo_edges_touching(conn, repo_id)?;
             }
 

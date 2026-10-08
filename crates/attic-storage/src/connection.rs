@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OpenFlags};
 
+use attic_core::{ensure_private_dir, set_private_file_permissions, write_private_file};
+
 use crate::error::StorageError;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +90,7 @@ pub fn verify_connection(conn: &Connection) -> Result<Vec<StorageError>, Storage
 ///   execution continues.
 pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageError> {
     // Ensure the backup directory exists.
-    fs::create_dir_all(backup_dir).map_err(|e| {
+    ensure_private_dir(backup_dir).map_err(|e| {
         StorageError::Io(std::io::Error::other(format!(
             "failed to create backup directory: {e}"
         )))
@@ -111,7 +113,7 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
     })?;
 
     // Write to tmp file first, then atomic rename.
-    std::fs::write(&tmp_path, &main_data).map_err(|e| {
+    write_private_file(&tmp_path, &main_data).map_err(|e| {
         StorageError::Io(std::io::Error::other(format!(
             "failed to write backup tmp file: {e}"
         )))
@@ -123,6 +125,11 @@ pub fn backup_database(db_path: &Path, backup_dir: &Path) -> Result<(), StorageE
         let _ = std::fs::remove_file(&tmp_path);
         StorageError::Io(std::io::Error::other(format!(
             "failed to rename backup file: {e}"
+        )))
+    })?;
+    set_private_file_permissions(&backup_path).map_err(|e| {
+        StorageError::Io(std::io::Error::other(format!(
+            "failed to harden backup file permissions: {e}"
         )))
     })?;
 
@@ -277,6 +284,7 @@ pub fn open_rw_with_pragmas(
     mmap_bytes: u64,
 ) -> Result<Connection, StorageError> {
     let conn = Connection::open(path)?;
+    set_private_file_permissions(path)?;
     configure_connection_with_pragmas(&conn, cache_pages, mmap_bytes)?;
     Ok(conn)
 }
@@ -606,6 +614,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_db_hardens_database_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join(format!("attic_open_db_mode_{}.db", uuid::Uuid::new_v4()));
+
+        let (_writer, _pool) = open_db(&path).expect("open_db should succeed");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -955,6 +979,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join(format!("attic_bk_mode_{}.db", uuid::Uuid::new_v4()));
+        let backup_dir = dir.join(format!("attic_bk_mode_dir_{}", uuid::Uuid::new_v4()));
+
+        {
+            let (writer, _pool) = open_db(&path).unwrap();
+            crate::migration::run_migrations(&writer).unwrap();
+        }
+        backup_database(&path, &backup_dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let backup = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .find_map(|e| e.ok())
+            .map(|e| e.path())
+            .expect("backup exists");
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -491,6 +491,9 @@ where
 /// Returns a `HashSet` of repo-relative paths using forward-slash separators.
 /// Returns an error if the `git` process cannot be spawned or exits non-zero.
 pub fn git_tracked_files(repo_root: &Path) -> Result<HashSet<String>, std::io::Error> {
+    // Safe on Rust 1.98+: std::process::Command resolves bare executables
+    // from PATH without searching the repository CWD first on Windows, so a
+    // repo-local `git.cmd` / `git.exe` cannot hijack this spawn.
     let output = Command::new("git")
         .args(["ls-files", "--cached", "--full-name", "-z"])
         .current_dir(repo_root)

@@ -181,18 +181,25 @@ impl WindowedProvider<'_> {
             return self.inner.embed_batch(inputs, cancel, usage, deadline);
         }
 
-        // Expand: every window gets a unique key; remember which unit it
-        // belongs to, how many bytes it carries, and whether it is a split.
+        // Expand: every window gets a key unique WITHIN THIS CALL (input
+        // position, not the caller's `unit_key`, which need not be unique —
+        // a duplicate would overwrite its twin's entry and fail the batch);
+        // remember which unit it belongs to, how many bytes it carries, and
+        // whether it is a split. Results are re-keyed to `unit_key` below.
         let mut expanded: Vec<EmbeddingInput> = Vec::with_capacity(inputs.len() * 2);
         let mut owner: HashMap<String, (usize, usize)> = HashMap::new();
         for (idx, input) in inputs.iter().enumerate() {
             if input.text.len() <= window {
-                owner.insert(input.unit_key.clone(), (idx, input.text.len()));
-                expanded.push(input.clone());
+                let key = format!("{idx}\u{1f}u");
+                owner.insert(key.clone(), (idx, input.text.len()));
+                expanded.push(EmbeddingInput {
+                    unit_key: key,
+                    text: input.text.clone(),
+                });
                 continue;
             }
             for (w, piece) in split_windows(&input.text, window).into_iter().enumerate() {
-                let key = format!("{}\u{1f}w{w}", input.unit_key);
+                let key = format!("{idx}\u{1f}w{w}");
                 owner.insert(key.clone(), (idx, piece.len()));
                 expanded.push(EmbeddingInput {
                     unit_key: key,
@@ -343,6 +350,27 @@ mod tests {
         let n = (out[1].vector[0].powi(2) + out[1].vector[1].powi(2)).sqrt();
         assert!((n - 1.0).abs() < 1e-5, "pooled vector must be unit length");
         assert!(out[1].vector[0] > 0.0 && out[1].vector[1] > 0.0);
+    }
+
+    #[test]
+    fn duplicate_unit_keys_in_a_split_batch_each_get_a_vector() {
+        let p = WindowedProvider::new(&Echo);
+        let out = p
+            .embed_batch(
+                &[
+                    input("dup", "aaa"),
+                    input("dup", "bbb"),
+                    input("big", "aaaaaaaabbbbbbbb"),
+                ],
+                &CancelFlag::new(),
+                &mut ResourceUsage::default(),
+                None,
+            )
+            .expect("duplicate keys must not fail the batch");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].unit_key, "dup");
+        assert_eq!(out[1].unit_key, "dup");
+        assert_eq!(out[2].unit_key, "big");
     }
 
     #[test]
