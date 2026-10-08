@@ -53,8 +53,6 @@ use interprocess::local_socket::{
 };
 use rmcp::ServiceExt;
 #[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
 use tokio::net::{UnixListener as IpcListener, UnixStream as IpcStream};
 use tracing::{debug, info, trace, warn};
 
@@ -829,7 +827,7 @@ async fn run_relay_with_cache(
 ) -> anyhow::Result<RelayExit> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut recv_half, mut send_half) = relay.stream.split();
+    let (mut recv_half, mut send_half) = tokio::io::split(relay.stream);
 
     // Two separate read buffers — tokio::select! evaluates both future
     // expressions before polling, which means both `stdin.read(&mut buf)`
@@ -1282,7 +1280,7 @@ async fn handle_connection(
 ) {
     let _guard = ConnectionGuard::new(active);
     debug!("daemon: new IPC connection accepted");
-    let (read_half, write_half) = stream.split();
+    let (read_half, write_half) = tokio::io::split(stream);
     match server.serve((read_half, write_half)).await {
         Ok(running) => {
             let _ = running.waiting().await;
