@@ -739,12 +739,16 @@ background capacity is capped strictly below foreground capacity, and under
 memory pressure expensive `DEEP` retrieval mode is automatically downgraded
 to `NORMAL` rather than failing outright.
 
-Whole-machine memory feeds the pressure tiers, but percentage alone never
-escalates a machine that still has plenty of free RAM: **Warning** at ≥75 %
-used; **Critical** at ≥82 % used *and* under 8 GiB available; **Emergency** at
-under 2 GiB available, or at ≥90 % used *and* under 4 GiB available.
-Hysteresis keeps a tier from flapping and ignores the percentage once
-available RAM is back above those headrooms. Foreground MCP calls are never
+Whole-machine memory feeds the pressure tiers, judged purely on **absolute
+available RAM** — the only signal that means the same thing on every machine:
+**Warning** at ≤1 GiB available (1 024 MiB); **Critical** at ≤700 MiB;
+**Emergency** at ≤600 MiB. Usage percentage plays no part: a 32 GB developer
+box at 90 % used still has ~3.2 GiB free and stays Normal. Hysteresis keeps a
+tier from flapping: a held tier de-escalates only once available RAM climbs
+back above its exit line (Warning past 1 200 MiB, Critical past 950 MiB,
+Emergency past 850 MiB) and holds there for the tier's hold period. Attic's
+own share of its configured memory budget is a separate axis (Warning ≥70 %,
+Critical ≥85 % of budget) with percentage-based exits. Foreground MCP calls are never
 refused for memory pressure — every tool (`search`, `file`, `status`,
 `context`, `workspace`) is admitted at every tier. Pressure only throttles
 background work and the optional depth of a foreground answer (`DEEP` →

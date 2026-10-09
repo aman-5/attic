@@ -23,25 +23,33 @@ pub const PRESSURE_WARNING_PCT: u64 = 70;
 /// RSS percentage of the memory budget at which pressure transitions to Critical.
 pub const PRESSURE_CRITICAL_PCT: u64 = 85;
 
-/// r08 live SYSTEM thresholds (whole-machine usage, not just Attic's share):
-/// the developer's IDE/browser/build always win. Reduce background work when
-/// total system usage reaches 75%.
-pub const SYSTEM_WARNING_PCT: u64 = 75;
-/// Total system usage at which background work pauses (r08).
-pub const SYSTEM_CRITICAL_PCT: u64 = 82;
-/// Total system usage at which background work halts outright (r08).
-pub const SYSTEM_EMERGENCY_PCT: u64 = 90;
-/// Absolute reserve: fewer available MiB than this is Emergency regardless
-/// of percentages (r08).
-pub const SYSTEM_MIN_AVAILABLE_MIB: u64 = 2048;
-/// Percentage-based Emergency applies only when available RAM ALSO drops below
-/// this headroom. A large-memory workstation at 90% used can still have
-/// several gigabytes free, so percentage alone must not halt host-RAM work.
-pub const SYSTEM_EMERGENCY_HEADROOM_MIB: u64 = 4096;
-/// Percentage-based Critical applies only when available RAM ALSO drops below
-/// this headroom. This keeps high-RAM developer boxes out of Critical when
-/// their absolute free memory is still ample.
-pub const SYSTEM_CRITICAL_HEADROOM_MIB: u64 = 8192;
+/// r08 live SYSTEM thresholds (whole-machine state, not just Attic's share):
+/// the developer's IDE/browser/build always win. System pressure is judged
+/// purely on ABSOLUTE AVAILABLE RAM — the only signal that means the same
+/// thing on every machine. Percentages were dropped deliberately: a 32 GB
+/// developer workstation legitimately runs at 85–95% used with gigabytes
+/// still free, and must not be throttled for that.
+///
+/// At or below this many available MiB, reduce background work (Warning).
+pub const SYSTEM_WARNING_FLOOR_MIB: u64 = 1024;
+/// At or below this many available MiB, pause most background work (Critical).
+pub const SYSTEM_CRITICAL_FLOOR_MIB: u64 = 700;
+/// At or below this many available MiB, halt background work outright
+/// (Emergency).
+pub const SYSTEM_EMERGENCY_FLOOR_MIB: u64 = 600;
+/// Available-RAM hysteresis exits: a tier held on the system axis
+/// de-escalates only once available RAM climbs back above its exit line (and
+/// stays there for the hold period), so a machine hovering at a boundary does
+/// not flap between tiers. Exits sit above the next tier's floor: Warning
+/// entered at <=1 GiB exits past 1.2 GiB, Critical at <=700 exits past 950,
+/// Emergency at <=600 exits past 850.
+pub const HYSTERESIS_EXIT_WARNING_MIB: u64 = 1200;
+/// Available-RAM exit line for a held Critical tier (see
+/// [`HYSTERESIS_EXIT_WARNING_MIB`]).
+pub const HYSTERESIS_EXIT_CRITICAL_MIB: u64 = 950;
+/// Available-RAM exit line for a held Emergency tier (see
+/// [`HYSTERESIS_EXIT_WARNING_MIB`]).
+pub const HYSTERESIS_EXIT_EMERGENCY_MIB: u64 = 850;
 
 /// Host-RAM safety floor for embedding on a DEDICATED GPU.
 ///
@@ -57,15 +65,12 @@ pub const DEDICATED_GPU_HOST_FLOOR_MIB: u64 = 512;
 /// Metal, or an integrated GPU allowed via `allow_integrated_gpu`).
 ///
 /// Such a GPU allocates its model and activations out of system RAM, so host
-/// pressure is real for it — but the percentage tiers are a poor signal on
-/// these machines (macOS keeps RAM "used" by compressed memory and file cache
-/// that it reclaims on demand), and parking at 90% used idles a GPU that
-/// still has gigabytes of headroom. Unified-memory embedding therefore parks
-/// only below the same absolute reserve the system tiers already treat as
-/// Emergency, and shrinks its batch under pressure instead (see
-/// [`unified_gpu_embedding_batch`]), since batch size is what drives its
-/// transient memory.
-pub const UNIFIED_GPU_HOST_FLOOR_MIB: u64 = SYSTEM_MIN_AVAILABLE_MIB;
+/// pressure is real for it — but parking early idles a GPU that still has
+/// usable headroom. Unified-memory embedding therefore parks only below the
+/// same absolute reserve the system tiers treat as Critical, and shrinks its
+/// batch under pressure instead (see [`unified_gpu_embedding_batch`]), since
+/// batch size is what drives its transient memory.
+pub const UNIFIED_GPU_HOST_FLOOR_MIB: u64 = SYSTEM_CRITICAL_FLOOR_MIB;
 
 /// Where an embedding backend keeps its working set, which decides how
 /// host-RAM pressure gates it.
@@ -772,55 +777,37 @@ impl ResourceMonitor {
         self.update_effective_limits();
     }
 
-    /// Pressure implied by whole-system memory facts (r08). Normal until the
-    /// first sample lands (all-zero fields).
+    /// Pressure implied by whole-system memory facts (r08): a pure cascade on
+    /// ABSOLUTE AVAILABLE RAM. Total/used percentages are ignored by design —
+    /// only the headroom the machine actually has left matters. Normal until
+    /// the first sample lands (all-zero fields).
     fn system_pressure(&self) -> ResourcePressure {
         let total = self.system_total_mib.load(Ordering::Relaxed);
         if total == 0 {
             return ResourcePressure::Normal;
         }
         let avail = self.system_available_mib.load(Ordering::Relaxed);
-        let used = self.system_used_mib.load(Ordering::Relaxed);
-        if avail < SYSTEM_MIN_AVAILABLE_MIB {
-            return ResourcePressure::Emergency;
-        }
-        let pct = used.saturating_mul(100) / total;
-        if pct >= SYSTEM_EMERGENCY_PCT && avail < SYSTEM_EMERGENCY_HEADROOM_MIB {
+        if avail <= SYSTEM_EMERGENCY_FLOOR_MIB {
             ResourcePressure::Emergency
-        } else if pct >= SYSTEM_CRITICAL_PCT && avail < SYSTEM_CRITICAL_HEADROOM_MIB {
+        } else if avail <= SYSTEM_CRITICAL_FLOOR_MIB {
             ResourcePressure::Critical
-        } else if pct >= SYSTEM_WARNING_PCT {
+        } else if avail <= SYSTEM_WARNING_FLOOR_MIB {
             ResourcePressure::Warning
         } else {
             ResourcePressure::Normal
         }
     }
 
-    /// Percentage basis for hysteresis de-escalation: the worse of Attic's
-    /// own share and the system percentage that is STILL relevant to the
-    /// currently held tier. Once a large-memory machine has climbed back
-    /// above the tier's absolute headroom guard, hysteresis must not keep it
-    /// stuck in that tier on percentage alone.
-    fn pressure_pct_basis(&self, attic_effective_mib: u64, held: ResourcePressure) -> u64 {
-        let max = self.max_memory_mib.load(Ordering::Relaxed);
-        let attic_pct = attic_effective_mib
-            .saturating_mul(100)
-            .checked_div(max)
-            .unwrap_or(0);
-        let total = self.system_total_mib.load(Ordering::Relaxed);
-        let system_pct = self
-            .system_used_mib
-            .load(Ordering::Relaxed)
-            .saturating_mul(100)
-            .checked_div(total)
-            .unwrap_or(0);
-        let system_avail = self.system_available_mib.load(Ordering::Relaxed);
-        let system_pct = match held {
-            ResourcePressure::Emergency if system_avail >= SYSTEM_EMERGENCY_HEADROOM_MIB => 0,
-            ResourcePressure::Critical if system_avail >= SYSTEM_CRITICAL_HEADROOM_MIB => 0,
-            _ => system_pct,
-        };
-        attic_pct.max(system_pct)
+    /// Available-RAM exit line for a tier held on the system axis: the held
+    /// tier blocks de-escalation until available RAM climbs strictly above
+    /// this line (the tier's floor plus its anti-flap margin).
+    fn system_exit_line_mib(held: ResourcePressure) -> u64 {
+        match held {
+            ResourcePressure::Emergency => HYSTERESIS_EXIT_EMERGENCY_MIB,
+            ResourcePressure::Critical => HYSTERESIS_EXIT_CRITICAL_MIB,
+            ResourcePressure::Warning => HYSTERESIS_EXIT_WARNING_MIB,
+            ResourcePressure::Normal => 0,
+        }
     }
 
     /// Test-only override of the whole-system memory sample. Public (hidden)
@@ -874,7 +861,7 @@ impl ResourceMonitor {
             return;
         }
 
-        // De-escalation requires hysteresis.
+        // De-escalation requires hysteresis on BOTH pressure axes.
         if raw_tier < current_tier {
             let (exit_pct, hold_ms) = match current {
                 ResourcePressure::Emergency => {
@@ -889,11 +876,26 @@ impl ResourceMonitor {
                 ResourcePressure::Normal => return,
             };
 
-            // De-escalation basis merges Attic's share and system usage.
-            let pct = self.pressure_pct_basis(effective_mib, current);
-
-            if pct >= exit_pct {
+            // Attic-share axis: Attic's own percentage of its memory budget
+            // must be below the tier's exit band.
+            let attic_pct = effective_mib
+                .saturating_mul(100)
+                .checked_div(max)
+                .unwrap_or(0);
+            if attic_pct >= exit_pct {
                 // Not yet below the exit band.
+                self.hysteresis_exit_eligible_ms.store(0, Ordering::Relaxed);
+                return;
+            }
+
+            // System axis: available RAM must have climbed back above the
+            // held tier's exit line. An unsampled system (no facts yet)
+            // never blocks de-escalation.
+            if self.system_total_mib.load(Ordering::Relaxed) != 0
+                && self.system_available_mib.load(Ordering::Relaxed)
+                    <= Self::system_exit_line_mib(current)
+            {
+                // Still inside the exit margin.
                 self.hysteresis_exit_eligible_ms.store(0, Ordering::Relaxed);
                 return;
             }
@@ -1486,14 +1488,15 @@ mod tests {
     /// Backend-aware gate matrix under a forced Emergency tier: CPU parks;
     /// a dedicated GPU keeps full permits and batch until its 512 MiB floor;
     /// a unified-memory GPU keeps running with a quarter batch until its
-    /// 2 GiB floor. The configured concurrency ceiling holds for every class.
+    /// 700 MiB floor. The configured concurrency ceiling holds for every class.
     #[test]
     fn embedding_gate_matrix_by_memory_class() {
         use EmbeddingMemoryClass::*;
         let m = monitor_with_budget(8192);
         m.apply_resource_policy(8, 2, 16);
         m.set_forced_pressure_for_testing(Some(ResourcePressure::Emergency));
-        // 91% used, ~2.9 GiB available: Emergency by percentage, above both floors.
+        // ~2.9 GiB available: above both GPU host floors (the tier itself is
+        // forced Emergency for this matrix).
         m.set_system_memory_for_testing(32_768, 29_800, 2_968);
 
         assert!(m.embedding_parked(HostRam));
@@ -1523,8 +1526,9 @@ mod tests {
         drop((p1, p2));
         assert_eq!(m.embedding_heavy_active(), 0);
 
-        // 1.5 GiB available: below the unified floor, above the dedicated one.
-        m.set_system_memory_for_testing(32_768, 31_232, 1_536);
+        // 650 MiB available: below the unified floor (700), above the
+        // dedicated one (512).
+        m.set_system_memory_for_testing(32_768, 32_118, 650);
         assert!(m.embedding_parked(UnifiedGpu));
         assert_eq!(m.embedding_batch_for(UnifiedGpu), 0);
         assert!(m.try_embedding_heavy_for(UnifiedGpu).is_none());
@@ -1591,47 +1595,43 @@ mod tests {
     fn system_memory_pressure_escalates_without_attic_usage() {
         let m = monitor_with_budget(8192);
 
-        // 50% system usage, plenty free → Normal even at zero Attic RSS.
+        // 8 GiB available → Normal even at zero Attic RSS.
         m.set_system_memory_for_testing(16_384, 8_192, 8_192);
         m.recompute_pressure_hysteresis(0);
         assert_eq!(m.guidance_pressure(), ResourcePressure::Normal);
 
-        // 83% system usage → Critical regardless of Attic's tiny footprint.
-        m.set_system_memory_for_testing(16_384, 13_600, 2_784);
+        // 650 MiB available → Critical regardless of Attic's tiny footprint.
+        m.set_system_memory_for_testing(16_384, 15_734, 650);
         m.recompute_pressure_hysteresis(0);
         assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
 
-        // Under 2 GiB available → Emergency by the absolute reserve rule.
-        m.set_system_memory_for_testing(16_384, 15_000, 1_384);
+        // 600 MiB available → Emergency at the absolute reserve.
+        m.set_system_memory_for_testing(16_384, 15_784, 600);
         m.recompute_pressure_hysteresis(0);
         assert_eq!(m.guidance_pressure(), ResourcePressure::Emergency);
     }
 
     #[test]
-    fn system_pressure_respects_absolute_headroom_guards() {
+    fn system_pressure_is_a_pure_available_floor_cascade() {
         let m = monitor_with_budget(8192);
 
-        // 16 GiB box: 87% used still has only ~2.1 GiB free, so Critical.
-        m.set_system_memory_for_testing(16_384, 14_256, 2_128);
-        assert_eq!(m.system_pressure(), ResourcePressure::Critical);
+        // 64 GiB box at ~94% used still has 4 GiB free: Normal — usage
+        // percentage plays no part in the system tier.
+        m.set_system_memory_for_testing(65_536, 61_536, 4_000);
+        assert_eq!(m.system_pressure(), ResourcePressure::Normal);
 
-        // 16 GiB box: < 512 MiB free trips Emergency outright.
-        m.set_system_memory_for_testing(16_384, 15_904, 480);
-        assert_eq!(m.system_pressure(), ResourcePressure::Emergency);
-
-        // 64 GiB box at 90% still has ~6.4 GiB free: no percentage Emergency.
-        m.set_system_memory_for_testing(65_536, 58_983, 6_553);
-        assert_eq!(m.system_pressure(), ResourcePressure::Critical);
-
-        // 64 GiB box at 97% drops below the 2 GiB reserve: Emergency.
-        m.set_system_memory_for_testing(65_536, 63_570, 1_966);
-        assert_eq!(m.system_pressure(), ResourcePressure::Emergency);
-
-        // 8 GiB box: the 2 GiB reserve is exclusive, so exactly 2 GiB free is
-        // Warning and dipping below it is Emergency.
-        m.set_system_memory_for_testing(8_192, 6_144, 2_048);
+        // 4 GiB box with exactly 1 GiB free: Warning (floors are inclusive).
+        m.set_system_memory_for_testing(4_096, 3_072, 1_024);
         assert_eq!(m.system_pressure(), ResourcePressure::Warning);
-        m.set_system_memory_for_testing(8_192, 6_226, 1_966);
+
+        // At/below 700 MiB free: Critical.
+        m.set_system_memory_for_testing(4_096, 3_396, 700);
+        assert_eq!(m.system_pressure(), ResourcePressure::Critical);
+
+        // At/below 600 MiB free: Emergency — on any machine size.
+        m.set_system_memory_for_testing(4_096, 3_496, 600);
+        assert_eq!(m.system_pressure(), ResourcePressure::Emergency);
+        m.set_system_memory_for_testing(65_536, 64_936, 600);
         assert_eq!(m.system_pressure(), ResourcePressure::Emergency);
     }
 
@@ -1640,13 +1640,13 @@ mod tests {
     #[test]
     fn system_pressure_blocks_deescalation_while_hot() {
         let m = monitor_with_budget(8192);
-        // Escalate via system pressure (83%).
-        m.set_system_memory_for_testing(16_384, 13_600, 2_784);
+        // Escalate via system pressure (650 MiB free <= the Critical floor).
+        m.set_system_memory_for_testing(16_384, 15_734, 650);
         m.recompute_pressure_hysteresis(0);
         assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
 
-        // Attic's own usage falls to zero; system still at 83% — above the
-        // 78% Critical exit threshold — so the tier must hold.
+        // Attic's own usage falls to zero; the system is still at 650 MiB
+        // free — below the 950 MiB Critical exit line — so the tier must hold.
         m.recompute_pressure_hysteresis(0);
         assert_eq!(
             m.guidance_pressure(),
@@ -1654,8 +1654,8 @@ mod tests {
             "system-hot de-escalation must not happen"
         );
 
-        // System cools below the exit band → de-escalation can begin (hold
-        // timers apply; tier must not be Critical-stuck forever).
+        // System recovers past the exit line → de-escalation becomes
+        // eligible (hold timers apply; the tier must not be stuck forever).
         m.set_system_memory_for_testing(16_384, 8_192, 8_192);
         m.recompute_pressure_hysteresis(0);
         assert_ne!(m.guidance_pressure(), ResourcePressure::Emergency);
@@ -1666,10 +1666,14 @@ mod tests {
         let m = monitor_with_budget(8192);
 
         let cases = [
-            ((16_384, 14_254, 2_130), ResourcePressure::Critical),
-            ((16_384, 15_894, 490), ResourcePressure::Emergency),
-            ((65_536, 58_986, 6_550), ResourcePressure::Critical),
-            ((65_536, 63_570, 1_966), ResourcePressure::Emergency),
+            // 32 GiB dev box at ~90% used with 3.2 GiB free: fully Normal.
+            ((32_768, 29_500, 3_268), ResourcePressure::Normal),
+            // 16 GiB box down to 900 MiB free: Warning.
+            ((16_384, 15_484, 900), ResourcePressure::Warning),
+            // 16 GiB box down to 650 MiB free: Critical.
+            ((16_384, 15_734, 650), ResourcePressure::Critical),
+            // 64 GiB box down to 576 MiB free: Emergency.
+            ((65_536, 64_960, 576), ResourcePressure::Emergency),
         ];
 
         for ((total, used, avail), expected) in cases {
@@ -1682,25 +1686,37 @@ mod tests {
         }
     }
 
+    /// A tier held on the system axis must not de-escalate until available
+    /// RAM climbs back above the tier's exit line (floor plus anti-flap
+    /// margin) — and the exit hold timer must start once it has.
     #[test]
-    fn headroom_guards_drop_large_box_system_pct_from_hysteresis_basis() {
+    fn system_exit_margin_gates_deescalation() {
         let m = monitor_with_budget(8192);
 
-        // 64 GiB box recovered above the Emergency headroom: percent alone
-        // must not keep it held in Emergency.
-        m.set_system_memory_for_testing(65_536, 58_983, 6_553);
-        assert_eq!(m.pressure_pct_basis(0, ResourcePressure::Emergency), 0);
+        // Enter Critical: 650 MiB free is at/below the 700 MiB floor.
+        m.set_system_memory_for_testing(16_384, 15_734, 650);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
 
-        // 64 GiB box recovered above the Critical headroom: percent alone
-        // must not keep it held in Critical either.
-        m.set_system_memory_for_testing(65_536, 57_000, 8_536);
-        assert_eq!(m.pressure_pct_basis(0, ResourcePressure::Critical), 0);
+        // Recovered to 800 MiB: past the Critical floor but still inside the
+        // exit margin (950 MiB) — the tier must hold and no exit timer runs.
+        m.set_system_memory_for_testing(16_384, 15_584, 800);
+        m.recompute_pressure_hysteresis(0);
+        assert_eq!(m.guidance_pressure(), ResourcePressure::Critical);
+        assert_eq!(m.hysteresis_exit_eligible_ms.load(Ordering::Relaxed), 0);
 
-        // Smaller boxes below the same headroom guards still use the system
-        // percentage to hold the tier until the exit band clears.
-        m.set_system_memory_for_testing(16_384, 14_256, 2_128);
-        assert_eq!(m.pressure_pct_basis(0, ResourcePressure::Emergency), 87);
-        assert_eq!(m.pressure_pct_basis(0, ResourcePressure::Critical), 87);
+        // Recovered past the exit line: the de-escalation hold timer starts
+        // (the tier is no longer margin-blocked; the hold still applies).
+        // The sleep guarantees a non-zero elapsed-ms reading, since the
+        // timer uses 0 as its "not started" sentinel.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        m.set_system_memory_for_testing(16_384, 15_184, 1_200);
+        m.recompute_pressure_hysteresis(0);
+        assert_ne!(
+            m.hysteresis_exit_eligible_ms.load(Ordering::Relaxed),
+            0,
+            "past the exit line the de-escalation hold timer must start"
+        );
     }
 
     /// r08: an unsampled system (all-zero facts, e.g. before the first

@@ -1161,7 +1161,7 @@ impl BackgroundEnricher {
                                 C::DedicatedGpu =>
                                     "dedicated GPU — host-RAM tiers ignored, parks only below the 512 MiB host floor",
                                 C::UnifiedGpu =>
-                                    "unified-memory GPU — parks only below the 2 GiB host floor, batch shrinks under pressure",
+                                    "unified-memory GPU — parks only below the 700 MiB host floor, batch shrinks under pressure",
                                 C::HostRam => "host-RAM tiers apply (CPU)",
                             }
                         );
@@ -1177,9 +1177,9 @@ impl BackgroundEnricher {
                         // quarter batch) at Critical precisely so background
                         // embedding keeps making slow forward progress. The
                         // result was total starvation: on any developer
-                        // machine sitting above SYSTEM_CRITICAL_PCT (82% of
-                        // system memory — routine with an IDE and a browser
-                        // open) the queue reported a granted slot yet never
+                        // machine sitting at Critical (<=700 MiB available —
+                        // routine with an IDE and a browser open on a smaller
+                        // box) the queue reported a granted slot yet never
                         // dispatched a single batch, indefinitely.
                         //
                         // Critical now proceeds under the already-reduced
@@ -1192,7 +1192,7 @@ impl BackgroundEnricher {
                         // tiers only idles it — it parks below a 512 MiB
                         // floor. A unified-memory GPU (Apple Metal,
                         // integrated) does draw on system RAM, so it parks
-                        // below the 2 GiB reserve and shrinks its batch.
+                        // below the 700 MiB reserve and shrinks its batch.
                         if monitor.embedding_parked(mem_class) {
                             std::thread::sleep(jittered(Duration::from_millis(200)));
                             continue;
