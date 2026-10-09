@@ -124,13 +124,18 @@ async fn call_tool_text(
     }
 }
 
-/// Poll `search` until `token` appears in results (up to `max_attempts × 500 ms`).
+/// Poll raw retrieval (`context` with mode="SEARCH") until `token` appears
+/// in results (up to `max_attempts × 500 ms`).
 /// Returns the `repository_id` of the first hit, or panics on timeout.
 async fn wait_for_token(srv: &mut ServerHandle, token: &str, max_attempts: u32) -> String {
     for attempt in 0..max_attempts {
-        let text = call_tool_text(srv, "search", serde_json::json!({ "query": token }))
-            .await
-            .unwrap_or_default();
+        let text = call_tool_text(
+            srv,
+            "context",
+            serde_json::json!({ "query": token, "mode": "SEARCH" }),
+        )
+        .await
+        .unwrap_or_default();
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if let Some(results) = v["results"].as_array()
             && let Some(first) = results.first()
@@ -393,10 +398,13 @@ async fn test_restart_unavailable_repo_shows_degraded() {
         );
 
         // A and C are still usable — search for token_a must still work.
-        let a_results_text =
-            call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_a }))
-                .await
-                .expect("search token_a run2");
+        let a_results_text = call_tool_text(
+            &mut srv,
+            "context",
+            serde_json::json!({ "query": token_a, "mode": "SEARCH" }),
+        )
+        .await
+        .expect("search token_a run2");
         let av: Value = serde_json::from_str(&a_results_text).expect("search JSON run2");
         let a_hits = av["results"].as_array().map(Vec::len).unwrap_or(0);
         assert_eq!(
@@ -583,9 +591,13 @@ async fn test_stale_db_repos_do_not_leak() {
         wait_for_token(&mut srv, token_c, 40).await;
 
         // B's token must NOT appear in search results.
-        let b_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_b }))
-            .await
-            .expect("search token_b run2");
+        let b_text = call_tool_text(
+            &mut srv,
+            "context",
+            serde_json::json!({ "query": token_b, "mode": "SEARCH" }),
+        )
+        .await
+        .expect("search token_b run2");
         let bv: Value = serde_json::from_str(&b_text).expect("search JSON");
         let b_hits = bv["results"].as_array().map(Vec::len).unwrap_or(0);
         assert_eq!(
@@ -687,9 +699,13 @@ async fn test_restart_b_disappears() {
         );
 
         // B's token must no longer be searchable.
-        let b_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_b }))
-            .await
-            .expect("search token_b after remove");
+        let b_text = call_tool_text(
+            &mut srv,
+            "context",
+            serde_json::json!({ "query": token_b, "mode": "SEARCH" }),
+        )
+        .await
+        .expect("search token_b after remove");
         let bv: Value = serde_json::from_str(&b_text).expect("search JSON");
         let b_hits = bv["results"].as_array().map(Vec::len).unwrap_or(0);
         assert_eq!(
@@ -698,9 +714,13 @@ async fn test_restart_b_disappears() {
         );
 
         // A and C still usable.
-        let a_text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token_a }))
-            .await
-            .expect("search token_a after remove");
+        let a_text = call_tool_text(
+            &mut srv,
+            "context",
+            serde_json::json!({ "query": token_a, "mode": "SEARCH" }),
+        )
+        .await
+        .expect("search token_a after remove");
         let av: Value = serde_json::from_str(&a_text).expect("search JSON A");
         assert!(
             av["results"].as_array().map(|v| v.len()).unwrap_or(0) > 0,
@@ -715,9 +735,13 @@ async fn test_restart_b_disappears() {
         let mut srv2 = connect_home(&bin, &home).await;
         wait_for_token(&mut srv2, token_a, 40).await;
 
-        let b_text2 = call_tool_text(&mut srv2, "search", serde_json::json!({ "query": token_b }))
-            .await
-            .expect("search token_b after restart");
+        let b_text2 = call_tool_text(
+            &mut srv2,
+            "context",
+            serde_json::json!({ "query": token_b, "mode": "SEARCH" }),
+        )
+        .await
+        .expect("search token_b after restart");
         let bv2: Value = serde_json::from_str(&b_text2).expect("search JSON run2");
         let b_hits2 = bv2["results"].as_array().map(Vec::len).unwrap_or(0);
         assert_eq!(

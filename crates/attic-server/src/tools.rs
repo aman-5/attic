@@ -34,25 +34,6 @@ pub(crate) fn make_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
-            "search",
-            "Hybrid search across indexed repositories: full-text (FTS5 query syntax) fused \
-             with semantic nearest-neighbour candidates via reciprocal-rank fusion. Degrades \
-             to lexical-only while semantic embeddings are unavailable or disabled. Each \
-             result has a source_type (knowledge/documentation/code/config/test); \
-             scope=\"knowledge\" returns only project knowledge.",
-            json_schema(json!({
-                "type": "object",
-                "properties": {
-                    "query":         {"type":"string","description":"FTS5 query (max 512 chars)"},
-                    "repository_id": {"type":"string","description":"Limit results to this repository UUID"},
-                    "file_type":     {"type":"string","description":"Filter by file extension (max 32)"},
-                    "language":      {"type":"string","description":"Filter by detected language (max 64)"},
-                    "scope":         {"type":"string","enum":["all","knowledge"],"description":"\"knowledge\" = only project knowledge (central knowledge folder first, then repository knowledge/ folders). Default \"all\""}
-                },
-                "required": ["query"]
-            })),
-        ),
-        Tool::new(
             "repo_map",
             "Return statistics and structure map for an indexed repository.",
             json_schema(json!({
@@ -94,20 +75,35 @@ pub(crate) fn make_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "context",
-            "Evidence-driven context assembly for a natural-language engineering question. \
-             Classifies the query, applies the Query Evidence Contract for its intent \
-             (definition/navigation/configuration/architecture/debugging/impact/dependency/\
-             test/knowledge), retrieves candidates from lexical+symbol+structural+relationship+\
-             knowledge indexes, validates freshness/provenance/confidence, expands bounded \
-             (graph walk or secure source verification) when requirements are unmet, and \
-             returns a secret-free, provenance-stamped context with verified claims — or an \
-             explicit INSUFFICIENT_EVIDENCE verdict. Modes: FAST (index-only), NORMAL, DEEP.",
+            "One door for retrieval and answers. Default (NORMAL): evidence-driven context \
+             assembly for a natural-language engineering question — classifies the query, \
+             applies the Query Evidence Contract for its intent (definition/navigation/\
+             configuration/architecture/debugging/impact/dependency/test/knowledge), \
+             retrieves candidates from lexical+symbol+structural+relationship+knowledge \
+             indexes, validates freshness/provenance/confidence, expands bounded (graph \
+             walk or secure source verification) when requirements are unmet, and returns \
+             a secret-free, provenance-stamped context with verified claims — or an \
+             explicit INSUFFICIENT_EVIDENCE verdict. Modes: FAST (index-only, cheapest), \
+             NORMAL (default), DEEP (up to 30 s of work; some MCP clients time out long \
+             requests — prefer NORMAL and escalate to DEEP on INSUFFICIENT_EVIDENCE). \
+             A hard-cancelled query still returns whatever evidence completed validation, \
+             with result POLICY_HARD_CANCELLED and confidence NONE. \
+             mode=\"SEARCH\": raw hybrid retrieval (FTS5 fused with semantic kNN via RRF) \
+             WITHOUT evidence assembly — for exact-string/identifier lookup, not \
+             questions. Each SEARCH result carries a source_type, a bounded ~240-char \
+             snippet, and start/end line anchors when recorded — use the `file` tool for \
+             full content. SEARCH accepts file_type, language, max_results (default 25, \
+             cap 200), and scope (\"all\"|\"knowledge\").",
             json_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query":         {"type":"string","description":"Natural-language question (max 512 chars)"},
-                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP"],"description":"Answer-mode policy (default NORMAL)"},
-                    "repository_id": {"type":"string","description":"Optional repository UUID scope"}
+                    "query":         {"type":"string","description":"Natural-language question (max 512 chars); an FTS5 query string when mode=\"SEARCH\""},
+                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP","SEARCH"],"description":"Answer-mode policy (default NORMAL); SEARCH = raw hybrid retrieval without evidence assembly"},
+                    "repository_id": {"type":"string","description":"Optional repository UUID scope"},
+                    "file_type":     {"type":"string","description":"SEARCH mode: filter by file extension (max 32)"},
+                    "language":      {"type":"string","description":"SEARCH mode: filter by detected language (max 64)"},
+                    "max_results":   {"type":"integer","minimum":1,"maximum":200,"description":"SEARCH mode: max results (default 25, hard cap 200)"},
+                    "scope":         {"type":"string","enum":["all","knowledge"],"description":"SEARCH mode: \"knowledge\" = only project knowledge (central knowledge folder first, then repository knowledge/ folders). Default \"all\""}
                 },
                 "required": ["query"]
             })),

@@ -183,12 +183,18 @@ async fn rmcp_client_full_lifecycle_over_stdio() {
         .expect("tools/list timed out")
         .expect("list_all_tools failed");
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
-    for expected in ["file", "search", "repo_map", "status"] {
+    for expected in ["file", "repo_map", "status", "context"] {
         assert!(
             names.iter().any(|n| n == expected),
             "missing tool `{expected}` in {names:?}"
         );
     }
+    // One-door merge: standalone `search` is gone; raw hybrid retrieval is
+    // `context` with mode="SEARCH".
+    assert!(
+        !names.iter().any(|n| n == "search"),
+        "search tool must not be listed after the one-door merge: {names:?}"
+    );
 
     // 3. tools/call status returns valid JSON with status=ok.
     let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
@@ -239,8 +245,8 @@ async fn rmcp_client_workspace_index_search_and_file_e2e() {
     for _ in 0..30 {
         search_payload = call_tool_text(
             &mut srv,
-            "search",
-            serde_json::json!({ "query": "rmcp_e2e_unique_token" }),
+            "context",
+            serde_json::json!({ "query": "rmcp_e2e_unique_token", "mode": "SEARCH" }),
         )
         .await
         .expect("search tool");
@@ -389,8 +395,8 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
 
     let search_err = call_tool_text(
         &mut srv,
-        "search",
-        serde_json::json!({ "query": "anything" }),
+        "context",
+        serde_json::json!({ "query": "anything", "mode": "SEARCH" }),
     )
     .await
     .unwrap_or_else(|e| e);
@@ -434,9 +440,13 @@ async fn rmcp_first_run_unconfigured_then_workspace_tool_configure_and_restart()
     for token in &tokens {
         let mut found = false;
         for _ in 0..30 {
-            let text = call_tool_text(&mut srv, "search", serde_json::json!({ "query": token }))
-                .await
-                .unwrap_or_else(|e| e);
+            let text = call_tool_text(
+                &mut srv,
+                "context",
+                serde_json::json!({ "query": token, "mode": "SEARCH" }),
+            )
+            .await
+            .unwrap_or_else(|e| e);
             let v: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(_) => panic!("search returned non-JSON: {text}"),

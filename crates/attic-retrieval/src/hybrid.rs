@@ -25,6 +25,22 @@ use crate::semantic::{SemanticStack, truncate_to_byte_limit};
 /// Standard RRF constant (Cormack et al.) — tunable later.
 pub const K_RRF: f64 = 60.0;
 
+/// Hard bound on snippet length in characters. Retrieval units can be
+/// megabyte-scale (e.g. minified JSON exports); returning full bodies per
+/// hit made responses unusable. 240 chars is enough to identify the hit;
+/// the `file` tool is the escape hatch for full content.
+pub const MAX_SNIPPET_CHARS: usize = 240;
+
+/// Head-truncate `text` to at most `MAX_SNIPPET_CHARS` characters on a
+/// char boundary, appending `…` when truncated.
+pub fn bound_snippet(text: &str) -> String {
+    if text.chars().count() <= MAX_SNIPPET_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX_SNIPPET_CHARS).collect();
+    format!("{truncated}…")
+}
+
 /// Default per-ranker candidate depth before fusion (provisional tuning).
 const DEFAULT_CANDIDATE_DEPTH: usize = 100;
 /// One search query's semantic budget. If the worker is still occupied past
@@ -137,8 +153,14 @@ pub struct HybridSearchResult {
     pub file_type: Option<String>,
     /// Language, when known from the FTS side.
     pub language: Option<String>,
-    /// Bounded snippet, when available from the FTS side.
+    /// Bounded snippet (see [`bound_snippet`]). Present for every result
+    /// whose unit text is available — lexical hits directly, semantic-only
+    /// hits via post-fusion enrichment.
     pub snippet: Option<String>,
+    /// Start line (0-based) of the retrieval unit span, when recorded.
+    pub start_line: Option<u32>,
+    /// End line (0-based, inclusive) of the retrieval unit span, when recorded.
+    pub end_line: Option<u32>,
     /// Which ranker(s) surfaced this unit.
     pub match_type: MatchType,
     /// Fused RRF score (higher = better).
@@ -164,6 +186,10 @@ struct SemanticHit {
     similarity: f32,
     repository_id: String,
     path: String,
+    /// Line window from the unit anchor (structural-node span), when known.
+    start_line: Option<u32>,
+    /// Line window end (0-based, inclusive), when known.
+    end_line: Option<u32>,
     /// 1-based rank in the original kNN order, BEFORE anchor-resolution
     /// filtering drops any hits. RRF must score by this, not by position in
     /// the (possibly shorter) filtered `Vec` — otherwise a hit whose
@@ -218,11 +244,48 @@ impl<'a> HybridSearcher<'a> {
             (fts, semantic)
         });
         let fts = fts?;
-        let results = rrf_fuse(fts, semantic_hits, opts.result_limit);
+        let mut results = rrf_fuse(fts, semantic_hits, opts.result_limit);
+        self.enrich_semantic_only(&mut results);
         Ok(HybridSearchResponse {
             results,
             semantic_degraded,
         })
+    }
+
+    /// Fill `snippet`/`language`/`file_type` for semantic-only finalists in
+    /// one batched read (they arrive from the kNN side with neither text nor
+    /// classification). Best-effort: on failure the results are returned
+    /// as-is — enrichment must never turn a healthy search into a failed one.
+    fn enrich_semantic_only(&self, results: &mut [HybridSearchResult]) {
+        let ids: Vec<String> = results
+            .iter()
+            .filter(|r| r.match_type == MatchType::Semantic && r.snippet.is_none())
+            .map(|r| r.retrieval_unit_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let enriched = self
+            .pool
+            .with_reader(|conn| attic_storage::retrieval_unit_texts(conn, &ids));
+        let Ok(map) = enriched else {
+            tracing::warn!("hybrid search: semantic-only enrichment failed; returning as-is");
+            return;
+        };
+        for r in results.iter_mut() {
+            if r.match_type == MatchType::Semantic
+                && r.snippet.is_none()
+                && let Some(e) = map.get(&r.retrieval_unit_id)
+            {
+                r.snippet = Some(bound_snippet(&e.retrieval_text));
+                if r.language.is_none() {
+                    r.language = e.language.clone();
+                }
+                if r.file_type.is_none() {
+                    r.file_type = e.file_type.clone();
+                }
+            }
+        }
     }
 
     /// Never returns `Err` — any failure at any step (availability,
@@ -344,6 +407,8 @@ impl<'a> HybridSearcher<'a> {
                         similarity: h.similarity,
                         repository_id: anchor.repository_id.clone(),
                         path: anchor.path.clone(),
+                        start_line: anchor.start_line,
+                        end_line: anchor.end_line,
                         rank: i + 1,
                     });
                 }
@@ -372,6 +437,8 @@ struct FusionEntry {
     file_type: Option<String>,
     language: Option<String>,
     snippet: Option<String>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
     lexical_score: Option<f64>,
     semantic_similarity: Option<f32>,
 }
@@ -397,6 +464,12 @@ fn rrf_fuse(
                 e.score += contribution;
                 e.match_type = MatchType::Both;
                 e.lexical_score = Some(r.score);
+                if e.start_line.is_none() {
+                    e.start_line = r.start_line;
+                }
+                if e.end_line.is_none() {
+                    e.end_line = r.end_line;
+                }
             })
             .or_insert(FusionEntry {
                 score: contribution,
@@ -405,7 +478,9 @@ fn rrf_fuse(
                 path: r.path.clone(),
                 file_type: Some(r.file_type.clone()),
                 language: r.language.clone(),
-                snippet: Some(r.body.clone()),
+                snippet: Some(bound_snippet(&r.body)),
+                start_line: r.start_line,
+                end_line: r.end_line,
                 lexical_score: Some(r.score),
                 semantic_similarity: None,
             });
@@ -420,6 +495,12 @@ fn rrf_fuse(
                 e.score += contribution;
                 e.match_type = MatchType::Both;
                 e.semantic_similarity = Some(h.similarity);
+                if e.start_line.is_none() {
+                    e.start_line = h.start_line;
+                }
+                if e.end_line.is_none() {
+                    e.end_line = h.end_line;
+                }
             })
             .or_insert(FusionEntry {
                 score: contribution,
@@ -429,6 +510,8 @@ fn rrf_fuse(
                 file_type: None,
                 language: None,
                 snippet: None,
+                start_line: h.start_line,
+                end_line: h.end_line,
                 lexical_score: None,
                 semantic_similarity: Some(h.similarity),
             });
@@ -450,6 +533,8 @@ fn rrf_fuse(
             file_type: e.file_type,
             language: e.language,
             snippet: e.snippet,
+            start_line: e.start_line,
+            end_line: e.end_line,
             match_type: e.match_type,
             rrf_score: e.score,
             lexical_score: e.lexical_score,
@@ -489,8 +574,64 @@ mod tests {
             similarity,
             repository_id: "repo".into(),
             path: format!("{id}.rs"),
+            start_line: None,
+            end_line: None,
             rank: 1,
         }
+    }
+
+    #[test]
+    fn bound_snippet_truncates_long_bodies_on_char_boundary() {
+        let long: String = "a".repeat(MAX_SNIPPET_CHARS * 4);
+        let bounded = bound_snippet(&long);
+        assert!(bounded.chars().count() == MAX_SNIPPET_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+
+        // Multi-byte chars must never be split mid-scalar.
+        let wide: String = "界".repeat(MAX_SNIPPET_CHARS * 2);
+        let bounded_wide = bound_snippet(&wide);
+        assert_eq!(bounded_wide.chars().count(), MAX_SNIPPET_CHARS + 1);
+
+        // Short text passes through unchanged.
+        assert_eq!(bound_snippet("short"), "short");
+    }
+
+    #[test]
+    fn lexical_hits_carry_bounded_snippet_and_line_span() {
+        let mut hit = fts_hit("a", 10.0);
+        hit.body = "x".repeat(MAX_SNIPPET_CHARS * 3);
+        hit.start_line = Some(7);
+        hit.end_line = Some(9);
+        let out = rrf_fuse(vec![hit], vec![], 10);
+        assert_eq!(out[0].start_line, Some(7));
+        assert_eq!(out[0].end_line, Some(9));
+        let snippet = out[0].snippet.as_deref().unwrap();
+        assert_eq!(snippet.chars().count(), MAX_SNIPPET_CHARS + 1);
+        assert!(snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn both_merge_keeps_lines_from_whichever_side_has_them() {
+        let mut hit = fts_hit("a", 10.0);
+        hit.start_line = Some(3);
+        hit.end_line = Some(5);
+        let mut sem = sem_hit("a", 0.9);
+        sem.start_line = Some(11);
+        sem.end_line = Some(12);
+        let out = rrf_fuse(vec![hit], vec![sem], 10);
+        assert_eq!(out[0].match_type, MatchType::Both);
+        assert_eq!(out[0].start_line, Some(3));
+        assert_eq!(out[0].end_line, Some(5));
+    }
+
+    #[test]
+    fn semantic_lines_survive_when_lexical_side_lacks_them() {
+        let mut sem = sem_hit("a", 0.9);
+        sem.start_line = Some(11);
+        sem.end_line = Some(12);
+        let out = rrf_fuse(vec![fts_hit("a", 10.0)], vec![sem], 10);
+        assert_eq!(out[0].start_line, Some(11));
+        assert_eq!(out[0].end_line, Some(12));
     }
 
     #[test]

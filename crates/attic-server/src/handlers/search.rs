@@ -1,5 +1,9 @@
 use crate::*;
 
+/// Default result count when the caller does not pass `max_results`.
+/// Sized for agent consumption: enough to rank, small enough to stay dense.
+const DEFAULT_SEARCH_RESULTS: usize = 25;
+
 /// `search` is a thin caller over `HybridSearcher`, which fuses lexical
 /// (FTS) and semantic (kNN) candidates via RRF. When `semantic` is `None`
 /// (semantic disabled), every result is lexical-only, ranked exactly as
@@ -46,16 +50,34 @@ pub(crate) fn handle_search(
         validate_filter("language", lg, 64)?;
     }
 
+    // Default is deliberately small: every result carries a bounded snippet,
+    // so 200-row responses were multi-tens-of-KB blobs. Callers needing the
+    // full page pass `max_results` explicitly (hard cap MAX_SEARCH_RESULTS).
+    let max_results = match args.get("max_results") {
+        None => DEFAULT_SEARCH_RESULTS,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                ServerError::InvalidArg("max_results must be a positive integer".into())
+            })? as usize;
+            if n == 0 || n > MAX_SEARCH_RESULTS {
+                return Err(ServerError::InvalidArg(format!(
+                    "max_results must be 1..={MAX_SEARCH_RESULTS}, got {n}"
+                )));
+            }
+            n
+        }
+    };
+
     // [FIX] Candidate depth must be wider than `result_limit`, not equal to
     // it — RRF fusion quality depends on fusing over a wider pool than what
-    // gets returned (see `HybridSearchOptions`'s own doc comment). The
-    // previous code set all three fields to `MAX_SEARCH_RESULTS`, silently
-    // defeating that invariant on the only production call site. `2x` is a
+    // gets returned (see `HybridSearchOptions`'s own doc comment). `2x` is a
     // provisional multiplier, same caveat as the underlying candidate-depth
-    // constants — not benchmark-derived.
-    let mut opts = attic_retrieval::HybridSearchOptions::with_result_limit(MAX_SEARCH_RESULTS);
-    opts.fts_candidate_depth = MAX_SEARCH_RESULTS * 2;
-    opts.semantic_candidate_depth = MAX_SEARCH_RESULTS * 2;
+    // constants — not benchmark-derived. The 100 floor matches
+    // `DEFAULT_CANDIDATE_DEPTH` so small limits still fetch wide.
+    let candidate_depth = (max_results * 2).max(100);
+    let mut opts = attic_retrieval::HybridSearchOptions::with_result_limit(max_results);
+    opts.fts_candidate_depth = candidate_depth;
+    opts.semantic_candidate_depth = candidate_depth;
     opts.repository_id = repo_id.map(str::to_owned);
     opts.file_type = file_type.map(str::to_owned);
     opts.language = language.map(str::to_owned);
@@ -89,7 +111,7 @@ pub(crate) fn handle_search(
             }));
         }
         results.extend(response.results.iter().filter(|r| label(r) == "knowledge"));
-        results.truncate(MAX_SEARCH_RESULTS);
+        results.truncate(max_results);
     } else {
         results.extend(response.results.iter());
     }

@@ -346,11 +346,10 @@ flowchart TD
 
 | Tool | What it does |
 |---|---|
-| `search` | Hybrid search: full-text (FTS5 syntax) fused with semantic nearest neighbours. Each result has a `source_type`; `scope: "knowledge"` returns project knowledge only |
-| `context` | Evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder |
+| `context` | One door for answers and retrieval. Default: evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder. With `mode: "SEARCH"`: raw hybrid retrieval (FTS5 fused with semantic nearest neighbours) without evidence assembly — each result has a `source_type`, a bounded ~240-char snippet, and line anchors when recorded; accepts `file_type`, `language`, `max_results` (default 25, cap 200), and `scope: "knowledge"` for project knowledge only |
 | `file` | A bounded, secret-scanned region of a live file (line or byte range) |
 | `repo_map` | Structure and statistics of one repository |
-| `status` | Readiness, indexing/watcher state, semantic progress, resource pressure |
+| `status` | Readiness, indexing/watcher state, semantic progress, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result and semantic fallback reasons) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
 | `logging` | Turn the file log on/off or change its level (`error`…`trace`) instantly, no restart. To keep a level across restarts set `[logging] file_level` in `attic.toml` |
 | `debug_drain_task` | Admin: run one pending incremental task synchronously |

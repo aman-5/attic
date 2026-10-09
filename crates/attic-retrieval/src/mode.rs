@@ -125,7 +125,13 @@ impl AnswerModePolicy {
                 max_context_tokens: 16_384,
                 semantic_allowed: true, // Phase 5: selective use (§14)
                 max_semantic_candidates: 48,
-                semantic_time_budget_ms: 250,
+                // Live measurement (Dump corpus, loaded GPU worker, host under
+                // memory-pressure warning): the semantic step consistently
+                // exhausted 250 ms before embedding the query, while the
+                // hybrid `search` tool succeeded with its 1500 ms deadline on
+                // the same host. 625 ms ≈ 2.5× — enough for a busy-worker
+                // wait without making slow queries the norm.
+                semantic_time_budget_ms: 625,
                 reranking_allowed: true,
                 source_verification_level: VerificationLevel::Checksum,
                 repair_attempts: 1,

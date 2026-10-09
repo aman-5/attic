@@ -2552,7 +2552,16 @@ fn mcp_tools_list() {
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"file"), "missing file tool: {names:?}");
-    assert!(names.contains(&"search"), "missing search tool: {names:?}");
+    // One-door merge: standalone `search` is gone; raw hybrid retrieval is
+    // `context` with mode="SEARCH".
+    assert!(
+        !names.contains(&"search"),
+        "search tool must not be listed after the one-door merge: {names:?}"
+    );
+    assert!(
+        names.contains(&"context"),
+        "missing context tool: {names:?}"
+    );
     assert!(
         names.contains(&"repo_map"),
         "missing repo_map tool: {names:?}"
@@ -2643,7 +2652,12 @@ fn mcp_call_tool_search_missing_query() {
     let bin = require_binary();
     let tmp = TempDir::new().unwrap();
     let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
-    let call = mcp_request(2, "tools/call", json!({"name":"search","arguments":{}}));
+    // Raw retrieval now lives behind context's SEARCH mode (one-door merge).
+    let call = mcp_request(
+        2,
+        "tools/call",
+        json!({"name":"context","arguments":{"mode":"SEARCH"}}),
+    );
     let resp = send_recv(&mut child, &mut stdin, &call);
     assert_eq!(resp["jsonrpc"], "2.0");
     let content = &resp["result"]["content"];
@@ -2706,9 +2720,13 @@ fn mcp_context_tool_lists_and_rejects_missing_query() {
         })
         .unwrap_or_default();
     assert!(names.iter().any(|n| n == "context"), "tools={names:?}");
-    for legacy in ["file", "search", "repo_map", "status"] {
+    for legacy in ["file", "repo_map", "status"] {
         assert!(names.iter().any(|n| n == legacy), "{legacy} must remain");
     }
+    assert!(
+        !names.iter().any(|n| n == "search"),
+        "search must not survive the one-door merge"
+    );
 
     // Missing query is a clean argument error (never a panic/SQL leak).
     let call = mcp_request(3, "tools/call", json!({"name":"context","arguments":{}}));
@@ -2878,13 +2896,13 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
             text
         );
 
-        // Gate 6: local retrieval (search) still works while degraded.
+        // Gate 6: local retrieval (context SEARCH mode) still works while degraded.
         let search = mcp_request(
             3,
             "tools/call",
             json!({
-                "name": "search",
-                "arguments": {"query": "provider"}
+                "name": "context",
+                "arguments": {"query": "provider", "mode": "SEARCH"}
             }),
         );
         let sresp = send_recv(&mut child, &mut stdin, &search);
@@ -3399,7 +3417,7 @@ fn mcp_multi_root_workspace_via_config_no_common_parent() {
         let call = mcp_request(
             id,
             "tools/call",
-            json!({"name":"search","arguments":{"query": query}}),
+            json!({"name":"context","arguments":{"query": query, "mode": "SEARCH"}}),
         );
         let resp = send_recv(child, stdin, &call);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
@@ -3433,7 +3451,7 @@ fn mcp_multi_root_workspace_via_config_no_common_parent() {
     let scoped_call = mcp_request(
         6,
         "tools/call",
-        json!({"name":"search","arguments":{"query":"GAMMA_MARKER_TOKEN","repository_id": repo_a_id}}),
+        json!({"name":"context","arguments":{"query":"GAMMA_MARKER_TOKEN","repository_id": repo_a_id, "mode":"SEARCH"}}),
     );
     let scoped_resp = send_recv(&mut child, &mut stdin, &scoped_call);
     let scoped_text = scoped_resp["result"]["content"][0]["text"]

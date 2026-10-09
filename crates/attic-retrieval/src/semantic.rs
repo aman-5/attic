@@ -87,6 +87,10 @@ pub enum SemanticFallback {
     QueryTimedOut,
     /// Time/candidate budget exhausted before any result.
     TimeBudget,
+    /// Earlier candidate generators exhausted the shared per-query candidate
+    /// budget before the semantic step ran. Distinct from [`TimeBudget`]:
+    /// this is a scheduling/ordering condition, not slow retrieval.
+    CandidateBudgetExhausted,
     /// Contributed candidates (no fallback).
     Contributed,
     /// The disposable store itself failed (poisoned/IO) — canonical path
@@ -102,6 +106,7 @@ impl SemanticFallback {
             Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::QueryTimedOut => "SEMANTIC_QUERY_TIMED_OUT",
             Self::TimeBudget => "SEMANTIC_TIME_BUDGET",
+            Self::CandidateBudgetExhausted => "SEMANTIC_CANDIDATE_BUDGET_EXHAUSTED",
             Self::StoreUnavailable => "SEMANTIC_STORE_UNAVAILABLE",
             Self::Contributed => "",
         }
@@ -125,6 +130,9 @@ pub fn semantic_fallback_reason_text(reason: &str) -> Option<&'static str> {
         ),
         "SEMANTIC_TIME_BUDGET" => Some(
             "the semantic step ran out of its query budget, so canonical retrieval served the result",
+        ),
+        "SEMANTIC_CANDIDATE_BUDGET_EXHAUSTED" => Some(
+            "earlier retrieval steps used up this query's candidate budget before the semantic step ran, so canonical retrieval served the result",
         ),
         "SEMANTIC_STORE_UNAVAILABLE" => {
             Some("the semantic store is unavailable, so canonical retrieval served the result")
@@ -212,12 +220,25 @@ impl SemanticCandidateGenerator {
         let q = truncate_to_byte_limit(query_text, stack.provider.max_input_bytes());
         // ── Query embedding under the mode's time budget (§14/§20) ─────────
         let deadline = t0 + std::time::Duration::from_millis(policy.semantic_time_budget_ms);
-        if std::time::Instant::now() >= deadline || !env.budget.candidates_available() {
+        if std::time::Instant::now() >= deadline {
             return Ok((
                 Vec::new(),
                 SemanticOutcome {
                     candidates: 0,
                     fallback: SemanticFallback::TimeBudget,
+                },
+            ));
+        }
+        // Candidate starvation is a different failure than slowness — report
+        // it honestly so operators can tell "GPU busy" from "earlier
+        // generators ate the whole budget" (observed live: both surfaced as
+        // SEMANTIC_TIME_BUDGET, hiding the real cause).
+        if !env.budget.candidates_available() {
+            return Ok((
+                Vec::new(),
+                SemanticOutcome {
+                    candidates: 0,
+                    fallback: SemanticFallback::CandidateBudgetExhausted,
                 },
             ));
         }
