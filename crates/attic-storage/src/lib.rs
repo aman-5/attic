@@ -44,9 +44,9 @@ pub use crossrepo_ops::{
 };
 pub use error::StorageError;
 pub use fts::{
-    FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit,
+    FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit, UnitTextEnrichment,
     delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup, fts_search,
-    insert_retrieval_unit_with_fts,
+    insert_retrieval_unit_with_fts, retrieval_unit_texts,
 };
 pub use indexing_publication::{
     IndexPublication, IndexPublicationStats, PublicationFile, PublicationNode,
@@ -102,9 +102,10 @@ pub use repository::source_revision::{
 };
 pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occurrence};
 pub use retrieval_reads::{
-    FileHeader, NewRetrievalPlanRecord, NodeRow, RelationshipEdge, SymbolHit, file_header_by_id,
-    get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
-    lookup_symbol_exact, relationships_for_entity, search_symbols, structural_nodes_for_file,
+    FileHeader, NewRetrievalPlanRecord, NodeRow, RelationshipEdge, RetrievalTelemetry, SymbolHit,
+    file_header_by_id, get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
+    lookup_symbol_exact, relationships_for_entity, retrieval_plan_stats, search_symbols,
+    structural_nodes_for_file,
 };
 pub use semantic_reads::{
     SemanticUnitRow, UnitAnchor, retrieval_unit_anchor, retrieval_unit_anchors, semantic_unit_rows,

@@ -512,3 +512,88 @@ pub fn get_retrieval_plan_json(
         Err(e) => Err(e.into()),
     }
 }
+
+/// Aggregated retrieval telemetry over the most recent plans — the
+/// data-driven answer to "which modes run, how do they end, and why does
+/// semantic fall back". Feeds the `status` tool's `retrieval_telemetry`
+/// block so budget/default tuning is based on evidence, not guesses.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RetrievalTelemetry {
+    /// Plans aggregated (most recent first, bounded by `max_rows`).
+    pub plans_scanned: i64,
+    /// Count per (policy_mode, result) pair, e.g. "NORMAL/PARTIAL_SUCCESS".
+    pub by_mode_result: std::collections::BTreeMap<String, i64>,
+    /// Count per non-empty semantic fallback reason
+    /// (e.g. "SEMANTIC_TIME_BUDGET").
+    pub semantic_fallbacks: std::collections::BTreeMap<String, i64>,
+    /// Mean assembled context tokens per policy mode.
+    pub avg_context_tokens_by_mode: std::collections::BTreeMap<String, f64>,
+}
+
+/// Aggregate the newest `max_rows` completed plans. Read-only.
+pub fn retrieval_plan_stats(
+    conn: &Connection,
+    max_rows: i64,
+) -> Result<RetrievalTelemetry, StorageError> {
+    let mut t = RetrievalTelemetry::default();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT policy_mode, result, COUNT(*) FROM (
+                 SELECT policy_mode, result FROM ops_retrieval_log
+                 WHERE completed_at_us IS NOT NULL
+                 ORDER BY created_at_us DESC LIMIT ?1
+             ) GROUP BY policy_mode, result",
+        )?;
+        let rows = stmt.query_map([max_rows], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (mode, result, n) = row?;
+            t.by_mode_result.insert(format!("{mode}/{result}"), n);
+            t.plans_scanned += n;
+        }
+    }
+    {
+        // Semantic fallback reasons live in the authoritative plan JSON;
+        // json_extract keeps the aggregation in one pass.
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(plan_json, '$.policy_trace.semantic_fallback_reason'), COUNT(*)
+             FROM (
+                 SELECT plan_json FROM ops_retrieval_log
+                 WHERE completed_at_us IS NOT NULL
+                 ORDER BY created_at_us DESC LIMIT ?1
+             )
+             WHERE json_extract(plan_json, '$.policy_trace.semantic_fallback_reason') IS NOT NULL
+               AND json_extract(plan_json, '$.policy_trace.semantic_fallback_reason') != ''
+             GROUP BY 1",
+        )?;
+        let rows = stmt.query_map([max_rows], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (reason, n) = row?;
+            t.semantic_fallbacks.insert(reason, n);
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT policy_mode, AVG(context_tokens) FROM (
+                 SELECT policy_mode, context_tokens FROM ops_retrieval_log
+                 WHERE completed_at_us IS NOT NULL
+                 ORDER BY created_at_us DESC LIMIT ?1
+             ) GROUP BY policy_mode",
+        )?;
+        let rows = stmt.query_map([max_rows], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        for row in rows {
+            let (mode, avg) = row?;
+            t.avg_context_tokens_by_mode.insert(mode, avg);
+        }
+    }
+    Ok(t)
+}

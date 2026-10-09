@@ -28,6 +28,9 @@ use attic_storage::{
 use handlers::context::*;
 use handlers::file::*;
 use handlers::repo_map::*;
+// The standalone `search` tool was merged into `context` (mode="SEARCH");
+// the handler remains for that delegation and for tests.
+#[cfg(test)]
 use handlers::search::*;
 use handlers::status::*;
 use rmcp::{
@@ -2756,7 +2759,7 @@ impl ServerHandler for AtticServer {
                 "logging" => Self::handle_logging(&args),
                 "debug_drain_task" => self.handle_debug_drain_task(),
                 "workspace" => self.handle_workspace(&args).await,
-                "file" | "search" | "repo_map" | "context" if !workspace_configured => {
+                "file" | "repo_map" | "context" if !workspace_configured => {
                     // UNCONFIGURED first run (§8/§30): query tools that depend on
                     // indexed workspace state must NOT fabricate results. They return
                     // a clear structured error identifying the missing configuration
@@ -2772,13 +2775,6 @@ impl ServerHandler for AtticServer {
                     .into());
                 }
                 "file" => handle_file(&pool, &args, &active_ids),
-                "search" => handle_search(
-                    &pool,
-                    semantic.as_deref(),
-                    &args,
-                    &active_ids,
-                    self.knowledge_repository_id().as_deref(),
-                ),
                 "repo_map" => {
                     let discovery_counters = lock_or_call_err!(
                         self.last_discovery_counters.read(),

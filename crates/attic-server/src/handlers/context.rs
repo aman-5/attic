@@ -23,6 +23,20 @@ pub(crate) fn handle_context(
         .ok_or_else(|| ServerError::InvalidArg("query required".into()))?;
     validate_filter("query", query, 512)?;
 
+    // One door (tool-surface merge): `mode: "SEARCH"` is raw hybrid
+    // retrieval — the former standalone `search` tool — with its
+    // file_type/language/scope/max_results filters, bypassing the evidence
+    // pipeline. Evidence-assembled answering stays on FAST|NORMAL|DEEP.
+    if matches!(args.get("mode").and_then(Value::as_str), Some("SEARCH")) {
+        return crate::handlers::search::handle_search(
+            pool,
+            semantic.as_deref(),
+            args,
+            active_ids,
+            knowledge_repository_id.as_deref(),
+        );
+    }
+
     // Phase 7 graceful degradation: DEEP expansions are paused under
     // Pause/Emergency resource advisories; the query still runs at NORMAL
     // depth so foreground work is never starved by its own expensive mode.
@@ -32,7 +46,7 @@ pub(crate) fn handle_context(
         Some("DEEP") => attic_retrieval::AnswerMode::Deep,
         Some(other) => {
             return Err(ServerError::InvalidArg(format!(
-                "mode must be FAST|NORMAL|DEEP, got {other}"
+                "mode must be FAST|NORMAL|DEEP|SEARCH, got {other}"
             )));
         }
     };

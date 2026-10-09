@@ -101,9 +101,11 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
         "provider ignored its deadline: {elapsed:?}"
     );
 
-    // Pipeline-level: NORMAL's 250 ms semantic budget bounds the query-time
-    // embedding step; background-enriched coverage must still fall back
-    // promptly when the query itself cannot get an embedding in time.
+    // Pipeline-level: NORMAL's semantic time budget (see
+    // `AnswerModePolicy::for_mode`) bounds the query-time embedding step;
+    // background-enriched coverage must still fall back promptly when the
+    // query itself cannot get an embedding in time. The provider delay below
+    // is chosen to exceed that budget so the deadline path is exercised.
     struct QuerySlowHashing {
         inner: HashingEmbedder,
         delay_ms: u64,
@@ -181,7 +183,7 @@ fn slow_provider_stops_within_query_deadline_and_pipeline_degrades() {
         store: enriched.store.clone(),
         provider: Arc::new(QuerySlowHashing {
             inner: HashingEmbedder::new(),
-            delay_ms: 400,
+            delay_ms: 900,
         }),
     });
     let svc = RetrievalService {

@@ -92,8 +92,9 @@ flowchart TD
   cross-repo-dependent answers while degraded.
 - **MCP surface** (`attic-server`) — rmcp stdio transport (relayed over a
   daemon's local socket/named pipe on later launches); tools: `file`,
-  `search`, `repo_map`, `status`, `context`, `workspace`, `logging`, and the
-  admin tool `debug_drain_task`.
+  `repo_map`, `status`, `context`, `workspace`, `logging`, and the
+  admin tool `debug_drain_task`. Raw hybrid retrieval lives behind
+  `context` with `mode: "SEARCH"` (one door: no separate `search` tool).
 
 ### Indexing pipeline
 
@@ -277,7 +278,8 @@ for adding symbol-level support (definitions and intra-file references, no
 import or relationship resolution) to a further language cheaply. Every other
 text-based language or format — config files, docs,
 build files, etc. — falls back to tier 3, `GenericAnalyzer`, which
-still makes it fully searchable via `search` and readable via `file`, just
+still makes it fully searchable via `context` (`mode: "SEARCH"`) and
+readable via `file`, just
 without symbol-level structure. Rich language support is additive, not a
 gate on usability.
 
@@ -373,7 +375,8 @@ first start, `attic_core::sibling(db, "knowledge")`). `dir` points elsewhere
 (never created); `enabled = false` turns it off. The server indexes and
 watches the folder as a hidden repository
 (`AtticServer::start_central_knowledge`). It is never a workspace member, so
-it never appears in `workspace`, default `search` results or cross-repo sync.
+it never appears in `workspace`, default `context` SEARCH-mode results or
+cross-repo sync.
 
 ```mermaid
 flowchart LR
@@ -395,8 +398,9 @@ flowchart LR
   code evidence served is unchanged.
 - Every file there is `Knowledge` / `ProjectKnowledge`, except the folder's
   root `README.md`, which is never served.
-- `search` adds `source_type` to every result. `scope: "knowledge"` returns
-  central notes first, then repository `knowledge/` hits.
+- `context` with `mode: "SEARCH"` adds `source_type` to every result.
+  `scope: "knowledge"` returns central notes first, then repository
+  `knowledge/` hits.
 - `status.knowledge` reports `state` (`off` / `indexing` / `ready` /
   `failed`), `dir`, `repository_id` and `reason`. A bad path never stops
   startup.
@@ -739,13 +743,17 @@ background capacity is capped strictly below foreground capacity, and under
 memory pressure expensive `DEEP` retrieval mode is automatically downgraded
 to `NORMAL` rather than failing outright.
 
-Whole-machine memory feeds the pressure tiers, but percentage alone never
-escalates a machine that still has plenty of free RAM: **Warning** at ≥75 %
-used; **Critical** at ≥82 % used *and* under 8 GiB available; **Emergency** at
-under 2 GiB available, or at ≥90 % used *and* under 4 GiB available.
-Hysteresis keeps a tier from flapping and ignores the percentage once
-available RAM is back above those headrooms. Foreground MCP calls are never
-refused for memory pressure — every tool (`search`, `file`, `status`,
+Whole-machine memory feeds the pressure tiers, judged purely on **absolute
+available RAM** — the only signal that means the same thing on every machine:
+**Warning** at ≤1 GiB available (1 024 MiB); **Critical** at ≤700 MiB;
+**Emergency** at ≤600 MiB. Usage percentage plays no part: a 32 GB developer
+box at 90 % used still has ~3.2 GiB free and stays Normal. Hysteresis keeps a
+tier from flapping: a held tier de-escalates only once available RAM climbs
+back above its exit line (Warning past 1 200 MiB, Critical past 950 MiB,
+Emergency past 850 MiB) and holds there for the tier's hold period. Attic's
+own share of its configured memory budget is a separate axis (Warning ≥70 %,
+Critical ≥85 % of budget) with percentage-based exits. Foreground MCP calls are never
+refused for memory pressure — every tool (`file`, `status`,
 `context`, `workspace`) is admitted at every tier. Pressure only throttles
 background work and the optional depth of a foreground answer (`DEEP` →
 `NORMAL`); the sole hard refusal is the foreground concurrency-slot limit
@@ -842,8 +850,8 @@ pins the entire application home: config + database + backups + scratch.
 Attic speaks MCP exclusively over stdio: **stdout carries only the MCP
 JSON-RPC protocol; every log line goes to stderr** (`tracing`, controlled by
 `ATTIC_LOG`/`RUST_LOG`). This has been verified by a smoke test that spawns
-the release binary and inspects both streams directly. The eight registered
-tools (`file`, `search`, `repo_map`, `status`, `context`, `workspace`,
+the release binary and inspects both streams directly. The seven registered
+tools (`file`, `repo_map`, `status`, `context`, `workspace`,
 `logging`, `debug_drain_task`) are documented in the README; their exact
 schemas are defined once in
 `crates/attic-server/src/main.rs::make_tools()` and returned verbatim via

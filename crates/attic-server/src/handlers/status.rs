@@ -102,6 +102,14 @@ pub(crate) fn handle_status(
     let stats = pool.with_reader(get_db_stats)?;
     let mut payload = json!({ "status": "ok", "db": stats });
 
+    // Retrieval telemetry: aggregated ops_retrieval_log outcomes over the
+    // newest 1000 completed plans — which modes run, how they end, and why
+    // semantic fell back. Data for budget/default tuning instead of guesses.
+    // Best-effort: telemetry failure never breaks status.
+    if let Ok(t) = pool.with_reader(|c| attic_storage::retrieval_plan_stats(c, 1000)) {
+        payload["retrieval_telemetry"] = json!(t);
+    }
+
     // Same live decision the enricher makes each iteration: how host-RAM
     // pressure gates embedding on the backend that is actually serving.
     let embedding_class = phase8.semantic.map(|s| {

@@ -209,7 +209,7 @@ fn dedicated_gpu_parks_below_its_host_floor() {
 
 #[test]
 fn unified_memory_gpu_runs_above_its_floor_and_parks_below_it() {
-    // Apple Metal: unified memory, runs above the 2 GiB floor.
+    // Apple Metal: unified memory, runs above the 700 MiB floor.
     let rig = Rig::start(
         BackendAs::new(ExecutionBackend::CandleMetal),
         ABOVE_BOTH_FLOORS,

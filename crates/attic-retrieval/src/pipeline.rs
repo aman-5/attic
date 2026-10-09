@@ -366,9 +366,15 @@ impl RetrievalService {
             Option<String>,
             ServedClaims,
             Vec<Evidence>,
-        ) = if validated.is_empty() || hard_cancelled {
+        ) = if validated.is_empty() {
             (None, Vec::new(), Vec::new())
         } else {
+            // Note: hard-cancelled runs still serve whatever completed
+            // validation. The `POLICY_HARD_CANCELLED` result and
+            // confidence NONE remain the loud "incomplete" signal —
+            // discarding validated evidence here turned slow queries into
+            // empty ones (observed live: FAST under host memory pressure
+            // returned zero evidence despite validated hits).
             build_context_and_claims(
                 self,
                 &mut plan,
@@ -439,6 +445,9 @@ impl RetrievalService {
         // Central knowledge first, on its own budget: it searches only the
         // knowledge repository, so neither the shared candidate budget nor
         // stronger code matches elsewhere can leave it empty.
+        // CONTRACT (tests/central_knowledge.rs): central notes must reach
+        // answers for ANY repository scope, even when `repository_id` is
+        // explicitly set — do not gate this on `repo_filter`.
         if let Some(kid) = central_knowledge
             && !ex.terms.is_empty()
         {
@@ -611,7 +620,10 @@ impl RetrievalService {
                     conn,
                     repository_id: repo_filter.clone(),
                     budget: &mut budget,
-                    limit: 48,
+                    // Was hard-coded 48, which silently capped DEEP's
+                    // `max_semantic_candidates = 120` down to NORMAL's
+                    // ceiling — DEEP's broader semantic budget never engaged.
+                    limit: policy.max_semantic_candidates as usize,
                 };
                 match crate::semantic::SemanticCandidateGenerator::run(
                     &mut env,
@@ -994,6 +1006,15 @@ impl RetrievalService {
                     } else {
                         let mut degraded = false;
                         for id in ids {
+                            // The time budget is otherwise only checked at
+                            // expansion-round boundaries; a 200-file DEEP
+                            // verification round could otherwise overshoot
+                            // `max_time_ms` by minutes, pushing the whole
+                            // call past MCP client request timeouts.
+                            if budget.time_exceeded() {
+                                degraded = true;
+                                break;
+                            }
                             let Some(pos) = validated.iter_mut().position(|e| e.id == id) else {
                                 continue;
                             };

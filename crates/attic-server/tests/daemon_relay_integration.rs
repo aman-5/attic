@@ -958,7 +958,10 @@ async fn recovery_is_bounded_when_daemon_cannot_start() {
         .expect("killed daemon did not exit in time");
 
     // Immediately squat on attic.lock from the TEST process itself so no
-    // relay can ever win the re-election.
+    // relay can ever win the re-election. The killed daemon's lock release is
+    // not instantaneous (OS handle teardown under host load), so poll briefly
+    // instead of a single racy attempt — but give up fast enough that the
+    // relay's own re-election cannot win first and void the premise.
     let lock_path = db.with_file_name("attic.lock");
     let squat_lock = std::fs::OpenOptions::new()
         .create(true)
@@ -966,8 +969,16 @@ async fn recovery_is_bounded_when_daemon_cannot_start() {
         .write(true)
         .open(&lock_path)
         .expect("open lock file to squat on it");
-    squat_lock.try_lock().expect(
-        "test process must win the lock immediately after the daemon died \
+    let mut acquired = squat_lock.try_lock();
+    for _ in 0..20 {
+        if acquired.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        acquired = squat_lock.try_lock();
+    }
+    acquired.expect(
+        "test process must win the lock shortly after the daemon died \
          (before the relay's own re-election attempt) for this test's premise to hold",
     );
 

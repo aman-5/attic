@@ -17,6 +17,8 @@
 //!   (a) the FTS5 `'delete'` protocol is used for removal, and
 //!   (b) the INNER JOIN with `core_retrieval_units` acts as a double-check.
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -362,6 +364,58 @@ pub fn fts_search(
         results.push(row?);
     }
     Ok(results)
+}
+
+/// Post-fusion enrichment payload for one retrieval unit: the pre-redacted
+/// text plus the occurrence-level classification the kNN side of hybrid
+/// search does not carry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitTextEnrichment {
+    /// Pre-redacted searchable text (secret-safe by the Phase 1B contract).
+    pub retrieval_text: String,
+    /// Detected language, when known.
+    pub language: Option<String>,
+    /// File type string (e.g. `"rust"`, `"python"`).
+    pub file_type: Option<String>,
+}
+
+/// Fetch enrichment payloads for an explicit set of retrieval unit ids.
+///
+/// Used by hybrid search to fill in semantic-only hits after fusion: those
+/// arrive from the kNN side with no text and no classification. Ids whose
+/// units are missing or `INVALID` are simply absent from the result map.
+///
+/// Batched (64 ids per statement) to stay inside SQLite variable limits.
+pub fn retrieval_unit_texts(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, UnitTextEnrichment>, StorageError> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(64) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT r.id, r.retrieval_text, fo.language, fo.file_type
+               FROM core_retrieval_units   r
+               JOIN core_file_occurrences  fo ON fo.id = r.file_occurrence_id
+              WHERE r.id IN ({placeholders})
+                AND r.freshness_state != 'INVALID'"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let paramslice: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(paramslice.as_slice())?;
+        while let Some(row) = rows.next()? {
+            out.insert(
+                row.get::<_, String>(0)?,
+                UnitTextEnrichment {
+                    retrieval_text: row.get(1)?,
+                    language: row.get(2)?,
+                    file_type: row.get(3)?,
+                },
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Execute an exact path lookup: return all retrieval units for a specific
