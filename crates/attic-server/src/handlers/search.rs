@@ -4,10 +4,7 @@ use crate::*;
 /// Sized for agent consumption: enough to rank, small enough to stay dense.
 const DEFAULT_SEARCH_RESULTS: usize = 25;
 
-/// `search` is a thin caller over `HybridSearcher`, which fuses lexical
-/// (FTS) and semantic (kNN) candidates via RRF. When `semantic` is `None`
-/// (semantic disabled), every result is lexical-only, ranked exactly as
-/// `fts_search` ranks it.
+/// Raw lexical search through `HybridSearcher`, ranked by FTS relevance.
 ///
 /// Every result carries `source_type` (`knowledge` / `documentation` /
 /// `code` / `config` / `test`). `scope: "knowledge"` returns only knowledge:
@@ -16,7 +13,6 @@ const DEFAULT_SEARCH_RESULTS: usize = 25;
 /// unchanged and never include the central folder.
 pub(crate) fn handle_search(
     pool: &DbPool,
-    semantic: Option<&attic_retrieval::semantic::SemanticStack>,
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
     knowledge_repository_id: Option<&str>,
@@ -77,11 +73,10 @@ pub(crate) fn handle_search(
     let candidate_depth = (max_results * 2).max(100);
     let mut opts = attic_retrieval::HybridSearchOptions::with_result_limit(max_results);
     opts.fts_candidate_depth = candidate_depth;
-    opts.semantic_candidate_depth = candidate_depth;
     opts.repository_id = repo_id.map(str::to_owned);
     opts.file_type = file_type.map(str::to_owned);
     opts.language = language.map(str::to_owned);
-    let searcher = attic_retrieval::HybridSearcher::new(pool, semantic);
+    let searcher = attic_retrieval::HybridSearcher::new(pool);
     let mut response = searcher.search(query, &opts)?;
     // Membership-authoritative retrieval scope (§16/§26): a workspace-wide
     // search (no explicit repository_id) must never surface hits from
@@ -128,10 +123,6 @@ pub(crate) fn handle_search(
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&json!({
             "results": results,
-            "semantic_degraded": response.semantic_degraded,
-            "semantic_degraded_reason_text": response
-                .semantic_degraded
-                .map(|reason| reason.description()),
         }))?,
     )]))
 }

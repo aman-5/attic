@@ -89,7 +89,6 @@ impl TwoRepos {
         let service = RetrievalService {
             readers: self.pool.clone(),
             writer: self.writer.clone(),
-            semantic: None,
             crossrepo_degraded: false,
         };
         let mut req = AnswerRequest::new(question, AnswerMode::Normal);

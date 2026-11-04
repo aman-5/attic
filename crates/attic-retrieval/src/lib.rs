@@ -37,14 +37,12 @@ pub mod pipeline;
 pub mod plan;
 pub mod query;
 pub mod rank;
-pub mod semantic;
 pub mod validate;
 pub mod verify;
 
 pub use error::RetrievalError;
 pub use hybrid::{
     HybridSearchOptions, HybridSearchResponse, HybridSearchResult, HybridSearcher, MatchType,
-    SemanticDegradationReason,
 };
 pub use mode::{AnswerMode, AnswerModePolicy};
 pub use pipeline::{AnswerOutcome, AnswerRequest, RetrievalService};

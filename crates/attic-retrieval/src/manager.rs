@@ -134,10 +134,6 @@ pub fn next_expansion(
             FallbackStrategy::KnowledgeLookup => {
                 return Some(ExpansionAction::KnowledgeLookup(knowledge_terms(evidence)));
             }
-            FallbackStrategy::SemanticSearch => {
-                // Phase 5 capability: recorded as unavailable, never fake.
-                continue;
-            }
         }
     }
     None

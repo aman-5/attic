@@ -994,7 +994,6 @@ fn e2e_manifest_change_edge_visible_via_mcp() {
     let service = RetrievalService {
         readers: pool.clone(),
         writer: writer_handle.clone(),
-        semantic: None,
         crossrepo_degraded: false,
     };
     let req = AnswerRequest::new("lib", AnswerMode::Fast);

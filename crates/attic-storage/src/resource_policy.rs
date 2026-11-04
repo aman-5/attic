@@ -137,11 +137,6 @@ pub struct ResourcePolicy {
     pub min_free_memory_mib: u64,
     /// `ResourceMonitor` foreground admission capacity.
     pub max_foreground_queries: usize,
-    /// Embedding batch size (consumed by `SemanticProvider` / `Qwen3Embedder`).
-    pub embedding_batch_size: usize,
-    /// Number of concurrent background embedding worker threads
-    /// (`BackgroundEnricher::spawn`).
-    pub embedding_worker_count: usize,
     /// `WriterQueue` batch size.
     pub writer_batch_size: usize,
     /// `WriterQueue` flush interval, in ms.
@@ -205,8 +200,6 @@ impl ResourcePolicy {
                 // sits safely under the 307 ceiling with headroom.
                 min_free_memory_mib: 256,
                 max_foreground_queries: 32,
-                embedding_batch_size: 8,
-                embedding_worker_count: 1,
                 writer_batch_size: 128,
                 writer_flush_interval_ms: 100,
                 writer_queue_capacity: 256,
@@ -219,8 +212,6 @@ impl ResourcePolicy {
                 memory_budget_mib: 4096,
                 min_free_memory_mib: 400,
                 max_foreground_queries: 64,
-                embedding_batch_size: 16,
-                embedding_worker_count: 3,
                 writer_batch_size: 256,
                 writer_flush_interval_ms: 50,
                 writer_queue_capacity: 512,
@@ -233,8 +224,6 @@ impl ResourcePolicy {
                 memory_budget_mib: 8192,
                 min_free_memory_mib: 400,
                 max_foreground_queries: 128,
-                embedding_batch_size: 64,
-                embedding_worker_count: 8,
                 writer_batch_size: 512,
                 writer_flush_interval_ms: 25,
                 writer_queue_capacity: 1024,
@@ -271,12 +260,6 @@ impl ResourcePolicy {
             scheduler_workers: overrides
                 .scheduler_workers
                 .unwrap_or(self.scheduler_workers),
-            embedding_batch_size: overrides
-                .embedding_batch_size
-                .unwrap_or(self.embedding_batch_size),
-            embedding_worker_count: overrides
-                .embedding_worker_count
-                .unwrap_or(self.embedding_worker_count),
             ..self
         }
     }
@@ -294,16 +277,6 @@ impl ResourcePolicy {
         if self.max_foreground_queries == 0 {
             return Err(ConfigError::Invalid(
                 "max_foreground_queries must be >= 1".into(),
-            ));
-        }
-        if self.embedding_batch_size == 0 {
-            return Err(ConfigError::Invalid(
-                "embedding_batch_size must be >= 1".into(),
-            ));
-        }
-        if self.embedding_worker_count == 0 {
-            return Err(ConfigError::Invalid(
-                "embedding_worker_count must be >= 1".into(),
             ));
         }
         // [FIX] Now that max_io_ops_per_sec is actually enforced (writer.rs's
@@ -370,14 +343,12 @@ impl ResourcePolicy {
         };
         let min_free_memory_mib =
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
-        // r08: reserve two physical cores for the developer's foreground
-        // work — background indexing/embedding never gets the whole machine.
+        // Reserve two physical cores for the developer's foreground work.
         let usable_cores = snapshot.cpu_cores.saturating_sub(2).max(1);
         EffectiveResourceConfig {
             memory_budget_mib,
             min_free_memory_mib,
             scheduler_workers: self.scheduler_workers.min(usable_cores).max(1),
-            embedding_worker_count: self.embedding_worker_count.min(usable_cores).max(1),
             ..self.into()
         }
     }
@@ -399,7 +370,6 @@ impl ResourcePolicy {
             crate::resource_manager::safe_min_free_mib(memory_budget_mib, self.min_free_memory_mib);
         EffectiveResourceConfig {
             scheduler_workers: self.scheduler_workers.clamp(1, 2),
-            embedding_worker_count: self.embedding_worker_count.clamp(1, 2),
             memory_budget_mib,
             min_free_memory_mib,
             ..self.into()
@@ -424,10 +394,6 @@ pub struct EffectiveResourceConfig {
     pub min_free_memory_mib: u64,
     /// See [`ResourcePolicy::max_foreground_queries`].
     pub max_foreground_queries: usize,
-    /// See [`ResourcePolicy::embedding_batch_size`].
-    pub embedding_batch_size: usize,
-    /// See [`ResourcePolicy::embedding_worker_count`].
-    pub embedding_worker_count: usize,
     /// See [`ResourcePolicy::writer_batch_size`].
     pub writer_batch_size: usize,
     /// See [`ResourcePolicy::writer_flush_interval_ms`].
@@ -447,8 +413,6 @@ impl From<ResourcePolicy> for EffectiveResourceConfig {
             memory_budget_mib: p.memory_budget_mib,
             min_free_memory_mib: p.min_free_memory_mib,
             max_foreground_queries: p.max_foreground_queries,
-            embedding_batch_size: p.embedding_batch_size,
-            embedding_worker_count: p.embedding_worker_count,
             writer_batch_size: p.writer_batch_size,
             writer_flush_interval_ms: p.writer_flush_interval_ms,
             writer_queue_capacity: p.writer_queue_capacity,
@@ -595,14 +559,6 @@ pub fn env_resource_overrides_from(
             "ATTIC_SCHEDULER_WORKERS",
             get("ATTIC_SCHEDULER_WORKERS"),
         )?,
-        embedding_batch_size: parse_env_value(
-            "ATTIC_EMBEDDING_BATCH_SIZE",
-            get("ATTIC_EMBEDDING_BATCH_SIZE"),
-        )?,
-        embedding_worker_count: parse_env_value(
-            "ATTIC_EMBEDDING_WORKERS",
-            get("ATTIC_EMBEDDING_WORKERS"),
-        )?,
     })
 }
 
@@ -732,17 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_overrides_sets_worker_and_embedding_tunables() {
+    fn apply_overrides_sets_scheduler_tunables() {
         let p = ResourcePolicy::baseline_for_mode(ResourceMode::Balanced);
         let applied = p.apply_overrides(&ResourceOverrides {
             scheduler_workers: Some(5),
-            embedding_batch_size: Some(24),
-            embedding_worker_count: Some(2),
             ..Default::default()
         });
         assert_eq!(applied.scheduler_workers, 5);
-        assert_eq!(applied.embedding_batch_size, 24);
-        assert_eq!(applied.embedding_worker_count, 2);
         assert_eq!(applied.writer_batch_size, p.writer_batch_size);
     }
 
@@ -770,15 +722,11 @@ mod tests {
         let o = env_resource_overrides_from(env_of(&[
             ("ATTIC_RESOURCE_MODE", "Performance"),
             ("ATTIC_SCHEDULER_WORKERS", "3"),
-            ("ATTIC_EMBEDDING_BATCH_SIZE", " 12 "),
-            ("ATTIC_EMBEDDING_WORKERS", "1"),
             ("ATTIC_WRITER_BATCH_SIZE", "128"),
         ]))
         .unwrap();
         assert_eq!(o.mode, Some(ResourceModeSetting::Performance));
         assert_eq!(o.scheduler_workers, Some(3));
-        assert_eq!(o.embedding_batch_size, Some(12));
-        assert_eq!(o.embedding_worker_count, Some(1));
         assert_eq!(o.writer_batch_size, Some(128));
         assert_eq!(o.max_io_ops_per_sec, None);
     }
@@ -788,6 +736,17 @@ mod tests {
         let o = env_resource_overrides_from(env_of(&[
             ("ATTIC_RESOURCE_MODE", ""),
             ("ATTIC_SCHEDULER_WORKERS", "  "),
+        ]))
+        .unwrap();
+        assert_eq!(o.mode, None);
+        assert_eq!(o.scheduler_workers, None);
+    }
+
+    #[test]
+    fn removed_embedding_environment_controls_are_ignored() {
+        let o = env_resource_overrides_from(env_of(&[
+            ("ATTIC_EMBEDDING_BATCH_SIZE", "not-a-number"),
+            ("ATTIC_EMBEDDING_WORKERS", "-1"),
         ]))
         .unwrap();
         assert_eq!(o.mode, None);
@@ -944,7 +903,6 @@ mod tests {
         assert_eq!(eff14.scheduler_workers, 8, "wants 8, 14-2=12 allows 8");
         let eff4 = p.clamp_to_hardware(&snap(65536, 4));
         assert_eq!(eff4.scheduler_workers, 2, "4 cores reserve 2");
-        assert_eq!(eff4.embedding_worker_count, 2, "embedding respects reserve");
         let eff2 = p.clamp_to_hardware(&snap(65536, 2));
         assert_eq!(
             eff2.scheduler_workers, 1,

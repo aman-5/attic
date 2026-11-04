@@ -51,62 +51,6 @@ pub const HYSTERESIS_EXIT_CRITICAL_MIB: u64 = 950;
 /// [`HYSTERESIS_EXIT_WARNING_MIB`]).
 pub const HYSTERESIS_EXIT_EMERGENCY_MIB: u64 = 850;
 
-/// Host-RAM safety floor for embedding on a DEDICATED GPU.
-///
-/// The system-memory tiers above protect the developer's other applications
-/// from Attic's CPU/RAM appetite. Embedding on a dedicated GPU keeps its model
-/// and activations in VRAM and only stages small tokenized batches through
-/// host RAM, so parking it at a host-RAM tier protects nothing and just leaves
-/// the GPU idle. Dedicated-GPU embedding therefore ignores the tiers and
-/// pauses only when fewer than this many MiB of host RAM are available.
-pub const DEDICATED_GPU_HOST_FLOOR_MIB: u64 = 512;
-
-/// Host-RAM safety floor for embedding on a UNIFIED-MEMORY GPU (Apple Silicon
-/// Metal, or an integrated GPU allowed via `allow_integrated_gpu`).
-///
-/// Such a GPU allocates its model and activations out of system RAM, so host
-/// pressure is real for it — but parking early idles a GPU that still has
-/// usable headroom. Unified-memory embedding therefore parks only below the
-/// same absolute reserve the system tiers treat as Critical, and shrinks its
-/// batch under pressure instead (see [`unified_gpu_embedding_batch`]), since
-/// batch size is what drives its transient memory.
-pub const UNIFIED_GPU_HOST_FLOOR_MIB: u64 = SYSTEM_CRITICAL_FLOOR_MIB;
-
-/// Where an embedding backend keeps its working set, which decides how
-/// host-RAM pressure gates it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddingMemoryClass {
-    /// CPU inference (or unknown): full host-RAM tier gate, parks at Emergency.
-    HostRam,
-    /// GPU sharing system RAM (Apple Metal, integrated GPU): parks below
-    /// [`UNIFIED_GPU_HOST_FLOOR_MIB`], batch shrinks at Critical/Emergency.
-    UnifiedGpu,
-    /// GPU with its own VRAM: ignores host-RAM tiers, parks only below
-    /// [`DEDICATED_GPU_HOST_FLOOR_MIB`], always full batch.
-    DedicatedGpu,
-}
-
-impl EmbeddingMemoryClass {
-    /// Stable label for status output.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HostRam => "host_ram",
-            Self::UnifiedGpu => "unified_gpu",
-            Self::DedicatedGpu => "dedicated_gpu",
-        }
-    }
-
-    /// Available-RAM floor below which this class parks, or `None` when it
-    /// follows the host-RAM tiers instead.
-    pub fn host_floor_mib(self) -> Option<u64> {
-        match self {
-            Self::HostRam => None,
-            Self::UnifiedGpu => Some(UNIFIED_GPU_HOST_FLOOR_MIB),
-            Self::DedicatedGpu => Some(DEDICATED_GPU_HOST_FLOOR_MIB),
-        }
-    }
-}
-
 const HYSTERESIS_EXIT_WARNING_PCT: u64 = 65;
 const HYSTERESIS_EXIT_CRITICAL_PCT: u64 = 78;
 const HYSTERESIS_EXIT_EMERGENCY_PCT: u64 = 82;
@@ -303,46 +247,6 @@ pub fn adaptive_indexing_limit(max: usize, pressure: ResourcePressure) -> usize 
     }
 }
 
-/// Compute the effective maximum embedding-heavy permits given `max` and current `pressure`.
-///
-/// Normal → `max`, Warning → 62.5 % (min 1), Critical → 1, Emergency → 0.
-pub fn adaptive_embedding_limit(max: usize, pressure: ResourcePressure) -> usize {
-    match pressure {
-        ResourcePressure::Normal => max,
-        ResourcePressure::Warning => ceil_frac(max, 5, 8).max(1),
-        ResourcePressure::Critical => 1,
-        ResourcePressure::Emergency => 0,
-    }
-}
-
-/// Compute the effective embedding batch size given the configured `max` and current `pressure`.
-///
-/// Normal → `max`, Warning → `max/2` (min 1), Critical → `max/4` (min 1),
-/// Emergency → 0 (no new batches).
-pub fn adaptive_embedding_batch(max: usize, pressure: ResourcePressure) -> usize {
-    match pressure {
-        ResourcePressure::Normal => max,
-        ResourcePressure::Warning => (max / 2).max(1),
-        ResourcePressure::Critical => (max / 4).max(1),
-        ResourcePressure::Emergency => 0,
-    }
-}
-
-/// Embedding batch for a unified-memory GPU: gentler than the CPU curve
-/// (never 0 — parking is decided by the host floor, not the tier) but still
-/// shrinking, because on shared memory the batch's activations come out of
-/// system RAM.
-///
-/// Normal/Warning → `max`, Critical → `max/2`, Emergency → `max/4` (min 1).
-pub fn unified_gpu_embedding_batch(max: usize, pressure: ResourcePressure) -> usize {
-    let max = max.max(1);
-    match pressure {
-        ResourcePressure::Normal | ResourcePressure::Warning => max,
-        ResourcePressure::Critical => (max / 2).max(1),
-        ResourcePressure::Emergency => (max / 4).max(1),
-    }
-}
-
 /// Compute the indexing-heavy permit limit imposed by the current [`RecoveryStage`].
 ///
 /// Emergency → 0, Step1 → 1/4, Step2 → 2/4, Step3 → 3/4, Full → `max`.
@@ -364,8 +268,8 @@ pub fn stage_indexing_limit(max: usize, stage: RecoveryStage) -> usize {
 /// Central adaptive resource monitor for the Attic MCP server.
 ///
 /// Tracks process RSS, applies hysteresis-smoothed pressure tiers, and exposes
-/// RAII permits for foreground queries, background indexing, and embedding
-/// model execution.  All fields are atomics so the monitor can be shared via
+/// RAII permits for foreground queries and background indexing.
+/// All fields are atomics so the monitor can be shared via
 /// `Arc` without a runtime lock.
 pub struct ResourceMonitor {
     memory_used: AtomicU64,
@@ -387,12 +291,6 @@ pub struct ResourceMonitor {
     indexing_heavy_active: AtomicUsize,
     max_indexing_heavy: AtomicUsize,
     effective_indexing_heavy: AtomicUsize,
-    // Phase 93+: adaptive embedding heavy permits
-    embedding_heavy_active: AtomicUsize,
-    max_embedding_heavy: AtomicUsize,
-    effective_embedding_heavy: AtomicUsize,
-    max_embedding_batch: AtomicUsize,
-    effective_embedding_batch: AtomicUsize,
     // Phase 93+: graduated recovery
     recovery_stage: AtomicU64,
     recovery_stage_since_ms: AtomicU64,
@@ -404,7 +302,6 @@ pub struct ResourceMonitor {
     pub daemon_reconnect_count: AtomicU64,
     // Phase 93+: Condvar notifications
     indexing_capacity_notify: Arc<(Mutex<()>, Condvar)>,
-    embedding_capacity_notify: Arc<(Mutex<()>, Condvar)>,
     // Phase 96: deterministic testing hooks
     forced_pressure_tier: AtomicU64,
     // r08: whole-system memory facts (0/0/0 = not sampled yet). Pressure is
@@ -457,26 +354,6 @@ impl Drop for IndexingHeavyPermit<'_> {
     }
 }
 
-/// RAII permit that represents one active embedding model-execution operation.
-///
-/// Acquiring this permit counts against the adaptive embedding-heavy limit.
-/// The limit is released on drop; the permit is independent of indexing-heavy
-/// permits so the two can be throttled separately.
-pub struct EmbeddingHeavyPermit<'a> {
-    monitor: &'a ResourceMonitor,
-}
-
-impl Drop for EmbeddingHeavyPermit<'_> {
-    fn drop(&mut self) {
-        self.monitor
-            .embedding_heavy_active
-            .fetch_sub(1, Ordering::AcqRel);
-        let (lock, cvar) = &*self.monitor.embedding_capacity_notify;
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        cvar.notify_all();
-    }
-}
-
 // ── ResourceMonitor impl ───────────────────────────────────────────────────
 
 impl ResourceMonitor {
@@ -493,7 +370,7 @@ impl ResourceMonitor {
             .max(1);
         let background = config
             .max_background_workers
-            .unwrap_or(resources::MAX_INDEXING_WORKERS + resources::MAX_SEMANTIC_WORKERS);
+            .unwrap_or(resources::MAX_INDEXING_WORKERS);
         let background = background.min(foreground.saturating_sub(1).max(1));
         let max_memory_mib = config
             .total_memory_budget_mib
@@ -505,7 +382,6 @@ impl ResourceMonitor {
                 .min_free_memory_mib
                 .unwrap_or(resources::MIN_FREE_MEMORY_MIB),
         );
-        let default_embedding_batch = 64usize;
         let forced_val = match std::env::var("ATTIC_FORCE_RESOURCE_PRESSURE")
             .ok()
             .as_deref()
@@ -547,17 +423,11 @@ impl ResourceMonitor {
             indexing_heavy_active: AtomicUsize::new(0),
             max_indexing_heavy: AtomicUsize::new(background),
             effective_indexing_heavy: AtomicUsize::new(background),
-            embedding_heavy_active: AtomicUsize::new(0),
-            max_embedding_heavy: AtomicUsize::new(background),
-            effective_embedding_heavy: AtomicUsize::new(background),
-            max_embedding_batch: AtomicUsize::new(default_embedding_batch),
-            effective_embedding_batch: AtomicUsize::new(default_embedding_batch),
             recovery_stage: AtomicU64::new(RecoveryStage::Full.as_u64()),
             recovery_stage_since_ms: AtomicU64::new(0),
             mcp_pressure_rejections: AtomicU64::new(0),
             daemon_reconnect_count: AtomicU64::new(0),
             indexing_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
-            embedding_capacity_notify: Arc::new((Mutex::new(()), Condvar::new())),
             forced_pressure_tier: AtomicU64::new(forced_val),
             system_total_mib: AtomicU64::new(0),
             system_used_mib: AtomicU64::new(0),
@@ -575,22 +445,13 @@ impl ResourceMonitor {
 
     // ── Phase 93+: Apply resource policy maximums ──────────────────────────
 
-    /// Apply resource-mode maximums (indexing workers, embedding workers, batch size).
+    /// Apply the resource-mode maximum number of indexing workers.
     ///
     /// Called once at startup by the server after the `ResourceMode` has been
     /// resolved.  Immediately recomputes all effective limits.
-    pub fn apply_resource_policy(
-        &self,
-        max_indexing_heavy: usize,
-        max_embedding_heavy: usize,
-        max_embedding_batch: usize,
-    ) {
+    pub fn apply_resource_policy(&self, max_indexing_heavy: usize) {
         self.max_indexing_heavy
             .store(max_indexing_heavy, Ordering::Release);
-        self.max_embedding_heavy
-            .store(max_embedding_heavy, Ordering::Release);
-        self.max_embedding_batch
-            .store(max_embedding_batch, Ordering::Release);
         self.update_effective_limits();
     }
 
@@ -599,8 +460,6 @@ impl ResourceMonitor {
     fn update_effective_limits(&self) {
         let pressure = self.guidance_pressure();
         let max_idx = self.max_indexing_heavy.load(Ordering::Relaxed);
-        let max_emb = self.max_embedding_heavy.load(Ordering::Relaxed);
-        let max_batch = self.max_embedding_batch.load(Ordering::Relaxed);
 
         let stage = RecoveryStage::from_u64(self.recovery_stage.load(Ordering::Relaxed));
         let pressure_idx_limit = adaptive_indexing_limit(max_idx, pressure);
@@ -609,23 +468,10 @@ impl ResourceMonitor {
         self.effective_indexing_heavy
             .store(eff_idx, Ordering::Release);
 
-        let eff_emb = adaptive_embedding_limit(max_emb, pressure);
-        self.effective_embedding_heavy
-            .store(eff_emb, Ordering::Release);
-
-        let eff_batch = adaptive_embedding_batch(max_batch, pressure);
-        self.effective_embedding_batch
-            .store(eff_batch, Ordering::Release);
-
         self.maybe_advance_recovery_stage(pressure);
 
         {
             let (lock, cvar) = &*self.indexing_capacity_notify;
-            let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-            cvar.notify_all();
-        }
-        {
-            let (lock, cvar) = &*self.embedding_capacity_notify;
             let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
             cvar.notify_all();
         }
@@ -811,7 +657,7 @@ impl ResourceMonitor {
     }
 
     /// Test-only override of the whole-system memory sample. Public (hidden)
-    /// so other crates' tests can drive the dedicated-GPU host floor; pair
+    /// so other crates' tests can drive memory-pressure transitions; pair
     /// with `set_forced_pressure_for_testing` so a live refresh does not
     /// overwrite the injected values.
     #[doc(hidden)]
@@ -1051,59 +897,6 @@ impl ResourceMonitor {
         }
     }
 
-    // ── Phase 93+: Embedding heavy permits ────────────────────────────────
-
-    /// Try to acquire an embedding-heavy permit without blocking.
-    ///
-    /// Returns `Some(EmbeddingHeavyPermit)` if a permit is available under
-    /// the current adaptive embedding limit, or `None` otherwise.
-    pub fn try_embedding_heavy(&self) -> Option<EmbeddingHeavyPermit<'_>> {
-        let eff = self.effective_embedding_heavy.load(Ordering::Acquire);
-        if eff == 0 {
-            return None;
-        }
-        let prev = self.embedding_heavy_active.fetch_add(1, Ordering::AcqRel);
-        if prev < eff {
-            Some(EmbeddingHeavyPermit { monitor: self })
-        } else {
-            self.embedding_heavy_active.fetch_sub(1, Ordering::AcqRel);
-            None
-        }
-    }
-
-    /// Block until an embedding-heavy permit becomes available, then return it.
-    ///
-    /// The `cancel` closure is polled on each wake; if it returns `true` the
-    /// function returns `None` immediately (cancellation).  Otherwise blocks
-    /// until a permit is available, refreshing RSS on each iteration.
-    pub fn acquire_embedding_heavy_blocking(
-        &self,
-        cancel: impl Fn() -> bool,
-    ) -> Option<EmbeddingHeavyPermit<'_>> {
-        loop {
-            if cancel() {
-                return None;
-            }
-            self.refresh_process_memory();
-            if let Some(permit) = self.try_embedding_heavy() {
-                return Some(permit);
-            }
-            let (lock, cvar) = &*self.embedding_capacity_notify;
-            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(500));
-        }
-    }
-
-    /// Return the current effective embedding batch size.
-    ///
-    /// Callers must read this immediately before constructing each new batch;
-    /// do not cache the value across batch boundaries.
-    pub fn current_embedding_batch(&self) -> usize {
-        self.effective_embedding_batch.load(Ordering::Acquire)
-    }
-
-    // ── Backend-aware embedding gate ──────────────────────────────────────
-
     /// Last sampled whole-system available RAM in MiB, or `None` before the
     /// first sample (or when sampling is unavailable).
     pub fn system_available_mib(&self) -> Option<u64> {
@@ -1113,102 +906,11 @@ impl ResourceMonitor {
         Some(self.system_available_mib.load(Ordering::Relaxed))
     }
 
-    /// Whether embedding of this memory class must park right now.
-    ///
-    /// `HostRam` follows the tier gate (Emergency parks). GPU classes ignore
-    /// the tiers and park only when a real sample shows available RAM below
-    /// the class floor; an unsampled monitor never parks a GPU, because
-    /// absence of data must not idle a healthy device.
-    pub fn embedding_parked(&self, class: EmbeddingMemoryClass) -> bool {
-        match class.host_floor_mib() {
-            None => self.is_emergency(),
-            Some(floor) => self
-                .system_available_mib()
-                .is_some_and(|avail| avail < floor),
-        }
-    }
-
-    /// Embedding concurrency ceiling for this memory class right now.
-    ///
-    /// GPU classes use the configured (unreduced) ceiling — the tiers do not
-    /// describe GPU capacity — or 0 while parked by their host floor.
-    pub fn embedding_limit_for(&self, class: EmbeddingMemoryClass) -> usize {
-        match class {
-            EmbeddingMemoryClass::HostRam => self.effective_embedding_limit(),
-            _ if self.embedding_parked(class) => 0,
-            _ => self.max_embedding_heavy.load(Ordering::Acquire).max(1),
-        }
-    }
-
-    /// Embedding batch size for this memory class right now. Callers must
-    /// read it immediately before each batch, like
-    /// [`Self::current_embedding_batch`].
-    pub fn embedding_batch_for(&self, class: EmbeddingMemoryClass) -> usize {
-        let max = self.max_embedding_batch.load(Ordering::Acquire);
-        match class {
-            EmbeddingMemoryClass::HostRam => self.current_embedding_batch(),
-            _ if self.embedding_parked(class) => 0,
-            EmbeddingMemoryClass::DedicatedGpu => max.max(1),
-            EmbeddingMemoryClass::UnifiedGpu => {
-                unified_gpu_embedding_batch(max, self.guidance_pressure())
-            }
-        }
-    }
-
-    /// Non-blocking embedding permit for this memory class. Every class
-    /// shares the one active counter, so the configured ceiling holds no
-    /// matter which classes hold permits.
-    pub fn try_embedding_heavy_for(
-        &self,
-        class: EmbeddingMemoryClass,
-    ) -> Option<EmbeddingHeavyPermit<'_>> {
-        if class == EmbeddingMemoryClass::HostRam {
-            return self.try_embedding_heavy();
-        }
-        let limit = self.embedding_limit_for(class);
-        if limit == 0 {
-            return None;
-        }
-        let prev = self.embedding_heavy_active.fetch_add(1, Ordering::AcqRel);
-        if prev < limit {
-            Some(EmbeddingHeavyPermit { monitor: self })
-        } else {
-            self.embedding_heavy_active.fetch_sub(1, Ordering::AcqRel);
-            None
-        }
-    }
-
-    /// Blocking form of [`Self::try_embedding_heavy_for`]. Returns `None` on
-    /// cancellation.
-    pub fn acquire_embedding_heavy_blocking_for(
-        &self,
-        class: EmbeddingMemoryClass,
-        cancel: impl Fn() -> bool,
-    ) -> Option<EmbeddingHeavyPermit<'_>> {
-        loop {
-            if cancel() {
-                return None;
-            }
-            self.refresh_process_memory();
-            if let Some(permit) = self.try_embedding_heavy_for(class) {
-                return Some(permit);
-            }
-            let (lock, cvar) = &*self.embedding_capacity_notify;
-            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(500));
-        }
-    }
-
     // ── Phase 93+: Observability accessors ────────────────────────────────
 
     /// Return the current effective indexing-heavy permit limit.
     pub fn effective_indexing_heavy_limit(&self) -> usize {
         self.effective_indexing_heavy.load(Ordering::Relaxed)
-    }
-
-    /// Return the current effective embedding-heavy permit limit.
-    pub fn effective_embedding_limit(&self) -> usize {
-        self.effective_embedding_heavy.load(Ordering::Relaxed)
     }
 
     /// Return the configured maximum indexing-heavy permit count.
@@ -1219,11 +921,6 @@ impl ResourceMonitor {
     /// Return the number of indexing-heavy permits currently held.
     pub fn indexing_heavy_active(&self) -> usize {
         self.indexing_heavy_active.load(Ordering::Relaxed)
-    }
-
-    /// Return the number of embedding-heavy permits currently held.
-    pub fn embedding_heavy_active(&self) -> usize {
-        self.embedding_heavy_active.load(Ordering::Relaxed)
     }
 
     /// Return the current [`RecoveryStage`].
@@ -1409,10 +1106,8 @@ impl ResourceAdvisory {
     /// Note that `Restricted` deliberately covers BOTH Critical and
     /// Emergency, so it answers "should new expensive work be refused?" —
     /// NOT "should all background work stop?". Those are different
-    /// questions: Critical still grants a reduced embedding budget (see
-    /// `adaptive_embedding_limit`/`adaptive_embedding_batch`), and gating
-    /// dispatch on this advisory instead of on the budget starves that work
-    /// completely. Use `ResourceMonitor::is_emergency` for a true stop.
+    /// questions: Critical still grants a reduced indexing budget. Use
+    /// `ResourceMonitor::is_emergency` for a true stop.
     pub fn from_pressure(pressure: ResourcePressure) -> Self {
         match pressure {
             ResourcePressure::Normal => Self::Ok,
@@ -1483,110 +1178,6 @@ mod tests {
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Critical), 2);
         assert_eq!(adaptive_indexing_limit(8, ResourcePressure::Emergency), 0);
         assert_eq!(adaptive_indexing_limit(1, ResourcePressure::Critical), 1);
-    }
-
-    /// Backend-aware gate matrix under a forced Emergency tier: CPU parks;
-    /// a dedicated GPU keeps full permits and batch until its 512 MiB floor;
-    /// a unified-memory GPU keeps running with a quarter batch until its
-    /// 700 MiB floor. The configured concurrency ceiling holds for every class.
-    #[test]
-    fn embedding_gate_matrix_by_memory_class() {
-        use EmbeddingMemoryClass::*;
-        let m = monitor_with_budget(8192);
-        m.apply_resource_policy(8, 2, 16);
-        m.set_forced_pressure_for_testing(Some(ResourcePressure::Emergency));
-        // ~2.9 GiB available: above both GPU host floors (the tier itself is
-        // forced Emergency for this matrix).
-        m.set_system_memory_for_testing(32_768, 29_800, 2_968);
-
-        assert!(m.embedding_parked(HostRam));
-        assert!(
-            m.try_embedding_heavy_for(HostRam).is_none(),
-            "CPU path parks"
-        );
-        assert_eq!(m.embedding_batch_for(HostRam), 0);
-
-        assert!(!m.embedding_parked(DedicatedGpu));
-        assert_eq!(m.embedding_batch_for(DedicatedGpu), 16);
-        assert_eq!(m.embedding_limit_for(DedicatedGpu), 2);
-
-        assert!(!m.embedding_parked(UnifiedGpu));
-        assert_eq!(
-            m.embedding_batch_for(UnifiedGpu),
-            4,
-            "quarter batch at Emergency"
-        );
-
-        let p1 = m.try_embedding_heavy_for(DedicatedGpu).expect("permit 1");
-        let p2 = m.try_embedding_heavy_for(UnifiedGpu).expect("permit 2");
-        assert!(
-            m.try_embedding_heavy_for(DedicatedGpu).is_none(),
-            "configured ceiling is shared across classes"
-        );
-        drop((p1, p2));
-        assert_eq!(m.embedding_heavy_active(), 0);
-
-        // 650 MiB available: below the unified floor (700), above the
-        // dedicated one (512).
-        m.set_system_memory_for_testing(32_768, 32_118, 650);
-        assert!(m.embedding_parked(UnifiedGpu));
-        assert_eq!(m.embedding_batch_for(UnifiedGpu), 0);
-        assert!(m.try_embedding_heavy_for(UnifiedGpu).is_none());
-        assert!(!m.embedding_parked(DedicatedGpu));
-
-        // Below the dedicated floor: every class parks.
-        m.set_system_memory_for_testing(32_768, 32_300, DEDICATED_GPU_HOST_FLOOR_MIB - 1);
-        assert!(m.embedding_parked(DedicatedGpu));
-        assert_eq!(m.embedding_limit_for(DedicatedGpu), 0);
-        assert!(
-            m.acquire_embedding_heavy_blocking_for(DedicatedGpu, || true)
-                .is_none()
-        );
-
-        // The floor is exclusive.
-        m.set_system_memory_for_testing(32_768, 32_256, DEDICATED_GPU_HOST_FLOOR_MIB);
-        assert!(!m.embedding_parked(DedicatedGpu));
-        assert!(
-            m.acquire_embedding_heavy_blocking_for(DedicatedGpu, || false)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn unified_gpu_batch_curve_is_gentle_and_never_zero() {
-        assert_eq!(
-            unified_gpu_embedding_batch(16, ResourcePressure::Normal),
-            16
-        );
-        assert_eq!(
-            unified_gpu_embedding_batch(16, ResourcePressure::Warning),
-            16
-        );
-        assert_eq!(
-            unified_gpu_embedding_batch(16, ResourcePressure::Critical),
-            8
-        );
-        assert_eq!(
-            unified_gpu_embedding_batch(16, ResourcePressure::Emergency),
-            4
-        );
-        assert_eq!(
-            unified_gpu_embedding_batch(1, ResourcePressure::Emergency),
-            1
-        );
-        assert_eq!(unified_gpu_embedding_batch(0, ResourcePressure::Normal), 1);
-    }
-
-    #[test]
-    fn unsampled_monitor_never_parks_a_gpu() {
-        let m = monitor_with_budget(8192);
-        assert_eq!(m.system_available_mib(), None);
-        assert!(!m.embedding_parked(EmbeddingMemoryClass::DedicatedGpu));
-        assert!(!m.embedding_parked(EmbeddingMemoryClass::UnifiedGpu));
-        assert!(
-            m.try_embedding_heavy_for(EmbeddingMemoryClass::DedicatedGpu)
-                .is_some()
-        );
     }
 
     /// r08: whole-system memory pressure escalates even when Attic itself is
@@ -1730,25 +1321,6 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_embedding_limit() {
-        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Normal), 8);
-        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Warning), 5);
-        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Critical), 1);
-        assert_eq!(adaptive_embedding_limit(8, ResourcePressure::Emergency), 0);
-        assert_eq!(adaptive_embedding_limit(1, ResourcePressure::Warning), 1);
-    }
-
-    #[test]
-    fn test_adaptive_embedding_batch() {
-        assert_eq!(adaptive_embedding_batch(64, ResourcePressure::Normal), 64);
-        assert_eq!(adaptive_embedding_batch(64, ResourcePressure::Warning), 32);
-        assert_eq!(adaptive_embedding_batch(64, ResourcePressure::Critical), 16);
-        assert_eq!(adaptive_embedding_batch(64, ResourcePressure::Emergency), 0);
-        assert_eq!(adaptive_embedding_batch(1, ResourcePressure::Warning), 1);
-        assert_eq!(adaptive_embedding_batch(1, ResourcePressure::Critical), 1);
-    }
-
-    #[test]
     fn test_stage_indexing_limit() {
         assert_eq!(stage_indexing_limit(8, RecoveryStage::Emergency), 0);
         assert_eq!(stage_indexing_limit(8, RecoveryStage::Step1), 2);
@@ -1811,30 +1383,12 @@ mod tests {
     #[test]
     fn test_indexing_heavy_permit_normal() {
         let m = monitor_with_budget(8192);
-        m.apply_resource_policy(4, 4, 64);
+        m.apply_resource_policy(4);
         let p = m.try_indexing_heavy();
         assert!(p.is_some());
         assert_eq!(m.indexing_heavy_active(), 1);
         drop(p);
         assert_eq!(m.indexing_heavy_active(), 0);
-    }
-
-    #[test]
-    fn test_embedding_heavy_permit_drops() {
-        let m = monitor_with_budget(8192);
-        m.apply_resource_policy(4, 4, 64);
-        let p = m.try_embedding_heavy();
-        assert!(p.is_some());
-        assert_eq!(m.embedding_heavy_active(), 1);
-        drop(p);
-        assert_eq!(m.embedding_heavy_active(), 0);
-    }
-
-    #[test]
-    fn test_current_embedding_batch_normal() {
-        let m = monitor_with_budget(8192);
-        m.apply_resource_policy(4, 4, 64);
-        assert_eq!(m.current_embedding_batch(), 64);
     }
 
     #[test]
@@ -1893,10 +1447,9 @@ mod tests {
     #[test]
     fn test_apply_resource_policy_limits() {
         let m = monitor_with_budget(8192);
-        m.apply_resource_policy(8, 6, 64);
+        m.apply_resource_policy(8);
         assert_eq!(m.max_indexing_heavy(), 8);
         assert_eq!(m.effective_indexing_heavy_limit(), 8);
-        assert_eq!(m.current_embedding_batch(), 64);
     }
 
     #[test]
@@ -1926,25 +1479,22 @@ mod tests {
     #[test]
     fn test_set_forced_pressure_for_testing() {
         let m = monitor_with_budget(8192);
-        m.apply_resource_policy(8, 6, 64);
+        m.apply_resource_policy(8);
         assert_eq!(m.pressure(), ResourcePressure::Normal);
         assert_eq!(m.effective_indexing_heavy_limit(), 8);
 
         m.set_forced_pressure_for_testing(Some(ResourcePressure::Warning));
         assert_eq!(m.pressure(), ResourcePressure::Warning);
         assert_eq!(m.effective_indexing_heavy_limit(), 6);
-        assert_eq!(m.current_embedding_batch(), 32);
 
         m.set_forced_pressure_for_testing(Some(ResourcePressure::Critical));
         assert_eq!(m.pressure(), ResourcePressure::Critical);
         assert_eq!(m.effective_indexing_heavy_limit(), 2);
-        assert_eq!(m.current_embedding_batch(), 16);
 
         m.set_forced_pressure_for_testing(Some(ResourcePressure::Emergency));
         assert_eq!(m.pressure(), ResourcePressure::Emergency);
         assert!(m.is_emergency());
         assert_eq!(m.effective_indexing_heavy_limit(), 0);
-        assert_eq!(m.current_embedding_batch(), 0);
 
         m.set_forced_pressure_for_testing(None);
         assert_eq!(m.pressure(), ResourcePressure::Normal);
@@ -1955,7 +1505,7 @@ mod tests {
     #[test]
     fn test_set_recovery_stage_for_testing() {
         let m = monitor_with_budget(8192);
-        m.apply_resource_policy(8, 6, 64);
+        m.apply_resource_policy(8);
 
         m.set_recovery_stage_for_testing(RecoveryStage::Step1);
         assert_eq!(m.recovery_stage(), RecoveryStage::Step1);

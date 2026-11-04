@@ -45,12 +45,15 @@ impl BudgetAccountant {
         self.started.elapsed().as_millis() as u64
     }
 
+    pub fn deadline(&self) -> Instant {
+        self.started + self.max_time
+    }
+
     pub fn time_exceeded(&self) -> bool {
         self.started.elapsed() >= self.max_time
     }
 
     /// Extend the time budget by a one-time cost that is not retrieval work
-    /// (e.g. starting the embedding worker after it was unloaded).
     pub fn credit_time(&mut self, d: Duration) {
         self.max_time = self.max_time.saturating_add(d);
     }

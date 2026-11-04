@@ -982,15 +982,6 @@ pub fn index_repository_with_cancellation(
     rss.sample();
     stage_start = std::time::Instant::now();
     //
-    // PR-7: bulk-load the analysis cache from any prior attempt at this
-    // repository (one query, same bulk-preload shape as PR-5). A cache hit
-    // (same path, same content hash) skips re-running the analyzer entirely
-    // — this is what makes a retry after a transient failure cheap instead
-    // of re-analyzing every file in the repository again.
-    let analysis_cache: HashMap<String, attic_storage::CachedFileAnalysis> = store
-        .readers
-        .with_reader(|c| attic_storage::bulk_load_analysis_cache(c, &repo_id))
-        .map_err(IndexError::Storage)?;
     let mut cache_writes: Vec<attic_storage::CachedFileAnalysis> = Vec::new();
 
     let registry = structural_pipeline::shared_registry(opts)?;
@@ -1016,8 +1007,8 @@ pub fn index_repository_with_cancellation(
     // `analyze_single_file` is pure — it reads one path, dispatches to a
     // `Send + Sync` analyzer, and returns owned data. It performs no database
     // access, so parallelising it cannot interact with the coordinated-writer
-    // contract. The shared inputs (`analysis_cache`, `registry`, `opts`,
-    // `policy_hash`) are all read-only here.
+    // contract. The shared inputs (the stripe's analysis-cache entries,
+    // `registry`, `opts`, `policy_hash`) are all read-only here.
     //
     // Analysis runs in stripes: one stripe is analyzed in parallel, merged
     // below, and dropped before the next stripe is analyzed. Analyzing the
@@ -1047,6 +1038,20 @@ pub fn index_repository_with_cancellation(
         if cancellation.is_cancelled() {
             return Err(IndexError::Cancelled);
         }
+        // Keep serialized cache payloads bounded by the same stripe as
+        // analysis output. Loading this repository's full cache here made
+        // startup memory grow with every cached file, even though analysis
+        // itself is deliberately striped.
+        let cache_paths: Vec<String> = stripe
+            .iter()
+            .map(|record| record.repo_relative.clone())
+            .collect();
+        let analysis_cache = store
+            .readers
+            .with_reader(|c| {
+                attic_storage::load_analysis_cache_for_paths(c, &repo_id, &cache_paths)
+            })
+            .map_err(IndexError::Storage)?;
         let prepped = analyze_files(
             stripe,
             &AnalysisCacheLookup {
@@ -2474,8 +2479,11 @@ mod tests {
 
         let cancellation = CancellationToken::new();
         let hook_cancellation = cancellation.clone();
+        let owner = std::thread::current().id();
         let _hook = install_indexing_test_hook(std::sync::Arc::new(move |point| {
-            if point == IndexingTestHookPoint::BeforeRepositoryUpsert {
+            if std::thread::current().id() == owner
+                && point == IndexingTestHookPoint::BeforeRepositoryUpsert
+            {
                 hook_cancellation.cancel();
             }
         }));
@@ -2956,26 +2964,36 @@ mod tests {
     }
 
     #[test]
-    fn stage_timings_survive_a_reindex_and_report_cache_hits() {
-        // On a second run every file hits `index_analysis_cache`, so the
-        // JSON copy is skipped entirely. Guards the claim that the second
-        // buffer is a cold-run cost, not a permanent one.
+    fn stage_timings_survive_a_successful_reindex() {
         let fx = make_store();
-        write_file(
-            fx._dir.path(),
-            "cached_once.rs",
-            "pub fn cached_once_token() {}\n",
-        );
+        for i in 0..40 {
+            write_file(
+                fx._dir.path(),
+                &format!("cached_{i}.rs"),
+                &format!("pub fn cached_token_{i}() {{}}\n"),
+            );
+        }
         let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions::default();
+        let opts = IndexOptions {
+            analysis_threads: 1,
+            ..IndexOptions::default()
+        };
         let s = store(&fx);
         let first = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(first.files_indexed, 40);
         assert!(
             first.stage_timings.pending_units_peak_bytes > 0,
             "first run must emit units"
         );
 
+        reset_analyze_single_file_calls();
         let second = index_repository(&s, fx._dir.path(), &policy, &opts).unwrap();
+        assert_eq!(second.files_indexed, 40);
+        assert_eq!(
+            analyze_single_file_calls(),
+            40,
+            "successful publication clears the retry cache"
+        );
         assert!(
             second.stage_timings.total_ms >= second.stage_timings.publish_ms,
             "total wall clock must cover the publication stage on every run"
@@ -3868,7 +3886,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
 
         let fx = make_store();
-        const N: usize = 12;
+        const N: usize = 40;
         for i in 0..N {
             write_file(
                 fx._dir.path(),
@@ -3877,7 +3895,10 @@ mod tests {
             );
         }
         let policy = DiscoveryPolicy::default_git();
-        let opts = IndexOptions::default();
+        let opts = IndexOptions {
+            analysis_threads: 1,
+            ..IndexOptions::default()
+        };
         let s = store(&fx);
 
         let locked_path = fx._dir.path().join("f0.rs");

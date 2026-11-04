@@ -18,6 +18,7 @@
 //!   (b) the INNER JOIN with `core_retrieval_units` acts as a double-check.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -295,6 +296,28 @@ pub struct FtsSearchParams<'a> {
 /// - `query` is passed as a parameterized FTS5 MATCH operand.
 /// - All filters use parameterized bindings — never string interpolation.
 pub fn fts_search(
+    conn: &Connection,
+    p: &FtsSearchParams<'_>,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_search_inner(conn, p)
+}
+
+/// Execute a bounded FTS query, interrupting SQLite if its VM work exceeds
+/// `timeout`. The handler is removed on every return path before the pooled
+/// connection can be reused.
+pub fn fts_search_with_timeout(
+    conn: &Connection,
+    p: &FtsSearchParams<'_>,
+    timeout: Duration,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
+    let started = Instant::now();
+    conn.progress_handler(1_000, Some(move || started.elapsed() >= timeout))?;
+    let result = fts_search_inner(conn, p);
+    conn.progress_handler(0, None::<fn() -> bool>)?;
+    result
+}
+
+fn fts_search_inner(
     conn: &Connection,
     p: &FtsSearchParams<'_>,
 ) -> Result<Vec<FtsSearchResult>, StorageError> {
@@ -612,6 +635,42 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].retrieval_unit_id, unit_id);
+    }
+
+    #[test]
+    fn timed_out_fts_search_interrupts_and_resets_connection_handler() {
+        let conn = migrated_conn();
+        let (repo_id, rev_id, gen_id) = seed_repo_rev_gen(&conn, "/repo/timeout");
+        let occ_id = seed_file(&conn, &repo_id, &rev_id, &gen_id, "src/lib.rs");
+        for index in 0..1_000 {
+            let unit_id = uuid::Uuid::new_v4().to_string();
+            insert_retrieval_unit_with_fts(
+                &conn,
+                &NewRetrievalUnit {
+                    id: &unit_id,
+                    file_occurrence_id: &occ_id.to_string_repr(),
+                    index_generation_id: &gen_id.to_string_repr(),
+                    repository_id: &repo_id.to_string_repr(),
+                    retrieval_text: &format!("timeoutneedle occurrence{index}"),
+                    analyzer_id: "generic",
+                    analyzer_version: "1.0.0",
+                    start_line: None,
+                    end_line: None,
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+        }
+
+        let params = FtsSearchParams {
+            query: "timeoutneedle",
+            repository_id: None,
+            file_type: None,
+            language: None,
+            max_results: 10,
+        };
+        assert!(fts_search_with_timeout(&conn, &params, Duration::ZERO).is_err());
+        assert_eq!(fts_search(&conn, &params).unwrap().len(), 10);
     }
 
     // -----------------------------------------------------------------------

@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use attic_core::RepositoryId;
 
@@ -91,6 +91,53 @@ pub fn bulk_load_analysis_cache(
         out.insert(entry.repo_relative.clone(), entry);
     }
     Ok(out)
+}
+
+/// Load analysis payloads only for the caller's bounded batch of paths.
+///
+/// Uncached paths are omitted. The caller should pass one processing stripe,
+/// not the entire repository, to bound retained JSON payloads.
+pub fn load_analysis_cache_for_paths(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+    paths: &[String],
+) -> Result<HashMap<String, CachedFileAnalysis>, StorageError> {
+    let mut statement = conn.prepare_cached(
+        "SELECT repo_relative, content_hash, security_state, is_partial_scan,
+                secret_pattern_version, analyzer_registry_version,
+                discovery_policy_hash, structural, max_units_per_file,
+                units_json, captured_json
+           FROM index_analysis_cache
+          WHERE repository_id = ?1 AND repo_relative = ?2",
+    )?;
+    let repository_id = repository_id.to_string_repr();
+    let mut result = HashMap::new();
+    for path in paths {
+        if result.contains_key(path) {
+            continue;
+        }
+        let entry = statement
+            .query_row(rusqlite::params![repository_id, path], |row| {
+                Ok(CachedFileAnalysis {
+                    repo_relative: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    security_state: row.get(2)?,
+                    is_partial_scan: row.get::<_, i64>(3)? != 0,
+                    secret_pattern_version: row.get(4)?,
+                    analyzer_registry_version: row.get(5)?,
+                    discovery_policy_hash: row.get(6)?,
+                    structural: row.get::<_, i64>(7)? != 0,
+                    max_units_per_file: row.get::<_, i64>(8)? as u64,
+                    units_json: row.get(9)?,
+                    captured_json: row.get(10)?,
+                })
+            })
+            .optional()?;
+        if let Some(entry) = entry {
+            result.insert(entry.repo_relative.clone(), entry);
+        }
+    }
+    Ok(result)
 }
 
 /// Persist (upsert) cache entries for every file successfully analyzed so

@@ -22,14 +22,10 @@
   Default:
       latest
 
-.PARAMETER SkipModels
-  Do not download the embedding models now. Attic then downloads them in
-  the background the first time it starts.
 #>
 
 param(
-    [string]$Version = "latest",
-    [switch]$SkipModels
+    [string]$Version = "latest"
 )
 
 $ErrorActionPreference = "Stop"
@@ -357,19 +353,9 @@ try {
 
 
     # -------------------------------------------------------------------------
-    # 10b. Download embedding models now (GPU model first when eligible), so
-    #      the first session starts on the right device. Never fails setup:
-    #      Attic retries the download itself on first start.
+    # No embedding models or model downloads are required.
     # -------------------------------------------------------------------------
 
-    if (-not $SkipModels) {
-        Write-Host "Downloading embedding models (about 1.2 GB per model, two on a GPU machine; download leftovers are removed afterwards; run with -SkipModels to defer)..."
-        & $BinPath setup-models
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Model download did not complete (exit $LASTEXITCODE). Attic will download the models automatically when it first starts."
-        }
-        Write-Host ""
-    }
 
 
     # -------------------------------------------------------------------------

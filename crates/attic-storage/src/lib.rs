@@ -9,18 +9,18 @@
 //! - resource policy (hardware/mode sizing) and the runtime resource monitor
 
 pub mod analysis_cache;
+pub mod catalog_projection;
 pub mod connection;
 pub mod crossrepo_ops;
 pub mod error;
 pub mod fts;
-pub mod gpu_telemetry;
-pub mod gpu_thermal;
 pub mod indexing_publication;
 pub mod invalidation_ops;
 pub mod migration;
 pub mod ops_tasks;
 pub mod repo_eviction;
 pub mod repository;
+pub mod repository_store_manager;
 pub mod resource_manager;
 pub mod resource_policy;
 pub mod retrieval_reads;
@@ -30,8 +30,9 @@ pub mod writer;
 
 pub use analysis_cache::{
     CachedFileAnalysis, bulk_load_analysis_cache, clear_analysis_cache,
-    upsert_analysis_cache_entries,
+    load_analysis_cache_for_paths, upsert_analysis_cache_entries,
 };
+pub use catalog_projection::export_repository_catalog;
 pub use connection::{DbPool, open_db, open_db_with_pragmas};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
@@ -46,7 +47,7 @@ pub use error::StorageError;
 pub use fts::{
     FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit, UnitTextEnrichment,
     delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup, fts_search,
-    insert_retrieval_unit_with_fts, retrieval_unit_texts,
+    fts_search_with_timeout, insert_retrieval_unit_with_fts, retrieval_unit_texts,
 };
 pub use indexing_publication::{
     IndexPublication, IndexPublicationStats, PublicationFile, PublicationNode,
@@ -58,17 +59,20 @@ pub use invalidation_ops::{
     get_freshness_totals, get_freshness_totals_for_repo, invalidate_for_occurrences,
     record_invalidation, record_recomputed,
 };
-pub use migration::run_migrations;
+pub use migration::{migrate_new_or_compatible_catalog, run_migrations};
 pub use ops_tasks::{
     ClaimedTask, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
     enqueue_task, finish_task, get_task_counts, get_task_counts_for_repo,
     recover_interrupted_tasks, set_task_checkpoint,
 };
+pub use repository_store_manager::{
+    RepositoryReadiness, RepositoryRegistration, RepositoryRemoval, RepositoryStatus,
+    RepositoryStoreLease, RepositoryStoreManager, RepositoryWriter,
+};
 pub use resource_manager::{
-    EmbeddingHeavyPermit, IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig,
-    ResourceMonitor, adaptive_embedding_batch, adaptive_embedding_limit, adaptive_indexing_limit,
-    sample_process_rss_mib,
+    IndexingHeavyPermit, RecoveryStage, ResourceAdvisory, ResourceConfig, ResourceMonitor,
+    adaptive_indexing_limit, sample_process_rss_mib,
 };
 pub use resource_policy::{
     EffectiveResourceConfig, HardwareSnapshot, MonitorOverrides, ResourceDetectionError,

@@ -213,7 +213,7 @@ pub fn verify_evidence(
         return Ok(VerifyOutcome::BlockedByBudget);
     }
 
-    let Some(span) = ev.source_span else {
+    let Some(span) = ev.excerpt_span.or(ev.source_span) else {
         return Ok(VerifyOutcome::Unavailable("no span to verify".into()));
     };
     let start = span.start_line.saturating_sub(2).max(1);

@@ -193,7 +193,8 @@ fn first_line(s: &str) -> String {
 }
 
 fn span_label(ev: &Evidence) -> String {
-    ev.source_span
+    ev.excerpt_span
+        .or(ev.source_span)
         .map(|s| format!("line {}", s.start_line + 1))
         .unwrap_or_else(|| "unknown line".into())
 }

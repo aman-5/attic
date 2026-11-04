@@ -8,7 +8,7 @@
 /// Cooperative cancellation primitives shared by long-running Attic operations.
 pub mod cancellation;
 
-/// `attic.toml` configuration model (resource/embedding tunables). Pure
+/// `attic.toml` configuration model (resource/indexing tunables). Pure
 /// parsing only — see `attic_storage::resource_policy` for hardware
 /// detection, baseline resolution, and env-var override layering.
 pub mod config;
@@ -27,7 +27,7 @@ pub mod paths;
 
 pub use config::{
     ATTIC_TOML_TEMPLATE, AtticConfig, ConfigError, IndexingOverride, KnowledgeConfig,
-    ResourceModeSetting, ResourceOverrides, SemanticConfig,
+    ResourceModeSetting, ResourceOverrides,
 };
 pub use constants::{
     ANALYZER_REGISTRY_VERSION, CURRENT_SCHEMA_VERSION, SECRET_PATTERN_VERSION, resources,

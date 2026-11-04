@@ -192,13 +192,11 @@ pub struct WriterQueueHandle {
     /// unknown state and no further mutations may be enqueued.
     poisoned: Arc<AtomicBool>,
     /// Shared with the worker. Incremented once per successfully committed
-    /// (non-empty) batch — a cheap, always-correct "something in the
-    /// canonical index just changed" signal. Lets consumers (e.g. the
-    /// semantic background enricher) react to real writes instead of
-    /// polling on a timer, since every canonical mutation — bootstrap,
-    /// incremental, watcher-triggered, present or future — is already
-    /// serialized through this single writer.
+    /// batch affecting index data. Operational logs and task bookkeeping
+    /// (`ops_*`) do not invalidate published repository generations.
     generation: Arc<AtomicU64>,
+    lifecycle: Option<Arc<std::sync::Mutex<bool>>>,
+    lease: Option<Arc<dyn Send + Sync>>,
 }
 
 impl WriterQueueHandle {
@@ -221,6 +219,18 @@ impl WriterQueueHandle {
     where
         F: FnOnce(&Connection) -> Result<(), StorageError> + Send + 'static,
     {
+        let _lifecycle = match &self.lifecycle {
+            Some(gate) => {
+                let guard = gate
+                    .lock()
+                    .map_err(|error| StorageError::MutexPoisoned(error.to_string()))?;
+                if !*guard {
+                    return Err(StorageError::QueueShutdown);
+                }
+                Some(guard)
+            }
+            None => None,
+        };
         // Refuse to enqueue if the writer is poisoned.
         if self.poisoned.load(Ordering::Acquire) {
             return Err(StorageError::WriterPoisoned);
@@ -255,6 +265,16 @@ impl WriterQueueHandle {
     /// [`WriterQueueHandle::generation`] field docs).
     pub fn generation(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.generation)
+    }
+
+    pub(crate) fn with_lease(
+        mut self,
+        gate: Arc<std::sync::Mutex<bool>>,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        self.lifecycle = Some(gate);
+        self.lease = Some(lease);
+        self
     }
 }
 
@@ -324,6 +344,8 @@ impl WriterQueue {
             tx,
             poisoned: Arc::clone(&poisoned),
             generation: Arc::clone(&generation),
+            lifecycle: None,
+            lease: None,
         };
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -506,6 +528,23 @@ fn flush_batch(
         batch.drain(..).map(|it| (it.f, it.result_tx)).collect();
 
     let n = fns_and_txs.len();
+    let index_changed = Arc::new(AtomicBool::new(false));
+    let changed = index_changed.clone();
+    if let Err(error) = conn.update_hook(Some(
+        move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+            if !table.starts_with("ops_") {
+                changed.store(true, Ordering::Release);
+            }
+        },
+    )) {
+        error!("attic-writer: cannot install index generation hook: {error}");
+        for (_, tx) in fns_and_txs {
+            let _ = tx.send(Err(StorageError::Worker(format!(
+                "index generation hook failed: {error}"
+            ))));
+        }
+        return;
+    }
 
     // Open transaction.  On failure every caller receives the error.
     // No transaction is open so poisoning is not required here.
@@ -581,14 +620,7 @@ fn flush_batch(
         // ----------------------------------------------------------------
         match finalizer.commit(conn) {
             Ok(()) => {
-                // COMMIT succeeded: all results are already Ok(()). Bump the
-                // generation counter so consumers watching for canonical
-                // changes (e.g. the semantic enricher) see this batch — but
-                // only when a row actually changed. Read-only work routed
-                // through the writer (an idle task-claim poll finding
-                // nothing) used to bump it several times a second, making
-                // the enricher re-run its full reconcile after every slice.
-                if conn.total_changes() != changes_before {
+                if conn.total_changes() != changes_before && index_changed.load(Ordering::Acquire) {
                     generation.fetch_add(1, Ordering::Release);
                 }
             }
@@ -929,6 +961,8 @@ mod tests {
             tx,
             poisoned,
             generation,
+            lifecycle: None,
+            lease: None,
         };
 
         // Fill the queue.
@@ -964,6 +998,8 @@ mod tests {
             tx,
             poisoned,
             generation,
+            lifecycle: None,
+            lease: None,
         };
 
         let result = handle.send(|_| Ok(()));
@@ -1249,6 +1285,34 @@ mod tests {
             elapsed >= Duration::from_millis(400),
             "throttle had no effect: 4 commits at max_io_ops_per_sec=5 took only {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn operational_logs_do_not_invalidate_index_generation() {
+        let (_tmp, path, conn) = migrated_file_db();
+        let queue = WriterQueue::new(conn).unwrap();
+        let writer = queue.handle();
+        writer.send(|conn| {
+            conn.execute_batch("CREATE TABLE ops_generation_test (value TEXT); CREATE TABLE generation_test (value TEXT);")?;
+            Ok(())
+        }).unwrap();
+        let before = writer.generation().load(Ordering::Acquire);
+        writer
+            .send(|conn| {
+                conn.execute("INSERT INTO ops_generation_test VALUES ('query log')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writer.generation().load(Ordering::Acquire), before);
+        writer
+            .send(|conn| {
+                conn.execute("INSERT INTO generation_test VALUES ('index update')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writer.generation().load(Ordering::Acquire), before + 1);
+        drop(queue);
+        cleanup(&path);
     }
 
     #[test]

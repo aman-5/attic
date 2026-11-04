@@ -899,6 +899,12 @@ impl Detector {
 
 static DETECTORS: &[Detector] = &[
     Detector {
+        id: "API-001",
+        placeholder: "[REDACTED:API-KEY]",
+        redact_mode: RedactMode::Full,
+        find_all: find_api_key_matches,
+    },
+    Detector {
         id: "PK-001",
         placeholder: PEM_PLACEHOLDER,
         redact_mode: RedactMode::Full,
@@ -929,6 +935,26 @@ static DETECTORS: &[Detector] = &[
         find_all: find_high_entropy_matches,
     },
 ];
+
+fn find_api_key_matches(text: &str) -> Vec<Match> {
+    let mut out = Vec::new();
+    for prefix in ["sk-live-", "sk_live_"] {
+        for (start, _) in text.match_indices(prefix) {
+            let tail = &text[start + prefix.len()..];
+            let suffix_len = tail
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                .count();
+            if suffix_len >= 16 {
+                out.push(Match {
+                    start,
+                    length: prefix.len() + suffix_len,
+                });
+            }
+        }
+    }
+    out
+}
 
 fn find_pem_private_key_matches(text: &str) -> Vec<Match> {
     let mut out = Vec::new();
@@ -1122,6 +1148,18 @@ mod tests {
         let r = scan_and_redact("");
         assert!(r.redacted.is_empty());
         assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn live_api_keys_are_redacted_without_entropy_guessing() {
+        for prefix in ["sk-live-", "sk_live_"] {
+            let key = format!("{prefix}abcdefgh12345678");
+            let input = format!("api_token = \"{key}\"");
+            let scan = scan_and_redact(&input);
+            assert!(!scan.findings.is_empty());
+            assert!(!scan.redacted.contains(&key));
+        }
+        assert!(scan_and_redact("sk-live-example").findings.is_empty());
     }
 
     #[test]

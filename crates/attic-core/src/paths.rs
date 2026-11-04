@@ -20,15 +20,18 @@
 //!
 //! ```text
 //! ~/.attic/
-//! ├── attic-server(.exe), DirectML.dll — installed binary (MCP configs point here)
+//! ├── attic-server(.exe) — installed binary (MCP configs point here)
 //! ├── config/       — config.toml (workspace membership), attic.toml (tunables)
-//! ├── data/         — attic.db, semantic.db (+ SQLite -wal/-shm)
+//! ├── data/         — catalog.db (+ SQLite -wal/-shm)
+//! │   └── repositories/<stable-id>/index.db (+ SQLite -wal/-shm)
 //! ├── run/          — attic.lock, attic.ipc (daemon election)
-//! ├── models/       — model cache, created lazily when models are downloaded
 //! ├── knowledge/    — central project-knowledge notes, created on first start
 //! ├── logs/         — file logs, created lazily when file logging is enabled
 //! └── backups/      — crash-recovery backups, created lazily on shutdown backup
 //! ```
+//!
+//! Legacy `attic.db`, `semantic.db` and `models/` files are preserved during
+//! layout migration; current Attic does not use or create them.
 //!
 //! The structured layout is used only for a database that
 //! [`AtticPaths::resolve`] placed in `<home>/data/` itself (the default, no
@@ -90,8 +93,8 @@ pub fn sibling(db_path: &Path, name: &str) -> PathBuf {
 /// Location of Attic file `name` relative to the database `db_path`.
 ///
 /// Structured layout (database in `<home>/data/`): configs go to
-/// `<home>/config/`, lock/ipc to `<home>/run/`, `models`/`logs`/`backups` to
-/// `<home>/`, databases stay in `data/`. Flat layout: beside the database.
+/// `<home>/config/`, lock/ipc to `<home>/run/`, and logs/knowledge/backups to
+/// `<home>/`; databases stay in `data/`. Flat layout: beside the database.
 pub fn sibling_in(db_path: &Path, name: &str, structured: bool) -> PathBuf {
     let parent = db_path.parent().unwrap_or(Path::new("."));
     let Some(home) = parent.parent().filter(|_| structured) else {
@@ -105,8 +108,8 @@ pub fn sibling_in(db_path: &Path, name: &str, structured: bool) -> PathBuf {
     }
 }
 
-/// A database and the SQLite companions that must travel with it: a `-wal`
-/// separated from its database loses committed transactions.
+/// Legacy databases and their SQLite companions move together so a `-wal` is
+/// never separated from its database.
 const DB_GROUPS: &[&[&str]] = &[
     &["semantic.db", "semantic.db-wal", "semantic.db-shm"],
     &["attic.db", "attic.db-wal", "attic.db-shm"],
@@ -264,15 +267,13 @@ impl PathResolutionError {
 pub struct AtticPaths {
     /// The Attic home directory (`~/.attic` or `$ATTIC_HOME`).
     pub home: PathBuf,
-    /// Main SQLite database (`<home>/attic.db`).
+    /// Workspace catalog (`<home>/data/catalog.db`).
     pub database: PathBuf,
-    /// Persistent workspace configuration file (`<home>/config.toml`).
+    /// Persistent workspace configuration file (`<home>/config/config.toml`).
     pub config_file: PathBuf,
-    /// Resource/embedding tunables file (`<home>/attic.toml`). A second,
+    /// Resource/indexing tunables file (`<home>/config/attic.toml`). A second,
     /// separate file from `config_file` — never merged with it.
     pub runtime_config: PathBuf,
-    /// Semantic layer database (`<home>/semantic.db`).
-    pub semantic_db: PathBuf,
 }
 
 impl AtticPaths {
@@ -364,7 +365,10 @@ impl AtticPaths {
                         "attic: keeping the legacy flat layout in {} for this run ({migration:?})",
                         home.display()
                     );
-                    home.join("attic.db")
+                    return Err(PathResolutionError::new(format!(
+                        "legacy Attic is still running or layout migration failed ({migration:?}); stop the old instance before opening the new catalog; existing data preserved at {}",
+                        home.display()
+                    )));
                 } else {
                     if let LayoutMigration::Failed(reason) = &migration {
                         eprintln!(
@@ -382,7 +386,7 @@ impl AtticPaths {
                     }
                     let data = home.join("data");
                     let _ = STRUCTURED_DATA_DIR.set(data.clone());
-                    data.join("attic.db")
+                    data.join("catalog.db")
                 }
             }
         };
@@ -390,7 +394,6 @@ impl AtticPaths {
         Ok(Self {
             config_file: sibling(&database, "config.toml"),
             runtime_config: sibling(&database, "attic.toml"),
-            semantic_db: sibling(&database, "semantic.db"),
             database,
             home,
         })

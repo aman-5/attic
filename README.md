@@ -8,27 +8,27 @@ JavaScript/TypeScript, Go, AEM and more — across one repository or many.**
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust 2024 edition](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](rust-toolchain.toml)
 
-Your repositories on disk are always the source of truth. Every index, graph
-and embedding Attic builds is derived, local and disposable — and Attic never
-writes into your projects.
+Your repositories on disk are always the source of truth. Every index and
+graph Attic builds is derived, local and disposable — and Attic never writes
+into your projects.
 
 ## What you get
 
 | | |
 |---|---|
-| 🔎 **Hybrid search** | Full-text search fused with local semantic embeddings: exact identifiers *and* "where do we retry failed payments?" |
+| 🔎 **Hybrid search** | Local lexical search combined with explicit code relationships; no model inference or vector index |
 | 🧬 **Code structure** | Symbols, definitions, imports and call/inheritance relationships for Java, Python, Go, JS/TS and 11 more languages |
 | ⚡ **Always current** | A file watcher re-indexes only what changed, seconds after you save |
 | ✅ **Evidence, not guesses** | `context` answers cite verified source spans — or say `INSUFFICIENT_EVIDENCE` |
 | 🕸️ **Many repositories** | One workspace spanning unrelated folders, with cross-repo dependency edges from Maven, Gradle, npm, Go, Python, OSGi, AEM and git submodules |
 | 🧠 **Project knowledge** | Drop Markdown notes in `~/.attic/knowledge/` (on by default); every `context` answer gets them, for every repo |
-| 🔒 **Local-first** | Code never leaves your machine. The only network access is the one-time embedding-model download (`ATTIC_SEMANTIC=0` turns it off) |
+| 🔒 **Local-first** | Indexing and retrieval require no cloud service, model download or external database |
 
 ## Contents
 
 - [Quick start](#quick-start) — install, connect, index
 - [Pick your stack](#pick-your-stack) — Python · Java/Spring/Kotlin · JS/TS · Go · AEM · everything else
-- [Ask questions](#ask-questions) · [Semantic backend & performance](#semantic-backend--performance) · [MCP tools](#mcp-tools)
+- [Ask questions](#ask-questions) · [Storage and startup](#storage-and-startup) · [MCP tools](#mcp-tools)
 - [How it works](#how-it-works) · [Workspaces](#workspaces)
 - [Configuration](#configuration) — files, `attic.toml`, environment variables
 - [Languages & analyzer plugins](#languages--analyzer-plugins)
@@ -62,13 +62,10 @@ cd attic
 
 The script downloads the prebuilt binary for your platform, refuses to install
 it unless its published SHA-256 checksum matches, installs it as
-`~/.attic/attic-server` (`attic-server.exe` plus `DirectML.dll` for the GPU on
-Windows) without admin rights,
-downloads the embedding models (`attic-server setup-models`; skip with
-`-SkipModels` / `ATTIC_SKIP_MODELS=1`), and prints the MCP configuration with the
-real path filled in. No Rust toolchain needed — or
-[build it yourself](#build-from-source) (`cargo xtask install`
-runs `setup-models` for you).
+`~/.attic/attic-server` (`attic-server.exe` on Windows) without admin rights,
+and prints MCP configuration with the real path filled in. No Rust toolchain,
+GPU runtime or embedding model is needed. Alternatively,
+[build it yourself](#build-from-source).
 
 ### 2 · Connect your AI client
 
@@ -213,8 +210,6 @@ exclude = ["**/generated-sources/**"]
 # ~/.attic/config/attic.toml (optional)
 [indexing]
 exclude = ["**/*.min.js", "public/vendor/**"]
-[semantic]
-exclude_globs = ["**/__snapshots__/**"]
 ```
 
 </details>
@@ -253,7 +248,7 @@ exclude_globs = ["**/__snapshots__/**"]
   Ruby/PHP dynamic calls) results are marked partial, never guessed.
 - **JSON:** canonical subtree chunks with JSON-pointer addresses, so
   near-identical environment exports are stored and searched once.
-- **Any other text** (YAML, SQL, Markdown, shell, …): full-text and semantic
+- **Any other text** (YAML, SQL, Markdown, shell, …): full-text
   search.
 - Missing a language? See
   [Languages & analyzer plugins](#languages--analyzer-plugins).
@@ -273,127 +268,71 @@ Just talk to your AI client — it calls Attic's tools for you:
 "Find the configuration controlling retry behaviour."
 ```
 
-Search and `file` work as soon as the first index finishes (seconds for most
-repositories). Semantic results join in automatically while embeddings are
-generated in the background; until then search is purely lexical.
+Content tools become available only after required index verification.
+MCP initialization, tool discovery and process status do not wait for database
+verification. An initializing request returns an explicit retryable response;
+a verification failure returns an error, never unchecked content.
 
-## Semantic backend & performance
+## Storage and startup
 
-Semantic search is enabled by default and runs locally. The model is downloaded
-once into `~/.attic/models` (never `~/.cache/huggingface`). The installers run
-`attic-server setup-models` right after installing the binary, so the models are
-ready before the first session (GPU model first on an eligible GPU; skip with
-`setup.ps1 -SkipModels` or `ATTIC_SKIP_MODELS=1`). You can run it again any time;
-present models are skipped, and download leftovers Attic never reads are removed
-(about 2.3 GB stays on disk on a GPU machine). If models are still missing at start, Attic downloads
-in the background and embeds that session on CPU; the GPU backend is used from
-the next start. `setup-models` exit codes: `0` ready · `1` usage error ·
-`2` download failed · `3` could not create the models directory.
+SQLite stores graph relationships as nodes and edges alongside lexical indexes
+and evidence. A graph is a data model, not a separate database product. No
+MySQL service, Python sidecar, cloud Graphify instance or custom storage engine
+is required.
 
-### Files in `~/.attic`
+The daemon owns initialization, so reconnecting clients share its progress
+and do not restart verification. The first launch becomes the **daemon**:
+it owns one catalog writer and one writer per open repository store, watchers
+and recovery. Each later launch becomes a thin **relay** to that daemon.
+Large integrity checks may still take
+longer than 30 seconds; keeping MCP responsive does not make unchecked content
+safe to serve.
 
-```text
-~/.attic/
-├── attic-server(.exe), DirectML.dll   installed binary (MCP configs point here)
-├── config/    config.toml (workspace), attic.toml (tunables)
-├── data/      attic.db, semantic.db
-├── run/       attic.lock, attic.ipc
-├── models/    embedding models
-├── knowledge/ your project-knowledge notes (created on first start)
-├── logs/      file logs (when enabled)
-└── backups/   shutdown backups
-```
-
-An older flat `~/.attic` is migrated into these folders on the first start
-(skipped for that run while an older Attic is still running). The move is
-all-or-nothing: each database travels with its `-wal`/`-shm` files, and a
-failed attempt is rolled back and retried on the next start. Setting
-`ATTIC_DB_PATH` keeps every file beside that database instead, even when it
-points into a folder named `data`.
-
-```mermaid
-flowchart TD
-    A[Start Attic] --> B{Platform}
-    B -->|Windows MSVC| W[DirectML GPU<br/>any DX12 GPU]
-    B -->|Apple Silicon| M[Metal GPU<br/>automatic with cargo xtask install]
-    B -->|Linux default| L[CPU]
-    L -->|build with --features candle-cuda| C[CUDA GPU<br/>not validated in Sep 2026 round]
-    B -->|Intel Mac| I[CPU]
-    W --> D{~/.attic/models/onnx-fp16 exists?}
-    D -->|no| F[Download now<br/>CPU for this session]
-    D -->|yes| G[GPU defaults]
-    M --> G
-    C --> G
-    F --> CPU[CPU defaults]
-    L --> CPU
-    I --> CPU
-```
-
-| Default | GPU (DirectML / Metal / CUDA) | CPU |
-|---|---:|---:|
-| `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `500000` | `2560` |
-| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `500000` | `500000` |
-
-> [!TIP]
-> Measured on an RTX A500 Laptop GPU, DirectML fp16 ONNX reaches about
-> **5,600–6,000 padded tokens/s**. Chunks/s varies with chunk size: Attic's own
-> small chunks measured **76–89 chunks/s**, while larger AEM chunks measured
-> **6.22–13.7 chunks/s**. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+Embedding generation, models, model downloads, GPU inference and vector search
+have been removed. Graph and lexical retrieval do not guarantee equivalent
+recall for vague conceptual queries; identifiers, framework relationships and
+explicit dependency contracts remain grounded in source evidence.
 
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
-| `context` | One door for answers and retrieval. Default: evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder. With `mode: "SEARCH"`: raw hybrid retrieval (FTS5 fused with semantic nearest neighbours) without evidence assembly — each result has a `source_type`, a bounded ~240-char snippet, and line anchors when recorded; accepts `file_type`, `language`, `max_results` (default 25, cap 200), and `scope: "knowledge"` for project knowledge only |
+| `context` | One door for answers and retrieval. Default: evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder. With `mode: "SEARCH"`: raw lexical retrieval (SQLite FTS5) without evidence assembly — each result has a `source_type`, a bounded ~240-char snippet, and line anchors when recorded; accepts `file_type`, `language`, `max_results` (default 25, cap 200), and `scope: "knowledge"` for project knowledge only |
 | `file` | A bounded, secret-scanned region of a live file (line or byte range) |
 | `repo_map` | Structure and statistics of one repository |
-| `status` | Readiness, indexing/watcher state, semantic progress, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result and semantic fallback reasons) |
+| `status` | Readiness, indexing/watcher state, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
 | `logging` | Turn the file log on/off or change its level (`error`…`trace`) instantly, no restart. To keep a level across restarts set `[logging] file_level` in `attic.toml` |
 | `debug_drain_task` | Admin: run one pending incremental task synchronously |
 
-The exact schemas come from `make_tools()` in `crates/attic-server/src/main.rs`
+The exact schemas come from `make_tools()` in `crates/attic-server/src/tools.rs`
 and are returned by `tools/list`.
+
+Answer responses keep context, claims and evidence at the top level;
+`repository_answers` contains compact per-repository summaries, not duplicate
+answers. Identical excerpts share a body while preserving all source citations.
+Rejected-evidence counts/reasons are always present; pass
+`include_diagnostics: true` for individual rejected items. Response `telemetry`
+reports server timings and exact JSON-text bytes, not client/model latency.
+Existing retrieval budgets remain; no extra global response cap is imposed.
+See [response quality and latency diagnosis](docs/PERFORMANCE.md).
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    R[Repositories] --> D[Discovery<br/>gitignore + security]
-    D --> A[Analyzer plugins]
-    A --> I[(Canonical index<br/>SQLite + FTS5)]
-    I --> S[(Semantic store<br/>Qwen3 embeddings)]
-    W[File watcher] --> I
-    I --> Q[Retrieval + evidence]
-    S --> Q
-    Q --> M[MCP tools] --> C[AI client]
+    MCP[MCP handshake and status] --> R[Readiness gate]
+    Files[Local source files] --> Parse[Bounded discovery and analyzers]
+    Parse --> Index[(Lexical index, graph and evidence)]
+    Index --> Verify[Verification and freshness checks]
+    Verify --> R
+    R --> Answer[Evidence-backed context]
 ```
 
-**One process model.** The first Attic launch for a database becomes the
-**daemon**: it owns the single database writer, the watchers and crash
-recovery. Every later launch (another IDE window, another agent) becomes a thin
-**relay** that forwards its stdio to the daemon. If the daemon dies, a relay
-takes over transparently.
-
-```mermaid
-sequenceDiagram
-    participant A as Client A
-    participant D as attic-server (daemon)
-    participant R as attic-server (relay)
-    participant B as Client B
-    A->>D: launch (stdio)
-    Note over D: wins attic.lock · owns writer, watchers, recovery<br/>publishes its socket in attic.ipc
-    B->>R: launch (stdio)
-    R->>D: connect (Unix socket / named pipe)
-    Note over R,D: MCP bytes relayed both ways
-    A--xD: disconnect
-    B--xR: disconnect
-    Note over D: no clients for 90 s → graceful shutdown
-```
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
+Parsing produces symbols and explicit relationships; lexical retrieval finds
+source candidates, graph traversal expands connected evidence, and evidence
+gates reject unsupported or stale claims. AEM XML/HTL/clientlibs and package
+manifests remain local. Ambiguous names are not invented dependency edges.
 
 ## Workspaces
 
@@ -434,20 +373,22 @@ repositories and never in Hugging Face's global `~/.cache/huggingface` cache:
 
 | Path | Contents |
 |---|---|
-| `attic-server(.exe)`, `DirectML.dll` | Installed binary (MCP configs point here) |
-| `data/attic.db` (+ `-wal`, `-shm`) | Canonical index — disposable, rebuilt from source |
-| `data/semantic.db` | Embeddings — disposable |
+| `attic-server(.exe)` | Installed binary (MCP configs point here) |
+| `data/catalog.db` (+ `-wal`, `-shm`) | Workspace membership and bounded cross-repository metadata |
+| `data/repositories/<stable-id>/index.db` (+ `-wal`, `-shm`) | Repository-local graph, lexical index and source evidence |
 | `config/config.toml` | Workspace membership (`[[repositories]]`) |
 | `config/attic.toml` | Tunables (below); a commented template is written on first run |
-| `models/` | Embedding model cache under `ATTIC_HOME`; filled by `setup-models` or on first use |
 | `knowledge/` | Your project-knowledge notes, served to every `context` answer. Created on first start; move or disable it with `[knowledge]` in `attic.toml`. See [`knowledge/README.md`](knowledge/README.md) |
 | `logs/` | Daily file log — off by default, created only after `logging {"action":"on"}` |
-| `backups/` | Crash-recovery backups (last 3), created only when the shutdown backup first runs |
+| `backups/` | Historical backups, preserved; not automatically purged |
 | `run/attic.lock`, `run/attic.ipc` | Daemon election and relay address |
 
-Removing a repository from the workspace also deletes its stored data
-(index, embeddings) in the background; adding it back before that finishes
-cancels the deletion.
+Removing a repository immediately excludes its index and touching relationships
+from new requests. Owned index files are reclaimed after outstanding leases drain;
+other repositories are not reindexed. Re-adding before reclamation cancels future
+cleanup, but cannot restore already deleted records. Missing source folders alone
+never authorize deletion. Legacy `attic.db`, `semantic.db` and model caches remain
+untouched until explicitly cleaned up; this version does not use or download models.
 
 ### `attic.toml`
 
@@ -469,28 +410,15 @@ clear error. Restart Attic after editing.
 | `min_free_memory_mib` | 256 / 400 / 400 | Background work pauses below this much free memory |
 | `max_foreground_queries` | 32 / 64 / 128 | Concurrent MCP requests |
 | `scheduler_workers` | 2 / 2 / 8 | Concurrent incremental re-index tasks and repository bootstraps |
-| `embedding_batch_size` | 8 / 16 / 64 | Items per embedding call (capped at 16 while semantic is on, unless set explicitly) |
-| `embedding_worker_count` | 1 / 3 / 8 | Embedding workers (a provider that serializes still runs one lane) |
 | `writer_batch_size` | 128 / 256 / 512 | Mutations per database transaction |
 | `writer_flush_interval_ms` | 100 / 50 / 25 | Maximum delay before a partial batch commits |
 | `writer_queue_capacity` | 256 / 512 / 1024 | Pending mutations before back-pressure |
 | `max_io_ops_per_sec` | 100 / 200 / 400 | Commit rate limit |
 
-**`[semantic]`**
-
-Explicit values override the backend-specific automatic defaults. Attic logs
-`semantic selection defaults` at startup with the resolved values.
-
-| Key | Default | Effect |
-|---|---|---|
-| `enabled` | `true` | `false` keeps search lexical-only and never downloads the model |
-| `model` | `"qwen3-embedding-0.6b"` | The supported embedding model |
-| `dimension` | native (1024) | Smaller vectors (e.g. `512`) use less disk and RAM; changing it re-embeds |
-| `min_score` | GPU `0.0` / CPU `0.30` | Minimum selection score to embed a unit; 0.0 embeds every eligible unit |
-| `max_units_per_repo` | GPU `500000` / CPU `2560` | Embedding cap per repository (unique, selected chunks) |
-| `max_file_bytes` | GPU `8388608` (8 MiB) / CPU `262144` (256 KiB) | Larger files are searchable but never embedded |
-| `max_units_total` | `500000` | Whole-workspace embedding cap (unique, selected chunks; every indexed chunk is considered; max `5000000`) |
-| `exclude_globs` | `[]` | Paths never embedded, e.g. `["**/*.min.js", "testdata/"]` |
+Old `[semantic]`/`[embedding]` tables and embedding resource overrides are
+recognized only for upgrade compatibility. They cannot enable a model; startup
+warns that these settings should be removed. Other unknown configuration keys
+still fail closed.
 
 **`[indexing]`**
 
@@ -526,14 +454,6 @@ Explicit values override the backend-specific automatic defaults. Attic logs
 | `ATTIC_CONFIG` | Workspace config file listing `[[repositories]]` |
 | `ATTIC_WORKSPACE_ROOT` | Single repository root (not persisted) |
 
-**Semantic layer**
-
-| Variable | Effect |
-|---|---|
-| `ATTIC_SEMANTIC` | `0` disables semantic search (default: on) |
-| `ATTIC_ONNX_MODEL_DIR` | GPU build only: directory with `model_fp16.onnx` + `tokenizer.json` |
-| `ATTIC_VRAM_CEILING_MIB` | GPU build only: VRAM budget override |
-
 **Resources** — same meaning as the `attic.toml` keys:
 
 | Variable | `attic.toml` key |
@@ -543,8 +463,6 @@ Explicit values override the backend-specific automatic defaults. Attic logs
 | `ATTIC_MIN_FREE_MEMORY_MIB` | `min_free_memory_mib` |
 | `ATTIC_MAX_FOREGROUND_QUERIES` | `max_foreground_queries` |
 | `ATTIC_SCHEDULER_WORKERS` | `scheduler_workers` |
-| `ATTIC_EMBEDDING_BATCH_SIZE` | `embedding_batch_size` |
-| `ATTIC_EMBEDDING_WORKERS` | `embedding_worker_count` |
 | `ATTIC_WRITER_BATCH_SIZE` | `writer_batch_size` |
 | `ATTIC_WRITER_FLUSH_INTERVAL_MS` | `writer_flush_interval_ms` |
 | `ATTIC_WRITER_QUEUE_CAPACITY` | `writer_queue_capacity` |
@@ -574,7 +492,7 @@ Test-only fault-injection and benchmark variables are listed in
 |---|---|---|
 | **Full** (hand-written tree-sitter) | Java · Python · Go · JavaScript · TypeScript (incl. TSX) · Kotlin · Scala · Lua · Ruby · PHP · Swift · C · C++ · C# · Rust · Dockerfile | Symbols, definitions, imports, inheritance, calls. Partial (and marked so) where exact resolution is impossible: Rust macros, C++ templates, Ruby/PHP dynamic calls; Lua has no inheritance; Dockerfile has build stages instead of calls |
 | **Platform** | AEM · JSON | JCR/HTL/OSGi structure and imports · canonical JSON subtrees |
-| **Search** | Everything else | Full-text and semantic search |
+| **Search** | Everything else | Full-text search |
 
 Each language or platform is an **analyzer plugin** with a config-facing id:
 `aem`, `java`, `python`, `go`, `javascript`, `typescript`, `json`, `c`, `cpp`,
@@ -601,111 +519,43 @@ tags query plus one catalog line; a new platform implements the four-method
 | Symptom | What to check |
 |---|---|
 | Client can't connect | The `command` path is absolute and correct; startup errors are on **stderr** (stdout carries only MCP) |
-| Server exits at startup | stderr names the cause: invalid `attic.toml`/`ATTIC_*` value, unreadable root, or a failed database integrity check |
+| Initialization fails | `status` and stderr report the cause; content remains unavailable after invalid configuration or failed integrity checks |
 | "workspace not configured" | Expected on first run — ask your AI to configure Attic, or set `ATTIC_WORKSPACE_ROOT` |
 | A file is missing | It is in `.gitignore`, a built-in skipped folder, or an `[indexing] exclude` pattern |
 | Results look stale | `status` → `incremental.state`; the `file` tool always reads live from disk and flags drift |
-| No semantic results yet | `status` → `semantic_progress`; the model downloads once, then embeddings build in the background |
 | "server busy" / high memory | `status` → `resource_pressure`; raise `total_memory_budget_mib` or `max_foreground_queries` |
 | Two windows, one database | Supported — the second launch relays to the daemon automatically |
 
-Start fresh at any time: stop Attic and delete `data\attic.db*` (and
-`data\semantic.db`) under `ATTIC_HOME`; everything is rebuilt from source. More in
-[`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#troubleshooting).
+Do not delete `.attic` or its WAL files while Attic runs. Existing legacy
+`attic.db`, `semantic.db` and model caches are preserved during upgrade; they
+are not used to justify serving unchecked data. Keep configuration and
+`knowledge/` when performing an explicitly scoped reindex or cleanup.
 
 </details>
 
 ## Build from source
 
-The developer install path is intentionally the same on Windows, Linux and
-macOS:
-
-```sh
-git clone https://github.com/aman-5/attic
-cd attic
-cargo xtask check
-cargo xtask install
-```
-
-`cargo xtask check` runs:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-`cargo xtask install` performs a release build of `attic-server`, stops any
-running local `attic-server` / `attic`, and installs the binary plus required
-runtime libraries (for example `DirectML.dll`) into `$ATTIC_HOME` or
-`~/.attic`, then runs `attic-server setup-models` to download missing models
-and remove duplicate model files (`--skip-models` skips this). It reads the
-executable path from Cargo's JSON output and replaces files with a
-temp+rename sequence that is safe for macOS code signatures. On Windows it
-builds for MSVC (DirectML) unless `CARGO_BUILD_TARGET` is set, even when a
-personal Cargo config defaults to GNU.
-
-`cargo xtask all` runs `cargo fmt --all`, `cargo xtask check`, then
-`cargo xtask install` in one go.
-
-<details open>
-<summary><b>Windows</b></summary>
-
-Use the MSVC Rust target for GPU support. DirectML is built in automatically on
-Windows MSVC; the legacy `ort-directml` feature flag is a no-op kept only for
-old scripts.
-
-`cargo xtask` already builds for MSVC when `CARGO_BUILD_TARGET` is unset. Set
-it only for plain `cargo` commands when a personal Cargo config forces GNU
-(`x86_64-pc-windows-gnu`):
+Use the Rust toolchain declared in `rust-toolchain.toml` plus a C compiler for
+tree-sitter grammars. Windows requires MSVC Build Tools and its SDK.
 
 ```powershell
 $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
-cargo xtask check
-cargo xtask install
+cargo xtask all
 ```
 
-In `cmd.exe`:
-
-```bat
-set CARGO_BUILD_TARGET=x86_64-pc-windows-msvc
-cargo xtask check
-cargo xtask install
+```sh
+cargo xtask all
 ```
 
-</details>
-
-<details>
-<summary><b>macOS</b></summary>
-
-On Apple Silicon, `cargo xtask install` automatically adds
-`--features candle-metal`, matching the `aarch64-apple-darwin` release
-packages. Intel Macs use CPU embeddings by default.
-
-</details>
-
-<details>
-<summary><b>Linux</b></summary>
-
-Linux defaults to CPU embeddings. For NVIDIA CUDA, build with
-`--features candle-cuda` on a machine with the CUDA toolkit installed; this path
-was not validated in the 29–30 Sep 2026 measurement round.
-
-</details>
-
-Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (`rustup show`
-installs it) and a C compiler for the bundled tree-sitter grammars — Build
-Tools for Visual Studio on Windows, `build-essential`/`gcc` on Linux, and
-`xcode-select --install` on macOS.
-
-See [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md#development) for benchmarks,
-opt-in GPU tests, and the release process.
+`all` formats, checks, runs tests, builds release and installs the binary.
+Installation replaces only the selected installation's executable; model setup
+and model downloads no longer run. No GPU feature flags are required.
 
 ## Documentation
 
 | Doc | Covers |
 |---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System design: pipeline, process model, storage, evidence, semantic layer, security, recovery |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System design: pipeline, process model, storage, evidence, security, recovery |
 | [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md) | Operations and development: status, recovery, adding languages, testing, releasing |
-| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Measured indexing/embedding throughput, sizing and how to benchmark your own repositories |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Local lexical/structural indexing performance and benchmarking |
 | [`knowledge/README.md`](knowledge/README.md) | 🧠 Teach Attic the "why": project-knowledge notes in under a minute |

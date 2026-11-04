@@ -50,6 +50,12 @@ pub fn fuse(candidates: Vec<Candidate>) -> Vec<crate::candidates::Candidate> {
         let kind = rep_candidate.kind;
         let mut rep = rep_candidate.evidence;
         for other in &group {
+            if rep.excerpt_span.is_none() && other.evidence.excerpt_span.is_some() {
+                rep.snippet = other.evidence.snippet.clone();
+                rep.excerpt_span = other.evidence.excerpt_span;
+                rep.snippet_leading_omitted = other.evidence.snippet_leading_omitted;
+                rep.snippet_trailing_omitted = other.evidence.snippet_trailing_omitted;
+            }
             rep.signals.merge_max(&other.evidence.signals);
             for src in &other.evidence.retrieval_sources {
                 if !rep
@@ -79,6 +85,26 @@ mod tests {
     use crate::candidates::RetrieverKind;
     use attic_core::SourceSpan;
     use attic_evidence::{Evidence, EvidenceSourceType};
+
+    #[test]
+    fn focused_lexical_and_path_hits_fuse_and_preserve_raw_excerpt() {
+        let mut lexical = cand("lexical", EvidenceSourceType::SourceCode, "unit", 1, 0.6);
+        lexical.evidence.excerpt_span = Some(SourceSpan::new(40, 12, 40, 40));
+        lexical.evidence.snippet = Some("payment_dispatch();".into());
+        lexical.evidence.snippet_leading_omitted = true;
+        lexical.evidence.snippet_trailing_omitted = true;
+        let mut path = cand("path", EvidenceSourceType::SourceCode, "unit", 1, 1.0);
+        path.kind = RetrieverKind::Path;
+        path.evidence.retrieval_sources[0].retriever_type = "PATH".into();
+        let fused = fuse(vec![path, lexical]);
+        assert_eq!(fused.len(), 1);
+        let evidence = &fused[0].evidence;
+        assert_eq!(evidence.retrieval_sources.len(), 2);
+        assert_eq!(evidence.source_span.unwrap().start_line, 1);
+        assert_eq!(evidence.excerpt_span.unwrap().start_line, 40);
+        assert_eq!(evidence.snippet.as_deref(), Some("payment_dispatch();"));
+        assert!(evidence.snippet_leading_omitted && evidence.snippet_trailing_omitted);
+    }
 
     #[test]
     fn fused_candidate_keeps_representative_kind_and_ignores_nan() {

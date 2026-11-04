@@ -29,6 +29,37 @@ fn evidence_for(path: &str, start: u32, end: u32, snippet: &str) -> Evidence {
 }
 
 #[test]
+fn raw_midline_excerpt_verifies_current_source_without_display_markers() {
+    let fx = Fixture::bootstrap();
+    let line = format!(
+        "{}payment_dispatch();{}\n",
+        "x".repeat(2400),
+        "y".repeat(2400)
+    );
+    let body = format!("{}{}", "// boilerplate\n".repeat(40), line);
+    std::fs::write(fx.root.join("config/app.yml"), &body).unwrap();
+    let snippet = &line[2100..3300];
+    let mut ev = evidence_for("config/app.yml", 1, 42, snippet);
+    ev.excerpt_span = Some(attic_core::SourceSpan::new(41, 2100, 41, 3300));
+    ev.snippet_leading_omitted = true;
+    ev.snippet_trailing_omitted = true;
+    let policy = policy_with_fs(3, 64 * 1024);
+    let mut budget = BudgetAccountant::new(&policy);
+    assert_eq!(
+        verify::verify_evidence(
+            &mut ev,
+            &fx.root.canonicalize().unwrap(),
+            &policy,
+            &mut budget
+        )
+        .unwrap(),
+        VerifyOutcome::VerifiedCurrent,
+    );
+    assert!(ev.live_source_verified);
+    assert_eq!(ev.verification_state, VerificationStatus::Verified);
+}
+
+#[test]
 fn small_file_overrun_stops_at_byte_budget_and_reports_degradation() {
     let fx = Fixture::bootstrap();
     // 8 KiB file whose marker sits at the very END.

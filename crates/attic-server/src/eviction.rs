@@ -4,11 +4,8 @@
 //! `workspace remove` enqueues one task per removed repository. This worker
 //! is the only consumer of that task type (the indexing scheduler never
 //! claims it). Each task deletes `attic.db` rows in small FK-ordered writer
-//! transactions, then the repository's `semantic.db` rows. Membership is
-//! re-checked inside every canonical delete transaction and again inside the
-//! semantic delete transaction, so a root re-added before the next delete
-//! phase begins cancels the task and keeps the remaining data. Tasks survive
-//! restarts and resume idempotently.
+//! transactions. Membership is re-checked inside every delete transaction.
+//! Tasks survive restarts and resume idempotently.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -36,7 +33,7 @@ fn now_us() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvictionTestHookPoint {
     BeforeCanonicalStep,
-    BeforeSemanticCleanup,
+    BeforeCompletion,
 }
 
 #[cfg(test)]
@@ -100,42 +97,47 @@ pub fn enqueue_eviction(
     })
 }
 
-/// Start the evictor thread. It runs for the life of the process.
+/// Start a daemon-owned evictor; cancellation and join precede database shutdown.
 pub fn spawn_evictor(
     pool: attic_storage::DbPool,
     writer: WriterQueueHandle,
-    semantic: Option<Arc<attic_retrieval::semantic::SemanticStack>>,
     active_roots: Arc<RwLock<Vec<PathBuf>>>,
-) {
+) -> Result<(attic_core::CancellationToken, tokio::task::JoinHandle<()>), attic_storage::StorageError>
+{
     // A crash mid-eviction leaves the task RUNNING; steps are idempotent,
     // so simply make it claimable again (writes only if such a row exists).
-    let _ = writer.send(|c| {
+    writer.send(|c| {
         c.execute(
             "UPDATE ops_tasks SET state = 'PENDING'
               WHERE task_type = 'STALE_EVICTION' AND state = 'RUNNING'",
             [],
         )?;
         Ok(())
-    });
-    let spawned = std::thread::Builder::new()
-        .name("attic-evictor".into())
-        .spawn(move || {
-            loop {
-                if !run_one(&pool, &writer, semantic.as_deref(), &active_roots) {
-                    std::thread::sleep(POLL);
+    })?;
+    let cancellation = attic_core::CancellationToken::new();
+    let token = cancellation.clone();
+    let handle = tokio::spawn(async move {
+        while !token.is_cancelled() {
+            let pool = pool.clone();
+            let writer = writer.clone();
+            let roots = active_roots.clone();
+            match tokio::task::spawn_blocking(move || run_one(&pool, &writer, &roots)).await {
+                Ok(true) => {}
+                Ok(false) => tokio::time::sleep(POLL).await,
+                Err(error) => {
+                    tracing::error!("repository evictor failed: {error}");
+                    return;
                 }
             }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!("repository evictor could not start: {e}");
-    }
+        }
+    });
+    Ok((cancellation, handle))
 }
 
 /// Claim and run one eviction task. Returns false when none was pending.
 fn run_one(
     pool: &attic_storage::DbPool,
     writer: &WriterQueueHandle,
-    semantic: Option<&attic_retrieval::semantic::SemanticStack>,
     active_roots: &RwLock<Vec<PathBuf>>,
 ) -> bool {
     // Poll on a READ connection: every writer commit bumps the write
@@ -177,7 +179,7 @@ fn run_one(
         .unwrap_or_default()
         .to_string();
 
-    let outcome = evict(writer, semantic, active_roots, &repo, &root);
+    let outcome = evict(writer, active_roots, &repo, &root);
     let task_id = task.id.clone();
     let _ = writer.send(move |c| finish_task(c, &task_id, &outcome, now_us()));
     true
@@ -185,7 +187,6 @@ fn run_one(
 
 fn evict(
     writer: &WriterQueueHandle,
-    semantic: Option<&attic_retrieval::semantic::SemanticStack>,
     _active_roots: &RwLock<Vec<PathBuf>>,
     repo: &str,
     root: &str,
@@ -239,38 +240,11 @@ fn evict(
         }
     }
     #[cfg(test)]
-    fire_test_hook(EvictionTestHookPoint::BeforeSemanticCleanup, repo, root);
-    let semantic_rows = match semantic {
-        Some(s) if root.is_empty() => match s.store.evict_repository(repo) {
-            Err(e) => {
-                return TaskOutcome::Failed {
-                    error: format!("semantic eviction failed: {e}"),
-                };
-            }
-            Ok(n) => n,
-        },
-        Some(s) => match s.store.evict_repository_if_inactive(repo, Path::new(root)) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                tracing::info!(
-                    repository_id = repo,
-                    "root re-added before semantic cleanup; eviction cancelled"
-                );
-                return TaskOutcome::Cancelled;
-            }
-            Err(e) => {
-                return TaskOutcome::Failed {
-                    error: format!("semantic eviction failed: {e}"),
-                };
-            }
-        },
-        None => 0,
-    };
+    fire_test_hook(EvictionTestHookPoint::BeforeCompletion, repo, root);
     tracing::info!(
         repository_id = repo,
         files,
         units,
-        semantic_rows,
         "removed repository data evicted"
     );
     TaskOutcome::Done
@@ -354,7 +328,6 @@ mod tests {
 
         let outcome = evict(
             &fx.writer,
-            None,
             &RwLock::new(Vec::new()),
             &first.repository_id,
             &fx.root.to_string_lossy(),

@@ -129,26 +129,38 @@ async fn call_tool_text(
     tool: &str,
     arguments: Value,
 ) -> Result<String, String> {
-    let mut params = CallToolRequestParams::new(tool.to_owned());
-    params.arguments = arguments.as_object().cloned();
-    let fut = srv.service.call_tool(params);
-    let outcome: Result<String, String> = match tokio::time::timeout(IO_TIMEOUT, fut).await {
-        Ok(Ok(result)) => match result.content.first() {
-            Some(ContentBlock::Text(t)) => Ok(t.text.clone()),
-            other => Err(format!(
-                "expected text content from `{tool}`, got {other:?}"
-            )),
-        },
-        Ok(Err(e)) => Err(format!("`{tool}` call failed: {e}")),
-        // Timed out: kill the wedged server immediately.
-        Err(_) => {
-            let _ = srv.child.start_kill();
-            return Err(format!(
-                "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
-            ));
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        let mut params = CallToolRequestParams::new(tool.to_owned());
+        params.arguments = arguments.as_object().cloned();
+        let fut = srv.service.call_tool(params);
+        let outcome: Result<String, String> = match tokio::time::timeout_at(deadline, fut).await {
+            Ok(Ok(result)) => match result.content.first() {
+                Some(ContentBlock::Text(t)) => Ok(t.text.clone()),
+                other => Err(format!(
+                    "expected text content from `{tool}`, got {other:?}"
+                )),
+            },
+            Ok(Err(e)) => Err(format!("`{tool}` call failed: {e}")),
+            // Timed out: kill the wedged server immediately.
+            Err(_) => {
+                let _ = srv.child.start_kill();
+                return Err(format!(
+                    "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
+                ));
+            }
+        };
+        if let Ok(text) = &outcome
+            && serde_json::from_str::<Value>(text)
+                .ok()
+                .is_some_and(|state| state["status"] == "initializing")
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
         }
-    };
-    outcome
+        return outcome;
+    }
 }
 
 #[tokio::test]

@@ -373,6 +373,7 @@ pub struct DbPool {
     /// Explicit `(cache_pages, mmap_bytes)` pragma override for lazily-opened
     /// readers (Phase 8). `None` uses the fixed defaults.
     pragmas: Option<(i64, u64)>,
+    lease: Option<Arc<dyn Send + Sync>>,
 }
 
 impl DbPool {
@@ -384,6 +385,7 @@ impl DbPool {
                 in_use: 0,
             })),
             pragmas: None,
+            lease: None,
         }
     }
 
@@ -399,7 +401,13 @@ impl DbPool {
                 in_use: 0,
             })),
             pragmas: Some((cache_pages, mmap_bytes)),
+            lease: None,
         }
+    }
+
+    pub(crate) fn with_lease(mut self, lease: Arc<dyn Send + Sync>) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     fn open_reader(&self) -> Result<Connection, StorageError> {

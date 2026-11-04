@@ -18,7 +18,7 @@ the system behaves.
 - [Known design limitations](#known-design-limitations)
 - [Key design decisions](#key-design-decisions)
 - [Core behavioral invariants](#core-behavioral-invariants)
-- [Semantic layer](#semantic-layer-optional-default-enabled)
+- [Local lexical and graph retrieval](#local-lexical-and-graph-retrieval)
 - [Resource management](#resource-management)
 - [Security](#security)
 - [Crash recovery](#crash-recovery)
@@ -27,12 +27,10 @@ the system behaves.
 
 ## What Attic is
 
-Attic is a local-first code-intelligence server. It indexes source
-repositories into a single SQLite database and serves retrieval — full-text
-search, bounded file reads, repository maps, health status, and
-evidence-grounded question answering — over the Model Context Protocol
-(MCP), so an MCP-capable AI client can ground its answers in real,
-verifiable source rather than guessing.
+Attic is a local-only code-intelligence server. It keeps a workspace catalog
+and a managed SQLite index for each repository, then serves lexical retrieval,
+code relationships, bounded file reads, repository maps, health status, and
+evidence-grounded question answering over MCP.
 
 The guiding separation, preserved throughout the pipeline — see
 [Retrieval & evidence](#retrieval--evidence) below:
@@ -67,11 +65,11 @@ flowchart TD
   generic `tags.scm`-driven engine (symbols + intra-file references only)
   covering eleven more languages, a JSON analyzer, and the AEM platform plugin
   — see [Language support](#language-support) below.
-- **Canonical index** (`attic-storage`, SQLite + FTS5) — files, retrieval
-  units, structural nodes, symbols, relationships. One coordinated
-  `WriterQueue` (single writer, serialized transactions); a `DbPool` of
-  concurrent read-only connections (WAL mode). `attic-indexing` publishes
-  each run atomically; no other code path writes index data.
+- **Managed storage** (`attic-storage`, SQLite + FTS5) — a workspace catalog
+  stores membership and bounded cross-repository provenance; each repository
+  has an isolated index for files, retrieval units, structural nodes, symbols
+  and relationships. Each store serializes writes through its own
+  `WriterQueue`; `DbPool` readers use WAL mode. Index publications are atomic.
 - **Incremental freshness** (`attic-incremental`) — native filesystem
   watcher, falling back to periodic reconciliation. Freshness states:
   `CURRENT` / `STALE` / `UNKNOWN` / pending refresh. Flow on change:
@@ -82,8 +80,8 @@ flowchart TD
 - **Retrieval Planner** (`attic-retrieval`) — a Query Evidence Contract
   selects required evidence per query intent (definition/navigation/
   configuration/architecture/debugging/impact/dependency/test/knowledge);
-  candidates come from lexical (FTS5) + symbol + structural + relationship
-  graph + optional semantic sources.
+  candidates come from lexical (FTS5), symbol, structural, relationship-graph
+  and project-knowledge sources. There is no embedding/vector retrieval.
 - **Evidence Manager** (`attic-evidence`) — verifies claims against
   retrieved evidence, assigns confidence, returns `INSUFFICIENT_EVIDENCE`
   explicitly rather than guessing.
@@ -145,7 +143,7 @@ SOURCE  !=  INDEX  !=  RETRIEVAL CANDIDATE  !=  EVIDENCE  !=  CONTEXT  !=  ANSWE
 ```
 
 Repositories on disk are always the source of truth. Every index, graph,
-embedding, and cache is derived and disposable — Attic can always
+and cache is derived and disposable — Attic can always
 reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
 ## Process and ownership model
@@ -201,7 +199,7 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   config file listing arbitrary `[[repositories]]` roots (`ATTIC_WORKSPACE_ROOT`
   remains the single-repository convenience form; the two are mutually
   exclusive). Each root is validated and bootstrapped independently and
-  becomes its own `core_repositories` row. Cross-repository dependency
+  becomes its own isolated repository store. Cross-repository dependency
   resolution (`attic-crossrepo::maintenance::sync_workspace`) runs once at
   startup, inside the daemon, over the configured member repositories
   (repositories left in storage by an earlier configuration never
@@ -212,7 +210,7 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
   ├── repo A (C:\Users\<username>\projects\repo-a)      ─┐
   ├── repo B (C:\Users\<username>\projects\repo-b)       ─┼─ each keeps independent
   └── repo C (C:\Users\<username>\projects\repo-c)  ─┘  source/index state (own
-                 core_repositories row, own SourceRevisions, own watcher) —
+                 own index, SourceRevisions, watcher and writer) —
                  sync_workspace resolves edges BETWEEN them and records
                  provenance back to the WorkspaceSnapshot (parent hash)
                  that was current when each edge was last resolved.
@@ -234,13 +232,11 @@ reconstruct them from source (see `docs/PLAYBOOK.md` for reset/rebuild).
 
 ## Storage concurrency
 
-SQLite runs in WAL mode: one dedicated writer connection processes all
-mutations serially through `WriterQueue` (a bounded work queue drained by a
-single worker thread, inside the writer's own transaction per publication);
-any number of reader connections (`DbPool`) run concurrently against the
-same file without blocking the writer or each other. There is no second
-writer path anywhere in the codebase — `attic-indexing`, `attic-incremental`,
-and `attic-crossrepo` all route mutations through the same `WriterQueueHandle`.
+SQLite runs in WAL mode. The catalog and every open repository index have
+their own dedicated `WriterQueue` and read-only `DbPool`; mutations to each
+database are serialized through that store's writer. Repository index writes
+remain isolated from other repositories, while cross-repository metadata is
+published to the catalog.
 
 ### Database lifecycle and retention
 
@@ -248,9 +244,8 @@ Deleted-file tombstones, invalidation-audit records, and terminal
 (completed/failed/cancelled) task rows are not kept forever:
 `prune_old_tombstones`, `prune_old_invalidation_records`, and
 `prune_terminal_tasks` (default retention 90/90/30 days respectively) run as
-part of `run_maintenance`, which also issues `VACUUM` against both
-`attic.db` and `semantic.db`. `run_maintenance` is wired into the shutdown
-sequence for both databases and runs on every clean shutdown — process
+part of maintenance, which operates on the managed catalog and repository
+stores. Clean shutdown runs maintenance and storage checkpointing — process
 exit, SIGINT, and a daemon's idle-timeout exit alike — so on-disk file size
 is expected to shrink after deletes rather than growing unbounded across
 the lifetime of a long-running daemon.
@@ -331,7 +326,7 @@ no cross-file resolution.
 | Java / Python / Go / JS / TS (incl. `.tsx`) / Kotlin / Scala / Lua / Ruby / PHP / Swift / C / C++ / C# / Rust / Dockerfile | Tier 1 — hand-written tree-sitter | Symbols, definitions, imports, inheritance, calls (partial where exact resolution is impossible, and marked so) |
 | JSON | `JsonAnalyzer` | Canonical subtree chunks with JSON-pointer addressing |
 | AEM (JCR content, HTL, OSGi configs, clientlibs) | `aem` platform plugin | Path-qualified nodes/symbols and imports; lexical units from `GenericAnalyzer` |
-| Everything else | Tier 3 — `GenericAnalyzer` | Full-text (and semantic) search; a dedicated analyzer can be added as a plugin without changing the pipeline (see `docs/PLAYBOOK.md`) |
+| Everything else | Tier 3 — `GenericAnalyzer` | Full-text search; a dedicated analyzer can be added as a plugin without changing the pipeline (see `docs/PLAYBOOK.md`) |
 
 ## Project Knowledge authority model
 
@@ -462,8 +457,8 @@ rationale lives only in the archive branch's git history now):
   exactly one row, so a second process attempting to write against the same
   database outside the daemon/relay protocol cannot silently diverge into
   two independent server-state views (see [Process and ownership
-  model](#process-and-ownership-model): one daemon owns the writer per
-  database; later launches relay to it rather than opening a second one).
+  model](#process-and-ownership-model): one daemon owns each catalog/store
+  writer; later launches relay to it rather than opening a second one).
 - **Per-subsystem compatibility versioning**: `core_index_generations.
   subsystem_versions_json` records the schema, analyzer-registry, indexer
   and secret-detector versions independently, so each generation states
@@ -478,7 +473,7 @@ rationale lives only in the archive branch's git history now):
   a separate repository boundary — a true submodule (`.gitmodules`-linked)
   and a plain, independently-cloned repository sitting under the workspace
   root are handled identically. Each becomes its own `core_repositories`
-  row with its own identity; `create_workspace_snapshot` records each
+  isolated index with its own identity; `create_workspace_snapshot` records each
   repository's current `SourceRevisionId` generically, so the workspace
   snapshot changes whenever any member repository advances — this is not
   gitlink/`.gitmodules`-specific. Uninitialized submodules (present in
@@ -494,7 +489,7 @@ rationale lives only in the archive branch's git history now):
   requirement, so "first registered wins" was rejected.
 - **`GenericAnalyzer` chunks at ~2,000 characters per `RetrievalUnit`**
   (`TARGET_CHUNK_CHARS`, recorded as `CHUNKING_VERSION`) — large enough for
-  useful context, small enough to stay well under embedding token limits;
+  useful context while keeping retrieval units bounded;
   chunks tile the file exactly and an over-long single line is split
   losslessly. Language-agnostic since it requires no parser.
 - **Filesystem watching uses `notify-debouncer-full`** (on top of `notify`
@@ -574,15 +569,16 @@ this system needs to not accidentally break.
   context.
 - A detected contradiction between evidence sources is surfaced, never
   silently dropped in favor of one side.
-- `FAST` mode never touches the filesystem or an embedding lookup — a code
+- `FAST` mode never touches the filesystem for source verification — a code
   path that does so for a `FAST`-mode query is a contract violation.
 - A `RetrievalPlan` is finalized exactly once and its steps are append-only;
   every piece of evidence considered is accounted for as either used or
   explicitly dropped, never silently ignored.
 
 **Recovery**
-- The server refuses to accept any MCP tool call until startup recovery
-  reaches a ready state (fail-closed, not a soft warning).
+- MCP initialization, tool discovery and status may respond during startup;
+  content-serving calls fail closed until recovery and index verification
+  reach a ready state.
 - Startup recovery is idempotent — running it against an already-recovered
   database is a no-op.
 - No recovery step deletes source files; only derived artifacts (indexes,
@@ -598,147 +594,24 @@ this system needs to not accidentally break.
 
 </details>
 
-## Semantic layer (optional, default-enabled)
+## Local lexical and graph retrieval
 
-Semantic (embedding-based) retrieval is **enabled by default**; set
-`ATTIC_SEMANTIC=0` to disable it. Canonical lexical/structural retrieval is
-entirely unaffected when the semantic layer is disabled or degraded.
-`Qwen3Embedder` (`Qwen/Qwen3-Embedding-0.6B`) is the production provider;
-`HashingEmbedder` is only a deterministic test double for offline tests.
+Attic does not generate embeddings, download models, run inference, or build a
+vector index. `context` uses SQLite FTS5 lexical candidates together with
+symbols, structural relationships, dependency edges and project knowledge.
+`context(mode="SEARCH")` returns raw lexical matches without evidence assembly;
+the other modes assemble and validate evidence before returning an answer.
 
-Every vector is tied to an `EmbeddingFingerprint` (model, revision, dimension,
-pooling, normalization, tokenizer, chunking, instruction, backend and
-quantization) and a semantic generation, so incompatible vectors are never
-mixed. Hybrid search fuses lexical and semantic candidates with RRF in
-`crates/attic-retrieval/src/hybrid.rs`.
-
-### Backend and default selection
-
-```mermaid
-flowchart TD
-    A[Semantic enabled] --> OS{Platform / target}
-    OS -->|Windows MSVC| W[DirectML GPU<br/>any DX12 GPU: NVIDIA / AMD / Intel]
-    OS -->|Apple Silicon| M[Metal GPU via candle-metal<br/>automatic with cargo xtask install]
-    OS -->|Linux| L{Built with candle-cuda?}
-    OS -->|Intel Mac| IM[CPU]
-    L -->|yes, NVIDIA available| CUDA[CUDA GPU<br/>not validated in Sep 2026 measurements]
-    L -->|no| LC[CPU]
-    W --> ONNX{~/.attic/models/onnx-fp16 exists?}
-    ONNX -->|no: first start| D[Download fp16 ONNX in background<br/>embed on CPU this session]
-    ONNX -->|yes: next start| GD[GPU defaults]
-    M --> GD
-    CUDA --> GD
-    D --> CD[CPU defaults]
-    LC --> CD
-    IM --> CD
-    GD --> Log[Startup log: semantic selection defaults]
-    CD --> Log
-```
-
-First start downloads the fp16 ONNX model (~1.2 GB) into `~/.attic/models`.
-Attic does not use Hugging Face's global `~/.cache/huggingface` cache. Every
-model artifact — safetensors and ONNX — is verified against a pinned
-SHA-256 manifest before it is used, and a mismatch quarantines the file; the
-inference worker never downloads an unpinned "latest" model on a cache miss,
-it fails closed and the parent re-provisions. If a GPU
-falls back to CPU after startup, the startup selection defaults remain.
-
-| Selection key | GPU (DirectML / Metal / CUDA) | CPU |
-|---|---:|---:|
-| `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `500000` | `2560` |
-| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `500000` | `500000` |
-
-The reason for backend-specific defaults is cost: full coverage is minutes on
-the measured GPU but would be about one hour per repository on CPU
-(**estimate**). Explicit `[semantic]` values in `attic.toml` override the table.
-
-### Embedding queue and vector pool
-
-```mermaid
-flowchart LR
-    U[Index retrieval units] --> S[Select units<br/>score + caps + file size]
-    S --> O[Occurrence / queue reconcile<br/>single transaction]
-    O --> Q[Leased queue<br/>fencing token]
-    Q --> W[Window large unit]
-    W --> B[Bucket + pack pass]
-    B --> P[Inference worker process]
-    P --> N[Mean-pool windows<br/>L2-normalise]
-    N --> V[(Canonical vectors<br/>vector space + content hash)]
-    V --> G[Project into active generation]
-    G --> H[Hybrid retrieval]
-```
-
-A claim takes a time-bounded lease and bumps a fencing token; a commit carrying
-an older token is rejected, so a stalled or crashed worker can never overwrite
-newer work. Expired leases return to the queue on the next drive. Canonical
-vectors are keyed by vector space and content hash, so unchanged content
-re-indexed under a new source revision reuses its vector instead of being
-embedded again. Reconcile writes all occurrence and queue rows in one
-transaction.
-
-Neural embedding always runs inside the supervised `attic inference-worker`
-child process. Worker stderr is forwarded. A hung or crashed model runtime is
-killed and restarted without taking down the MCP server.
-
-### Windowed embedding and GPU packing
-
-Batching never changes a vector: batches are right-padded and masked, and
-regression tests compare batched versus single-item vectors.
-
-- A unit larger than one model window is split on character/line boundaries
-  into up to **16** windows. Each window is embedded, then vectors are
-  length-weighted mean-pooled and L2-normalised into one vector. Units that fit
-  one window are embedded unchanged (bit-identical vectors).
-- If a dense-text window still exceeds the token window, only that unit is
-  bisected and re-split at half the window, at most **2** times. Nothing is
-  truncated. Units bigger than 16 windows are excluded and counted as
-  `exceeds_max_input_bytes`.
-- DirectML uses `onnx_seq_len = 512` on cards below **6 GB** (1 KiB per window)
-  and `1024` otherwise (2 KiB per window).
-- GPU pass packing uses buckets `32/48/64/96/128/192/256/384/512`, powers of two
-  plus 1.5× midpoints, with **7–20% less padded work** measured with the real
-  tokenizer. The default `gpu_batch_tokens` is **4096 padded tokens per pass**.
-- The DirectML worker requests only `last_hidden_state`; the older path copied
-  56 unused KV-cache tensors (about **448 MiB** per pass) to host memory.
-  DirectML memory pattern is disabled, as required by ONNX Runtime for this
-  dynamic-shape workload.
-
-DirectML fp16 ONNX uses its own fingerprint/vector space. CUDA and Metal are
-Candle GPU backends; moving between compatible Candle CPU/GPU backends is
-represented through the embedding fingerprint/generation rules rather than by
-mixing incompatible vectors.
-
-### Progress, diagnostics and failure policy
-
-`status` → `semantic_progress.chunks_per_sec` is measured from committed
-enrichment batches over the last **300 s** (`attic_semantic::throughput`).
-Model cache cleanup (`attic_semantic::model_cache`) removes the ONNX download
-cache once `onnx-fp16/` is complete and hard-links duplicate Windows blob
-copies; `setup-models` and server start run it. `status.semantic_identity` reports the active backend and
-fallback reason, and `diagnostics.why_slow` summarizes bottlenecks.
-
-With `ATTIC_LOG=debug`, the parent logs:
-
-- `semantic batch` — claimed, embedded, input bytes, prep ms, embed ms, commit ms
-- `DirectML embed batch` — items, passes, `shrunk_by_vram`, tokenize ms,
-  forward ms, wait ms, total ms
-
-GPU temperature is sampled in the background through `nvidia-smi` on NVIDIA
-Windows/Linux and hwmon on Linux; it is inactive on macOS and non-NVIDIA
-Windows. `nvidia-smi` is killed after **5 s**. Embedding pauses at **90 °C**
-and resumes at **85 °C**.
-
-Content errors — too many tokens, too-large units, or the `exceeds_max_input_bytes`
-case — never count toward GPU→CPU demotion and never force a model reload.
+Lexical and graph retrieval are not equivalent to vector similarity. Exact
+identifiers, source text and explicit relationships are supported; vague
+conceptual queries may retrieve differently from an embedding-based system.
 
 ## Resource management
 
 A `ResourceMonitor` (`attic-storage::resource_manager`) tracks real process
 RSS and enforces configurable budgets: total memory, foreground MCP query
 concurrency, and background worker concurrency. Foreground (interactive MCP
-calls) is never starved by background work (indexing, semantic enrichment) —
+calls) is never starved by background indexing —
 background capacity is capped strictly below foreground capacity, and under
 memory pressure expensive `DEEP` retrieval mode is automatically downgraded
 to `NORMAL` rather than failing outright.
@@ -757,26 +630,20 @@ refused for memory pressure — every tool (`file`, `status`,
 `context`, `workspace`) is admitted at every tier. Pressure only throttles
 background work and the optional depth of a foreground answer (`DEEP` →
 `NORMAL`); the sole hard refusal is the foreground concurrency-slot limit
-(flood protection, not memory policy). Background embedding on a CPU backend parks at Emergency; a
-dedicated GPU parks only below 512 MiB available host RAM. Semantic search
-over embeddings that already exist keeps working while background embedding is
-parked, a query embedding waits a bounded time behind a running batch and
-then falls back to lexical search with an explicit reason
-(`SEMANTIC_QUERY_TIMED_OUT`), and `status` → `semantic_availability` states
-the current tier, available RAM, whether enrichment is parked and why. Other
-`status` blocks: `semantic_provider_backoff` (provider not-ready streak, last
-error, next retry), `semantic_selection_coverage` (units eligible before caps
-vs selected, per-repo/global cap exclusions, plain `reason`), and
-`incremental_stuck_tasks` (tasks RUNNING past a generous bound, with task id,
-type, repository and age).
+(flood protection, not memory policy). `status` also reports incremental tasks, resource pressure and retrieval
+telemetry; these values are independent of any model runtime. The
+`scheduler_workers` setting controls background indexing concurrency; SQLite
+cache sizing remains mode-derived. Other `status` blocks include
+`incremental_stuck_tasks` (tasks RUNNING past a bound, with task id, type,
+repository and age).
 
 Resource values resolve as environment variable > `attic.toml [resources]`
 > hardware-detected mode baseline, are range-validated
 (`ResourcePolicy::validate`), and are clamped to the machine as the final
-step, so no override can exceed real hardware. `scheduler_workers`,
-`embedding_batch_size` and `embedding_worker_count` are user-tunable; SQLite
-cache/mmap sizing stays mode-derived. Unparsable environment values and
-unknown `attic.toml` tables/keys fail startup rather than being ignored.
+step, so no override can exceed real hardware. `scheduler_workers` is
+user-tunable; SQLite cache/mmap sizing stays mode-derived. Unparsable
+environment values and unknown `attic.toml` tables/keys fail startup rather
+than being ignored.
 
 ## Security
 
@@ -794,21 +661,15 @@ unknown `attic.toml` tables/keys fail startup rather than being ignored.
 
 ## Crash recovery
 
-On every startup, before serving any MCP request, Attic runs
-`run_startup_recovery`: interrupted tasks return to `PENDING`, refreshes a
-crash cut short return to `STALE` (and are rescheduled), in-progress secret
-scans restart, and the watcher epoch is bumped. Publication is atomic, so a
-crash mid-run never exposes partial state as `CURRENT`. This is
-fail-closed — if recovery cannot establish a safe state, or the subsequent
-database integrity check fails, the process refuses to serve rather than
-present possibly-stale or corrupt data as `CURRENT`. On clean shutdown,
-Attic performs an explicit WAL checkpoint and writes a crash-recovery backup
-(most recent 3 retained) before exiting — see "Core behavioral invariants"
-above for the recovery guarantees this implements.
+MCP initialization, tool discovery and status can respond while repository
+stores are being verified. Content-serving requests fail closed until the
+relevant indexes pass verification. Startup recovery and integrity checks
+must complete before indexed content is served. A crash mid-publication never
+exposes a partial generation as current.
 
 ## Logical workspace model (multi-root, MCP-configured)
 
-ONE Attic MCP process serves ONE persistent logical workspace made of
+ONE Attic MCP daemon serves ONE persistent logical workspace made of
 ZERO/ONE/MANY arbitrary repository roots. The workspace is configured
 through MCP itself (the `workspace` tool: `inspect`/`add`/`remove`/`set`),
 persisted atomically to `<ATTIC_HOME>/config/config.toml`, and reloaded on every
@@ -825,7 +686,10 @@ flowchart TD
     A["Repository A<br/>C:\..."]
     B["Repository B<br/>D:\..."]
     C["Repository C<br/>E:\..."]
-    DB[(Shared Attic DB)]
+    Catalog[(Workspace catalog)]
+    StoreA[(Repository A index)]
+    StoreB[(Repository B index)]
+    StoreC[(Repository C index)]
     CR[Cross-Repo Intelligence]
 
     AI <--> MCP
@@ -834,10 +698,13 @@ flowchart TD
     W --> A
     W --> B
     W --> C
-    A --> DB
-    B --> DB
-    C --> DB
-    DB --> CR
+    A --> StoreA
+    B --> StoreB
+    C --> StoreC
+    Catalog --> CR
+    StoreA --> CR
+    StoreB --> CR
+    StoreC --> CR
     CR --> MCP
 ```
 
@@ -853,7 +720,6 @@ JSON-RPC protocol; every log line goes to stderr** (`tracing`, controlled by
 the release binary and inspects both streams directly. The seven registered
 tools (`file`, `repo_map`, `status`, `context`, `workspace`,
 `logging`, `debug_drain_task`) are documented in the README; their exact
-schemas are defined once in
-`crates/attic-server/src/main.rs::make_tools()` and returned verbatim via
-`tools/list` — that function is the single source of truth for the tool
+schemas are defined once in `crates/attic-server/src/tools.rs::make_tools()`
+and returned via `tools/list` — that function is the single source of truth for the tool
 surface.

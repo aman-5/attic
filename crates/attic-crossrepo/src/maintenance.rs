@@ -206,8 +206,12 @@ pub fn sync_workspace(
 
     for (idx, repo_id) in repo_ids.iter().enumerate() {
         if opts.cancel.is_cancelled() || opts.deadline.expired() {
-            debug!("workspace sync cancelled at repo {idx}/{total}");
-            break;
+            return Err(CrossRepoError::LimitExceeded {
+                limit: "workspace_sync_deadline_or_cancellation",
+                context: format!(
+                    "stopped before repository {idx}/{total}; no partial snapshot published"
+                ),
+            });
         }
 
         // Scan manifests from disk (read-only — queries DB for paths, reads
@@ -308,6 +312,13 @@ pub fn sync_workspace(
         .splice(0..0, reader_missing);
     let edges_len = edges.len();
 
+    if opts.cancel.is_cancelled() || opts.deadline.expired() {
+        return Err(CrossRepoError::LimitExceeded {
+            limit: "workspace_sync_deadline_or_cancellation",
+            context: "stopped before publication; no partial snapshot published".into(),
+        });
+    }
+
     // Build (repo_id, source_revision_id) pairs for snapshot provenance.
     let snapshot_revisions_input: Vec<(String, String)> = all_repo_data
         .iter()
@@ -334,9 +345,16 @@ pub fn sync_workspace(
     //   - snap_rx cannot be dropped before the send because it lives on the
     //     same stack frame as the writer.send() call.
     let (snap_tx, snap_rx) = std::sync::mpsc::sync_channel::<String>(1);
+    let deadline = opts.deadline.clone();
+    let cancel = opts.cancel.clone();
 
     writer
         .send(move |conn| {
+            if cancel.is_cancelled() || deadline.expired() {
+                return Err(attic_storage::StorageError::Worker(
+                    "workspace sync stopped before publication; no snapshot was written".into(),
+                ));
+            }
             // Persist catalog + declarations for each repository.
             for repo_id in &repo_ids_for_persistence {
                 if let Some((scan, provides, declarations)) = scans_clone.get(repo_id) {
@@ -975,6 +993,49 @@ mod tests {
             result2.is_err(),
             "sync_workspace must return Err when writer is shut down, not panic"
         );
+    }
+
+    #[test]
+    fn sync_workspace_does_not_publish_when_cancelled_or_expired() {
+        use attic_storage::writer::WriterQueue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cancelled_sync.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            configure_connection(&conn).unwrap();
+            run_migrations(&conn).unwrap();
+        }
+
+        let writer_conn = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&writer_conn).unwrap();
+        let queue = WriterQueue::new(writer_conn).unwrap();
+        let writer = queue.handle();
+        let reader = rusqlite::Connection::open(&db_path).unwrap();
+        configure_connection(&reader).unwrap();
+
+        let expired = WorkspaceSyncOptions {
+            deadline: Deadline(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            active_repository_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(sync_workspace(&reader, &writer, &expired).is_err());
+
+        let cancelled_token = CancelToken::never();
+        cancelled_token.cancel();
+        let cancelled = WorkspaceSyncOptions {
+            cancel: cancelled_token,
+            active_repository_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(sync_workspace(&reader, &writer, &cancelled).is_err());
+
+        let snapshots: i64 = reader
+            .query_row("SELECT COUNT(*) FROM core_workspace_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(snapshots, 0, "cancelled sync must not publish a snapshot");
     }
 
     /// §14 / §16 — `active_repository_ids` must exclude stale DB repos from

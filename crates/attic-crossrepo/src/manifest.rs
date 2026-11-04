@@ -971,12 +971,14 @@ pub fn parse_proto_imports(rel_path: &str, bytes: &[u8]) -> ManifestParse {
 fn parse_aem_content_xml(rel_path: &str, text: &str) -> ManifestParse {
     let mut out = ManifestParse::default();
     // Only component definitions under an apps/ tree participate.
-    let Some(apps_pos) = rel_path.find("/apps/") else {
+    let resource_path = if let Some(path) = rel_path.strip_prefix("apps/") {
+        path
+    } else if let Some((_, path)) = rel_path.split_once("/apps/") {
+        path
+    } else {
         return out;
     };
-    let rt = rel_path[apps_pos + 1..]
-        .trim_end_matches("/.content.xml")
-        .to_string();
+    let rt = resource_path.trim_end_matches("/.content.xml").to_string();
     if rt.is_empty() || !rt.contains("/components/") {
         return out;
     }
@@ -993,6 +995,7 @@ fn parse_aem_content_xml(rel_path: &str, text: &str) -> ManifestParse {
             let quote = needle.chars().last().unwrap();
             if let Some(end) = rest.find(quote) {
                 let target = rest[..end].trim();
+                let target = target.strip_prefix("/apps/").unwrap_or(target);
                 if !target.is_empty() {
                     out.declarations.push(DependencyDeclaration {
                         path: rel_path.to_string(),
@@ -1372,11 +1375,7 @@ mod aem_tests {
             COMPONENT.as_bytes(),
         );
         let names: Vec<&str> = out.provides.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["apps/acme/components/paymentsummary"],
-            "{names:?}"
-        );
+        assert_eq!(names, vec!["acme/components/paymentsummary"], "{names:?}");
         assert_eq!(out.provides[0].ecosystem, Ecosystem::AemComponent);
         assert_eq!(out.declarations.len(), 1);
         assert_eq!(
