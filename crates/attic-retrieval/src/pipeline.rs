@@ -9,6 +9,7 @@
 //! returns.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use attic_storage::{DbPool, NewRetrievalPlanRecord, StorageError, WriterQueueHandle};
 
@@ -50,9 +51,6 @@ pub struct RetrievalService {
     pub readers: DbPool,
     /// Coordinated single-writer endpoint (plan persistence only).
     pub writer: WriterQueueHandle,
-    /// Phase 5 disposable semantic layer; `None` keeps byte-identical
-    /// Phase 4 behavior (deleting the semantic DB must degrade, never break).
-    pub semantic: Option<std::sync::Arc<crate::semantic::SemanticStack>>,
     /// Phase 6 cross-repo subsystem health.  When `true`, cross-repo
     /// evidence generation is skipped (subsystem degraded/unknown).
     /// Local retrieval continues unaffected.
@@ -98,6 +96,8 @@ pub struct AnswerOutcome {
     pub confidence: ConfidenceLevel,
     /// Assembled context text when evidence exists.
     pub context_text: Option<String>,
+    /// Structured, secret-scanned context for lossless response compaction.
+    pub context_document: Option<context::ContextDocument>,
     /// (claim text, verdict tag, evidence ids) for served claims.
     pub claims: Vec<(String, String, Vec<String>)>,
     /// The canonical Evidence items actually served into the assembled
@@ -169,7 +169,6 @@ struct DbPhaseOutcome {
     contradictions: Vec<Contradiction>,
     budget: BudgetAccountant,
     hard_cancelled: bool,
-    semantic: crate::semantic::SemanticOutcome,
 }
 
 /// Generation context: everything the per-step generator invocations share.
@@ -335,19 +334,24 @@ impl RetrievalService {
         let repo_filter = req.repository_ids.first().cloned();
         let single_repo = !req.repository_ids.is_empty();
         let central_knowledge = req.knowledge_repository_id.as_deref();
+        let budget = BudgetAccountant::new(&policy);
 
         let phase: Result<DbPhaseOutcome, StorageError> = self.readers.with_reader(|conn| {
-            self.run_db_phases(
+            let deadline = budget.deadline();
+            conn.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+            let result = self.run_db_phases(
                 conn,
                 &mut plan,
-                BudgetAccountant::new(&policy),
+                budget,
                 &classification,
                 &contract,
                 &policy,
                 &repo_filter,
                 single_repo,
                 central_knowledge,
-            )
+            );
+            conn.progress_handler(0, None::<fn() -> bool>)?;
+            result
         });
         let DbPhaseOutcome {
             validated,
@@ -355,15 +359,14 @@ impl RetrievalService {
             contradictions,
             budget,
             hard_cancelled,
-            semantic: semantic_outcome,
         } = phase.map_err(RetrievalError::Storage)?;
 
         // ── Outcome assembly ────────────────────────────────────────────────
         let (result, confidence, insufficient_reason) =
             compute_result(&report, validated.len(), hard_cancelled);
 
-        let (context_text, claims_out, served_evidence): (
-            Option<String>,
+        let (context_document, claims_out, served_evidence): (
+            Option<context::ContextDocument>,
             ServedClaims,
             Vec<Evidence>,
         ) = if validated.is_empty() {
@@ -394,14 +397,10 @@ impl RetrievalService {
         plan.policy_trace.fs_files_read = budget.fs_files_used;
         plan.policy_trace.fs_bytes_read = budget.fs_bytes_used;
         plan.policy_trace.context_tokens_used = plan.context_tokens;
-        plan.policy_trace.semantic_invoked = semantic_outcome.candidates > 0;
-        // Truthful observability: NO reranker exists in Phase 5 (ADR-014 D7).
         // Policy permission is NOT execution — this stays false until a
         // reranker actually runs.
         plan.policy_trace.reranking_invoked = false;
         plan.policy_trace.repair_cycles = plan.repair_cycles;
-        plan.policy_trace.semantic_candidates_returned = semantic_outcome.candidates as u32;
-        plan.policy_trace.semantic_fallback_reason = semantic_outcome.fallback.as_str().to_owned();
         plan.policy_trace.budget_fields_hit = budget.limits_hit().to_vec();
         plan.insufficiency_reason = insufficient_reason.clone();
         plan.policy_trace.final_result =
@@ -415,7 +414,8 @@ impl RetrievalService {
             plan,
             result,
             confidence,
-            context_text,
+            context_text: context_document.as_ref().map(|doc| doc.text.clone()),
+            context_document,
             claims: claims_out,
             served_evidence,
             insufficient_reason,
@@ -582,88 +582,6 @@ impl RetrievalService {
                     tracing::warn!(
                         "cross-repo subsystem degraded; skipping cross-repo evidence generation"
                     );
-                }
-            }
-        }
-
-        // ── Phase 5: semantic candidate generation (§12–§15) ────────────────
-        // Another bounded producer feeding the SAME fusion/rank/validation
-        // chain below. Every non-contribution reason is recorded.
-        let mut semantic_outcome = crate::semantic::SemanticOutcome {
-            candidates: 0,
-            fallback: crate::semantic::SemanticFallback::Disabled,
-        };
-        if let Some(stack) = self.semantic.as_ref() {
-            // Query text for embedding: extracted terms (+ symbol/path hints)
-            // — the same canonical extraction every other generator consumes.
-            let mut semantic_query = ex.terms.join(" ");
-            if let Some(sym) = &ex.symbol_hint {
-                semantic_query.push(' ');
-                semantic_query.push_str(sym);
-            }
-            if let Some(p) = &ex.path_hint {
-                semantic_query.push(' ');
-                semantic_query.push_str(p);
-            }
-            if !semantic_query.trim().is_empty() {
-                let s_sem = plan.begin_step(
-                    SubsystemTag::FtsSearch, // nearest tag; per-candidate origin is SEMANTIC
-                    "semantic_knn",
-                    &format!(
-                        "provider={} model={}",
-                        stack.provider_id(),
-                        stack.model_id()
-                    ),
-                    now_us(),
-                );
-                let mut env = GeneratorEnv {
-                    conn,
-                    repository_id: repo_filter.clone(),
-                    budget: &mut budget,
-                    // Was hard-coded 48, which silently capped DEEP's
-                    // `max_semantic_candidates = 120` down to NORMAL's
-                    // ceiling — DEEP's broader semantic budget never engaged.
-                    limit: policy.max_semantic_candidates as usize,
-                };
-                match crate::semantic::SemanticCandidateGenerator::run(
-                    &mut env,
-                    stack,
-                    policy,
-                    &semantic_query,
-                ) {
-                    Ok((cands, outcome)) => {
-                        semantic_outcome = outcome;
-                        let n = cands.len() as u32;
-                        collected.extend(cands);
-                        plan.complete_step(
-                            s_sem,
-                            if n > 0 {
-                                StepStatus::Completed
-                            } else {
-                                StepStatus::Skipped
-                            },
-                            if n > 0 {
-                                "candidates"
-                            } else {
-                                outcome.fallback.as_str()
-                            },
-                            0,
-                            n,
-                            now_us(),
-                        );
-                    }
-                    Err(e) => {
-                        semantic_outcome.fallback =
-                            crate::semantic::SemanticFallback::ProviderUnavailable;
-                        plan.complete_step(
-                            s_sem,
-                            StepStatus::Failed,
-                            &e.to_string(),
-                            0,
-                            0,
-                            now_us(),
-                        );
-                    }
                 }
             }
         }
@@ -1099,7 +1017,6 @@ impl RetrievalService {
             contradictions,
             budget,
             hard_cancelled,
-            semantic: semantic_outcome,
         })
     }
 }
@@ -1163,7 +1080,11 @@ fn build_context_and_claims(
     validated: &[Evidence],
     contradictions: &[Contradiction],
     central_knowledge: Option<&str>,
-) -> (Option<String>, ServedClaims, Vec<Evidence>) {
+) -> (
+    Option<context::ContextDocument>,
+    ServedClaims,
+    Vec<Evidence>,
+) {
     let is_central = |e: &Evidence| central_knowledge.is_some_and(|k| e.repository_id == k);
     // ── §15 priority floor: context serves the strongest evidence, not a
     // dump of everything validated. Two tiers keep contract-PREFERRED
@@ -1339,7 +1260,7 @@ fn build_context_and_claims(
                 .map(|e| (*e).clone())
         })
         .collect();
-    (Some(doc.text), claims, served_evidence)
+    (Some(doc), claims, served_evidence)
 }
 
 /// Persist the finalized plan through the coordinated writer queue.

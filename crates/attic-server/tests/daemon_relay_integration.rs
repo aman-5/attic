@@ -30,6 +30,13 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+// Keep independent process/SQLite/IPC scenarios from overwhelming one another
+// on Windows; tests still exercise concurrent clients within each scenario.
+static DAEMON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serialize_daemon_test() -> tokio::sync::MutexGuard<'static, ()> {
+    DAEMON_TEST_LOCK.lock().await
+}
 
 /// Locate the required `attic` binary.  Fails loudly when absent.
 fn require_bin() -> PathBuf {
@@ -145,23 +152,36 @@ async fn call_tool_text(
     tool: &str,
     arguments: Value,
 ) -> Result<String, String> {
-    let mut params = CallToolRequestParams::new(tool.to_owned());
-    params.arguments = arguments.as_object().cloned();
-    let fut = srv.service.call_tool(params);
-    match tokio::time::timeout(IO_TIMEOUT, fut).await {
-        Ok(Ok(result)) => match result.content.first() {
-            Some(ContentBlock::Text(t)) => Ok(t.text.clone()),
-            other => Err(format!(
-                "expected text content from `{tool}`, got {other:?}"
-            )),
-        },
-        Ok(Err(e)) => Err(format!("`{tool}` call failed: {e}")),
-        Err(_) => {
-            let _ = srv.child.start_kill();
-            Err(format!(
-                "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
-            ))
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        let mut params = CallToolRequestParams::new(tool.to_owned());
+        params.arguments = arguments.as_object().cloned();
+        let fut = srv.service.call_tool(params);
+        let response = match tokio::time::timeout_at(deadline, fut).await {
+            Ok(Ok(result)) => match result.content.first() {
+                Some(ContentBlock::Text(t)) => Ok(t.text.clone()),
+                other => Err(format!(
+                    "expected text content from `{tool}`, got {other:?}"
+                )),
+            },
+            Ok(Err(e)) => Err(format!("`{tool}` call failed: {e}")),
+            Err(_) => {
+                let _ = srv.child.start_kill();
+                Err(format!(
+                    "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
+                ))
+            }
+        };
+        if let Ok(text) = &response
+            && serde_json::from_str::<Value>(text)
+                .ok()
+                .is_some_and(|state| state["status"] == "initializing")
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
         }
+        return response;
     }
 }
 
@@ -260,6 +280,7 @@ async fn raw_initialize(
 /// can make MCP tool calls concurrently against the shared state.
 #[tokio::test]
 async fn daemon_and_relay_serve_concurrent_status_calls() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -321,6 +342,7 @@ async fn daemon_and_relay_serve_concurrent_status_calls() {
 /// forever.
 #[tokio::test]
 async fn daemon_shuts_down_after_idle_timeout_once_client_disconnects() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -372,6 +394,7 @@ async fn daemon_shuts_down_after_idle_timeout_once_client_disconnects() {
 /// the crashed process left behind.
 #[tokio::test]
 async fn crashed_daemon_lock_is_recovered_by_next_launch() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -407,6 +430,7 @@ async fn crashed_daemon_lock_is_recovered_by_next_launch() {
 /// reconnection!
 #[tokio::test]
 async fn relay_wins_election_and_promotes_while_keeping_client_connected() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -469,6 +493,7 @@ async fn relay_wins_election_and_promotes_while_keeping_client_connected() {
 /// answering requests even though nothing else was around to take over.
 #[tokio::test]
 async fn relay_supervision_returns_promotion_when_it_wins_election() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -504,6 +529,7 @@ async fn relay_supervision_returns_promotion_when_it_wins_election() {
 /// independent launch discover `attic.ipc` and successfully connect to it.
 #[tokio::test]
 async fn promotion_starts_replacement_daemon() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -538,6 +564,7 @@ async fn promotion_starts_replacement_daemon() {
 /// promotion completes, with no client-side reconnect ever happening.
 #[tokio::test]
 async fn promotion_preserves_existing_stdio_session() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -581,6 +608,7 @@ async fn promotion_preserves_existing_stdio_session() {
 /// really talking to the one shared replacement daemon.
 #[tokio::test]
 async fn promoted_relay_reconnects_to_local_daemon() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -619,6 +647,7 @@ async fn promoted_relay_reconnects_to_local_daemon() {
 /// one response bearing the SAME id we sent, with nothing extra queued.
 #[tokio::test]
 async fn promoted_relay_replays_initialize() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -688,6 +717,7 @@ async fn promoted_relay_replays_initialize() {
 /// must always be a genuine successful status result, bounded in time.
 #[tokio::test]
 async fn safe_read_request_retried_once_after_promotion() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -730,7 +760,10 @@ async fn safe_read_request_retried_once_after_promotion() {
     );
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     let v: Value = serde_json::from_str(text).expect("status payload is JSON");
-    assert_eq!(v["status"], "unconfigured", "{text}");
+    assert!(
+        matches!(v["status"].as_str(), Some("unconfigured" | "initializing")),
+        "{text}"
+    );
 
     let _ = srv2_child.start_kill();
     let _ = tokio::time::timeout(IO_TIMEOUT, srv2_child.wait()).await;
@@ -744,6 +777,7 @@ async fn safe_read_request_retried_once_after_promotion() {
 /// once — never duplicated, regardless of which side of the race fired.
 #[tokio::test]
 async fn mutation_not_retried_after_ambiguous_disconnect() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -825,6 +859,7 @@ async fn mutation_not_retried_after_ambiguous_disconnect() {
 /// a hang, and never a "result").
 #[tokio::test]
 async fn unknown_method_not_retried() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -873,6 +908,7 @@ async fn unknown_method_not_retried() {
 /// against that single replacement afterward.
 #[tokio::test]
 async fn multiple_relays_create_only_one_replacement_daemon() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -943,6 +979,7 @@ async fn multiple_relays_create_only_one_replacement_daemon() {
 /// relay's own re-election attempt — so the relay can never win it either.
 #[tokio::test]
 async fn recovery_is_bounded_when_daemon_cannot_start() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1012,6 +1049,7 @@ async fn recovery_is_bounded_when_daemon_cannot_start() {
 /// must exit promptly — never hang waiting on a client that is already gone.
 #[tokio::test]
 async fn shutdown_during_recovery_does_not_hang() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1062,6 +1100,7 @@ async fn shutdown_during_recovery_does_not_hang() {
 /// and reaches 8 scheduler workers, max_indexing_heavy = 8, and effective_indexing_heavy_limit = 8.
 #[tokio::test]
 async fn performance_reaches_eight_workers_when_healthy() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1086,8 +1125,8 @@ async fn performance_reaches_eight_workers_when_healthy() {
     assert_eq!(rp["level"], "normal");
     assert_eq!(rp["max_indexing_heavy"], 8);
     assert_eq!(rp["effective_indexing_heavy_limit"], 8);
-    assert_eq!(rp["effective_embedding_limit"], 8);
-    assert_eq!(rp["effective_embedding_batch"], 64);
+    assert!(rp.get("effective_embedding_limit").is_none());
+    assert!(rp.get("effective_embedding_batch").is_none());
     assert_eq!(rp["recovery_stage"], "Full");
 }
 
@@ -1095,6 +1134,7 @@ async fn performance_reaches_eight_workers_when_healthy() {
 /// (indexing limit drops to 6 = 75% of 8, embedding batch shrinks to 32 = half of 64).
 #[tokio::test]
 async fn warning_reduces_heavy_admission() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1120,7 +1160,7 @@ async fn warning_reduces_heavy_admission() {
     assert_eq!(rp["level"], "warning");
     assert_eq!(rp["max_indexing_heavy"], 8);
     assert_eq!(rp["effective_indexing_heavy_limit"], 6);
-    assert_eq!(rp["effective_embedding_batch"], 32);
+    assert!(rp.get("effective_embedding_batch").is_none());
 }
 
 /// §17 item 14: Critical pressure reduces heavy-work admission further
@@ -1129,6 +1169,7 @@ async fn warning_reduces_heavy_admission() {
 /// rejected outright at the admission gate.
 #[tokio::test]
 async fn critical_reduces_heavy_admission_without_rejecting_context() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1153,8 +1194,8 @@ async fn critical_reduces_heavy_admission_without_rejecting_context() {
     let rp = &v["resource_pressure"];
     assert_eq!(rp["level"], "critical");
     assert_eq!(rp["effective_indexing_heavy_limit"], 2);
-    assert_eq!(rp["effective_embedding_limit"], 1);
-    assert_eq!(rp["effective_embedding_batch"], 16);
+    assert!(rp.get("effective_embedding_limit").is_none());
+    assert!(rp.get("effective_embedding_batch").is_none());
 
     // `context` must pass admission at Critical and reach the normal
     // workspace-configured validation path instead of being rejected as busy.
@@ -1183,6 +1224,7 @@ async fn critical_reduces_heavy_admission_without_rejecting_context() {
 /// memory pressure never refuses an interactive request.
 #[tokio::test]
 async fn emergency_starts_no_new_heavy_work() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1208,9 +1250,9 @@ async fn emergency_starts_no_new_heavy_work() {
     let rp = &v["resource_pressure"];
     assert_eq!(rp["level"], "emergency");
     assert_eq!(rp["effective_indexing_heavy_limit"], 0);
-    assert_eq!(rp["effective_embedding_limit"], 0);
-    assert_eq!(rp["effective_embedding_batch"], 0);
-    assert_eq!(v["semantic_availability"]["pressure_tier"], "emergency");
+    assert!(rp.get("effective_embedding_limit").is_none());
+    assert!(rp.get("effective_embedding_batch").is_none());
+    assert!(v.get("semantic_availability").is_none());
 
     // Mutation tool (`workspace`) is admitted under Emergency.
     let ws_res = call_tool_text(
@@ -1246,19 +1288,14 @@ async fn emergency_starts_no_new_heavy_work() {
     assert_eq!(v2["resource_pressure"]["mcp_pressure_rejections"], 0);
 }
 
-/// §17 item 16: Embedding batch size shrinks monotonically with pressure:
-/// Normal (64) -> Warning (32) -> Critical (16) -> Emergency (0).
+/// Removed embedding controls must not survive as misleading status fields.
 #[tokio::test]
-async fn embedding_batch_shrinks_with_pressure() {
+async fn embedding_controls_are_absent_under_every_pressure() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
 
-    for (pressure_str, expected_batch) in [
-        ("normal", 64),
-        ("warning", 32),
-        ("critical", 16),
-        ("emergency", 0),
-    ] {
+    for pressure_str in ["normal", "warning", "critical", "emergency"] {
         let (home, db) = attic_home_and_db(&tmp.path().join(pressure_str));
         let mut srv = connect_daemon_with_env(
             &bin,
@@ -1276,9 +1313,11 @@ async fn embedding_batch_shrinks_with_pressure() {
             .await
             .expect("status call");
         let v: Value = serde_json::from_str(&res).expect("json");
-        assert_eq!(
-            v["resource_pressure"]["effective_embedding_batch"], expected_batch,
-            "failed batch check for pressure={pressure_str}"
+        assert!(
+            v["resource_pressure"]
+                .get("effective_embedding_batch")
+                .is_none(),
+            "embedding control remains for pressure={pressure_str}"
         );
         let _ = srv.service.close().await;
     }
@@ -1288,6 +1327,7 @@ async fn embedding_batch_shrinks_with_pressure() {
 /// (0 -> Step1: 2 -> Step2: 4 -> Step3: 6 -> Full: 8) without rapid oscillation.
 #[tokio::test]
 async fn resource_capacity_recovers_gradually() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1356,6 +1396,7 @@ async fn resource_capacity_recovers_gradually() {
 /// §17 item 18: MCP requests remain responsive during indexing / pressure.
 #[tokio::test]
 async fn mcp_remains_responsive_during_index_pressure() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1404,6 +1445,7 @@ async fn mcp_remains_responsive_during_index_pressure() {
 /// replay + memory pressure clearance + gradual capacity recovery.
 #[tokio::test]
 async fn combined_pressure_and_daemon_failure_recovers() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1486,7 +1528,10 @@ async fn combined_pressure_and_daemon_failure_recovers() {
         .await
         .expect("status via promoted relay without client reconnect");
     let v_post: Value = serde_json::from_str(&r_post).expect("json");
-    assert_eq!(v_post["status"], "unconfigured");
+    assert_eq!(
+        v_post["status"], "unconfigured",
+        "promoted daemon status after recovery: {r_post}"
+    );
 
     // 6. Clear memory pressure: capacity recovers gradually back to full Performance (8 workers)
     std::fs::write(&override_file, "normal").expect("write normal override");
@@ -1513,6 +1558,7 @@ async fn combined_pressure_and_daemon_failure_recovers() {
 /// requests on its original stdio connection without client restart.
 #[tokio::test]
 async fn replacement_daemon_failure_recovers_to_another_daemon() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1580,6 +1626,7 @@ async fn replacement_daemon_failure_recovers_to_another_daemon() {
 /// Assert Relay 4 survives all 3 deaths on its original stdio connection.
 #[tokio::test]
 async fn three_sequential_daemon_failures_recover() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1653,6 +1700,7 @@ async fn three_sequential_daemon_failures_recover() {
 /// When the last client disconnects, normal idle policy shuts down the daemon.
 #[tokio::test]
 async fn promoted_client_close_keeps_daemon_alive_for_other_clients() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());
@@ -1735,6 +1783,7 @@ async fn promoted_client_close_keeps_daemon_alive_for_other_clients() {
 /// and only byte lengths are recorded at trace.
 #[tokio::test]
 async fn no_raw_mcp_payloads_in_logs() {
+    let _test_guard = serialize_daemon_test().await;
     let bin = require_bin();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let (home, db) = attic_home_and_db(tmp.path());

@@ -113,8 +113,6 @@ fn opts() -> IndexOptions {
 
 pub struct Fixture {
     pub root: PathBuf,
-    /// Canonical index file (for direct read-only connections).
-    pub db_path: PathBuf,
     pub pool: DbPool,
     _queue: WriterQueue,
     pub writer: WriterQueueHandle,
@@ -178,21 +176,10 @@ impl Fixture {
         Self {
             dir,
             root,
-            db_path: db_path.clone(),
             pool,
             _queue: queue,
             writer,
         }
-    }
-
-    /// Direct READ-ONLY connection for semantic-layer calls whose error
-    /// types differ from the pool's closure signature.
-    pub fn read_conn(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("read-only canonical connection")
     }
 
     pub fn store(&self) -> IndexingStore<'_> {
@@ -206,24 +193,8 @@ impl Fixture {
         RetrievalService {
             readers: self.pool.clone(),
             writer: self.writer.clone(),
-            semantic: None,
             crossrepo_degraded: false,
         }
-    }
-
-    /// Service with a Phase 5 semantic stack over an in-memory store.
-    pub fn service_with_semantic(
-        &self,
-        provider: std::sync::Arc<dyn attic_semantic::SemanticProvider>,
-    ) -> Result<RetrievalService, String> {
-        Ok(RetrievalService {
-            readers: self.pool.clone(),
-            writer: self.writer.clone(),
-            semantic: Some(std::sync::Arc::new(
-                attic_retrieval::semantic::SemanticStack::in_memory(provider)?,
-            )),
-            crossrepo_degraded: false,
-        })
     }
 
     /// Run one query at the given mode and return the outcome.

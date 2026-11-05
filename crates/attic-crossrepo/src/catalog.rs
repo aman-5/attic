@@ -41,17 +41,21 @@ pub fn indexed_manifest_paths(
            JOIN core_file_identities fi ON fi.id = fo.file_identity_id
           WHERE fi.repository_id = ?1
             AND fo.existence_state != 'deleted'
-          ORDER BY fo.path
-          LIMIT ?2",
+          ORDER BY fo.path",
     )?;
-    let cap = MAX_MANIFESTS_PER_REPO as i64;
-    let rows = stmt.query_map(rusqlite::params![repository_id, cap], |r| {
-        r.get::<_, String>(0)
-    })?;
+    let rows = stmt.query_map(rusqlite::params![repository_id], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         let p = row?;
         if manifest::is_manifest_path(&p) {
+            if out.len() == MAX_MANIFESTS_PER_REPO {
+                return Err(CrossRepoError::LimitExceeded {
+                    limit: "MAX_MANIFESTS_PER_REPO",
+                    context: format!(
+                        "{repository_id} contains more than {MAX_MANIFESTS_PER_REPO} manifests"
+                    ),
+                });
+            }
             out.push(p);
         }
     }
@@ -177,12 +181,18 @@ pub fn scan_proto_imports(
           ORDER BY fo.path
           LIMIT ?2",
     )?;
-    let cap = MAX_MANIFESTS_PER_REPO as i64;
+    let cap = MAX_MANIFESTS_PER_REPO as i64 + 1;
     let rows = stmt.query_map(rusqlite::params![repository_id, cap], |r| {
         r.get::<_, String>(0)
     })?;
     let mut specifiers = Vec::new();
-    for row in rows {
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_MANIFESTS_PER_REPO {
+            return Err(CrossRepoError::LimitExceeded {
+                limit: "MAX_MANIFESTS_PER_REPO",
+                context: format!("too many protobuf paths in repository {repository_id}"),
+            });
+        }
         let p = row?;
         if let Ok(Some(bytes)) = read_proto_bounded(&root_path, &p) {
             let parse = manifest::parse_proto_imports(&p, &bytes);

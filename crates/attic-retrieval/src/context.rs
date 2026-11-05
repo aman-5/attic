@@ -25,6 +25,56 @@ pub struct ContextDocument {
     pub refs: Vec<EvidenceRef>,
     /// Evidence dropped during assembly with deterministic reasons.
     pub dropped: Vec<DroppedEvidence>,
+    /// Secret-scanned sections retained for lossless workspace compaction.
+    pub sections: Vec<ContextSection>,
+    pub prefix: String,
+    pub suffix: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextSection {
+    pub header: String,
+    pub body: String,
+}
+
+/// Share only byte-identical bodies; retain every provenance header and disclosure.
+pub fn compact_documents(documents: &[ContextDocument]) -> String {
+    let mut prefixes = Vec::new();
+    let mut suffixes = Vec::new();
+    let mut sections: Vec<ContextSection> = Vec::new();
+    let mut bodies = std::collections::HashMap::new();
+    let mut shared_counts = Vec::new();
+    for doc in documents {
+        if !doc.prefix.is_empty() && !prefixes.contains(&doc.prefix.as_str()) {
+            prefixes.push(doc.prefix.as_str());
+        }
+        for section in &doc.sections {
+            if let Some(&index) = bodies.get(section.body.as_str()) {
+                let shared: &mut ContextSection = &mut sections[index];
+                shared.header.push_str(&section.header);
+                shared_counts[index] += 1;
+            } else {
+                bodies.insert(section.body.as_str(), sections.len());
+                sections.push(section.clone());
+                shared_counts.push(1usize);
+            }
+        }
+        if !doc.suffix.is_empty() {
+            suffixes.push(doc.suffix.as_str());
+        }
+    }
+    let mut text = prefixes.join("\n");
+    for (section, count) in sections.into_iter().zip(shared_counts) {
+        text.push_str(&section.header);
+        if count > 1 {
+            text.push_str("\nShared excerpt for all citations above:\n");
+        }
+        text.push_str(&section.body);
+    }
+    for suffix in suffixes {
+        text.push_str(suffix);
+    }
+    text
 }
 
 /// Section order per source type — implementation first, relationships last.
@@ -59,12 +109,27 @@ pub fn build(
     // up front — evidence blocks fill only what is left, and the finished
     // document never exceeds the budget. Lines that cannot fit at all are
     // cut, with a count of what was omitted.
-    let disclosure = contradiction_disclosure(contradictions, budget_bytes / 2);
+    let repositories = ranked
+        .iter()
+        .map(|ev| ev.repository_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let scope = format!("Repositories: {repositories}");
+    let mut disclosure = contradiction_disclosure(
+        contradictions,
+        (budget_bytes / 2).saturating_sub(scope.len() + 2),
+    );
+    if !disclosure.is_empty() {
+        disclosure = format!("\n{scope}\n{disclosure}");
+    }
     let block_budget = budget_bytes.saturating_sub(disclosure.len());
     let mut text = String::new();
     let mut refs = Vec::new();
     let mut dropped = Vec::new();
-    let mut seen_snippets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_snippets = std::collections::HashSet::new();
+    let mut sections = Vec::new();
 
     // Deterministic ordering: the contract's PRIMARY source type leads,
     // then section rank, then combined score desc.
@@ -85,7 +150,10 @@ pub fn build(
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let header = format!("# Attic context for query type {}\n\n", qt.as_str());
+    let header = format!(
+        "# Attic context for query type {}\n{scope}\n\n",
+        qt.as_str()
+    );
     text.push_str(&header);
 
     let mut rank = 0u16;
@@ -113,11 +181,18 @@ pub fn build(
             }
         };
 
-        // Content-level dedup: identical snippet bodies contribute once.
-        let fp = snippet
-            .lines()
-            .fold(0u64, |acc, l| acc.wrapping_add(hash_line(l)));
-        if !seen_snippets.insert(format!("{}:{fp}", ev.path)) {
+        // Order-sensitive equality, scoped to the same source occurrence.
+        if !seen_snippets.insert((
+            ev.repository_id.clone(),
+            ev.path.clone(),
+            ev.source_id.clone(),
+            ev.source_revision_id.clone(),
+            ev.workspace_snapshot_id.clone(),
+            ev.excerpt_span
+                .or(ev.source_span)
+                .map(|span| span.to_string()),
+            snippet.clone(),
+        )) {
             dropped.push(DroppedEvidence {
                 evidence_id: ev.id.clone(),
                 source_type: ev.source_type.as_str().to_owned(),
@@ -128,12 +203,15 @@ pub fn build(
         }
 
         let mut block = format!(
-            "\n## [{}] {}:{}\n- authority: {}\n",
+            "\n## [{}] {}:{}\n- repository_id: {}\n- evidence_id: {}\n- authority: {}\n",
             ev.source_type.as_str(),
             ev.path,
-            ev.source_span
+            ev.excerpt_span
+                .or(ev.source_span)
                 .map(|s| format!("{}", s))
                 .unwrap_or_else(|| "-".into()),
+            ev.repository_id,
+            ev.id,
             authority_label(ev),
         );
         block.push_str(&freshness_note(ev));
@@ -145,9 +223,24 @@ pub fn build(
                 rel.confidence
             ));
         }
-        block.push_str("```\n");
-        block.push_str(snippet.trim_end());
-        block.push_str("\n```\n");
+        let section = ContextSection {
+            header: block.clone(),
+            body: format!(
+                "{}{}{}",
+                if ev.snippet_leading_omitted {
+                    "[earlier source omitted]\n"
+                } else {
+                    ""
+                },
+                format_args!("```\n{}\n```\n", snippet.trim_end()),
+                if ev.snippet_trailing_omitted {
+                    "[later source omitted]\n"
+                } else {
+                    ""
+                }
+            ),
+        };
+        block.push_str(&section.body);
 
         // ── SECRET-SAFETY PASS (per item, before inclusion) ────────────────
         // The approved Phase 1B detector runs over the fully-assembled BLOCK
@@ -180,6 +273,7 @@ pub fn build(
         }
 
         text.push_str(&block);
+        sections.push(section);
         refs.push(EvidenceRef {
             evidence_id: ev.id.clone(),
             source_type: ev.source_type.as_str().to_owned(),
@@ -216,6 +310,7 @@ pub fn build(
             });
         }
         refs.clear();
+        sections.clear();
         text.clear();
         text.push_str(&header);
         text.push_str("[content withheld by secret-safety policy]\n");
@@ -224,10 +319,21 @@ pub fn build(
 
     let tokens = approx_tokens(text.len());
     ContextDocument {
+        prefix: if sections.is_empty() {
+            text.clone()
+        } else {
+            header
+        },
+        suffix: if sections.is_empty() {
+            String::new()
+        } else {
+            disclosure
+        },
         text,
         tokens,
         refs,
         dropped,
+        sections,
     }
 }
 
@@ -255,14 +361,6 @@ fn contradiction_disclosure(
     out
 }
 
-fn hash_line(l: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in l.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    h
-}
-
 fn authority_label(ev: &Evidence) -> &'static str {
     match ev.authority {
         AuthorityLevel::Implementation => "IMPLEMENTATION",
@@ -283,6 +381,7 @@ fn freshness_note(ev: &Evidence) -> String {
             ev.freshness_state.as_str()
         );
     }
+
     match (ev.freshness_state, ev.verification_state) {
         (FreshnessState::Current, VerificationStatus::Verified) => {
             "- freshness: CURRENT (verified against source)\n".to_owned()
@@ -295,6 +394,173 @@ fn freshness_note(ev: &Evidence) -> String {
         (FreshnessState::PendingRefresh, _) => {
             "- freshness: PENDING_REFRESH — recompute in progress\n".to_owned()
         }
-        (FreshnessState::Invalid, _) => String::new(), // filtered pre-context
+        (FreshnessState::Invalid, _) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(id: &str, repo: &str, path: &str, snippet: &str) -> Evidence {
+        let mut ev = Evidence::new(id, repo);
+        ev.path = path.into();
+        ev.snippet = Some(snippet.into());
+        ev.signals.combined_score = Some(0.9);
+        ev.source_span = Some(attic_core::SourceSpan::new(1, 0, 3, 0));
+        ev
+    }
+
+    #[test]
+    fn compaction_shares_bodies_without_losing_citations_or_differences() {
+        let body = format!("fn shared() {{\n{}\n}}\n", "    run();\n".repeat(80));
+        let other = "fn different() { stop(); }";
+        let inputs = [
+            evidence("ev-one", "repo-one", "src/shared.rs", &body),
+            evidence("ev-two", "repo-two", "lib/copied.rs", &body),
+            evidence("ev-three", "repo-three", "lib/different.rs", other),
+        ];
+        let docs = inputs
+            .iter()
+            .map(|ev| {
+                build(
+                    std::slice::from_ref(ev),
+                    &[],
+                    QueryType::GenericSearch,
+                    16_384,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let original_bytes: usize = docs.iter().map(|doc| doc.text.len()).sum();
+        let compact = compact_documents(&docs);
+        assert_eq!(compact.matches("fn shared()").count(), 1);
+        assert_eq!(compact.matches(other).count(), 1);
+        for ev in inputs {
+            assert!(compact.contains(&ev.id));
+            assert!(compact.contains(&ev.repository_id));
+            assert!(compact.contains(&ev.path));
+        }
+        assert!(compact.len() < original_bytes);
+        assert_eq!(docs.iter().map(|doc| doc.refs.len()).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn reordered_lines_are_not_duplicates() {
+        let one = evidence("ev-one", "repo", "lib.rs", "first();\nsecond();");
+        let two = evidence("ev-two", "repo", "lib.rs", "second();\nfirst();");
+        let doc = build(&[one, two], &[], QueryType::GenericSearch, 16_384, None);
+        assert_eq!(doc.refs.len(), 2);
+        assert!(doc.dropped.is_empty());
+        assert!(compact_documents(std::slice::from_ref(&doc)).contains("second();\nfirst();"));
+    }
+
+    #[test]
+    fn compaction_preserves_same_path_in_different_repositories_and_spans() {
+        let one = evidence("ev-one", "repo-one", "lib.rs", "run();");
+        let mut two = evidence("ev-two", "repo-two", "lib.rs", "run();");
+        two.source_span = Some(attic_core::SourceSpan::new(10, 0, 12, 0));
+        let doc = build(&[one, two], &[], QueryType::GenericSearch, 16_384, None);
+        assert_eq!(doc.refs.len(), 2);
+        let compact = compact_documents(std::slice::from_ref(&doc));
+        for citation in ["repo-one", "repo-two", "1:0-3:0", "10:0-12:0"] {
+            assert!(compact.contains(citation), "missing {citation}");
+        }
+        assert_eq!(compact.matches("run();").count(), 1);
+    }
+
+    #[test]
+    fn compaction_keeps_disclosures_and_cannot_reintroduce_withheld_secrets() {
+        let secret = evidence(
+            "ev-secret",
+            "repo",
+            "config",
+            "aws_access_key_id = \"AKIAIOSFODNN7EXAMPLE\"",
+        );
+        let benign = evidence("ev-benign", "repo", "lib.rs", "fn safe() {}");
+        let doc = build(
+            &[secret, benign],
+            &[],
+            QueryType::GenericSearch,
+            16_384,
+            None,
+        );
+        let mut doc = doc;
+        doc.suffix
+            .push_str("\n## Contradictions detected\n- implementations disagree\n");
+        let compact = compact_documents(std::slice::from_ref(&doc));
+        assert!(!compact.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(compact.contains("implementations disagree"));
+        assert_eq!(doc.refs.len(), 1);
+    }
+
+    #[test]
+    fn identical_content_keeps_distinct_revision_provenance() {
+        let mut one = evidence("ev-one", "repo", "lib.rs", "run();");
+        let mut two = evidence("ev-two", "repo", "lib.rs", "run();");
+        one.source_revision_id = Some("revision-one".into());
+        two.source_revision_id = Some("revision-two".into());
+        let doc = build(&[one, two], &[], QueryType::GenericSearch, 16_384, None);
+        assert_eq!(doc.refs.len(), 2);
+        let compact = compact_documents(&[doc]);
+        assert!(compact.contains("ev-one"));
+        assert!(compact.contains("ev-two"));
+    }
+
+    #[test]
+    fn shared_excerpt_and_omissions_are_explicit() {
+        let mut one = evidence("ev-one", "repo-one", "lib.rs", "payment();");
+        one.snippet_leading_omitted = true;
+        one.snippet_trailing_omitted = true;
+        one.excerpt_span = Some(attic_core::SourceSpan::new(8, 120, 8, 130));
+        let mut two = one.clone();
+        two.id = "ev-two".into();
+        two.repository_id = "repo-two".into();
+        let doc = build(&[one, two], &[], QueryType::GenericSearch, 16_384, None);
+        let compact = compact_documents(&[doc]);
+        assert!(compact.contains("Shared excerpt for all citations above"));
+        assert!(compact.contains("[earlier source omitted]"));
+        assert!(compact.contains("[later source omitted]"));
+        assert!(compact.contains("8:120-8:130"));
+        assert_eq!(compact.matches("payment();").count(), 1);
+    }
+
+    #[test]
+    fn disclosures_and_identical_withheld_notices_keep_repository_scope() {
+        let mut docs = Vec::new();
+        for repo in ["repo-one", "repo-two"] {
+            let ev = evidence("ev", repo, "lib.rs", "run();");
+            let contradiction = attic_evidence::Contradiction {
+                kind: attic_evidence::ContradictionKind::ConflictingValues,
+                evidence_a: "ev".into(),
+                evidence_b: "other".into(),
+                description: "lib.rs differs".into(),
+            };
+            let mut doc = build(
+                &[ev],
+                &[contradiction],
+                QueryType::GenericSearch,
+                16_384,
+                None,
+            );
+            assert!(doc.suffix.contains(&format!("Repositories: {repo}")));
+            assert!(doc.suffix.contains("lib.rs differs"));
+            doc.sections.clear();
+            doc.prefix
+                .push_str("[content withheld by secret-safety policy]\n");
+            docs.push(doc);
+        }
+        let compact = compact_documents(&docs);
+        assert_eq!(
+            compact
+                .matches("[content withheld by secret-safety policy]")
+                .count(),
+            2
+        );
+        for repo in ["repo-one", "repo-two"] {
+            assert!(compact.contains(&format!(
+                "Repositories: {repo}\n\n## Contradictions detected"
+            )));
+        }
     }
 }

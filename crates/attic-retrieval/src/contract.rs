@@ -34,8 +34,6 @@ str_enum! {
         SourceVerification => "SOURCE_VERIFICATION",
         /// Search knowledge docs if not already done.
         KnowledgeLookup => "KNOWLEDGE_LOOKUP",
-        /// Semantic retrieval — Phase 5+; NEVER executed in Phase 4.
-        SemanticSearch => "SEMANTIC_SEARCH",
     }
 }
 

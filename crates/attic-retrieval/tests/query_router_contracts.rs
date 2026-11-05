@@ -153,27 +153,21 @@ fn current_only_contracts_reject_stale_by_default() {
 // ─── §5 FAST/NORMAL/DEEP as enforceable budgets ──────────────────────────────
 
 #[test]
-fn fast_policy_forbids_filesystem_and_semantics() {
+fn fast_policy_forbids_filesystem_reads() {
     let p = AnswerModePolicy::for_mode(AnswerMode::Fast);
     assert_eq!(p.max_fs_files, 0);
     assert_eq!(p.max_fs_bytes, 0);
     assert!(!p.fs_reads_permitted());
-    assert!(!p.semantic_allowed);
     assert_eq!(p.repair_attempts, 0);
 }
 
 #[test]
-fn deep_policy_expands_bounds_with_bounded_semantics() {
+fn deep_policy_expands_graph_bounds() {
     let n = AnswerModePolicy::for_mode(AnswerMode::Normal);
     let p = AnswerModePolicy::for_mode(AnswerMode::Deep);
     assert!(p.max_graph_depth > n.max_graph_depth);
     assert!(p.max_graph_nodes > n.max_graph_nodes);
     assert!(p.repair_attempts >= 1);
-    // Phase 5 §14: DEEP may use semantics MORE broadly than NORMAL, but
-    // always bounded — never unlimited vector search.
-    assert!(p.semantic_allowed);
-    assert!(p.max_semantic_candidates > n.max_semantic_candidates);
-    assert!(p.semantic_time_budget_ms >= n.semantic_time_budget_ms);
 }
 
 #[test]
@@ -204,7 +198,7 @@ fn fast_budget_refuses_source_verification_observably() {
             .any(|s| s.subsystem.as_str() == "POLICY_ENFORCER"),
         "AM-I1 warning step expected for FAST+explanation query"
     );
-    assert!(!policy_steps.is_empty() || !outcome.plan.policy_trace.semantic_invoked);
+    assert!(!policy_steps.is_empty());
     let _ = PolicyResult::CompletedWithinBudget;
 }
 

@@ -39,57 +39,13 @@ fn panic_diagnostic_helpers_render_and_chain() {
     assert!(chained, "default hook must still be chained");
 }
 
-#[test]
-fn backpressure_only_when_a_large_queue_grows() {
-    use std::time::{Duration, Instant};
-    let sample = std::sync::Mutex::new(None);
-    let t0 = Instant::now();
-    assert!(
-        !queue_is_growing_at(&sample, t0, 36_000),
-        "first sample has no trend"
-    );
-    // Draining (the normal case during a long GPU run).
-    assert!(!queue_is_growing_at(
-        &sample,
-        t0 + Duration::from_secs(40),
-        33_000
-    ));
-    assert!(!queue_is_growing_at(
-        &sample,
-        t0 + Duration::from_secs(80),
-        30_000
-    ));
-    // Growing and large: backpressure.
-    assert!(queue_is_growing_at(
-        &sample,
-        t0 + Duration::from_secs(120),
-        34_000
-    ));
-    // Growing but small: not backpressure.
-    let small = std::sync::Mutex::new(None);
-    queue_is_growing_at(&small, t0, 100);
-    assert!(!queue_is_growing_at(
-        &small,
-        t0 + Duration::from_secs(40),
-        900
-    ));
-}
-
 fn make_server(tmp: &TempDir) -> AtticServer {
-    // Explicit `false`, not `AtticServer::new()`: `new()` now defaults
-    // semantic ON, which would make every handler test using this helper
-    // eagerly build a real Qwen3Embedder against a fresh, empty per-test
-    // temp dir (no shared model cache) — i.e. a live network call per
-    // test. This helper is for handler tests that don't care about the
-    // semantic layer; `semantic_layer_is_opt_in_not_default` below is
-    // the one place that actually exercises opt-in behavior.
-    AtticServer::new_with_semantic_opt(&tmp.path().join("test.db"), false)
-        .expect("AtticServer::new_with_semantic_opt")
+    AtticServer::new(&tmp.path().join("test.db")).expect("AtticServer::new")
 }
 
 /// Default Phase 8 status bundle for tests that don't care about
-/// resource-mode/semantic-identity reporting specifically.
-fn test_resource_status() -> ResourceStatus<'static> {
+/// resource-mode reporting specifically.
+fn test_resource_status() -> ResourceStatus {
     ResourceStatus {
         resource_mode: attic_storage::ResourceMode::Balanced,
         resource_mode_source: attic_storage::ResourceModeSource::Detected,
@@ -97,8 +53,6 @@ fn test_resource_status() -> ResourceStatus<'static> {
             attic_storage::ResourceMode::Balanced,
         )
         .apply_fallback_safety_limits(),
-        semantic: None,
-        attic_config: Box::leak(Box::new(attic_core::AtticConfig::default())),
         knowledge: KnowledgeState::default().to_json(),
     }
 }
@@ -115,52 +69,6 @@ fn ids(srv: &AtticServer) -> HashSet<String> {
         .collect()
 }
 
-/// The explicit `semantic_opt_in` bool wired straight through, regardless
-/// of what `AtticServer::new()`'s env-based default resolves to.
-#[test]
-fn semantic_opt_flag_is_wired_through_explicitly() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("optin.db");
-
-    // Explicit `false` → no semantic stack, even though the layer is
-    // healthy and could open.
-    let server = AtticServer::new_with_semantic_opt(&db, false).expect("default server");
-    assert!(
-        server.semantic.is_none(),
-        "semantic_opt_in=false must never enable the layer"
-    );
-
-    // Explicit opt-in: layer present.
-    let server = AtticServer::new_with_semantic_opt(&db, true).expect("opted-in server");
-    assert!(
-        server.semantic.is_some(),
-        "explicit ATTIC_SEMANTIC=1 must enable the experimental layer"
-    );
-}
-
-/// Semantic is ON unless the user explicitly opts out with `=0`; unset,
-/// empty, or any other value all mean "on".
-#[test]
-fn semantic_opt_in_from_env_defaults_to_on() {
-    assert!(semantic_opt_in_from_env(None));
-    assert!(!semantic_opt_in_from_env(Some("0")));
-    assert!(semantic_opt_in_from_env(Some("1")));
-    assert!(semantic_opt_in_from_env(Some("")));
-    assert!(semantic_opt_in_from_env(Some("false")));
-}
-
-#[test]
-fn semantic_cpu_budget_scales_globally_near_thirty_three_percent() {
-    assert_eq!(semantic_cpu_thread_budget(4), 1);
-    // 3/8 would exceed the hard 35% ceiling, so integer granularity
-    // requires the conservative 2-thread choice on an 8-thread host.
-    assert_eq!(semantic_cpu_thread_budget(8), 2);
-    assert_eq!(semantic_cpu_thread_budget(16), 5);
-    assert_eq!(semantic_cpu_thread_budget(20), 7);
-    assert_eq!(semantic_cpu_thread_budget(32), 11);
-    assert_eq!(semantic_cpu_thread_budget(64), 21);
-}
-
 /// A fresh install (no `attic.toml` yet) must end up with a real,
 /// editable file on disk afterward — not just an invisible in-memory
 /// default the user can never find or tune.
@@ -171,8 +79,7 @@ fn fresh_startup_materializes_attic_toml_on_disk() {
     let attic_toml = tmp.path().join("attic.toml");
     assert!(!attic_toml.exists(), "precondition: no attic.toml yet");
 
-    let _server =
-        AtticServer::new_with_semantic_opt(&db, false).expect("fresh server should start");
+    let _server = AtticServer::new(&db).expect("fresh server should start");
 
     assert!(
         attic_toml.exists(),
@@ -185,7 +92,7 @@ fn fresh_startup_materializes_attic_toml_on_disk() {
         "the materialized file must match the shipped template exactly"
     );
     assert!(written.contains("[resources]"));
-    assert!(written.contains("[semantic]"));
+    assert!(!written.contains("[semantic]"));
 }
 
 /// A misspelled analyzer plugin id must stop startup with an actionable
@@ -199,7 +106,7 @@ fn unknown_analyzer_plugin_in_attic_toml_fails_startup() {
         "[indexing]\nanalyzers = [\"swfit\"]\n",
     )
     .unwrap();
-    let err = match AtticServer::new_with_semantic_opt(&db, false) {
+    let err = match AtticServer::new(&db) {
         Ok(_) => panic!("startup must fail on an unknown analyzer id"),
         Err(e) => e.to_string(),
     };
@@ -221,7 +128,7 @@ fn indexing_settings_flow_into_index_options() {
         "[indexing]\nanalysis_threads = 3\nanalyzers = [\"aem\", \"java\"]\nmax_units_per_file = 5000\n",
     )
     .unwrap();
-    let server = AtticServer::new_with_semantic_opt(&db, false).expect("valid config starts");
+    let server = AtticServer::new(&db).expect("valid config starts");
     let opts = server.index_options();
     assert_eq!(opts.analysis_threads, 3);
     assert_eq!(opts.max_units_per_file, 5000);
@@ -1079,7 +986,6 @@ fn search_missing_query() {
     let tmp = TempDir::new().unwrap();
     let e = handle_search(
         &make_server(&tmp).pool,
-        None,
         &HashMap::new(),
         &HashSet::new(),
         None,
@@ -1094,7 +1000,7 @@ fn search_query_too_long() {
     let tmp = TempDir::new().unwrap();
     let mut a = HashMap::new();
     a.insert("query".into(), json!("x".repeat(513)));
-    assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).is_err());
+    assert!(handle_search(&make_server(&tmp).pool, &a, &HashSet::new(), None).is_err());
 }
 
 #[test]
@@ -1103,7 +1009,7 @@ fn search_bad_repo_id() {
     let mut a = HashMap::new();
     a.insert("query".into(), json!("hello"));
     a.insert("repository_id".into(), json!("bad!id"));
-    assert!(handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).is_err());
+    assert!(handle_search(&make_server(&tmp).pool, &a, &HashSet::new(), None).is_err());
 }
 
 #[test]
@@ -1111,38 +1017,10 @@ fn search_empty_db_returns_results_array() {
     let tmp = TempDir::new().unwrap();
     let mut a = HashMap::new();
     a.insert("query".into(), json!("hello"));
-    let r = handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None).unwrap();
+    let r = handle_search(&make_server(&tmp).pool, &a, &HashSet::new(), None).unwrap();
     let t = text_of(&r);
     let v: Value = serde_json::from_str(&t).unwrap();
     assert!(v["results"].is_array());
-}
-
-#[test]
-fn search_reports_semantic_degraded_reason_text() {
-    let tmp = TempDir::new().unwrap();
-    let stack = attic_retrieval::semantic::SemanticStack::in_memory(std::sync::Arc::new(
-        attic_semantic::testing::HashingEmbedder::new(),
-    ))
-    .unwrap();
-    let mut a = HashMap::new();
-    a.insert("query".into(), json!("hello"));
-    let r = handle_search(
-        &make_server(&tmp).pool,
-        Some(&stack),
-        &a,
-        &HashSet::new(),
-        None,
-    )
-    .unwrap();
-    let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
-    assert_eq!(v["semantic_degraded"], "NO_EMBEDDINGS");
-    assert!(
-        v["semantic_degraded_reason_text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no embeddings exist"),
-        "{v}"
-    );
 }
 
 // ── central knowledge folder ([knowledge] dir) ─────────────────────────
@@ -1312,7 +1190,6 @@ async fn central_knowledge_folder_serves_context_and_search() {
     a.insert("query".into(), json!("What is the refund window?"));
     a.insert("repository_id".into(), json!(code_id));
     let r = handle_context(
-        None,
         &srv.pool,
         &srv.writer,
         false,
@@ -1323,14 +1200,6 @@ async fn central_knowledge_folder_serves_context_and_search() {
     )
     .unwrap();
     let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
-    assert_eq!(v["semantic_fallback_reason"], "SEMANTIC_DISABLED");
-    assert!(
-        v["semantic_fallback_reason_text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("disabled"),
-        "{v}"
-    );
     let ev = v["evidence"].as_array().unwrap();
     assert!(
         ev.iter()
@@ -1345,7 +1214,7 @@ async fn central_knowledge_folder_serves_context_and_search() {
     // search: default results unchanged (no central hits) but labelled.
     let mut s = HashMap::new();
     s.insert("query".into(), json!("refund"));
-    let r = handle_search(&srv.pool, None, &s, &active, Some(&kid)).unwrap();
+    let r = handle_search(&srv.pool, &s, &active, Some(&kid)).unwrap();
     let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
     let res = v["results"].as_array().unwrap();
     assert!(!res.is_empty());
@@ -1357,7 +1226,7 @@ async fn central_knowledge_folder_serves_context_and_search() {
 
     // scope=knowledge: only knowledge, central note first, no README.
     s.insert("scope".into(), json!("knowledge"));
-    let r = handle_search(&srv.pool, None, &s, &active, Some(&kid)).unwrap();
+    let r = handle_search(&srv.pool, &s, &active, Some(&kid)).unwrap();
     let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
     let res = v["results"].as_array().unwrap();
     assert!(!res.is_empty(), "{v}");
@@ -1375,7 +1244,7 @@ fn search_rejects_unknown_scope() {
     let mut a = HashMap::new();
     a.insert("query".into(), json!("x"));
     a.insert("scope".into(), json!("docs"));
-    let e = handle_search(&make_server(&tmp).pool, None, &a, &HashSet::new(), None)
+    let e = handle_search(&make_server(&tmp).pool, &a, &HashSet::new(), None)
         .unwrap_err()
         .to_string();
     assert!(e.contains("scope must be"), "{e}");
@@ -1548,166 +1417,8 @@ fn status_reports_incremental_stuck_tasks() {
     );
 }
 
-#[test]
-fn status_reports_semantic_progress_and_diagnostics() {
-    attic_semantic::diagnostics::clear_provider_backoff();
-    let tmp = TempDir::new().unwrap();
-    let srv = make_server(&tmp);
-    let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
-    let provider = Arc::new(attic_semantic::testing::HashingEmbedder::new());
-
-    // Register two occurrences and enqueue them on the leased queue
-    // (queue rows reference a registered occurrence).
-    let fp = attic_semantic::testing::test_fingerprint(provider.as_ref());
-    let vector_space = fp.vector_space_id();
-    let content_generation = fp.content_generation_id("sel");
-    for (occurrence, unit) in [("occ1", "unit1"), ("occ2", "unit2")] {
-        let hash = attic_semantic::content_hash(unit);
-        store
-            .add_occurrence(
-                occurrence,
-                unit,
-                &vector_space,
-                &hash,
-                "repo",
-                "rev",
-                "gen",
-                &content_generation,
-                "{}",
-            )
-            .unwrap();
-        store.queue_enqueue(occurrence, 1.0).unwrap();
-    }
-
-    let stack = attic_retrieval::semantic::SemanticStack {
-        store: store.clone(),
-        provider,
-    };
-
-    let mut res_status = test_resource_status();
-    res_status.semantic = Some(&stack);
-
-    let r = handle_status(
-        &srv.pool,
-        &HashMap::new(),
-        &HashMap::new(),
-        None,
-        true,
-        &[],
-        &[],
-        &[],
-        &HashMap::new(),
-        &HashMap::new(),
-        &res_status,
-    )
-    .unwrap();
-
-    let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
-    assert!(v.get("semantic_progress").is_some());
-    assert_eq!(v["semantic_progress"]["queue_pending"], 2);
-    assert_eq!(v["semantic_availability"]["coverage"]["embedded_units"], 0);
-    assert_eq!(v["semantic_availability"]["coverage"]["eligible_units"], 2);
-    assert_eq!(v["semantic_availability"]["search_uses_semantic"], false);
-    assert_eq!(
-        v["semantic_availability"]["search_semantic_reason"],
-        "NO_EMBEDDINGS"
-    );
-    assert!(
-        v["semantic_availability"]["search_semantic_reason_text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no embeddings exist"),
-        "{}",
-        v["semantic_availability"]
-    );
-    assert_eq!(v["semantic_progress"]["total_queue_depth"], 2);
-    assert!(v.get("diagnostics").is_some());
-    assert!(v["diagnostics"]["why_slow"].is_string());
-    // Queued work on a ready provider is reported as embedding in
-    // progress (CPU here), with the queue size, not as "nominal".
-    assert_eq!(
-        v["diagnostics"]["bottleneck_code"], "semantic_cpu_inference",
-        "{}",
-        v["diagnostics"]
-    );
-    assert!(
-        v["diagnostics"]["why_slow"]
-            .as_str()
-            .unwrap()
-            .contains("2 queued chunks")
-    );
-}
-
 /// The residual case (no bootstrap in progress, no recorded watcher
 /// failure) must still carry an honest label, not silence.
-#[test]
-fn status_reports_semantic_provider_backoff_and_selection_coverage() {
-    attic_semantic::diagnostics::clear_provider_backoff();
-    let tmp = TempDir::new().unwrap();
-    let srv = make_server(&tmp);
-    let store = Arc::new(attic_semantic::SemanticStore::open_in_memory().unwrap());
-    let provider = Arc::new(attic_semantic::testing::HashingEmbedder::new());
-    let fp = attic_semantic::testing::test_fingerprint(provider.as_ref());
-    let vector_space = fp.vector_space_id();
-    let content_generation = fp.content_generation_id("sel");
-    let hash = attic_semantic::content_hash("unit");
-    store
-        .add_occurrence(
-            "occ1",
-            "unit1",
-            &vector_space,
-            &hash,
-            "repo",
-            "rev",
-            "gen",
-            &content_generation,
-            "{}",
-        )
-        .unwrap();
-    store.queue_enqueue("occ1", 1.0).unwrap();
-
-    let mut excluded = HashMap::new();
-    excluded.insert(attic_semantic::EX_CAP_REPO, 3usize);
-    attic_semantic::publish_selection_report(&attic_semantic::SelectionReport {
-        scanned: 9,
-        scan_truncated: false,
-        selected: 2,
-        excluded,
-        per_repo_selected: HashMap::new(),
-    });
-    attic_semantic::diagnostics::note_provider_backoff(2, 1_500, "synthetic load failure");
-
-    let stack = attic_retrieval::semantic::SemanticStack { store, provider };
-    let mut res_status = test_resource_status();
-    res_status.semantic = Some(&stack);
-
-    let r = handle_status(
-        &srv.pool,
-        &HashMap::new(),
-        &HashMap::new(),
-        None,
-        true,
-        &[],
-        &[],
-        &[],
-        &HashMap::new(),
-        &HashMap::new(),
-        &res_status,
-    )
-    .unwrap();
-    let v: Value = serde_json::from_str(&text_of(&r)).unwrap();
-    assert_eq!(v["semantic_provider_backoff"]["consecutive_failures"], 2);
-    assert_eq!(v["semantic_selection_coverage"]["eligible_before_caps"], 5);
-    assert_eq!(v["semantic_selection_coverage"]["selected"], 2);
-    assert!(
-        v["semantic_selection_coverage"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("cap reached")),
-        "{}",
-        v["semantic_selection_coverage"]
-    );
-    attic_semantic::diagnostics::clear_provider_backoff();
-}
 
 #[test]
 fn status_reports_watcher_not_registered_reason() {
@@ -2132,7 +1843,7 @@ fn workspace_becomes_searchable_through_coordinated_writer() {
     let mut a = HashMap::new();
     a.insert("query".into(), json!("hello_world"));
     a.insert("repository_id".into(), json!(repo_id.clone()));
-    let r2 = handle_search(&srv.pool, None, &a, &ids(&srv), None).unwrap();
+    let r2 = handle_search(&srv.pool, &a, &ids(&srv), None).unwrap();
     let v2: Value = serde_json::from_str(&text_of(&r2)).unwrap();
     let results = v2["results"].as_array().expect("results array");
     assert!(
@@ -2418,11 +2129,6 @@ fn spawn_and_initialize(
             "ATTIC_DB_PATH",
             tmp.path().join("test.db").to_str().unwrap(),
         )
-        // Semantic now defaults ON in production; these MCP integration
-        // tests spawn the real binary against a fresh temp dir with no
-        // cached model, so leaving it on would make every one of them
-        // attempt a real network download. Explicitly opt out.
-        .env("ATTIC_SEMANTIC", "0")
         // Each test owns a private database, so this process wins the
         // election and serves its own stdio. A zero idle timeout makes a
         // closed transport shut the daemon down immediately, which
@@ -2453,7 +2159,28 @@ fn spawn_and_initialize(
         &mut stdin,
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
     );
-    (child, stdin)
+    for _ in 0..400 {
+        let response = send_recv(
+            &mut child,
+            &mut stdin,
+            &mcp_request(
+                999,
+                "tools/call",
+                json!({"name": "status", "arguments": {}}),
+            ),
+        );
+        let state: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        if state["status"] != "initializing" {
+            assert_ne!(state["status"], "failed", "{state}");
+            return (child, stdin);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    panic!("catalog did not become ready");
 }
 
 fn send_recv(
@@ -2586,43 +2313,11 @@ fn mcp_call_tool_status() {
     // Spawned without any workspace configuration: status must succeed
     // and report UNCONFIGURED (spec §30), never a fabricated empty ok.
     assert_eq!(v["status"], "unconfigured", "unexpected status: {v}");
-    // r13: identity truth is always present in status, even with no
-    // semantic provider (fields report "unknown"/absence honestly).
     assert!(
-        v.get("semantic_health").is_some(),
-        "semantic_health missing from status: {v}"
+        v.get("semantic_health").is_none(),
+        "removed subsystem must not be advertised: {v}"
     );
-    assert!(
-        v.get("semantic_availability").is_some(),
-        "semantic_availability missing from status: {v}"
-    );
-    child.kill().ok();
-    child.wait().ok();
-}
-
-/// r13: with semantic enabled and the Qwen3 model cached, status reports
-/// the supervised worker identity (backend/quantization/worker_isolated)
-/// — the operator-visible proof of which engine is serving.
-#[test]
-fn mcp_status_reports_semantic_identity() {
-    let bin = require_binary();
-    let tmp = TempDir::new().unwrap();
-    let (mut child, mut stdin) = spawn_and_initialize(&bin, &tmp);
-    let call = mcp_request(2, "tools/call", json!({"name":"status","arguments":{}}));
-    let resp = send_recv(&mut child, &mut stdin, &call);
-    let content = &resp["result"]["content"];
-    let text = content[0]["text"].as_str().unwrap_or("");
-    let v: Value = serde_json::from_str(text).expect("status JSON");
-    if let Some(id) = v.get("semantic_identity") {
-        assert!(id.get("provider_id").is_some(), "provider_id: {id}");
-        assert!(id.get("backend").is_some(), "backend: {id}");
-        assert!(id.get("quantization").is_some(), "quantization: {id}");
-        assert!(id.get("worker_isolated").is_some(), "worker flag: {id}");
-    } else {
-        // Semantic disabled/degraded: identity block may be absent, but
-        // semantic_health must still be honest.
-        assert!(v.get("semantic_health").is_some());
-    }
+    assert_eq!(v["storage"], "repository_sqlite");
     child.kill().ok();
     child.wait().ok();
 }
@@ -2816,8 +2511,21 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
 
     // ── Pre-seed DB by indexing all repos in-process ──────────────────────
     {
-        let srv =
-            AtticServer::new_with_semantic_opt(&db_path, false).expect("server for pre-seeding");
+        let mut srv = AtticServer::new(&db_path).expect("server for pre-seeding");
+        srv.stores = Some(Arc::new(
+            attic_storage::RepositoryStoreManager::open_with_catalog_writer(
+                &db_path,
+                tmp.path(),
+                8,
+                srv.writer.clone(),
+            )
+            .unwrap(),
+        ));
+        *srv.active_roots.write().unwrap() = vec![
+            provider_dir.clone(),
+            dependent_dir.clone(),
+            unrelated_dir.clone(),
+        ];
         let provider_id = srv
             .bootstrap_workspace(&provider_dir)
             .expect("index provider");
@@ -2865,6 +2573,26 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
                 &mut stdin,
                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             );
+            for poll_id in 900..1300 {
+                let response = send_recv(
+                    &mut child,
+                    &mut stdin,
+                    &mcp_request(
+                        poll_id,
+                        "tools/call",
+                        json!({"name":"status","arguments":{}}),
+                    ),
+                );
+                let state: Value = serde_json::from_str(
+                    response["result"]["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap();
+                if state["status"] != "initializing" {
+                    assert_ne!(state["status"], "failed", "{state}");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             (child, stdin)
         };
 
@@ -2927,15 +2655,24 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
     // degraded flag → cross-repo claims become available.
     // ─────────────────────────────────────────────────────────────────────
     let (provider_id_str, dependent_id_str, _unrelated_id_str) = {
-        // Read back the repository IDs from the pre-seeded DB.
-        let srv = AtticServer::new_with_semantic_opt(&db_path, false).expect("read repo ids");
-        let pid = srv.bootstrap_workspace(&provider_dir).expect("provider id");
-        let did = srv
-            .bootstrap_workspace(&dependent_dir)
-            .expect("dependent id");
-        let uid = srv
-            .bootstrap_workspace(&unrelated_dir)
-            .expect("unrelated id");
+        let manager = attic_storage::RepositoryStoreManager::open(
+            tmp.path().join("identity-catalog.db"),
+            tmp.path(),
+            4,
+        )
+        .unwrap();
+        let pid = manager
+            .register_repository(&provider_dir)
+            .unwrap()
+            .stable_id;
+        let did = manager
+            .register_repository(&dependent_dir)
+            .unwrap()
+            .stable_id;
+        let uid = manager
+            .register_repository(&unrelated_dir)
+            .unwrap()
+            .stable_id;
         (pid, did, uid)
     };
 
@@ -2987,6 +2724,7 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
     // gate question, then allow the immediately-following sync publication
     // to commit. This avoids racing initialize against startup sync.
     let mut all_current = false;
+    let mut last_status = json!({});
     for poll_id in 10..210 {
         let status_call = mcp_request(
             poll_id,
@@ -2998,6 +2736,7 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
             .as_str()
             .unwrap_or("");
         let status_v: Value = serde_json::from_str(status_text).unwrap_or(json!({}));
+        last_status = status_v.clone();
         if status_v["workspace"]["current_repository_count"] == 3 {
             all_current = true;
             break;
@@ -3006,7 +2745,7 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
     }
     assert!(
         all_current,
-        "cross-repo fixture repositories never became CURRENT"
+        "cross-repo fixture repositories never became CURRENT: {last_status}"
     );
     std::thread::sleep(Duration::from_millis(100));
 
@@ -3117,14 +2856,13 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
         "gate 4 FAIL: plan_id must be set (evidence path ran); got: {v}"
     );
 
-    // RP-INV-4: evidence_dropped (the "excluded" half of every
-    // considered evidence item, each with a deterministic drop_reason)
-    // must reach the MCP response alongside evidence_used, not be
-    // silently retained only in the internal plan.
+    // Drop accounting is always visible; per-item diagnostics are opt-in.
     assert!(
         v["evidence_dropped"].is_array(),
         "RP-INV-4 FAIL: evidence_dropped must be present as an array; got: {v}"
     );
+    assert!(v["evidence_dropped_summary"]["count"].is_u64());
+    assert!(v["evidence_dropped_summary"]["by_reason"].is_object());
 
     // Gate 4b (strengthened): WorkspaceSnapshot provenance must be traceable
     // from cross-repo evidence items.  Any evidence item that carries a
@@ -3192,10 +2930,13 @@ fn mcp_e2e_crossrepo_multi_repo_fixture() {
     // round-trip through bootstrap_workspace) purely to keep this test
     // step synchronous and scoped to indexing.
     {
-        let srv = AtticServer::new_with_semantic_opt(&db_path, false).expect("server for re-index");
+        let manager = attic_storage::RepositoryStoreManager::open(&db_path, tmp.path(), 4).unwrap();
+        let lease = manager.acquire(&dependent_id_str).unwrap();
+        let readers = lease.readers();
+        let writer = lease.writer_handle();
         let store = IndexingStore {
-            readers: &srv.pool,
-            writer: &srv.writer,
+            readers: &readers,
+            writer: &writer,
         };
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();

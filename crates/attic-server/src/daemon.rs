@@ -56,7 +56,7 @@ use rmcp::ServiceExt;
 use tokio::net::{UnixListener as IpcListener, UnixStream as IpcStream};
 use tracing::{debug, info, trace, warn};
 
-use crate::{AtticServer, ShutdownHandles, run_shutdown_sequence};
+use crate::startup::StartupServer as AtticServer;
 
 /// How long the daemon waits at zero active connections before shutting
 /// down. Single constant, easy to find/change. Overridable via
@@ -571,23 +571,12 @@ fn is_safe_readonly_method(method: &str) -> bool {
             | "resources/read"
             | "prompts/list"
             | "prompts/get"
-            // Attic search and retrieval
-            | "search"
-            | "search/semantic"
-            | "search/keyword"
-            | "search/hybrid"
+            // Read-only Attic tools. Mutating/mixed-action tools such as
+            // `workspace` and `logging` remain excluded.
+            | "file"
+            | "repo_map"
             | "context"
-            | "symbols"
-            | "definition"
-            | "hover"
-            | "references"
-            // Attic status / diagnostics
             | "status"
-            | "health"
-            | "diagnostics"
-            | "index/status"
-            | "workspace/list"
-            | "workspace/status"
     )
 }
 
@@ -1276,7 +1265,7 @@ async fn handle_connection(
     stream: IpcStream,
     server: AtticServer,
     active: Arc<AtomicUsize>,
-    handles: Arc<ShutdownHandles>,
+    handles: Arc<AtticServer>,
 ) {
     let _guard = ConnectionGuard::new(active);
     debug!("daemon: new IPC connection accepted");
@@ -1327,7 +1316,6 @@ impl Drop for ConnectionGuard {
 /// * `ready_tx` — oneshot sender signaling listener readiness.
 pub(crate) fn spawn_daemon(
     server: AtticServer,
-    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
     handle: DaemonHandle,
     ready_tx: tokio::sync::oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
@@ -1336,7 +1324,7 @@ pub(crate) fn spawn_daemon(
         // election (try_become_daemon). Signal readiness immediately.
         let _ = ready_tx.send(());
         info!("daemon: spawned replacement daemon accept loop");
-        run_daemon_accept_loop(server, semantic_enricher, handle, false).await
+        run_daemon_accept_loop(server, handle, false).await
     })
 }
 
@@ -1436,35 +1424,24 @@ pub(crate) async fn resume_relay_after_promotion(
 /// (immediately, when relays cannot connect at all).
 pub(crate) async fn run_daemon_accept_loop(
     server: AtticServer,
-    semantic_enricher: Option<attic_semantic::BackgroundEnricher>,
     handle: DaemonHandle,
     serve_stdio: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
-    // Phase 3: spawn the periodic RSS sampler before consuming `server`.
-    let rss_sampler = server.resource_monitor.as_ref().map(|monitor| {
-        let monitor = monitor.clone();
-        let cancel = attic_core::CancellationToken::new();
-        let cancel_for_task = cancel.clone();
-        let h = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if cancel_for_task.is_cancelled() {
-                    break;
-                }
-                monitor.refresh_process_memory();
-                let _ = monitor.guidance_pressure();
+    let sampler_server = server.clone();
+    let sampler_cancel = attic_core::CancellationToken::new();
+    let sampler_token = sampler_cancel.clone();
+    let rss_sampler = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if sampler_token.is_cancelled() {
+                break;
             }
-        });
-        (cancel, h)
+            sampler_server.refresh_resources();
+        }
     });
-
-    // Shutdown handles must be captured before `server` is consumed by
-    // any of the spawned `handle_connection` tasks.
-    let mut sh = ShutdownHandles::capture(&server);
-    sh.rss_sampler = rss_sampler;
-    let handles = Arc::new(sh);
+    let handles = Arc::new(server.clone());
 
     // Internal shutdown-signal channel — used to ask the loop to stop
     // cleanly (e.g. on Ctrl+C).
@@ -1586,25 +1563,11 @@ pub(crate) async fn run_daemon_accept_loop(
     }
     info!("daemon: accept loop exited");
 
-    // Unwrap the Arc — every spawned connection task holds a clone, but by
-    // the time the accept loop exits (idle timeout / shutdown signal) all
-    // connections have had their tasks spawned. We cannot wait for them to
-    // finish here (tokio::spawn detaches), but the shutdown sequence below
-    // drains owned bootstrap jobs and writer state, which is the only safe
-    // subset to deterministically drain at this point.
-    //
-    // `Arc::try_unwrap` may fail if a connection task is still running;
-    // fall back to a clone so shutdown still proceeds rather than hanging.
-    let sh = Arc::try_unwrap(handles).unwrap_or_else(|arc| ShutdownHandles {
-        writer: arc.writer.clone(),
-        db_path: arc.db_path.clone(),
-        watches: arc.watches.clone(),
-        bootstrap_jobs: arc.bootstrap_jobs.clone(),
-        scheduler: arc.scheduler.clone(),
-        rss_sampler: None, // already cancelled above via the Arc'd copy
-    });
-
-    run_shutdown_sequence(sh, semantic_enricher, "daemon accept loop exited").await;
+    sampler_cancel.cancel();
+    if let Err(error) = rss_sampler.await {
+        warn!("resource sampler join failed: {error}");
+    }
+    server.shutdown("daemon accept loop exited").await;
     Ok(())
 }
 
@@ -1622,21 +1585,13 @@ mod tests {
         assert!(is_safe_readonly_method("resources/read"));
         assert!(is_safe_readonly_method("prompts/list"));
         assert!(is_safe_readonly_method("prompts/get"));
-        assert!(is_safe_readonly_method("search"));
-        assert!(is_safe_readonly_method("search/semantic"));
-        assert!(is_safe_readonly_method("search/keyword"));
-        assert!(is_safe_readonly_method("search/hybrid"));
+        assert!(is_safe_readonly_method("file"));
+        assert!(is_safe_readonly_method("repo_map"));
         assert!(is_safe_readonly_method("context"));
-        assert!(is_safe_readonly_method("symbols"));
-        assert!(is_safe_readonly_method("definition"));
-        assert!(is_safe_readonly_method("hover"));
-        assert!(is_safe_readonly_method("references"));
         assert!(is_safe_readonly_method("status"));
-        assert!(is_safe_readonly_method("health"));
-        assert!(is_safe_readonly_method("diagnostics"));
-        assert!(is_safe_readonly_method("index/status"));
-        assert!(is_safe_readonly_method("workspace/list"));
-        assert!(is_safe_readonly_method("workspace/status"));
+        assert!(!is_safe_readonly_method("search/semantic"));
+        assert!(!is_safe_readonly_method("symbols"));
+        assert!(!is_safe_readonly_method("workspace/status"));
     }
 
     #[test]

@@ -298,18 +298,9 @@ log ""
 
 
 # -----------------------------------------------------------------------------
-# 9b. Download embedding models now, so the first session starts ready.
-#     Never fails setup: Attic retries the download itself on first start.
-#     Set ATTIC_SKIP_MODELS=1 to defer.
+# No embedding models or model downloads are required.
 # -----------------------------------------------------------------------------
 
-if [[ "${ATTIC_SKIP_MODELS:-0}" != "1" ]]; then
-    log "Downloading embedding models (about 1.2 GB; set ATTIC_SKIP_MODELS=1 to defer)..."
-    if ! "$BIN_PATH" setup-models; then
-        log "WARNING: model download did not complete; Attic will download the models automatically when it first starts."
-    fi
-    log ""
-fi
 
 
 # -----------------------------------------------------------------------------

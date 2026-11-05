@@ -361,8 +361,8 @@ async fn test_restart_unavailable_repo_shows_degraded() {
         let sv: Value = serde_json::from_str(&status_text).expect("status JSON run2");
 
         assert_eq!(
-            sv["status"], "ok",
-            "run2 status must be ok (not unconfigured): {status_text}"
+            sv["status"], "degraded",
+            "run2 status must report the unavailable member: {status_text}"
         );
         assert_eq!(
             sv["workspace"]["unavailable_repository_count"], 1,
@@ -425,12 +425,28 @@ async fn test_restart_unavailable_repo_shows_degraded() {
         // Wait for B's probe token to be re-indexed after the reappearance.
         wait_for_token(&mut srv, token_b, 40).await;
 
-        let status_text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+        let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+        let status_text = loop {
+            let text = tokio::time::timeout_at(
+                deadline,
+                call_tool_text(&mut srv, "status", serde_json::json!({})),
+            )
             .await
+            .expect("workspace readiness deadline")
             .expect("status run3");
+            let status: Value = serde_json::from_str(&text).expect("status JSON");
+            if status["status"] != "initializing" && status["status"] != "indexing" {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         let sv: Value = serde_json::from_str(&status_text).expect("status JSON run3");
 
         assert_eq!(sv["status"], "ok", "run3 status: {status_text}");
+        assert_eq!(
+            sv["workspace"]["current_repository_count"], 3,
+            "run3: all restored repositories must be ready; {status_text}"
+        );
         assert_eq!(
             sv["workspace"]["unavailable_repository_count"], 0,
             "run3: B restored — no unavailable repos; {status_text}"

@@ -139,6 +139,15 @@ pub struct Evidence {
     /// Exact span when known.
     pub source_span: Option<SourceSpan>,
 
+    /// Display/verification span of an excerpt; source_span remains the fusion identity.
+    #[serde(default)]
+    pub excerpt_span: Option<SourceSpan>,
+
+    #[serde(default)]
+    pub snippet_leading_omitted: bool,
+    #[serde(default)]
+    pub snippet_trailing_omitted: bool,
+
     /// BLAKE3 hex of the evidenced content (as stored in the index).
     pub content_hash: Option<String>,
 
@@ -206,6 +215,9 @@ impl Evidence {
             source_revision_id: None,
             index_generation_id: None,
             source_span: None,
+            excerpt_span: None,
+            snippet_leading_omitted: false,
+            snippet_trailing_omitted: false,
             content_hash: None,
             freshness_state: FreshnessState::Current,
             authority: AuthorityLevel::Implementation,

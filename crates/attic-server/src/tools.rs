@@ -88,22 +88,28 @@ pub(crate) fn make_tools() -> Vec<Tool> {
              requests — prefer NORMAL and escalate to DEEP on INSUFFICIENT_EVIDENCE). \
              A hard-cancelled query still returns whatever evidence completed validation, \
              with result POLICY_HARD_CANCELLED and confidence NONE. \
-             mode=\"SEARCH\": raw hybrid retrieval (FTS5 fused with semantic kNN via RRF) \
+             mode=\"SEARCH\": raw lexical retrieval (SQLite FTS5) \
              WITHOUT evidence assembly — for exact-string/identifier lookup, not \
              questions. Each SEARCH result carries a source_type, a bounded ~240-char \
              snippet, and start/end line anchors when recorded — use the `file` tool for \
              full content. SEARCH accepts file_type, language, max_results (default 25, \
-             cap 200), and scope (\"all\"|\"knowledge\").",
+             cap 200), and scope (\"all\"|\"knowledge\"). \
+             Answer modes share identical excerpt bodies while retaining every citation; \
+             repository_answers contains summaries, not duplicate full answers. \
+             Rejected-evidence counts/reasons are always included; set include_diagnostics=true \
+             for individual rejected items. telemetry reports server timings and UTF-8 response bytes, \
+             not client/model processing time. No additional response-size cap is applied.",
             json_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query":         {"type":"string","description":"Natural-language question (max 512 chars); an FTS5 query string when mode=\"SEARCH\""},
-                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP","SEARCH"],"description":"Answer-mode policy (default NORMAL); SEARCH = raw hybrid retrieval without evidence assembly"},
+                    "query":         {"type":"string","description":"Natural-language question (max 512 chars); literal lexical terms when mode=\"SEARCH\", not FTS5 operators"},
+                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP","SEARCH"],"description":"Answer-mode policy (default NORMAL); SEARCH = raw lexical retrieval without evidence assembly"},
                     "repository_id": {"type":"string","description":"Optional repository UUID scope"},
                     "file_type":     {"type":"string","description":"SEARCH mode: filter by file extension (max 32)"},
                     "language":      {"type":"string","description":"SEARCH mode: filter by detected language (max 64)"},
                     "max_results":   {"type":"integer","minimum":1,"maximum":200,"description":"SEARCH mode: max results (default 25, hard cap 200)"},
                     "scope":         {"type":"string","enum":["all","knowledge"],"description":"SEARCH mode: \"knowledge\" = only project knowledge (central knowledge folder first, then repository knowledge/ folders). Default \"all\""}
+                    ,"include_diagnostics": {"type":"boolean","default":false,"description":"Answer modes: include individual rejected-evidence diagnostics; counts/reasons are always returned"}
                 },
                 "required": ["query"]
             })),
@@ -114,9 +120,11 @@ pub(crate) fn make_tools() -> Vec<Tool> {
              Actions: `inspect` (report the configured + active roots and per-repository \
              state), `add <path>`, `remove <path>`, `set [<paths...>]` (authoritatively \
              replace membership). The configuration is persisted atomically to \
-             <ATTIC_HOME>/config.toml so it survives restarts; membership changes take \
+             <ATTIC_HOME>/config/config.toml in the structured home layout, so it survives \
+             restarts; membership changes take \
              effect live (bootstrap/index for newly added roots, watcher stop for removed \
-             ones). On a pristine machine this is the first-run configuration entry point.",
+             ones). Up to 65 active repository stores are supported. On a pristine \
+             machine this is the first-run configuration entry point.",
             json_schema(json!({
                 "type": "object",
                 "properties": {

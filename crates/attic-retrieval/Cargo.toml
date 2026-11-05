@@ -13,7 +13,6 @@ attic-core.workspace = true
 attic-storage = { path = "../attic-storage" }
 attic-discovery = { path = "../attic-discovery" }
 attic-evidence = { path = "../attic-evidence" }
-attic-semantic = { path = "../attic-semantic" }
 blake3.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

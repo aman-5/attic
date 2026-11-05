@@ -23,8 +23,6 @@ pub enum RetrieverKind {
     Structural,
     Relationship,
     Knowledge,
-    /// Phase 5: nearest-neighbor over the disposable semantic layer.
-    Semantic,
     /// Phase 6: cross-repository dependency edges.
     CrossRepo,
 }
@@ -38,7 +36,6 @@ pub fn retriever_from_str(s: &str) -> Option<RetrieverKind> {
         "STRUCTURAL" => Some(RetrieverKind::Structural),
         "RELATIONSHIP" | "GRAPH" => Some(RetrieverKind::Relationship),
         "KNOWLEDGE" => Some(RetrieverKind::Knowledge),
-        "SEMANTIC" | "VECTOR" => Some(RetrieverKind::Semantic),
         "CROSS_REPO" => Some(RetrieverKind::CrossRepo),
         _ => None,
     }
@@ -54,7 +51,6 @@ impl RetrieverKind {
             Self::Structural => "STRUCTURAL",
             Self::Relationship => "RELATIONSHIP",
             Self::Knowledge => "KNOWLEDGE",
-            Self::Semantic => "SEMANTIC",
             Self::CrossRepo => "CROSS_REPO",
         }
     }
@@ -130,7 +126,12 @@ pub fn source_type_for_path(path: &str) -> EvidenceSourceType {
         return EvidenceSourceType::Configuration;
     }
     const DOC_EXTS: &[&str] = &[".md", ".rst", ".txt", ".adoc"];
-    if DOC_EXTS.iter().any(|e| name.ends_with(e)) {
+    if DOC_EXTS.iter().any(|e| name.ends_with(e))
+        || matches!(
+            name,
+            "license" | "licence" | "notice" | "copying" | "copyright"
+        )
+    {
         return EvidenceSourceType::Documentation;
     }
     if name.ends_with(".json") {
@@ -219,6 +220,62 @@ pub fn bound_snippet(text: &str, max_chars: usize) -> String {
     format!("{}…", &text[..cut])
 }
 
+/// Keep the existing excerpt budget, centered on the line matching most query terms.
+fn focused_snippet(text: &str, terms: &[String], max_bytes: usize) -> (String, usize, usize) {
+    let mut offset = 0;
+    let mut best = (0, 0, 0);
+    for line in text.split_inclusive('\n') {
+        let lower = line.to_lowercase();
+        let matches = terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .count();
+        if matches > best.0 {
+            let first = terms
+                .iter()
+                .filter_map(|term| {
+                    let index = lower.find(term.as_str())?;
+                    // Unicode lowercasing can change byte lengths (e.g. U+0130).
+                    let mut folded_offset = 0;
+                    let mut original_start = 0;
+                    let mut original_end = line.len();
+                    for (original, ch) in line.char_indices() {
+                        let next =
+                            folded_offset + ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+                        if folded_offset <= index && index < next {
+                            original_start = original;
+                        }
+                        if next >= index + term.len() {
+                            original_end = original + ch.len_utf8();
+                            break;
+                        }
+                        folded_offset = next;
+                    }
+                    Some((original_start, original_end - original_start))
+                })
+                .min_by_key(|(index, _)| *index)
+                .unwrap_or((0, 0));
+            best = (matches, offset + first.0, first.1);
+        }
+        offset += line.len();
+    }
+    let mut start = best.1.saturating_sub(max_bytes / 4);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    // Include a complete leading line when it fits without losing the match.
+    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    if best.1.saturating_add(best.2).saturating_sub(line_start) <= max_bytes {
+        start = line_start;
+    }
+    let mut end = start.saturating_add(max_bytes).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let excerpt = &text[start..end];
+    (excerpt.to_owned(), start, end)
+}
+
 // ---------------------------------------------------------------------------
 // Generators (all read-only; each enforces the candidate budget)
 // ---------------------------------------------------------------------------
@@ -281,9 +338,27 @@ impl LexicalGenerator {
             ev.freshness_state = freshness_of(&h.freshness_state);
             ev.authority = authority_for(st);
             ev.confidence = attic_evidence::signals::normalize_lexical(h.score.max(0.0));
-            ev.snippet = Some(bound_snippet(&h.body, 1200));
+            let (snippet, start_byte, end_byte) = focused_snippet(&h.body, terms, 1200);
+            ev.snippet = Some(snippet);
+            ev.snippet_leading_omitted = start_byte > 0;
+            ev.snippet_trailing_omitted = end_byte < h.body.len();
             ev.signals.lexical_score = Some(attic_evidence::signals::normalize_lexical(h.score));
             ev.source_span = unit_span(h.start_line, h.end_line);
+            ev.excerpt_span = h.start_line.map(|line| {
+                let before = &h.body[..start_byte];
+                let start = line
+                    .saturating_add(before.bytes().filter(|byte| *byte == b'\n').count() as u32);
+                let start_col = before.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+                let excerpt = &h.body[start_byte..end_byte];
+                let end_line = start
+                    .saturating_add(excerpt.bytes().filter(|byte| *byte == b'\n').count() as u32);
+                let end_col = if end_line == start {
+                    start_col.saturating_add(excerpt.chars().count() as u32)
+                } else {
+                    excerpt.rsplit('\n').next().unwrap_or("").chars().count() as u32
+                };
+                attic_core::SourceSpan::new(start, start_col, end_line, end_col)
+            });
             fill_file_provenance(env.conn, &mut ev);
             let mut c = Candidate::new(RetrieverKind::Fts, ev);
             c.evidence.retrieval_sources[0].query_fragment = fts_query.clone();
@@ -313,7 +388,9 @@ impl PathExactGenerator {
             ev.freshness_state = freshness_of(&h.freshness_state);
             ev.authority = authority_for(ev.source_type);
             ev.confidence = 1.0; // exact path match
-            ev.snippet = Some(bound_snippet(&h.body, 1200));
+            let (snippet, _, end) = focused_snippet(&h.body, &[], 1200);
+            ev.snippet = Some(snippet);
+            ev.snippet_trailing_omitted = end < h.body.len();
             ev.signals.symbol_match_score = Some(1.0);
             ev.source_span = unit_span(h.start_line, h.end_line);
             fill_file_provenance(env.conn, &mut ev);
@@ -638,6 +715,78 @@ impl CrossRepoGenerator {
 #[cfg(test)]
 mod source_type_for_path_tests {
     use super::*;
+
+    #[test]
+    fn legal_notices_are_documentation_not_implementation() {
+        for path in [
+            "LICENSE",
+            "vendor/NOTICE",
+            "COPYING",
+            "Licence",
+            "Copyright",
+        ] {
+            assert_eq!(
+                source_type_for_path(path),
+                EvidenceSourceType::Documentation
+            );
+            assert_eq!(search_label_for_path(path), "documentation");
+        }
+        assert_eq!(
+            source_type_for_path("src/license.rs"),
+            EvidenceSourceType::SourceCode
+        );
+        assert_eq!(
+            source_type_for_path("knowledge/LICENSE"),
+            EvidenceSourceType::Knowledge
+        );
+    }
+
+    #[test]
+    fn lexical_excerpt_follows_matches_beyond_the_old_prefix() {
+        let prefix = "// unrelated boilerplate\n".repeat(100);
+        let body = format!("{prefix}fn submit_payment() {{ dispatch_payment(); }}\n// tail\n");
+        let (snippet, offset, end) = focused_snippet(
+            &body,
+            &["submit_payment".into(), "dispatch_payment".into()],
+            1200,
+        );
+        assert!(snippet.contains("fn submit_payment()"));
+        assert!(snippet.contains("dispatch_payment"));
+        assert!(offset > 0);
+        let actual = &body[offset..end];
+        assert!(actual.contains("fn submit_payment()"));
+        assert!(snippet.len() <= 1200 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn lexical_excerpt_preserves_unicode_and_no_match_prefix() {
+        let body = format!("{}matching_identifier\n", "\u{4e16}\u{754c}\n".repeat(400));
+        let (snippet, offset, _) = focused_snippet(&body, &["matching_identifier".into()], 1200);
+        assert!(snippet.contains("matching_identifier"));
+        assert!(offset > 0);
+        let short = "fn unchanged() {}\n";
+        assert_eq!(focused_snippet(short, &["missing".into()], 1200).0, short);
+    }
+
+    #[test]
+    fn lexical_excerpt_does_not_cut_match_to_retain_a_long_leading_line() {
+        let body = format!("{}specific_identifier();", " ".repeat(1199));
+        let (snippet, _, _) = focused_snippet(&body, &["specific_identifier".into()], 1200);
+        assert!(snippet.contains("specific_identifier"));
+    }
+
+    #[test]
+    fn focused_excerpt_unicode_offsets_and_raw_long_line_are_exact() {
+        for token in ["Ölpreis", "İstanbul"] {
+            let body = format!("{}{}{}", "x".repeat(2400), token, "y".repeat(2400));
+            let (snippet, start, end) = focused_snippet(&body, &[token.to_lowercase()], 1200);
+            assert!(start > 0);
+            assert!(end < body.len());
+            assert!(snippet.contains(token));
+            assert_eq!(snippet, body[start..end]);
+            assert!(!snippet.contains('…'));
+        }
+    }
 
     // Regression coverage for the knowledge/** vs. ordinary-documentation
     // authority boundary documented in README.md / docs/ARCHITECTURE.md —

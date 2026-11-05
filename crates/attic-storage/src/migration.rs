@@ -48,6 +48,35 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     }
 }
 
+/// Initialize a new canonical catalog or keep an exactly compatible schema.
+///
+/// Unlike [`run_migrations`], this never resets an existing database. Unknown
+/// schemas (including older layouts) fail closed so callers can preserve the
+/// original file and choose a fresh catalog path explicitly.
+pub fn migrate_new_or_compatible_catalog(conn: &Connection) -> Result<(), StorageError> {
+    let has_migrations: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+          WHERE type = 'table' AND name = 'core_schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return run_migrations(conn);
+    }
+    if has_migrations && is_current_schema(conn)? {
+        return Ok(());
+    }
+    Err(StorageError::Migration {
+        message: "existing database schema is incompatible; preserved unchanged. Choose a fresh catalog path and explicitly reindex".into(),
+    })
+}
+
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS core_schema_migrations (

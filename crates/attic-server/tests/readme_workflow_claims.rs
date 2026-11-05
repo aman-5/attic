@@ -12,8 +12,8 @@ fn readme() -> String {
 fn readme_describes_the_single_daemon_process_model() {
     let readme = readme();
     assert!(
-        readme.contains("becomes the **daemon**: it owns the single database writer"),
-        "README must say the first launch becomes the daemon that owns the one writer"
+        readme.contains("becomes the **daemon**: it owns one catalog writer and one writer per open repository store"),
+        "README must describe daemon-owned catalog and repository writers"
     );
     assert!(
         readme.contains("becomes a thin **relay**"),

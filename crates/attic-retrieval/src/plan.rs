@@ -20,7 +20,6 @@ str_enum! {
         SymbolLookup => "SYMBOL_LOOKUP",
         StructuralLookup => "STRUCTURAL_LOOKUP",
         GraphWalk => "GRAPH_WALK",
-        SemanticSearch => "SEMANTIC_SEARCH",
         Reranker => "RERANKER",
         SecretFilter => "SECRET_FILTER",
         EvidenceAssembler => "EVIDENCE_ASSEMBLER",

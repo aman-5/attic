@@ -6,9 +6,6 @@
 #
 #   attic-v<version>-<target>/
 #     attic-server[.exe]        the server binary (only executable)
-#     DirectML.dll              Windows only: DirectML runtime the GPU backend
-#                               loads from beside the exe (newer than the
-#                               copy Windows ships in System32)
 #     README.md                 product documentation
 #     LICENSE-MIT               license texts
 #     LICENSE-APACHE
@@ -20,13 +17,7 @@
 #   tools/package.sh --target <triple> [--out <dir>] [--verify <archive-dir>]
 #                   [--features "<cargo-features>"] [--stage-only]
 #
-# Backend variants:
-#   default build                 Target default; Windows MSVC includes
-#                                 DirectML automatically.
-#   Windows DirectML              Built automatically for the MSVC target; no
-#                                 feature flag is needed. The
-#                                 `inference-worker` subcommand is part of the
-#                                 same binary; no extra artifact is packaged.
+# No embedding backend or model runtime is packaged.
 #
 # Cross-compilation targets:
 #   x86_64-pc-windows-msvc      Windows x86_64
@@ -74,9 +65,6 @@ if [[ "$MODE" == verify ]]; then
   BIN_COUNT=$(find "$DIR" -maxdepth 1 -type f \( -name 'attic-server' -o -name 'attic-server.exe' \) | wc -l)
   test "$BIN_COUNT" -eq 1 || { echo "FAIL: exactly one attic-server binary expected (found $BIN_COUNT)"; exit 1; }
   test -f "$DIR/README.md" || { echo "FAIL: README.md missing"; exit 1; }
-  if find "$DIR" -maxdepth 1 -type f -name 'attic-server.exe' -print -quit | grep -q .; then
-    test -f "$DIR/DirectML.dll" || { echo "FAIL: DirectML.dll missing from Windows archive"; exit 1; }
-  fi
   test -d "$DIR/docs" || { echo "FAIL: docs/ missing"; exit 1; }
   test -f "$DIR/LICENSE-MIT" || {
   echo "FAIL: LICENSE-MIT missing"
@@ -111,38 +99,6 @@ esac
 
 cd "$REPO_ROOT"
 
-# Per-target GPU backend defaults.
-#
-# Windows      -> DirectML is compiled automatically for the MSVC target by
-#                 attic-semantic, so no feature flag is required.
-#
-# macOS arm64  -> candle-metal. Metal ships with the OS and needs no SDK
-#                 beyond the Xcode command line tools, so this cannot fail
-#                 to build on any machine that can already build the target,
-#                 and every Apple Silicon Mac can actually use it.
-#
-# Linux        -> nothing, DESPITE candle-cuda existing and working. It is a
-#                 deliberate omission, not an oversight: linking it requires
-#                 the NVIDIA CUDA toolkit *at build time*, so defaulting it
-#                 on would turn a routine release build into a hard failure
-#                 on every machine and CI runner without the toolkit
-#                 installed — and would do so for the majority of Linux
-#                 users, who have no NVIDIA card at all. Build the CUDA
-#                 variant explicitly on a toolkit-equipped machine:
-#
-#                     tools/package.sh --target x86_64-unknown-linux-gnu \
-#                       --features candle-cuda
-#
-# In every case `device.rs` resolves the actual device at runtime and falls
-# back to CPU with a stated reason, so a binary built with a GPU feature
-# still runs correctly on a machine that has no such device.
-if [[ -z "$FEATURES" ]]; then
-  case "$TARGET" in
-    aarch64-apple-darwin) FEATURES="candle-metal" ;;
-  esac
-  [[ -n "$FEATURES" ]] && echo "== enabling default GPU backend for $TARGET: $FEATURES"
-fi
-
 echo "== building attic-server for $TARGET${FEATURES:+ (features: $FEATURES)}"
 if [[ -n "$FEATURES" ]]; then
   cargo build --release --package attic-server --target "$TARGET" --features "$FEATURES"
@@ -167,11 +123,6 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/docs"
 
 cp "$BIN" "$STAGE/$STAGED_EXE"
-if [[ "$TARGET" == *windows* ]]; then
-  DML="target/$TARGET/release/DirectML.dll"
-  test -f "$DML" || { echo "FAIL: $DML not found; the DirectML GPU backend needs it beside the exe" >&2; exit 1; }
-  cp "$DML" "$STAGE/"
-fi
 cp "$REPO_ROOT/README.md" "$STAGE/"
 for lic in LICENSE-MIT LICENSE-APACHE; do
   [[ -f "$REPO_ROOT/$lic" ]] && cp "$REPO_ROOT/$lic" "$STAGE/"

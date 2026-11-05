@@ -10,7 +10,7 @@ For what Attic is, start with the [README](../README.md); for how it is built,
   - [Start and stop](#start-and-stop) · [Indexing lifecycle](#indexing-lifecycle)
   - [Checking health](#checking-health) · [Managing repositories](#managing-repositories)
   - [Several windows, one workspace](#several-windows-one-workspace)
-  - [Project knowledge](#project-knowledge) · [Semantic search on/off](#semantic-search-onoff)
+  - [Project knowledge](#project-knowledge) · [MCP tools](#mcp-tools)
 - [Troubleshooting](#troubleshooting)
 - [Recovery](#recovery)
 - [Adding a language or platform](#adding-a-language-or-platform)
@@ -58,10 +58,8 @@ answers `status` and `workspace`, and query tools return a clear "workspace
 not configured" error until you add a repository.
 
 Attic stops on Ctrl+C, or — as a daemon — once no client has been connected
-for the idle timeout (90 s by default). Both paths run the same graceful
-shutdown: stop accepting work, stop watchers and the scheduler, stop semantic
-workers, record a clean-shutdown marker, prune old records, checkpoint the
-WAL, write a crash-recovery backup and close the databases.
+for the idle timeout (90 s by default). Both paths run graceful shutdown: stop accepting work, stop watchers and the
+scheduler, drain bounded writer work, checkpoint stores and close databases.
 
 > [!NOTE]
 > On macOS, a replacement daemon can take over a killed daemon's leftover
@@ -71,28 +69,31 @@ WAL, write a crash-recovery backup and close the databases.
 
 ```mermaid
 flowchart LR
-    S[Startup] --> R[Recovery<br/>fail-closed]
-    R --> B[Full index pass<br/>per configured root]
-    B --> X[Cross-repo sync]
+    S[MCP initialize + tools/list] --> C[Catalog and repository-store verification]
+    C --> R[Content readiness]
+    R --> B[Per-repository indexing]
+    B --> X[Cross-repository sync]
     X --> W[Watchers + scheduler]
-    W -->|file saved| I[Verify → invalidate<br/>→ re-index changed files]
+    W -->|file saved| I[Verify → invalidate → re-index]
     I --> W
+    S --> T[status / workspace available during verification]
 ```
 
-- **Startup** — `run_startup_recovery` runs before anything is served:
-  interrupted tasks return to `PENDING`, interrupted refreshes return to
-  `STALE`, in-progress secret scans restart, and the database integrity check
-  must pass.
-- **Full index pass** — runs in the background right after startup for
-  every configured root (tools answer immediately; `status` shows each
-  repository's state). It is authoritative: paths deleted or newly excluded
-  while Attic was stopped are tombstoned, and unchanged files are reproduced
-  from the analysis cache instead of being re-analyzed.
+- **Startup** — MCP initialization, tool discovery and `status` are independent
+  of repository-index readiness. `workspace` actions and content-serving tools
+  require completed catalog verification; content is never served from an
+  unchecked store.
+- **Verification** — each configured repository has an isolated SQLite index.
+  Verification can take longer than a client's connection deadline for a
+  large store; a responsive MCP handshake does not mean indexed content is
+  ready. Retry content requests after `status` reports readiness.
+- **Indexing** — each repository is indexed independently. Unchanged files can
+  reuse cached analysis; cross-repository relationships are synchronized
+  across configured members only.
 - **Incremental** — a native file watcher (falling back to periodic
-  reconciliation if the OS watch cannot be established) debounces changes
-  for 500 ms, verifies them against real content hashes, invalidates the
-  affected artifacts and re-indexes only the changed files. `status`'s
-  `watcher.mode` says which mechanism is active.
+  reconciliation if the OS watch cannot be established) detects changes,
+  verifies content hashes, invalidates affected artifacts and re-indexes
+  changed files. `status` reports watcher and indexing state.
 
 ### Checking health
 
@@ -104,7 +105,7 @@ Ask your client for Attic's status, or call the `status` tool. Key fields:
 | `workspace.repositories[]` | Per-repository state, watcher mode and any error |
 | `incremental.state` | `CURRENT` / `INDEXING` / `RECONCILIATION_REQUIRED` / `UNKNOWN` |
 | `incremental.tasks` | Pending/running background tasks |
-| `semantic_progress` | Embedding queue depth and completion |
+| `retrieval_telemetry` | Recent retrieval-plan outcomes by mode and result |
 | `diagnostics.why_slow` | Plain-language bottleneck diagnosis |
 | `resource_pressure` | Memory tier (`normal`/`warning`/`critical`/`emergency`) and effective limits |
 | `resource_mode` / `resource_mode_source` | Selected low/balanced/performance tier and where it came from |
@@ -121,12 +122,16 @@ editing. Tell your client *"add D:\new-service to Attic"*, or call it directly:
 | `{"action":"remove","path":"..."}` | Stop watching; the repository immediately disappears from search, context and status |
 | `{"action":"set","paths":[...]}` | Replace the whole membership |
 
-Membership is written atomically to `<ATTIC_HOME>/config/config.toml`. A removed
-repository disappears from results immediately, and its stored data (index,
-embeddings) is deleted in the background; adding it back before that finishes
-cancels the deletion. A configured root that is temporarily unavailable (say, an
-unmounted drive) is reported under `workspace.unavailable_repositories` while
-the others keep working.
+Membership is written atomically to `<ATTIC_HOME>/config/config.toml`. A
+removed repository disappears from results immediately. Its manager-owned
+index may be reclaimed after active readers release their leases; adding it
+back before cleanup completes cancels pending cleanup. Legacy databases and
+model files are not managed or deleted. A configured root that is temporarily
+unavailable (say, an unmounted drive) is reported under
+`workspace.unavailable_repositories` while the others keep working. At most
+65 active managed repository stores can be open at once; excess roots are
+reported as bootstrap failures rather than silently served from an unchecked
+or unavailable store.
 
 ### Several windows, one workspace
 
@@ -150,90 +155,56 @@ for the template.
   silently resolved — treat it as a sign the knowledge file needs updating.
 - Never store secrets there: knowledge files are served like source code.
 
-### Semantic search on/off
+### MCP tools
 
-Semantic search is **on by default**. Turn it off with `ATTIC_SEMANTIC=0` or
-`[semantic] enabled = false`; delete `semantic.db` to reclaim the disk.
-Canonical (lexical/structural) retrieval never depends on it.
-
-```mermaid
-flowchart LR
-    R[Retrieval units] --> S[Semantic selection]
-    S --> Q[Persistent queue]
-    Q --> W[Window + pack]
-    W --> E[Embedding worker]
-    E --> V[(semantic.db)]
-    V --> H[Hybrid search]
-```
-
-Backend defaults:
-
-| Platform | Default backend |
+| Tool | Purpose |
 |---|---|
-| Windows MSVC | DirectML GPU on any DX12 GPU (NVIDIA / AMD / Intel) |
-| Apple Silicon | Metal GPU via `candle-metal` (automatic with `cargo xtask install`) |
-| Linux | CPU; NVIDIA CUDA requires `--features candle-cuda` and was not validated in the Sep 2026 measurement round |
-| Intel Mac | CPU |
+| `context` | Evidence-backed answer (`FAST`, `NORMAL`, `DEEP`) or raw lexical search with `mode: "SEARCH"` |
+| `file` | Read a bounded, secret-scanned range from a live source file |
+| `repo_map` | Inspect repository structure and indexing statistics |
+| `status` | Readiness, per-repository indexing/watch state, resource pressure and retrieval telemetry |
+| `workspace` | Inspect or change configured repository roots |
+| `logging` | Enable/disable file logging or change log level |
+| `debug_drain_task` | Admin-only: run one pending incremental task synchronously |
 
-Selection defaults also depend on backend, unless explicitly set in
-`attic.toml`:
+Tool schemas are returned by MCP `tools/list`; their source of truth is
+`crates/attic-server/src/tools.rs::make_tools()`. Search is lexical (SQLite
+FTS5) and graph-assisted. Attic does not generate embeddings or claim vector
+similarity; vague conceptual queries can retrieve differently than with a
+vector search engine.
 
-| Key | GPU | CPU |
-|---|---:|---:|
-| `min_score` | `0.0` | `0.30` |
-| `max_units_per_repo` | `500000` | `2560` |
-| `max_file_bytes` | `8388608` (8 MiB) | `262144` (256 KiB) |
-| `max_units_total` | `500000` | `500000` |
-
-The server logs `semantic selection defaults` at startup. If the GPU later
-falls back to CPU at runtime, the startup defaults remain. The installers run
-`attic-server setup-models`, which downloads the fp16 ONNX model (~1.2 GB, GPU
-first when eligible) into `~/.attic/models` before the first session. If it is
-still missing at start, Attic downloads it in the background; that session
-embeds on CPU and the GPU backend is used from the next start. Once the
-models are ready, `setup-models` and the server remove files they never read:
-the ONNX download cache (`models--onnx-community--…`, kept only until
-`onnx-fp16/` is complete) and, on Windows, duplicate `blobs/` copies (replaced
-by hard links). About 2.3 GB stays on disk instead of ~4.6 GB.
-
-> [!TIP]
-> `status.semantic_progress.chunks_per_sec` is measured from committed
-> enrichment batches over the last 300 s, so it does not jump between zero and
-> a per-poll burst rate.
+For answer modes, read top-level `context`, `claims` and `evidence`.
+`repository_answers` contains summaries only. Shared excerpts retain all
+repository/path citations; use `file` to expand a returned source span.
+Rejection counts/reasons appear in `evidence_dropped_summary`; individual
+rejections require `include_diagnostics: true`. Inspect response `telemetry`
+and managed-tool timing logs to separate server work from client processing.
+See [PERFORMANCE.md](PERFORMANCE.md) for field definitions and compatibility notes.
 
 ### Attic home layout
 
-`ATTIC_HOME` defaults to `~/.attic`. Startup creates the home directory,
-`data/` (with `attic.db*`), `config/` (with `attic.toml` when missing) and
-`run/` (daemon lock/address). A legacy flat home is migrated into these folders
-once (skipped for a run while an older Attic still holds the lock). The move is
-all-or-nothing — databases travel with their `-wal`/`-shm` files, a failed
-attempt is rolled back, and an interrupted one is resumed on the next start.
-Other directories are
-lazy: `models/` is created only for model downloads, `logs/` only after the
-`logging` tool is turned on (`action=on`, optional `level=debug|trace|…`) or
-`[logging] file_level` is set in `attic.toml` (applied at every start), and
-`backups/` only after the shutdown backup first succeeds.
-Attic does not read from or write to `~/.cache/huggingface`; model assets live
-under `ATTIC_HOME`.
+`ATTIC_HOME` defaults to `~/.attic`. Managed state lives under `data/`
+(catalog and per-repository indexes), `config/` (`config.toml` for workspace
+membership and `attic.toml` for tunables) and `run/` (daemon lock/address).
+`logs/` is created only when file logging is enabled. Legacy `attic.db`,
+`semantic.db` and model files are preserved; they are not used by current
+retrieval and are not automatically deleted.
 
 ## Troubleshooting
 
 | Problem | What to check |
 |---|---|
 | MCP won't connect | Absolute `command` path; errors are on **stderr** — stdout carries only MCP |
-| Exits immediately | stderr: invalid `attic.toml` or `ATTIC_*` value (both fail closed), unreadable root, failed integrity check |
+| MCP connects but content tools are not ready | Check `status`; large SQLite integrity checks can continue after initialization and may exceed a client's deadline |
+| Exits immediately | stderr: invalid config or `ATTIC_*` value, unreadable root, failed integrity check |
 | Repository missing | `workspace {"action":"inspect"}`; `status.workspace.unavailable_repositories` |
 | File missing | `.gitignore`, built-in skipped folders, `[indexing] exclude` |
 | Results stale | `status.incremental.state`; the `file` tool reads live and appends an `[index freshness: …]` note on drift |
 | Indexing seems stuck | `status.incremental.tasks` not decreasing across calls; stderr scheduler errors |
 | Watcher degraded | `status.watcher.mode` = `periodic-reconciliation` — a documented fallback, not a crash |
 | Cross-repo answers withheld | Startup cross-repo sync not finished or failed (stderr `cross-repo workspace sync failed`); single-repo retrieval unaffected |
-| No semantic results yet | `status.semantic_progress`; first model download embeds on CPU and GPU starts on the next launch when `~/.attic/models/onnx-fp16` exists |
-| GPU expected, CPU used on Windows | Check the Rust target. DirectML is automatic on Windows MSVC; if Cargo config forces GNU, set `CARGO_BUILD_TARGET=x86_64-pc-windows-msvc` |
-| GPU slow or hot | `ATTIC_LOG=debug`; inspect `DirectML embed batch` wait/forward times, `shrunk_by_vram`, and temperature. Thermal pause/resume defaults are 90 °C / 85 °C |
 | "server busy" / memory | `status.resource_pressure`; raise `total_memory_budget_mib` / `max_foreground_queries`, or index fewer repositories at once |
-| Disk usage | `attic.db*`, `semantic.db`, lazy `models/` / `backups/` under `ATTIC_HOME` — not Cargo's `target/` or `~/.cache/huggingface` |
+| Disk usage | Check `data/catalog.db` and `data/repositories/*/index.db`; legacy files are preserved and can be removed only by an explicit operator decision |
 
 <details>
 <summary><strong>Details and diagnostics</strong></summary>
@@ -245,16 +216,8 @@ under `ATTIC_HOME`.
   leftover socket file.
 - **"workspace not configured"** is the intended first-run state — configure
   through the `workspace` tool, `ATTIC_CONFIG` or `ATTIC_WORKSPACE_ROOT`.
-- **Semantic debug logging.** `ATTIC_LOG=debug` adds `semantic batch` lines
-  (claimed, embedded, input bytes, prep/embed/commit ms) and `DirectML embed
-  batch` lines (items, passes, `shrunk_by_vram`, tokenize/forward/wait/total
-  ms). Worker stderr is forwarded.
-- **Content errors.** Too-large or too-token-heavy units are counted for that
-  unit only; they do not demote GPU to CPU and do not force a model reload.
-- **Disk over time.** Every clean shutdown (including the daemon's idle exit)
-  prunes tombstones, invalidation records and finished tasks past their
-  retention (90 / 90 / 30 days) and vacuums both databases, so size tracks
-  indexed content rather than growing without bound.
+- **Readiness diagnostics.** Use `status` to distinguish MCP connectivity
+  from per-repository store verification and indexing readiness.
 
 </details>
 
@@ -262,14 +225,13 @@ under `ATTIC_HOME`.
 
 | Situation | What to do |
 |---|---|
-| Killed mid-index | Nothing — startup recovery resumes; partial publications are never visible |
-| Start over | Stop Attic, delete `attic.db`, `attic.db-wal`, `attic.db-shm`; restart. Always safe: everything is rebuilt from source |
-| Integrity check fails | Attic refuses to serve. Move `attic.db*` aside, then copy the newest file from `backups/` to `attic.db`, or start over |
-| Rebuild embeddings | Delete `semantic.db` and restart |
-| "schema version not supported" | An older binary opened a newer database: upgrade the binary, or start over |
+| Killed during startup or indexing | Restart Attic and inspect `status`; interrupted manager-owned initialization is retried and partial generations are not served |
+| Store verification takes too long | Keep the daemon running and retry content requests after `status` reports readiness; do not remove SQLite files while the daemon is active |
+| Integrity check fails | Do not overwrite or delete the affected store. Preserve the files and backups, capture stderr/status, then diagnose or restore from a verified backup |
+| "schema version not supported" | Preserve the database and use a binary compatible with its schema; do not reset unknown schemas |
 
-Attic never writes into a workspace, so no recovery step can touch your
-source.
+Attic never writes into a workspace, so recovery does not alter source files.
+Legacy databases and model files are not automatically migrated or deleted.
 
 ## Adding a language or platform
 
@@ -424,31 +386,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo xtask install` performs a release build of `attic-server`, stops any
-running local `attic-server` / `attic`, and installs the binary plus runtime
-libraries (for example `DirectML.dll`) into `$ATTIC_HOME` or `~/.attic`. It
-uses Cargo's JSON output to find the executable, so a configured `[build]`
-target is honoured, and replaces files via temp+rename so macOS code
-signatures remain valid. It then runs `attic-server setup-models`
-(`--skip-models` skips it). On Windows it builds for MSVC unless
-`CARGO_BUILD_TARGET` is set. `cargo xtask all` = `cargo fmt --all` + check +
-install.
-
-On Apple Silicon it automatically adds `--features candle-metal`, matching the
-`aarch64-apple-darwin` release packages. On Windows MSVC, DirectML is built in
-automatically; the legacy `ort-directml` feature is a no-op kept for old
-scripts. Linux defaults to CPU; NVIDIA CUDA requires `--features candle-cuda`
-and was not validated in the Sep 2026 measurement round.
-
-The real-GPU end-to-end test runs automatically inside `cargo test` when
-`~/.attic/models/onnx-fp16` exists; `ATTIC_RUN_MODEL_E2E=0` skips it.
+`cargo xtask install` builds and installs `attic-server` into the selected
+installation. It does not download models or install GPU runtimes. On Windows
+it builds for MSVC unless `CARGO_BUILD_TARGET` is set. `cargo xtask all`
+formats, checks, tests, builds and installs.
 
 <details>
 <summary><b>Toolchains per platform</b></summary>
 
 - **Windows (recommended):** rustup's default `x86_64-pc-windows-msvc` plus
-  Build Tools for Visual Studio with the C++ workload. DirectML is automatic;
-  no feature flag is needed.
+  Build Tools for Visual Studio with the C++ workload.
 
   `cargo xtask` builds for MSVC automatically when `CARGO_BUILD_TARGET` is
   unset. For plain `cargo` commands with a personal Cargo config that forces
@@ -468,8 +415,7 @@ The real-GPU end-to-end test runs automatically inside `cargo test` when
   cargo xtask install
   ```
 
-- **Linux:** a system C compiler (`build-essential` / `gcc`). CPU is the
-  default semantic backend. CUDA is opt-in with `--features candle-cuda`.
+- **Linux:** a system C compiler (`build-essential` / `gcc`).
 - **macOS:** `xcode-select --install`. Apple Silicon gets Metal automatically
   through `cargo xtask install`; Intel Mac uses CPU.
 
@@ -481,15 +427,12 @@ The real-GPU end-to-end test runs automatically inside `cargo test` when
 | Variable | Purpose |
 |---|---|
 | `ATTIC_BENCH_INDEX=1` (+ `ATTIC_BENCH_ROOT`, …) | Indexing benchmark — see [`PERFORMANCE.md`](PERFORMANCE.md) |
-| `ATTIC_BENCH_QWEN=1` (+ `ATTIC_BENCH_QWEN_CORPUS`, …) | Real-model embedding benchmark |
-| `ATTIC_RUN_MODEL_E2E=0` | Skip the real-GPU e2e test that runs automatically when `~/.attic/models/onnx-fp16` exists |
 | `ATTIC_ACCEPTANCE_DUMP=<dir>` | Frozen-count acceptance run over the reference JSON-export corpus |
 | `ATTIC_ACCEPTANCE_WORKSPACE=<dir>` | Frozen-count acceptance run over the reference 20-repository workspace |
 | `ATTIC_FORCE_RESOURCE_PRESSURE` | Fault injection: start at a fixed pressure tier |
 | `ATTIC_FORCE_CPU_CORES=<n>` | Test hook: pin the detected physical core count so resource tests don't depend on the machine |
 | `ATTIC_PRESSURE_OVERRIDE_FILE` | Fault injection: a file whose content (`normal`…`emergency`) forces the tier while it exists |
 | `ATTIC_FAST_RECOVERY_MS` | Fault injection: shorten graduated-recovery dwell times |
-| `ATTIC_MOCK_WORKER` | Inference-worker test double: `echo` / `hang` / `corrupt` / `crash` |
 
 The acceptance runs assert exact counts for their reference corpora and are
 skipped when the variable is unset; everything else in the suite is
@@ -506,11 +449,9 @@ safe.
 <summary><strong>Procedures</strong></summary>
 
 - **Schema changes** — migrations are ordered and forward-only. Add
-  `migrations/000N_<name>.sql` (core, wired into `run_migrations` in
-  `crates/attic-storage/src/migration.rs`) or
-  `migrations/semantic/000N_<name>.sql` (wired into `SemanticStore::migrate`).
-  Each script records itself; never edit one that has shipped. A database
-  carrying a version the binary does not know is refused, not guessed at.
+  `migrations/000N_<name>.sql` (wired into `run_migrations` in
+  `crates/attic-storage/src/migration.rs`). Each script records itself; never
+  edit one that has shipped. Unknown schemas must be refused, not reset.
 - **Analyzer or grammar update** — bump the `tree-sitter-*` dependency, check
   its ABI against `tree-sitter`'s supported range, re-run the analyzer tests,
   and bump `ANALYZER_REGISTRY_VERSION` if output changes.
