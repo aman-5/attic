@@ -4,7 +4,10 @@
 
 mod common;
 
-use attic_retrieval::{AnswerMode, QueryType};
+use attic_retrieval::{
+    AnswerMode, AnswerRequest, HybridSearchOptions, HybridSearcher, QueryType, SearchMatchMode,
+};
+use attic_storage::PathScope;
 use common::Fixture;
 
 #[test]
@@ -143,6 +146,43 @@ fn exact_path_lookup_returns_that_file_only_context() {
     assert_eq!(out.plan.query_type, QueryType::ExactLookup);
     let ctx = out.context_text.expect("context");
     assert!(ctx.contains("app.yml"));
+}
+
+#[test]
+fn scoped_search_and_answer_only_return_the_requested_file() {
+    let fx = Fixture::seed_pub(&[
+        ("forms/dev.json", r#"{"rule":"alphaunique wrong OTP"}"#),
+        ("forms/other.json", r#"{"rule":"alphaunique other"}"#),
+    ]);
+    let searcher = HybridSearcher::new(&fx.pool);
+    let mut options = HybridSearchOptions::with_result_limit(10);
+    options.path_scope = Some(PathScope::Exact("forms/dev.json".into()));
+    let hits = searcher
+        .search("alphaunique OR missingword", &options)
+        .unwrap();
+    assert_eq!(hits.results.len(), 1);
+    assert_eq!(hits.results[0].path, "forms/dev.json");
+    let phrase = searcher.search("\"wrong OTP\"", &options).unwrap();
+    assert_eq!(phrase.results.len(), 1);
+    options.match_mode = SearchMatchMode::All;
+    assert!(
+        searcher
+            .search("alphaunique missingword", &options)
+            .unwrap()
+            .results
+            .is_empty()
+    );
+
+    let mut request = AnswerRequest::new("alphaunique wrong OTP", AnswerMode::Fast);
+    request.path_scope = Some(PathScope::Exact("forms/dev.json".into()));
+    let outcome = fx.service().answer(&request).unwrap();
+    assert!(!outcome.served_evidence.is_empty());
+    assert!(
+        outcome
+            .served_evidence
+            .iter()
+            .all(|evidence| evidence.path == "forms/dev.json")
+    );
 }
 
 #[test]

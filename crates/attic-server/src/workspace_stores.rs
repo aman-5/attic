@@ -499,14 +499,17 @@ impl AtticServer {
         validate_filter("query", query, 512)?;
         if !matches!(
             args.get("mode").and_then(Value::as_str),
-            None | Some("NORMAL" | "FAST" | "DEEP" | "SEARCH")
+            None | Some("NORMAL" | "FAST" | "DEEP" | "SEARCH" | "REFERENCES")
         ) {
             return Err(ServerError::InvalidArg(
-                "mode must be FAST|NORMAL|DEEP|SEARCH".into(),
+                "mode must be FAST|NORMAL|DEEP|SEARCH|REFERENCES".into(),
             ));
         }
         if let Some(id) = scoped {
             require_active_member(active_ids, id)?;
+        }
+        if args.get("mode").and_then(Value::as_str) == Some("REFERENCES") {
+            return crate::handlers::references::handle_managed_references(self, args, active_ids);
         }
         let mut ids: Vec<String> = match scoped {
             Some(id) => vec![id.to_string()],
@@ -514,7 +517,13 @@ impl AtticServer {
         };
         let search = args.get("mode").and_then(Value::as_str) == Some("SEARCH");
         let knowledge_scope = args.get("scope").and_then(Value::as_str) == Some("knowledge");
-        if (!search || knowledge_scope)
+        let explicit_path_scope = parse_path_scope(args)?.is_some();
+        let include_knowledge = if search {
+            knowledge_scope && scoped.is_none()
+        } else {
+            !explicit_path_scope
+        };
+        if include_knowledge
             && let Some(knowledge) = self.knowledge_repository_id()
             && !ids.contains(&knowledge)
         {
@@ -525,6 +534,7 @@ impl AtticServer {
         let mut documents = Vec::new();
         let mut missing = Vec::new();
         let mut lexical_results = Vec::new();
+        let mut search_diagnostics = Vec::new();
         for batch in ids.chunks(WORKSPACE_QUERY_CONCURRENCY) {
             let outcomes = std::thread::scope(|scope| {
                 let handles = batch
@@ -534,6 +544,18 @@ impl AtticServer {
                         let id = id.clone();
                         let mut local_args = args.clone();
                         local_args.insert("repository_id".into(), json!(id));
+                        if search {
+                            let limit = args
+                                .get("max_results")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(25);
+                            if (1..=MAX_SEARCH_RESULTS as u64).contains(&limit) {
+                                local_args.insert(
+                                    "max_results".into(),
+                                    json!((limit * 2).min(MAX_SEARCH_RESULTS as u64)),
+                                );
+                            }
+                        }
                         scope.spawn(move || {
                             let local = match server.repository_server(&id) {
                                 Ok(local) => local,
@@ -592,6 +614,12 @@ impl AtticServer {
                     Err(error) => return Err(error),
                 };
                 if search {
+                    if !outcome["search_diagnostics"].is_null() {
+                        search_diagnostics.push(json!({
+                            "repository_id": id,
+                            "details": outcome["search_diagnostics"],
+                        }));
+                    }
                     if let Some(results) = outcome["results"].as_array() {
                         for (rank, item) in results.iter().enumerate() {
                             let mut item = item.clone();
@@ -610,12 +638,12 @@ impl AtticServer {
         let fanout_ms = started.elapsed().as_secs_f64() * 1000.0;
         let catalog_started = std::time::Instant::now();
         if !search
+            && !explicit_path_scope
             && !self
                 .crossrepo_degraded
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
-            let mut catalog_args = args.clone();
-            catalog_args.remove("repository_id");
+            let catalog_args = args.clone();
             let (catalog, document) = crate::handlers::context::prepare_context(
                 &self.pool,
                 &self.writer,
@@ -653,96 +681,60 @@ impl AtticServer {
                 .get("max_results")
                 .and_then(Value::as_u64)
                 .unwrap_or(25) as usize;
-            lexical_results.truncate(limit);
+            lexical_results =
+                crate::handlers::search::collapse_search_results(lexical_results, limit);
         }
-        let claims: Vec<Value> = outputs
-            .iter()
-            .filter_map(|output| output["answer"]["claims"].as_array())
-            .flatten()
-            .cloned()
-            .collect();
-        let evidence: Vec<Value> = outputs
-            .iter()
-            .filter_map(|output| output["answer"]["evidence"].as_array())
-            .flatten()
-            .cloned()
-            .collect();
-        let context = attic_retrieval::context::compact_documents(&documents);
-        let successful = outputs.iter().any(|output| {
-            matches!(
-                output["answer"]["result"].as_str(),
-                Some("SUCCESS" | "PARTIAL_SUCCESS")
-            )
+        let mut payload = crate::handlers::context::aggregate_context_answers(
+            &outputs,
+            &documents,
+            &missing,
+            ids.len(),
+            diagnostics,
+        )?;
+        if search {
+            payload["result"] = json!(if missing.is_empty() {
+                "SUCCESS"
+            } else {
+                "PARTIAL_SUCCESS"
+            });
+            payload["search_diagnostics"] = if lexical_results.is_empty() {
+                json!({"repositories": search_diagnostics, "unavailable": missing})
+            } else {
+                Value::Null
+            };
+        } else {
+            payload["search_diagnostics"] = Value::Null;
+        }
+        payload["results"] = json!(lexical_results);
+        payload["duplicate_coverage"] = json!(if search {
+            "bounded_candidate_window"
+        } else {
+            "not_applicable"
         });
-        let plan_ids = outputs
-            .iter()
-            .filter_map(|output| output["answer"]["plan_id"].as_str())
-            .collect::<Vec<_>>();
-        let evidence_dropped = outputs
-            .iter()
-            .filter_map(|output| output["answer"]["evidence_dropped"].as_array())
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut drop_reasons = std::collections::BTreeMap::<String, u64>::new();
-        let mut dropped_count = 0u64;
-        for output in &outputs {
-            let summary = &output["answer"]["evidence_dropped_summary"];
-            dropped_count += summary["count"].as_u64().unwrap_or(0);
-            if let Some(reasons) = summary["by_reason"].as_object() {
-                for (reason, count) in reasons {
-                    *drop_reasons.entry(reason.clone()).or_default() += count.as_u64().unwrap_or(0);
-                }
-            }
+        payload["crossrepo_ready"] = json!(
+            !self
+                .crossrepo_degraded
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        payload["telemetry"] = json!({
+            "fanout_ms": fanout_ms,
+            "catalog_ms": catalog_ms,
+            "aggregation_ms": aggregation_started.elapsed().as_secs_f64() * 1000.0,
+            "server_processing_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "context_bytes_before_sharing": documents.iter().map(|doc| doc.text.len()).sum::<usize>(),
+            "context_bytes": payload["context"].as_str().map_or(0, str::len),
+        });
+        if !search {
+            crate::handlers::context::apply_document_budget(
+                &mut payload,
+                &documents,
+                crate::handlers::context::response_limit(args),
+            )?;
         }
-        let confidence = outputs
-            .iter()
-            .filter(|output| {
-                matches!(
-                    output["answer"]["result"].as_str(),
-                    Some("SUCCESS" | "PARTIAL_SUCCESS")
-                )
-            })
-            .filter_map(|output| output["answer"]["confidence"].as_str())
-            .min_by_key(|value| match *value {
-                "HIGH" => 3,
-                "MEDIUM" => 2,
-                "LOW" => 1,
-                _ => 0,
-            })
-            .unwrap_or("NONE");
-        let repository_answers = outputs
-            .iter()
-            .map(crate::handlers::context::repository_summary)
-            .collect::<Result<Vec<_>, _>>()?;
-        crate::handlers::context::context_response(json!({
-            "result": if search || successful { if missing.is_empty() { "SUCCESS" } else { "PARTIAL_SUCCESS" } } else { "INSUFFICIENT_EVIDENCE" },
-            "context": context,
-            "claims": claims,
-            "evidence_used": evidence.len(),
-            "evidence": evidence,
-            "confidence": confidence,
-            "plan_id": plan_ids.first(),
-            "plan_ids": plan_ids,
-            "evidence_dropped": evidence_dropped,
-            "evidence_dropped_summary": {
-                "count": dropped_count,
-                "by_reason": drop_reasons,
-                "details_included": diagnostics,
-            },
-            "results": lexical_results,
-            "repository_answers": repository_answers,
-            "coverage": {"requested": ids.len(), "unavailable": missing},
-            "crossrepo_ready": !self.crossrepo_degraded.load(std::sync::atomic::Ordering::SeqCst),
-            "telemetry": {
-                "fanout_ms": fanout_ms,
-                "catalog_ms": catalog_ms,
-                "aggregation_ms": aggregation_started.elapsed().as_secs_f64() * 1000.0,
-                "server_processing_ms": started.elapsed().as_secs_f64() * 1000.0,
-                "context_bytes_before_sharing": documents.iter().map(|doc| doc.text.len()).sum::<usize>(),
-                "context_bytes": context.len(),
-            },
-        }))
+        crate::handlers::context::context_response_bounded(
+            payload,
+            crate::handlers::context::response_limit(args),
+        )
     }
 }
 
@@ -837,6 +829,74 @@ mod tests {
                 "SEARCH query {query:?} should be treated as literal text"
             );
         }
+        let references_args = HashMap::from([
+            ("query".into(), json!("shared_flow")),
+            ("mode".into(), json!("REFERENCES")),
+            ("max_files".into(), json!(1)),
+        ]);
+        let references = AtticServer::response_json(
+            server
+                .managed_tool(
+                    "context",
+                    &references_args,
+                    &HashSet::from([first.clone(), second.clone()]),
+                    attic_storage::resource_manager::ResourceAdvisory::Ok,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let coverage = references["coverage"]["repositories"].as_array().unwrap();
+        assert_eq!(coverage.len(), 2, "{references}");
+        let considered: u64 = coverage
+            .iter()
+            .map(|item| item["coverage"]["files_considered"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(considered, 1, "{references}");
+        assert!(references.to_string().contains("workspace_budget"));
+        let mut invalid_references = references_args.clone();
+        invalid_references.insert("max_files".into(), json!(0));
+        assert!(
+            server
+                .managed_tool(
+                    "context",
+                    &invalid_references,
+                    &HashSet::from([first.clone(), second.clone()]),
+                    attic_storage::resource_manager::ResourceAdvisory::Ok,
+                )
+                .is_err()
+        );
+        server.knowledge.write().unwrap().repository_id = Some(second.clone());
+        let scoped_args = HashMap::from([
+            ("query".into(), json!("shared_flow")),
+            ("mode".into(), json!("NORMAL")),
+            ("repository_id".into(), json!(first)),
+            ("path".into(), json!("shared.rs")),
+        ]);
+        let scoped = AtticServer::response_json(
+            server
+                .managed_tool(
+                    "context",
+                    &scoped_args,
+                    &HashSet::from([first.clone(), second.clone()]),
+                    attic_storage::resource_manager::ResourceAdvisory::Ok,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !scoped["evidence"].as_array().unwrap().is_empty(),
+            "{scoped}"
+        );
+        assert!(
+            scoped["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| { entry["repository_id"] == first && entry["path"] == "shared.rs" }),
+            "{scoped}"
+        );
+        assert_eq!(scoped["coverage"]["requested"], 1);
+        server.knowledge.write().unwrap().repository_id = None;
         let answer_args = HashMap::from([
             ("query".into(), json!("where is shared_flow defined")),
             ("mode".into(), json!("NORMAL")),

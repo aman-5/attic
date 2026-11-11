@@ -755,6 +755,375 @@ fn file_returns_live_content_and_region() {
 }
 
 #[test]
+fn file_expands_indexed_json_unit_pointer_parent_and_outline() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("json-navigation");
+    fs::create_dir_all(&repo).unwrap();
+    let text = format!(
+        "{{\n  \"pad\":\"{}\",\n  \"a/b~c\":{{\"token\":\"uniqueNavigationNeedle\",\"child\":{{\"flag\":false}}}}\n}}",
+        "x".repeat(2200)
+    );
+    fs::write(repo.join("form.json"), &text).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let search_args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("uniqueNavigationNeedle")),
+    ]);
+    let search = handle_search(&srv.pool, &search_args, &ids(&srv), None).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&search)).unwrap();
+    let result = &value["results"][0];
+    assert_eq!(result["json_pointer"], "/a~1b~0c");
+    assert_eq!(result["start_line"], 3);
+    assert_eq!(result["end_line"], 3);
+    let unit_id = result["retrieval_unit_id"].as_str().unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("unit_id".into(), json!(unit_id)),
+    ]);
+    let body = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    assert!(body.contains("uniqueNavigationNeedle"), "{body}");
+    assert!(body.contains("live JSON pointer"), "{body}");
+    assert!(!body.contains("\"pad\""), "{body}");
+
+    let pointer_args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("form.json")),
+        ("json_pointer".into(), json!("/a~1b~0c/child")),
+        ("parent".into(), json!(true)),
+        ("outline".into(), json!(true)),
+    ]);
+    let outline = text_of(&handle_file(&srv.pool, &pointer_args, &ids(&srv)).unwrap());
+    assert!(outline.contains("/a~1b~0c/child/flag"), "{outline}");
+    assert!(!outline.contains("uniqueNavigationNeedle"), "{outline}");
+
+    fs::write(
+        repo.join("form.json"),
+        r#"{"a/b~c":{"token":"changedLiveValue"}}"#,
+    )
+    .unwrap();
+    let live = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    assert!(live.contains("changedLiveValue"), "{live}");
+    assert!(!live.contains("uniqueNavigationNeedle"), "{live}");
+}
+
+#[test]
+fn file_rejects_invalid_json_navigation_and_mismatched_unit_path() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("json-invalid");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("one.json"), r#"{"key":"needleForUnit"}"#).unwrap();
+    fs::write(repo.join("two.json"), "{}").unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let base = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("one.json")),
+    ]);
+    for pointer in ["no-leading-slash", "/bad~2escape", "/missing"] {
+        let mut args = base.clone();
+        args.insert("json_pointer".into(), json!(pointer));
+        assert!(
+            handle_file(&srv.pool, &args, &ids(&srv)).is_err(),
+            "{pointer}"
+        );
+    }
+    let search = handle_search(
+        &srv.pool,
+        &HashMap::from([
+            ("repository_id".into(), json!(repo_id)),
+            ("query".into(), json!("needleForUnit")),
+        ]),
+        &ids(&srv),
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&text_of(&search)).unwrap();
+    let unit_id = value["results"][0]["retrieval_unit_id"].as_str().unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("two.json")),
+        ("unit_id".into(), json!(unit_id)),
+    ]);
+    assert!(handle_file(&srv.pool, &args, &ids(&srv)).is_err());
+}
+
+#[test]
+fn file_rejects_oversized_json_value_without_truncating_json() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("large-json-navigation");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("form.json"),
+        json!({"large": "x".repeat(MAX_RESPONSE_BYTES + 1)}).to_string(),
+    )
+    .unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("form.json")),
+        ("json_pointer".into(), json!("/large")),
+    ]);
+    let error = handle_file(&srv.pool, &args, &ids(&srv))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("more specific json_pointer"), "{error}");
+}
+
+#[test]
+fn file_expands_json_array_group_using_original_indices() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("json-array-groups");
+    fs::create_dir_all(&repo).unwrap();
+    let items = (0..100)
+        .map(|index| json!({"rule": format!("rule-{index}"), "padding": "x".repeat(90)}))
+        .collect::<Vec<_>>();
+    fs::write(repo.join("form.json"), json!({"rules": items}).to_string()).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let (unit_id, metadata): (String, String) = srv.pool.with_reader(|conn| {
+        conn.query_row(
+            "SELECT id, occurrence_metadata FROM core_retrieval_units WHERE analyzer_id = 'json' AND occurrence_metadata LIKE '%array_start%' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(Into::into)
+    }).unwrap();
+    let metadata: Value = serde_json::from_str(&metadata).unwrap();
+    let start = metadata["array_start"].as_u64().unwrap() as usize;
+    let end = metadata["array_end"].as_u64().unwrap() as usize;
+    assert!(start > 0);
+    let mut args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("unit_id".into(), json!(unit_id)),
+    ]);
+    let response = handle_file(&srv.pool, &args, &ids(&srv)).unwrap();
+    let text = text_of(&response);
+    let body: Value = serde_json::from_str(&text[text.find('[').unwrap_or(0)..])
+        .or_else(|_| {
+            let start = text.find("\n\n[").unwrap() + 2;
+            serde_json::from_str(&text[start..])
+        })
+        .unwrap();
+    assert_eq!(body.as_array().unwrap().len(), end - start);
+    assert_eq!(body[0]["rule"], format!("rule-{start}"));
+    args.insert("outline".into(), json!(true));
+    let response = handle_file(&srv.pool, &args, &ids(&srv)).unwrap();
+    let text = text_of(&response);
+    let body: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(
+        body["entries"][1]["json_pointer"],
+        format!("/rules/{start}")
+    );
+}
+
+#[test]
+fn file_grep_reports_matches_continuation_and_complete_absence() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("grep");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("data.txt"), "alpha\nerror 42\nerror 77\nomega\n").unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let mut args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("data.txt")),
+        ("grep".into(), json!(r"error \d+")),
+        ("regex".into(), json!(true)),
+        ("max_matches".into(), json!(1)),
+    ]);
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    let value: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(value["matches"][0]["line"], 2);
+    assert_eq!(value["coverage_complete"], false);
+    assert_eq!(value["next_line"], 3);
+    args.insert("start_line".into(), value["next_line"].clone());
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    let value: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(value["matches"][0]["line"], 3);
+
+    args.insert("grep".into(), json!("not-present"));
+    args.insert("regex".into(), json!(false));
+    args.remove("start_line");
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    let value: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(value["matches"].as_array().unwrap().len(), 0);
+    assert_eq!(value["coverage_complete"], true);
+    args.insert("grep".into(), json!("["));
+    args.insert("regex".into(), json!(true));
+    assert!(handle_file(&srv.pool, &args, &ids(&srv)).is_err());
+}
+
+#[test]
+fn file_grep_reports_multiple_matches_on_one_line() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("grep-columns");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("data.txt"), "needle and needle\n").unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("data.txt")),
+        ("grep".into(), json!("needle")),
+    ]);
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    let value: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(value["matches"][0]["byte_columns"], json!([0, 11]));
+    assert_eq!(value["coverage_complete"], true);
+}
+
+#[test]
+fn file_grep_scans_large_sanitized_lines_beyond_response_limit() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("large-grep");
+    fs::create_dir_all(&repo).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    fs::write(
+        repo.join("large.txt"),
+        format!("{}markerAtTheEnd\n", "x".repeat(4 * 1024 * 1024 + 128)),
+    )
+    .unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("large.txt")),
+        ("grep".into(), json!("markerAtTheEnd")),
+    ]);
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    let value: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(value["matches"][0]["line"], 1);
+    assert!(
+        value["matches"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("markerAtTheEnd")
+    );
+    assert_eq!(value["coverage_complete"], true);
+}
+
+#[test]
+fn references_locate_duplicate_json_values_and_continue() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("references");
+    fs::create_dir_all(&repo).unwrap();
+    let text = concat!(
+        "{\r\n",
+        "  \"arr\": [],\r\n",
+        "  \"arr\": [\"needle\"],\r\n",
+        "  \"a/b~c\": \"needle\",\r\n",
+        "  \"a/b~c\": \"needle\"\r\n",
+        "}\r\n"
+    );
+    fs::write(repo.join("form.json"), text).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let mut args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("form.json")),
+        ("query".into(), json!("needle")),
+        ("mode".into(), json!("REFERENCES")),
+    ]);
+    let response =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&response)).unwrap();
+    let matches = value["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 3, "{value}");
+    assert_eq!(matches[0]["json_pointer"], "/arr/0");
+    assert_eq!(matches[0]["start_line"], 3);
+    assert_eq!(matches[1]["json_pointer"], "/a~1b~0c");
+    assert_eq!(matches[1]["start_line"], 4);
+    assert_eq!(matches[2]["start_line"], 5);
+    assert_eq!(matches[1]["pointer_ambiguous"], true);
+    assert_eq!(value["coverage"]["complete"], true, "{value}");
+    for hit in matches {
+        let start = hit["source_start_byte"].as_u64().unwrap() as usize;
+        let end = hit["source_end_byte"].as_u64().unwrap() as usize;
+        assert_eq!(&text[start..end], "\"needle\"");
+        assert_eq!(hit["content_hash_verified"], true);
+    }
+
+    args.insert("max_results".into(), json!(1));
+    let first =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let first: Value = serde_json::from_str(&text_of(&first)).unwrap();
+    assert_eq!(first["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(first["coverage"]["complete"], false);
+    let continuation = &first["coverage"]["repositories"][0]["continuation"]["within_file"];
+    assert_eq!(continuation["reference_offset"], 1);
+    args.insert(
+        "reference_offset".into(),
+        continuation["reference_offset"].clone(),
+    );
+    let next =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let next: Value = serde_json::from_str(&text_of(&next)).unwrap();
+    assert_eq!(next["matches"][0]["start_line"], 4);
+}
+
+#[test]
+fn references_only_prove_absence_for_safe_current_exact_files() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("reference-coverage");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("form.json"), r#"{"state":"ready"}"#).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("form.json")),
+        ("query".into(), json!("missing-value")),
+        ("mode".into(), json!("REFERENCES")),
+    ]);
+    let current =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let current: Value = serde_json::from_str(&text_of(&current)).unwrap();
+    assert_eq!(current["coverage"]["absence_proven"], true, "{current}");
+
+    fs::write(repo.join("form.json"), r#"{"state":"changed"}"#).unwrap();
+    let stale =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let stale: Value = serde_json::from_str(&text_of(&stale)).unwrap();
+    assert_eq!(stale["coverage"]["absence_proven"], false, "{stale}");
+    assert!(stale.to_string().contains("content_hash_unverified"));
+
+    let db = attic_storage::connection::open_rw(&tmp.path().join("test.db")).unwrap();
+    db.execute(
+        "UPDATE core_file_occurrences SET existence_state = 'excluded' WHERE path = ?1",
+        ["form.json"],
+    )
+    .unwrap();
+    let excluded =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let excluded: Value = serde_json::from_str(&text_of(&excluded)).unwrap();
+    assert_eq!(excluded["coverage"]["absence_proven"], false, "{excluded}");
+    assert!(excluded.to_string().contains("file_not_indexed_as_present"));
+}
+
+#[test]
+fn references_redact_secrets_and_report_incomplete_scan() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("reference-redaction");
+    fs::create_dir_all(&repo).unwrap();
+    let token = format!("{}{}", "AKIA", "0123456789ABCDEF");
+    fs::write(repo.join("form.json"), json!({"value": token}).to_string()).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("path".into(), json!("form.json")),
+        ("query".into(), json!("missing-value")),
+    ]);
+    let result =
+        crate::handlers::references::handle_references(&srv.pool, &args, &ids(&srv)).unwrap();
+    let text = text_of(&result);
+    assert!(!text.contains(&token));
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["coverage"]["absence_proven"], false, "{value}");
+    assert!(text.contains("security_redaction_or_partial_scan"));
+}
+
+#[test]
 fn file_traversal_rejected() {
     use std::fs;
     let tmp = TempDir::new().unwrap();
@@ -1021,6 +1390,327 @@ fn search_empty_db_returns_results_array() {
     let t = text_of(&r);
     let v: Value = serde_json::from_str(&t).unwrap();
     assert!(v["results"].is_array());
+}
+
+#[test]
+fn search_groups_only_structurally_equivalent_results_and_preserves_locations() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("duplicates");
+    fs::create_dir_all(&repo).unwrap();
+    let body = json!({"tag": "sharedGroupingNeedle", "result": "failure"});
+    let pad = "x".repeat(2200);
+    fs::write(
+        repo.join("a.json"),
+        json!({"pad": pad, "rule": body}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("b.json"),
+        json!({"pad": pad, "rule": body}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("c.json"),
+        json!({"pad": pad, "other": body}).to_string(),
+    )
+    .unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("sharedGroupingNeedle")),
+    ]);
+    let answer = handle_search(&srv.pool, &args, &ids(&srv), None).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&answer)).unwrap();
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{value}");
+    let grouped = results
+        .iter()
+        .find(|result| result["also_in"].is_array())
+        .unwrap();
+    let paths: HashSet<_> = std::iter::once(grouped["path"].as_str().unwrap())
+        .chain(
+            grouped["also_in"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|location| location["path"].as_str().unwrap()),
+        )
+        .collect();
+    assert_eq!(paths, HashSet::from(["a.json", "b.json"]));
+    assert!(grouped["also_in"][0]["retrieval_unit_id"].is_string());
+    assert_eq!(grouped["also_in"][0]["json_pointer"], "/rule");
+    assert!(
+        results
+            .iter()
+            .any(|result| result["json_pointer"] == "/other")
+    );
+}
+
+#[test]
+fn search_empty_diagnostics_respect_strict_terms_and_scope() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("diagnostics");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("one.txt"), "presentNeedle").unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("presentNeedle absentNeedle")),
+        ("match_mode".into(), json!("all")),
+    ]);
+    let response = handle_search(&srv.pool, &args, &ids(&srv), None).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&response)).unwrap();
+    assert!(value["results"].as_array().unwrap().is_empty());
+    assert_eq!(value["search_diagnostics"]["complete"], true);
+    let terms = value["search_diagnostics"]["terms"].as_array().unwrap();
+    assert_eq!(terms[0]["has_indexed_match"], true);
+    assert_eq!(terms[1]["has_indexed_match"], false);
+}
+
+#[test]
+fn search_knowledge_excludes_root_readme_before_limits_and_diagnostics() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("central-knowledge");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("README.md"),
+        "readmeOnlyNeedle\nsharedKnowledgeNeedle",
+    )
+    .unwrap();
+    fs::write(repo.join("notes.md"), "sharedKnowledgeNeedle").unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let mut args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("readmeOnlyNeedle")),
+        ("scope".into(), json!("knowledge")),
+        ("max_results".into(), json!(1)),
+    ]);
+    let answer = handle_search(&srv.pool, &args, &ids(&srv), Some(&repo_id)).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&answer)).unwrap();
+    assert!(value["results"].as_array().unwrap().is_empty(), "{value}");
+    assert_eq!(
+        value["search_diagnostics"]["terms"][0]["has_indexed_match"],
+        false
+    );
+    args.insert("query".into(), json!("sharedKnowledgeNeedle"));
+    let answer = handle_search(&srv.pool, &args, &ids(&srv), Some(&repo_id)).unwrap();
+    let value: Value = serde_json::from_str(&text_of(&answer)).unwrap();
+    assert_eq!(value["results"][0]["path"], "notes.md");
+}
+
+#[test]
+fn context_reports_ambiguous_missing_and_multiple_nested_path_hints() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("path-hints");
+    for subdir in ["one", "two"] {
+        fs::create_dir_all(repo.join(subdir)).unwrap();
+        fs::write(
+            repo.join(subdir).join("nested.json"),
+            r#"{"rule":"pathNeedle"}"#,
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.join("one").join("related.json"),
+        r#"{"rule":"relatedNeedle"}"#,
+    )
+    .unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let mut args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("nested.json")),
+        ("mode".into(), json!("FAST")),
+    ]);
+    let result = handle_context(
+        &srv.pool,
+        &srv.writer,
+        true,
+        &args,
+        &ids(&srv),
+        attic_storage::resource_manager::ResourceAdvisory::Ok,
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    assert_eq!(
+        value["path_resolution"]["hints"][0]["status"], "ambiguous",
+        "{value}"
+    );
+    assert_eq!(
+        value["path_resolution"]["hints"][0]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        value["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|evidence| {
+                evidence["path"]
+                    .as_str()
+                    .unwrap_or("")
+                    .ends_with("/nested.json")
+            })
+    );
+
+    args.insert(
+        "query".into(),
+        json!("Why do nested.json and related.json and absent.json fail?"),
+    );
+    let result = handle_context(
+        &srv.pool,
+        &srv.writer,
+        true,
+        &args,
+        &ids(&srv),
+        attic_storage::resource_manager::ResourceAdvisory::Ok,
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    let hints = value["path_resolution"]["hints"].as_array().unwrap();
+    assert_eq!(hints.len(), 3, "{value}");
+    assert_eq!(hints[0]["status"], "ambiguous");
+    assert_eq!(hints[1]["status"], "unique");
+    assert_eq!(hints[2]["status"], "missing");
+}
+
+#[test]
+fn context_does_not_expose_legacy_synthetic_json_lines() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("legacy-json");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("form.json"), r#"{"target":"legacyNeedle"}"#).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).unwrap();
+    let db = attic_storage::connection::open_rw(&tmp.path().join("test.db")).unwrap();
+    db.execute(
+        "UPDATE core_retrieval_units SET occurrence_metadata = ?1, start_line = 0, end_line = 1 WHERE analyzer_id = 'json'",
+        [r#"{"json_pointer":"/target"}"#],
+    ).unwrap();
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("query".into(), json!("form.json")),
+        ("mode".into(), json!("FAST")),
+    ]);
+    let result = handle_context(
+        &srv.pool,
+        &srv.writer,
+        true,
+        &args,
+        &ids(&srv),
+        attic_storage::resource_manager::ResourceAdvisory::Ok,
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    let evidence = value["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == "form.json")
+        .expect("JSON evidence");
+    assert!(evidence["source_span"].is_null(), "{value}");
+    assert_eq!(evidence["location_status"], "unavailable_reindex_required");
+}
+
+#[test]
+fn context_unscoped_direct_path_queries_all_active_repositories_only() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let mut repo_ids = Vec::new();
+    for name in ["first", "second", "inactive"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("shared.rs"),
+            format!("pub fn shared_workspace_probe_{name}() {{}}\n"),
+        )
+        .unwrap();
+        repo_ids.push(srv.bootstrap_workspace(&repo).unwrap());
+    }
+    let active = HashSet::from([repo_ids[0].clone(), repo_ids[1].clone()]);
+    let args = HashMap::from([
+        ("query".into(), json!("shared_workspace_probe")),
+        ("mode".into(), json!("NORMAL")),
+    ]);
+    let result = handle_context(
+        &srv.pool,
+        &srv.writer,
+        true,
+        &args,
+        &active,
+        attic_storage::resource_manager::ResourceAdvisory::Ok,
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    let evidence = value["evidence"].as_array().unwrap();
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| entry["repository_id"] == repo_ids[0]),
+        "{value}"
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| entry["repository_id"] == repo_ids[1]),
+        "{value}"
+    );
+    assert!(
+        evidence
+            .iter()
+            .all(|entry| entry["repository_id"] != repo_ids[2]),
+        "{value}"
+    );
+}
+
+#[test]
+fn repository_selector_resolves_unique_active_names_and_rejects_ambiguity() {
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let first = tmp.path().join("first").join("duplicate");
+    let second = tmp.path().join("second").join("duplicate");
+    let unique = tmp.path().join("unique-repo");
+    for root in [&first, &second, &unique] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("file.txt"), "repository selector").unwrap();
+    }
+    let first_id = srv.bootstrap_workspace(&first).unwrap();
+    srv.bootstrap_workspace(&second).unwrap();
+    let unique_id = srv.bootstrap_workspace(&unique).unwrap();
+    let active = ids(&srv);
+    let by_name = HashMap::from([("repository".into(), json!("unique-repo"))]);
+    let resolved =
+        crate::validate::resolve_repository_selector(&srv.pool, &by_name, &active).unwrap();
+    assert_eq!(resolved["repository_id"], unique_id);
+    let by_path = HashMap::from([("repository".into(), json!(first.to_string_lossy()))]);
+    let resolved =
+        crate::validate::resolve_repository_selector(&srv.pool, &by_path, &active).unwrap();
+    assert_eq!(resolved["repository_id"], first_id);
+    let ambiguous = HashMap::from([("repository".into(), json!("duplicate"))]);
+    let error = crate::validate::resolve_repository_selector(&srv.pool, &ambiguous, &active)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ambiguous"), "{error}");
+    let conflicting = HashMap::from([
+        ("repository".into(), json!("unique-repo")),
+        ("repository_id".into(), json!(unique_id)),
+    ]);
+    assert!(
+        crate::validate::resolve_repository_selector(&srv.pool, &conflicting, &active).is_err()
+    );
+    assert!(
+        crate::validate::resolve_repository_selector(&srv.pool, &by_name, &HashSet::new()).is_err()
+    );
 }
 
 // ── central knowledge folder ([knowledge] dir) ─────────────────────────

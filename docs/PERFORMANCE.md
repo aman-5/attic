@@ -31,10 +31,14 @@ bounded source matches without evidence assembly. Other `context` modes combine
 lexical candidates with symbols, explicit graph relationships, dependency
 edges and project knowledge, then apply freshness and evidence checks.
 
-`SEARCH` input is treated as literal text: each whitespace-separated token is
-quoted before FTS5 matching, so dots, colons and other punctuation (for example
-`attic.toml` or `FormCode: value`) are not parsed as FTS5 syntax or column
-filters. Each `SEARCH` FTS query is interrupted after 3 seconds. Answer modes
+`SEARCH` defaults to ranked OR for adjacent terms; `match_mode: "all"`
+requests strict AND. Double-quoted phrases, uppercase `AND`, `OR`, binary
+`NOT`, and parentheses form validated expressions; other punctuation is
+escaped as literal input rather than treated as FTS column syntax. Exact
+`path`, directory `path_prefix`, and `path_glob` filters apply before
+candidate limits. Empty results include bounded term diagnostics; they do not
+prove semantic absence. Each `SEARCH` FTS query is interrupted after 3 seconds.
+Answer modes
 install a SQLite progress-handler deadline matching the mode budget
 (`FAST` 300 ms, `NORMAL` 3 s, `DEEP` 30 s per repository). SQLite checks this
 deadline periodically during execution. This does not bound connection
@@ -60,8 +64,12 @@ Every repository/path/span/evidence citation and its freshness/authority header
 is retained above the shared excerpt. Different excerpt bodies are never
 merged, and contradiction disclosures remain visible. Claims carry
 `evidence_ids`; top-level evidence records retain source-revision/snapshot
-provenance and source spans. No additional global byte cap or confidence-based
-repository exclusion is applied; existing per-mode retrieval budgets remain.
+provenance and source spans. Workspace-wide `context` response caps are
+64 KiB (FAST), 128 KiB (NORMAL, SEARCH, REFERENCES), and 256 KiB (DEEP).
+The JSON response remains valid; `response_budget` records omissions and
+continuation or scope-narrowing guidance. Claims are retained only when all
+their cited evidence remains. Oversized nontrimmable metadata produces an
+explicit error rather than a silently truncated response.
 
 Shared bodies are explicitly labeled. Contradiction disclosures and withheld
 notices carry repository scope, including when multiple repositories use the
@@ -81,10 +89,22 @@ Lexical excerpts retain the existing approximately 1,200-byte budget but focus
 on the line matching the most query terms instead of always taking the start
 of a retrieval unit. Returned spans identify the excerpt; use `file` with
 `repository_id`, `path`, `start_line` and `end_line` to expand source context.
+JSON source locations are indexed, not live-verified; `position_basis`
+identifies analyzed content, which can be redacted. Use `file` with the
+returned JSON pointer or unit ID to inspect current sanitized content.
 Extensionless legal files (`LICENSE`, `LICENCE`, `NOTICE`, `COPYING`,
 `COPYRIGHT`) are documentation, not implementation evidence; they remain
 searchable. These are targeted relevance fixes, not a claim of vector recall
 or a broadly benchmarked ranking improvement.
+
+`REFERENCES` scans a workspace-wide shared budget: 32 files by default
+(maximum 64), at most 16 MiB and approximately 1.5 seconds of scanning.
+These are scan budgets, not end-to-end deadlines. Use `max_results`
+(default 100, maximum 200), repository and path filters, and returned
+`after_path`, `reference_offset`, or `reference_start_line` continuation
+values. JSON classifications are syntactic. Check `coverage` before drawing
+conclusions: only `absence_proven: true` establishes absence in the exact,
+safe, current indexed file.
 
 ## Measuring query latency
 

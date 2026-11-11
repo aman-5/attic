@@ -181,12 +181,58 @@ fn parse_stored_span(s: &str) -> Option<attic_core::SourceSpan> {
 
 /// Unit line window as a span (columns unknown at unit granularity).
 pub fn unit_span(start_line: Option<u32>, end_line: Option<u32>) -> Option<attic_core::SourceSpan> {
+    let start_line = start_line?;
     Some(attic_core::SourceSpan::new(
-        start_line.unwrap_or(0),
+        start_line,
         0,
-        end_line.unwrap_or(start_line?.saturating_add(1)),
+        end_line.unwrap_or(start_line.saturating_add(1)),
         0,
     ))
+}
+
+fn assign_unit_location(ev: &mut Evidence, hit: &attic_storage::FtsSearchResult) -> bool {
+    if hit.analyzer_id != "json" {
+        ev.source_span = unit_span(hit.start_line, hit.end_line);
+        return true;
+    }
+    ev.indexed_unit_id = Some(hit.retrieval_unit_id.clone());
+    let metadata = hit
+        .occurrence_metadata
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+    ev.json_pointer = metadata
+        .as_ref()
+        .and_then(|value| value.get("json_pointer"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    ev.position_basis = metadata
+        .as_ref()
+        .and_then(|value| value.get("position_basis"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let has_location = metadata.as_ref().is_some_and(|value| {
+        value
+            .get("source_start_byte")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && value
+                .get("source_end_byte")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            && ev.position_basis.is_some()
+    });
+    ev.source_span = has_location
+        .then(|| unit_span(hit.start_line, hit.end_line))
+        .flatten();
+    ev.location_status = Some(
+        if ev.source_span.is_some() {
+            "indexed_unverified"
+        } else {
+            "unavailable_reindex_required"
+        }
+        .to_owned(),
+    );
+    false
 }
 
 fn freshness_of(s: &str) -> FreshnessState {
@@ -303,13 +349,22 @@ impl LexicalGenerator {
         env: &mut GeneratorEnv<'_>,
         terms: &[String],
     ) -> Result<Vec<Candidate>, RetrievalError> {
+        Self::run_scoped(env, terms, None)
+    }
+
+    /// Generate lexical candidates within an optional repository-relative scope.
+    pub fn run_scoped(
+        env: &mut GeneratorEnv<'_>,
+        terms: &[String],
+        scope: Option<&attic_storage::PathScope>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
         // Deterministic phrase construction: `"term1" OR "term2"`.
-        let fts_query = terms
+        let selected = prioritize_lexical_terms(terms);
+        let fts_query = selected
             .iter()
-            .take(6)
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -324,7 +379,7 @@ impl LexicalGenerator {
                 0
             },
         };
-        let hits = attic_storage::fts_search(env.conn, &params)?;
+        let hits = attic_storage::fts_search_scoped(env.conn, &params, scope)?;
         let mut out = Vec::new();
         for h in hits {
             if !env.budget.admit_candidate() {
@@ -343,22 +398,28 @@ impl LexicalGenerator {
             ev.snippet_leading_omitted = start_byte > 0;
             ev.snippet_trailing_omitted = end_byte < h.body.len();
             ev.signals.lexical_score = Some(attic_evidence::signals::normalize_lexical(h.score));
-            ev.source_span = unit_span(h.start_line, h.end_line);
-            ev.excerpt_span = h.start_line.map(|line| {
-                let before = &h.body[..start_byte];
-                let start = line
-                    .saturating_add(before.bytes().filter(|byte| *byte == b'\n').count() as u32);
-                let start_col = before.rsplit('\n').next().unwrap_or("").chars().count() as u32;
-                let excerpt = &h.body[start_byte..end_byte];
-                let end_line = start
-                    .saturating_add(excerpt.bytes().filter(|byte| *byte == b'\n').count() as u32);
-                let end_col = if end_line == start {
-                    start_col.saturating_add(excerpt.chars().count() as u32)
-                } else {
-                    excerpt.rsplit('\n').next().unwrap_or("").chars().count() as u32
-                };
-                attic_core::SourceSpan::new(start, start_col, end_line, end_col)
-            });
+            let has_source_excerpt = assign_unit_location(&mut ev, &h);
+            ev.excerpt_span = has_source_excerpt
+                .then_some(h.start_line)
+                .flatten()
+                .map(|line| {
+                    let before = &h.body[..start_byte];
+                    let start =
+                        line.saturating_add(
+                            before.bytes().filter(|byte| *byte == b'\n').count() as u32
+                        );
+                    let start_col = before.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+                    let excerpt = &h.body[start_byte..end_byte];
+                    let end_line = start.saturating_add(
+                        excerpt.bytes().filter(|byte| *byte == b'\n').count() as u32,
+                    );
+                    let end_col = if end_line == start {
+                        start_col.saturating_add(excerpt.chars().count() as u32)
+                    } else {
+                        excerpt.rsplit('\n').next().unwrap_or("").chars().count() as u32
+                    };
+                    attic_core::SourceSpan::new(start, start_col, end_line, end_col)
+                });
             fill_file_provenance(env.conn, &mut ev);
             let mut c = Candidate::new(RetrieverKind::Fts, ev);
             c.evidence.retrieval_sources[0].query_fragment = fts_query.clone();
@@ -368,13 +429,52 @@ impl LexicalGenerator {
     }
 }
 
+fn prioritize_lexical_terms(terms: &[String]) -> Vec<&str> {
+    let mut ranked: Vec<(usize, &str)> = terms
+        .iter()
+        .enumerate()
+        .map(|(index, term)| (index, term.as_str()))
+        .collect();
+    ranked.sort_by_key(|(index, term)| {
+        let identifier = term.contains('_') || term.chars().any(|c| c.is_ascii_digit());
+        let score = usize::from(identifier) * 2 + usize::from(term.len() >= 9);
+        (std::cmp::Reverse(score), *index)
+    });
+    ranked.truncate(24);
+    ranked.sort_by_key(|(index, _)| *index);
+    ranked.into_iter().map(|(_, term)| term).collect()
+}
+
 /// Exact path lookup generator (uses `fts_path_lookup` + header provenance).
 pub struct PathExactGenerator;
 
 impl PathExactGenerator {
     pub fn run(env: &mut GeneratorEnv<'_>, path: &str) -> Result<Vec<Candidate>, RetrievalError> {
-        let hits =
-            attic_storage::fts_path_lookup(env.conn, path, repo_filter(env), env.limit.min(64))?;
+        Self::run_matching(env, path, false)
+    }
+
+    pub fn run_inferred(
+        env: &mut GeneratorEnv<'_>,
+        path: &str,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        Self::run_matching(env, path, true)
+    }
+
+    fn run_matching(
+        env: &mut GeneratorEnv<'_>,
+        path: &str,
+        inferred: bool,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        let hits = if inferred {
+            attic_storage::fts_path_lookup_inferred(
+                env.conn,
+                path,
+                repo_filter(env),
+                env.limit.min(8),
+            )?
+        } else {
+            attic_storage::fts_path_lookup(env.conn, path, repo_filter(env), env.limit.min(64))?
+        };
         let mut out = Vec::new();
         for h in hits {
             if !env.budget.admit_candidate() {
@@ -383,8 +483,8 @@ impl PathExactGenerator {
             let st = source_type_for_path(&h.path);
             let mut ev = Evidence::new(uuid::Uuid::new_v4().to_string(), h.repository_id.clone());
             ev.source_type = st;
-            ev.source_id = h.file_occurrence_id;
-            ev.path = h.path;
+            ev.source_id = h.file_occurrence_id.clone();
+            ev.path = h.path.clone();
             ev.freshness_state = freshness_of(&h.freshness_state);
             ev.authority = authority_for(ev.source_type);
             ev.confidence = 1.0; // exact path match
@@ -392,7 +492,7 @@ impl PathExactGenerator {
             ev.snippet = Some(snippet);
             ev.snippet_trailing_omitted = end < h.body.len();
             ev.signals.symbol_match_score = Some(1.0);
-            ev.source_span = unit_span(h.start_line, h.end_line);
+            assign_unit_location(&mut ev, &h);
             fill_file_provenance(env.conn, &mut ev);
             out.push(Candidate::new(RetrieverKind::Path, ev));
         }
@@ -405,13 +505,28 @@ pub struct SymbolGenerator;
 
 impl SymbolGenerator {
     pub fn run(env: &mut GeneratorEnv<'_>, name: &str) -> Result<Vec<Candidate>, RetrievalError> {
+        Self::run_scoped(env, name, None)
+    }
+
+    pub fn run_scoped(
+        env: &mut GeneratorEnv<'_>,
+        name: &str,
+        scope: Option<&attic_storage::PathScope>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
         if name.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let exact = attic_storage::lookup_symbol_exact(env.conn, repo_filter(env), name, 16)?;
+        let exact =
+            attic_storage::lookup_symbol_exact_scoped(env.conn, repo_filter(env), name, 16, scope)?;
         let exact_match = !exact.is_empty();
         let fuzzy = if exact.is_empty() {
-            attic_storage::search_symbols(env.conn, repo_filter(env), name, env.limit.min(64))?
+            attic_storage::search_symbols_scoped(
+                env.conn,
+                repo_filter(env),
+                name,
+                env.limit.min(64),
+                scope,
+            )?
         } else {
             Vec::new()
         };
@@ -511,21 +626,48 @@ impl RelationshipGenerator {
         env: &mut GeneratorEnv<'_>,
         seed_entity_ids: &[String],
     ) -> Result<Vec<Candidate>, RetrievalError> {
+        Self::run_scoped(env, seed_entity_ids, None)
+    }
+
+    pub fn run_scoped(
+        env: &mut GeneratorEnv<'_>,
+        seed_entity_ids: &[String],
+        scope: Option<&attic_storage::PathScope>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
         let mut out = Vec::new();
         for entity in seed_entity_ids.iter().take(16) {
             if !env.budget.candidates_available() {
                 break;
             }
-            for e in attic_storage::relationships_for_entity(env.conn, entity, 24)? {
+            let edges = if let Some(scope) = scope {
+                attic_storage::relationships_for_entity_scoped(env.conn, entity, 24, scope)?
+                    .into_iter()
+                    .map(|(edge, path)| (edge, Some(path)))
+                    .collect::<Vec<_>>()
+            } else {
+                attic_storage::relationships_for_entity(env.conn, entity, 24)?
+                    .into_iter()
+                    .map(|edge| (edge, None))
+                    .collect::<Vec<_>>()
+            };
+            for (e, scoped_path) in edges {
                 if !env.budget.admit_candidate() {
                     break;
                 }
                 let resolution = ResolutionLevel::from_db_str(&e.resolution)
                     .unwrap_or(ResolutionLevel::Syntactic);
-                let mut ev = Evidence::new(uuid::Uuid::new_v4().to_string(), String::new());
+                let mut ev = Evidence::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    if scoped_path.is_some() {
+                        e.source_repository_id.clone()
+                    } else {
+                        String::new()
+                    },
+                );
                 ev.source_type = EvidenceSourceType::Relationship;
                 ev.source_id = e.id.clone();
-                ev.path = relationship_label(&e);
+                let label = relationship_label(&e);
+                ev.path = scoped_path.unwrap_or_else(|| label.clone());
                 ev.source_revision_id = Some(e.source_revision_id.clone());
                 ev.freshness_state = freshness_of(&e.freshness_state);
                 ev.authority = AuthorityLevel::Derived;
@@ -542,7 +684,7 @@ impl RelationshipGenerator {
                 // See CrossRepoGenerator: relationship evidence has no
                 // source-file snippet, so the edge label must fill that
                 // field or context::build drops the item as empty content.
-                ev.snippet = Some(ev.path.clone());
+                ev.snippet = Some(label);
                 out.push(Candidate::new(RetrieverKind::Relationship, ev));
             }
         }
@@ -567,7 +709,16 @@ impl KnowledgeGenerator {
         env: &mut GeneratorEnv<'_>,
         terms: &[String],
     ) -> Result<Vec<Candidate>, RetrievalError> {
-        let lexical = LexicalGenerator::run(env, terms)?;
+        Self::run_scoped(env, terms, None)
+    }
+
+    /// Generate knowledge candidates within an optional path scope.
+    pub fn run_scoped(
+        env: &mut GeneratorEnv<'_>,
+        terms: &[String],
+        scope: Option<&attic_storage::PathScope>,
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        let lexical = LexicalGenerator::run_scoped(env, terms, scope)?;
         Ok(lexical
             .into_iter()
             .filter(|c| {
@@ -642,7 +793,15 @@ pub struct CrossRepoGenerator;
 impl CrossRepoGenerator {
     pub fn run(
         env: &mut GeneratorEnv<'_>,
+        seed_entity_ids: &[String],
+    ) -> Result<Vec<Candidate>, RetrievalError> {
+        Self::run_scoped(env, seed_entity_ids, None)
+    }
+
+    pub fn run_scoped(
+        env: &mut GeneratorEnv<'_>,
         _seed_entity_ids: &[String],
+        allowed_repositories: Option<&[String]>,
     ) -> Result<Vec<Candidate>, RetrievalError> {
         let mut out = Vec::new();
 
@@ -652,7 +811,8 @@ impl CrossRepoGenerator {
         // edge source_entity_ids (dependent repo's go.mod). Using cross_edges_all
         // ensures every workspace-level cross-repo edge is evaluated; the
         // BudgetAccountant provides the real candidate ceiling.
-        let cross_edges = attic_storage::cross_edges_all(env.conn, 64)?;
+        let cross_edges =
+            attic_storage::cross_edges_all_scoped(env.conn, 64, allowed_repositories)?;
         for e in cross_edges {
             if !env.budget.admit_candidate() {
                 break;
@@ -756,6 +916,15 @@ mod source_type_for_path_tests {
         let actual = &body[offset..end];
         assert!(actual.contains("fn submit_payment()"));
         assert!(snippet.len() <= 1200 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn lexical_term_budget_keeps_late_identifiers() {
+        let mut terms: Vec<String> = (0..30).map(|_| "generic".to_string()).collect();
+        terms.push("critical_handler_949651".into());
+        let selected = prioritize_lexical_terms(&terms);
+        assert_eq!(selected.len(), 24);
+        assert!(selected.contains(&"critical_handler_949651"));
     }
 
     #[test]
@@ -946,5 +1115,11 @@ mod crossrepo_snapshot_tests {
             .copied()
             .expect("legacy edge keeps None");
         assert!(without.workspace_snapshot_id.is_none());
+
+        let allowed = vec![uuid5("repo-dependent"), uuid5("repo-provider")];
+        let scoped = CrossRepoGenerator::run_scoped(&mut env, &[], Some(&allowed)).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert!(scoped[0].evidence.path.contains("example.com/provider"));
+        assert!(!scoped[0].evidence.path.contains("example.com/other"));
     }
 }

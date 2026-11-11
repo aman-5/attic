@@ -325,6 +325,257 @@ async fn rmcp_client_workspace_index_search_and_file_e2e() {
         .expect("graceful shutdown timed out");
 }
 
+#[tokio::test]
+async fn rmcp_structured_workflow_search_expand_and_references() {
+    let bin = require_bin();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let primary = tmp.path().join("primary");
+    let secondary = tmp.path().join("secondary");
+    for root in [&primary, &secondary] {
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+    }
+    std::fs::write(
+        primary.join("flows").join("workflow.json"),
+        r#"{
+  "onVerify": {
+    "handler": "otp.json",
+    "condition": "checkHdbFlow and existingCustomer",
+    "failure": {"errorCode": "VERIFY_FAILURE", "effect": "showError"}
+  },
+  "marker": "primaryWorkflowProbe"
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        secondary.join("flows").join("workflow.json"),
+        r#"{"onVerify":{"condition":"checkHdbFlow","errorCode":"VERIFY_FAILURE"},"marker":"secondaryWorkflowProbe"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        primary.join("other.json"),
+        r#"{"condition":"checkHdbFlow","errorCode":"VERIFY_FAILURE"}"#,
+    )
+    .unwrap();
+
+    let mut srv = connect(&bin, &tmp.path().join("workflow.db"), Some(&primary)).await;
+    let added = call_tool_text(
+        &mut srv,
+        "workspace",
+        serde_json::json!({"action":"add", "path":secondary}),
+    )
+    .await
+    .expect("add second repository");
+    assert!(added.contains("config.toml"), "{added}");
+
+    let mut repo_ids = Vec::new();
+    for token in ["primaryWorkflowProbe", "secondaryWorkflowProbe"] {
+        let mut found = None;
+        for _ in 0..30 {
+            let text = call_tool_text(
+                &mut srv,
+                "context",
+                serde_json::json!({"query":token, "mode":"SEARCH"}),
+            )
+            .await
+            .expect("wait for indexed fixture");
+            let value: Value = serde_json::from_str(&text).expect("search JSON");
+            if let Some(hit) = value["results"].as_array().and_then(|items| items.first())
+                && (token == "primaryWorkflowProbe" || value["crossrepo_ready"] == true)
+            {
+                found = hit["repository_id"].as_str().map(str::to_owned);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        repo_ids.push(found.unwrap_or_else(|| panic!("{token} never became searchable")));
+    }
+    assert_ne!(repo_ids[0], repo_ids[1]);
+    let repo = &repo_ids[0];
+    let path = "flows/workflow.json";
+    let mut measurements = Vec::new();
+
+    async fn measured(
+        srv: &mut ServerHandle,
+        measurements: &mut Vec<Value>,
+        tool: &str,
+        arguments: Value,
+    ) -> String {
+        let started = std::time::Instant::now();
+        let text = call_tool_text(srv, tool, arguments)
+            .await
+            .expect("workflow call");
+        let decoded = serde_json::from_str::<Value>(&text).ok();
+        let server_ms = decoded
+            .as_ref()
+            .and_then(|value| value["telemetry"]["server_processing_ms"].as_f64());
+        if tool == "context" {
+            let value = decoded.as_ref().expect("context response JSON");
+            assert_eq!(value["telemetry"]["response_bytes"], text.len());
+            assert!(server_ms.is_some(), "missing server timing: {text}");
+        }
+        measurements.push(serde_json::json!({
+            "tool": tool,
+            "response_bytes": text.len(),
+            "client_wall_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "server_processing_ms": server_ms,
+        }));
+        text
+    }
+
+    let search = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"checkHdbFlow NeverIndexedSearchWord",
+            "mode":"SEARCH", "repository_id":repo, "path":path
+        }),
+    )
+    .await;
+    let search: Value = serde_json::from_str(&search).unwrap();
+    let hits = search["results"].as_array().unwrap();
+    assert!(!hits.is_empty(), "ranked OR must find known term: {search}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit["repository_id"] == *repo && hit["path"] == path),
+        "{search}"
+    );
+    let unit = hits[0]["retrieval_unit_id"]
+        .as_str()
+        .expect("indexed JSON unit");
+    assert!(hits[0]["json_pointer"].is_string(), "{search}");
+
+    let strict = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"checkHdbFlow NeverIndexedSearchWord",
+            "mode":"SEARCH", "match_mode":"all", "repository_id":repo, "path":path
+        }),
+    )
+    .await;
+    let strict: Value = serde_json::from_str(&strict).unwrap();
+    assert!(strict["results"].as_array().unwrap().is_empty(), "{strict}");
+    assert!(!strict["search_diagnostics"].is_null(), "{strict}");
+
+    let scoped = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"VERIFY_FAILURE", "mode":"SEARCH",
+            "repository_id":repo, "path_prefix":"flows"
+        }),
+    )
+    .await;
+    let scoped: Value = serde_json::from_str(&scoped).unwrap();
+    let scoped_hits = scoped["results"].as_array().unwrap();
+    assert!(!scoped_hits.is_empty(), "{scoped}");
+    assert!(
+        scoped_hits
+            .iter()
+            .all(|hit| hit["repository_id"] == *repo && hit["path"] == path),
+        "{scoped}"
+    );
+
+    let expanded = measured(
+        &mut srv,
+        &mut measurements,
+        "file",
+        serde_json::json!({"repository_id":repo, "retrieval_unit_id":unit}),
+    )
+    .await;
+    assert!(expanded.contains("checkHdbFlow"), "{expanded}");
+    assert!(
+        expanded.contains("indexed selection may have changed"),
+        "{expanded}"
+    );
+
+    let failure = measured(
+        &mut srv,
+        &mut measurements,
+        "file",
+        serde_json::json!({"repository_id":repo, "path":path, "json_pointer":"/onVerify/failure"}),
+    )
+    .await;
+    assert!(
+        failure.contains("VERIFY_FAILURE") && failure.contains("showError"),
+        "{failure}"
+    );
+
+    let answer = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"What does checkHdbFlow do in workflow.json?",
+            "mode":"NORMAL", "repository_id":repo, "path":path
+        }),
+    )
+    .await;
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert!(
+        !answer["evidence"].as_array().unwrap().is_empty(),
+        "{answer}"
+    );
+    assert!(
+        answer["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["repository_id"] == *repo && hit["path"] == path),
+        "{answer}"
+    );
+    assert!(
+        answer["repository_answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["scope"] != "workspace_relationships"),
+        "{answer}"
+    );
+
+    let references = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"VERIFY_FAILURE", "mode":"REFERENCES", "repository_id":repo, "path":path
+        }),
+    )
+    .await;
+    let references: Value = serde_json::from_str(&references).unwrap();
+    assert_eq!(references["coverage"]["complete"], true, "{references}");
+    assert!(
+        references["matches"].as_array().unwrap().iter().any(|hit| {
+            hit["json_pointer"] == "/onVerify/failure/errorCode"
+                && hit["kind"] == "reference"
+                && hit["repository_id"] == *repo
+        }),
+        "{references}"
+    );
+
+    let absent = measured(
+        &mut srv,
+        &mut measurements,
+        "context",
+        serde_json::json!({
+            "query":"UnseenOtpError", "mode":"REFERENCES", "repository_id":repo, "path":path
+        }),
+    )
+    .await;
+    let absent: Value = serde_json::from_str(&absent).unwrap();
+    assert_eq!(absent["coverage"]["absence_proven"], true, "{absent}");
+    assert!(measurements.len() <= 8, "{measurements:?}");
+    eprintln!(
+        "synthetic workflow measurements: {}",
+        serde_json::json!(measurements)
+    );
+
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close()).await;
+}
+
 /// REQUIRED first-run workspace-lifecycle gate (spec §8/§10/§11/§36):
 ///
 /// A pristine Attic install with an empty ATTIC_HOME must start over stdio,

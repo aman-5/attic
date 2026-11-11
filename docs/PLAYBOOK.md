@@ -159,8 +159,8 @@ for the template.
 
 | Tool | Purpose |
 |---|---|
-| `context` | Evidence-backed answer (`FAST`, `NORMAL`, `DEEP`) or raw lexical search with `mode: "SEARCH"` |
-| `file` | Read a bounded, secret-scanned range from a live source file |
+| `context` | Evidence-backed answer (`FAST`, `NORMAL`, `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
+| `file` | Read a bounded, sanitized file range, JSON pointer/unit, outline, or literal/regex matches |
 | `repo_map` | Inspect repository structure and indexing statistics |
 | `status` | Readiness, per-repository indexing/watch state, resource pressure and retrieval telemetry |
 | `workspace` | Inspect or change configured repository roots |
@@ -172,6 +172,18 @@ Tool schemas are returned by MCP `tools/list`; their source of truth is
 FTS5) and graph-assisted. Attic does not generate embeddings or claim vector
 similarity; vague conceptual queries can retrieve differently than with a
 vector search engine.
+
+For a structured workflow, search relevant identifiers with `mode: "SEARCH"`
+and an exact `path` or other explicit scope, expand a returned JSON pointer or
+unit using `file`, then use `mode: "REFERENCES"` for literal links. Adjacent
+search terms use ranked OR; choose `match_mode: "all"` for strict matching.
+`repository` accepts an unambiguous active name, UUID or absolute root.
+Answer modes without explicit path scope may also include central knowledge
+and workspace dependency evidence, even for a selected repository.
+Check `path_resolution`, indexed location status, response omissions and
+reference coverage; an empty reference result is conclusive only when
+`coverage.absence_proven` is true. Rebuild and restart the server, then
+reindex affected repositories to populate new JSON source locations.
 
 For answer modes, read top-level `context`, `claims` and `evidence`.
 `repository_answers` contains summaries only. Shared excerpts retain all

@@ -9,7 +9,8 @@ pub const CURRENT_SCHEMA_VERSION: &str = "1.0.0";
 /// 0.1.x = Phase 1C generic-only; 0.2.0 = Phase 3 structural languages;
 /// 0.3.0 = Tier-1 analyzers for Kotlin, Scala, Lua, Ruby, PHP, Swift, C, C++,
 /// C#, Rust and Dockerfile (existing analyses of those languages are redone).
-pub const ANALYZER_REGISTRY_VERSION: &str = "0.3.0";
+/// 0.4.0 = source-aware JSON locations and structured retrieval.
+pub const ANALYZER_REGISTRY_VERSION: &str = "0.4.0";
 
 /// Version of the secret-pattern ruleset used during scanning.
 /// Increment this whenever the ruleset changes to trigger re-scanning.
@@ -19,8 +20,9 @@ pub const SECRET_PATTERN_VERSION: i64 = 1;
 /// split). MUST be bumped whenever chunk boundary logic changes (e.g. the
 /// generic analyzer's TARGET_CHUNK_CHARS or a content-class router), so stale
 /// generations are detectable instead of silently mixing chunk shapes.
-/// 1.x = legacy line-count cap; 2.0.0 = character-target (TARGET_CHUNK_CHARS).
-pub const CHUNKING_VERSION: &str = "2.0.0";
+/// 1.x = legacy line-count cap; 2.0.0 = character-target (TARGET_CHUNK_CHARS);
+/// 2.1.0 = bounded JSON structured retrieval and source locations.
+pub const CHUNKING_VERSION: &str = "2.1.0";
 
 /// Well-known keys used in the `subsystem_versions_json` map stored in
 /// `core_index_generations`.

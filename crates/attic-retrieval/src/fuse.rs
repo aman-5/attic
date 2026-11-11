@@ -14,7 +14,7 @@ use crate::candidates::Candidate;
 /// keep the highest-confidence skeleton and the union of retrieval sources,
 /// and every signal dimension keeps its best observed value.
 pub fn fuse(candidates: Vec<Candidate>) -> Vec<crate::candidates::Candidate> {
-    let mut by_key: HashMap<(String, String, u32), usize> = HashMap::new();
+    let mut by_key: HashMap<(String, String, u32, Option<String>), usize> = HashMap::new();
     let mut fused: Vec<Vec<Candidate>> = Vec::new();
 
     for c in candidates {
@@ -104,6 +104,15 @@ mod tests {
         assert_eq!(evidence.excerpt_span.unwrap().start_line, 40);
         assert_eq!(evidence.snippet.as_deref(), Some("payment_dispatch();"));
         assert!(evidence.snippet_leading_omitted && evidence.snippet_trailing_omitted);
+    }
+
+    #[test]
+    fn distinct_json_units_on_the_same_source_line_do_not_fuse() {
+        let mut first = cand("first", EvidenceSourceType::Configuration, "file", 0, 0.8);
+        let mut second = cand("second", EvidenceSourceType::Configuration, "file", 0, 0.8);
+        first.evidence.indexed_unit_id = Some("unit-a".into());
+        second.evidence.indexed_unit_id = Some("unit-b".into());
+        assert_eq!(fuse(vec![first, second]).len(), 2);
     }
 
     #[test]

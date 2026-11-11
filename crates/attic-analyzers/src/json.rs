@@ -21,7 +21,11 @@
 //!   indexed as plain text.
 
 use attic_core::{FileType, SourceSpan};
+use std::collections::HashSet;
 use tracing::debug;
+
+#[path = "json_spans.rs"]
+pub mod json_spans;
 
 use crate::api::{
     Analyzer, AnalyzerCapabilities, AnalyzerContent, AnalyzerDescriptor, AnalyzerDiagnostic,
@@ -69,6 +73,11 @@ impl Analyzer for JsonAnalyzer {
         let start = std::time::Instant::now();
         let mut diagnostics: Vec<AnalyzerDiagnostic> = Vec::new();
         let mut units: Vec<RetrievalUnitSpec> = Vec::new();
+        let mut pointers = Vec::new();
+        let position_basis = match &input.content {
+            AnalyzerContent::FullBytes(_) => "source",
+            AnalyzerContent::RedactedBytes(_) | AnalyzerContent::StreamingHandle(_) => "processed",
+        };
 
         // This analyzer requires whole-content access (JSON parsing is not
         // line-streamable without a much larger streaming-JSON investment).
@@ -179,6 +188,7 @@ impl Analyzer for JsonAnalyzer {
         let max_units = input.resource_budget.max_retrieval_units as usize;
         let mut state = ChunkState {
             units: &mut units,
+            pointers: &mut pointers,
             diagnostics: &mut diagnostics,
             max_units,
             env: env_label.as_deref(),
@@ -189,12 +199,112 @@ impl Analyzer for JsonAnalyzer {
             depth_reported: false,
         };
         chunk_value(&value, "", &mut state, 0, &input.cancellation_token);
-
-        if state.cancelled {
+        if !state.cancelled && !state.budget_reported {
+            let mut group_budget = GroupBudget {
+                remaining_units: state.max_units.saturating_sub(state.units.len()).min(512),
+                remaining_bytes: usize::try_from(input.resource_budget.max_memory_bytes / 8)
+                    .unwrap_or(usize::MAX),
+                skipped: false,
+            };
+            add_array_groups(
+                &value,
+                "",
+                &mut state,
+                &mut group_budget,
+                0,
+                start,
+                input.resource_budget.max_time_ms,
+                &input.cancellation_token,
+            );
+            if group_budget.skipped {
+                state.diagnostics.push(AnalyzerDiagnostic::warning(
+                    diagnostic_codes::UNIT_TRUNCATED,
+                    "Optional JSON array groups exceeded their budget; complete leaf units remain indexed",
+                ));
+            }
+        }
+        let cancelled = state.cancelled;
+        if cancelled {
             diagnostics.push(AnalyzerDiagnostic::warning(
                 diagnostic_codes::CANCELLED,
                 "JSON analysis cancelled; output is partial",
             ));
+            return self.empty_output(file_occurrence_id, diagnostics);
+        }
+
+        let wanted: HashSet<String> = pointers.iter().cloned().collect();
+        let locations = match json_spans::locate(
+            &text,
+            &wanted,
+            start,
+            input.resource_budget.max_time_ms,
+            &input.cancellation_token,
+        ) {
+            Ok(locations) => locations,
+            Err(error) => {
+                diagnostics.push(AnalyzerDiagnostic::error(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    format!("{error}; falling back to plain-text chunking"),
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            }
+        };
+        let mut line_starts = vec![0usize];
+        line_starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        );
+        for (unit, pointer) in units.iter_mut().zip(&pointers) {
+            let Some(location) = locations.get(pointer) else {
+                diagnostics.push(AnalyzerDiagnostic::error(
+                    diagnostic_codes::MALFORMED_INPUT,
+                    format!("JSON pointer {pointer:?} has no source location; falling back to plain-text chunking"),
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            };
+            let start_line = line_starts.partition_point(|offset| *offset <= location.start) - 1;
+            let last_byte = location.end.saturating_sub(1).max(location.start);
+            let last_line = line_starts.partition_point(|offset| *offset <= last_byte) - 1;
+            let Some((start_line_u32, start_col, end_line, end_col)) = u32::try_from(start_line)
+                .ok()
+                .zip(u32::try_from(location.start - line_starts[start_line]).ok())
+                .zip(u32::try_from(last_line + 1).ok())
+                .zip(u32::try_from(location.end - line_starts[last_line]).ok())
+                .map(|(((start_line, start_col), end_line), end_col)| {
+                    (start_line, start_col, end_line, end_col)
+                })
+            else {
+                diagnostics.push(AnalyzerDiagnostic::error(
+                    diagnostic_codes::RESOURCE_EXHAUSTED,
+                    "JSON location exceeds supported coordinate range; falling back to plain-text chunking",
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            };
+            unit.span = SourceSpan {
+                start_line: start_line_u32,
+                start_col,
+                end_line,
+                end_col,
+            };
+            let Some(metadata) = unit
+                .occurrence_metadata
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .and_then(|value| value.as_object().cloned())
+            else {
+                diagnostics.push(AnalyzerDiagnostic::error(
+                    diagnostic_codes::MALFORMED_INPUT,
+                    "JSON unit metadata is invalid; falling back to plain-text chunking",
+                ));
+                return self.empty_output(file_occurrence_id, diagnostics);
+            };
+            let mut metadata = metadata;
+            metadata.insert("source_start_byte".into(), location.start.into());
+            metadata.insert("source_end_byte".into(), location.end.into());
+            metadata.insert("position_basis".into(), position_basis.into());
+            metadata.insert("position_kind".into(), "enclosing_value".into());
+            unit.occurrence_metadata = Some(serde_json::Value::Object(metadata).to_string());
         }
 
         debug!(
@@ -259,6 +369,7 @@ fn detect_env_label(filename: &str) -> Option<String> {
 
 struct ChunkState<'a> {
     units: &'a mut Vec<RetrievalUnitSpec>,
+    pointers: &'a mut Vec<String>,
     diagnostics: &'a mut Vec<AnalyzerDiagnostic>,
     max_units: usize,
     env: Option<&'a str>,
@@ -371,7 +482,7 @@ fn chunk_value(
     };
 
     if header.len() + body.len() <= TARGET_CHUNK_CHARS {
-        push_unit(state, header, &body, ordinal_start, pointer);
+        push_unit(state, header, &body, ordinal_start, pointer, None);
         return;
     }
 
@@ -431,23 +542,25 @@ fn push_text_pieces(
     let mut offset = 0usize;
     let mut first = true;
     while offset < body.len() && state.units.len() < state.max_units {
-        let mut end = (offset + TARGET_CHUNK_CHARS).min(body.len());
+        let piece_header = if first && header.len() <= TARGET_CHUNK_CHARS - 4 {
+            header
+        } else {
+            ""
+        };
+        let capacity = TARGET_CHUNK_CHARS - piece_header.len();
+        let mut end = (offset + capacity).min(body.len());
         // MSRV 1.89 has no str::floor_char_boundary — walk back to
         // the nearest UTF-8 char boundary manually.
         while !body.is_char_boundary(end) {
             end -= 1;
         }
-        let piece_header = if first {
-            header.to_string()
-        } else {
-            String::new()
-        };
         push_unit(
             state,
-            piece_header,
+            piece_header.to_string(),
             &body[offset..end],
             ordinal_start,
             pointer,
+            None,
         );
         first = false;
         offset = end;
@@ -463,6 +576,7 @@ fn push_unit(
     body: &str,
     ordinal_start: u32,
     pointer: &str,
+    group_range: Option<(usize, usize)>,
 ) {
     let ordinal = ordinal_start + state.units.len() as u32;
     let text = format!("{header}{body}");
@@ -471,10 +585,14 @@ fn push_unit(
     // content hashes identically across files and environments (r03). The
     // header lives only in retrieval_text (lexical display) and the
     // occurrence metadata JSON (provenance for filtering/display).
-    let occurrence_metadata = match state.env {
-        Some(env) => serde_json::json!({"json_pointer": pointer, "environment": env}).to_string(),
-        None => serde_json::json!({"json_pointer": pointer}).to_string(),
+    let mut occurrence_metadata = match state.env {
+        Some(env) => serde_json::json!({"json_pointer": pointer, "environment": env}),
+        None => serde_json::json!({"json_pointer": pointer}),
     };
+    if let Some((start, end)) = group_range {
+        occurrence_metadata["array_start"] = start.into();
+        occurrence_metadata["array_end"] = end.into();
+    }
     state.units.push(RetrievalUnitSpec {
         span: SourceSpan {
             start_line: 0,
@@ -484,10 +602,140 @@ fn push_unit(
         },
         retrieval_text: text,
         canonical_text: Some(body.to_string()),
-        occurrence_metadata: Some(occurrence_metadata),
+        occurrence_metadata: Some(occurrence_metadata.to_string()),
         ordinal,
         structural_node_index: None,
     });
+    state.pointers.push(pointer.to_string());
+}
+
+struct GroupBudget {
+    remaining_units: usize,
+    remaining_bytes: usize,
+    skipped: bool,
+}
+
+fn emit_array_group(
+    state: &mut ChunkState,
+    budget: &mut GroupBudget,
+    pointer: &str,
+    header: &str,
+    elements: &[String],
+    first: usize,
+) {
+    if elements.len() < 2 {
+        return;
+    }
+    let body = format!("[{}]", elements.join(","));
+    let size = header.len() + body.len();
+    if budget.remaining_units == 0 || size > budget.remaining_bytes {
+        budget.skipped = true;
+        return;
+    }
+    push_unit(
+        state,
+        header.to_string(),
+        &body,
+        0,
+        pointer,
+        Some((first, first + elements.len())),
+    );
+    budget.remaining_units -= 1;
+    budget.remaining_bytes -= size;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_array_groups(
+    value: &serde_json::Value,
+    pointer: &str,
+    state: &mut ChunkState,
+    budget: &mut GroupBudget,
+    depth: u32,
+    started: std::time::Instant,
+    max_time_ms: u64,
+    cancel: &crate::cancellation::CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        state.cancelled = true;
+        return;
+    }
+    if !value.is_array() && !value.is_object() {
+        return;
+    }
+    if depth >= state.max_depth
+        || (max_time_ms > 0 && started.elapsed().as_millis() > max_time_ms as u128)
+    {
+        budget.skipped = true;
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_pointer = format!("{pointer}/{}", escape_pointer(key));
+                add_array_groups(
+                    child,
+                    &child_pointer,
+                    state,
+                    budget,
+                    depth + 1,
+                    started,
+                    max_time_ms,
+                    cancel,
+                );
+                if state.cancelled {
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let header = match state.env {
+                Some(env) => format!("// json-pointer: {pointer} (env: {env})\n"),
+                None => format!("// json-pointer: {pointer}\n"),
+            };
+            if header.len() + canonical(value).len() > TARGET_CHUNK_CHARS {
+                let capacity = TARGET_CHUNK_CHARS.saturating_sub(header.len() + 2);
+                let mut elements: Vec<String> = Vec::new();
+                let mut group_size = 0usize;
+                let mut first = 0usize;
+                for (index, item) in items.iter().enumerate() {
+                    let body = canonical(item);
+                    let added = body.len() + usize::from(!elements.is_empty());
+                    if group_size + added > capacity {
+                        emit_array_group(state, budget, pointer, &header, &elements, first);
+                        elements.clear();
+                        group_size = 0;
+                    }
+                    if body.len() > capacity {
+                        continue;
+                    }
+                    if elements.is_empty() {
+                        first = index;
+                    } else {
+                        group_size += 1;
+                    }
+                    group_size += body.len();
+                    elements.push(body);
+                }
+                emit_array_group(state, budget, pointer, &header, &elements, first);
+            }
+            for (index, child) in items.iter().enumerate() {
+                add_array_groups(
+                    child,
+                    &format!("{pointer}/{index}"),
+                    state,
+                    budget,
+                    depth + 1,
+                    started,
+                    max_time_ms,
+                    cancel,
+                );
+                if state.cancelled {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +757,99 @@ mod tests {
             cancellation_token: crate::cancellation::CancellationToken::default(),
             resource_budget: ResourceBudget::default(),
         }
+    }
+
+    #[test]
+    fn source_locations_follow_escaped_pointers_and_last_duplicate_key() {
+        let doc = format!(
+            "{{\r\n  \"pad\":\"{}\",\r\n  \"a/b~c\": {{\"value\":\"雪\"}},\r\n  \"dup\": \"first\",\r\n  \"dup\": \"second\"\r\n}}",
+            "x".repeat(TARGET_CHUNK_CHARS)
+        );
+        let out = JsonAnalyzer::new().analyze(input_for(&doc, "source.json"));
+        assert!(!out.retrieval_units.is_empty(), "{:?}", out.diagnostics);
+        for (pointer, expected, line) in [
+            ("/a~1b~0c", "{\"value\":\"雪\"}", 2),
+            ("/dup", "\"second\"", 4),
+        ] {
+            let unit = out
+                .retrieval_units
+                .iter()
+                .find(|unit| {
+                    let metadata: serde_json::Value =
+                        serde_json::from_str(unit.occurrence_metadata.as_ref().unwrap()).unwrap();
+                    metadata["json_pointer"] == pointer
+                })
+                .unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(unit.occurrence_metadata.as_ref().unwrap()).unwrap();
+            let start = metadata["source_start_byte"].as_u64().unwrap() as usize;
+            let end = metadata["source_end_byte"].as_u64().unwrap() as usize;
+            assert_eq!(&doc[start..end], expected);
+            assert_eq!(unit.span.start_line, line);
+            assert_eq!(unit.span.end_line, line + 1);
+            assert_eq!(metadata["position_basis"], "source");
+        }
+    }
+
+    #[test]
+    fn redacted_input_locations_are_marked_as_processed() {
+        let text = "{\n  \"secret\": \"[REDACTED]\"\n}";
+        let mut input = input_for(text, "redacted.json");
+        input.content = AnalyzerContent::RedactedBytes(text.as_bytes().to_vec());
+        let out = JsonAnalyzer::new().analyze(input);
+        let metadata: serde_json::Value =
+            serde_json::from_str(out.retrieval_units[0].occurrence_metadata.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(metadata["position_basis"], "processed");
+        assert_eq!(metadata["source_start_byte"], 0);
+        assert_eq!(metadata["source_end_byte"], text.len());
+        assert_eq!(out.retrieval_units[0].span.end_line, 3);
+    }
+
+    #[test]
+    fn oversized_arrays_keep_bounded_groups_and_all_leaf_units() {
+        let items: Vec<_> = (0..20)
+            .map(|index| serde_json::json!({"index": index, "rule": "x".repeat(240)}))
+            .collect();
+        let text = serde_json::json!({"rules": items}).to_string();
+        let mut input = input_for(&text, "groups.json");
+        input.resource_budget.max_retrieval_units = 21;
+        let out = JsonAnalyzer::new().analyze(input);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == diagnostic_codes::RESOURCE_EXHAUSTED),
+            "{:?}",
+            out.diagnostics
+        );
+        let mut leaves = 0;
+        let mut groups = 0;
+        for unit in &out.retrieval_units {
+            assert!(unit.retrieval_text.len() <= TARGET_CHUNK_CHARS);
+            let metadata: serde_json::Value =
+                serde_json::from_str(unit.occurrence_metadata.as_ref().unwrap()).unwrap();
+            if metadata["array_start"].is_number() {
+                groups += 1;
+                let start = metadata["array_start"].as_u64().unwrap() as usize;
+                let end = metadata["array_end"].as_u64().unwrap() as usize;
+                let group: Vec<serde_json::Value> =
+                    serde_json::from_str(unit.canonical_text.as_ref().unwrap()).unwrap();
+                assert_eq!(group, items[start..end]);
+                assert_eq!(metadata["json_pointer"], "/rules");
+            } else if metadata["json_pointer"]
+                .as_str()
+                .unwrap()
+                .starts_with("/rules/")
+            {
+                leaves += 1;
+            }
+        }
+        assert_eq!(leaves, items.len());
+        assert_eq!(groups, 1);
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == diagnostic_codes::UNIT_TRUNCATED
+                && diagnostic.message.contains("complete leaf units")
+        }));
     }
 
     #[test]

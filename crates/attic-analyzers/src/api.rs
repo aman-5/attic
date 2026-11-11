@@ -395,17 +395,10 @@ impl RelationshipSpec {
 ///
 /// ## Span semantics
 ///
-/// `span.start_line` and `span.end_line` are **1-based** line numbers in the
-/// source file as delivered (post-redaction for `RedactedBytes`; the emitted
-/// chunk bytes for `StreamingHandle`).
-///
-/// `span.start_byte` and `span.end_byte` are byte offsets within the content
-/// as delivered to this analyzer (i.e. within `retrieval_text`, not the
-/// original pre-redaction file when redaction changed byte lengths).
-///
-/// For `FullBytes` inputs with no redaction the byte offsets correspond exactly
-/// to the original file positions.  For `RedactedBytes` and `StreamingHandle`
-/// inputs they correspond to positions in the redacted representation.
+/// `span` uses zero-based coordinates and an exclusive end as defined by
+/// [`SourceSpan`]. Coordinates refer to the content delivered to the analyzer,
+/// which can differ from the original file after redaction. Source byte offsets,
+/// when available, are stored in occurrence metadata rather than `SourceSpan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalUnitSpec {
     /// Span within the content as delivered to this analyzer.

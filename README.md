@@ -297,8 +297,8 @@ explicit dependency contracts remain grounded in source evidence.
 
 | Tool | What it does |
 |---|---|
-| `context` | One door for answers and retrieval. Default: evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder. With `mode: "SEARCH"`: raw lexical retrieval (SQLite FTS5) without evidence assembly — each result has a `source_type`, a bounded ~240-char snippet, and line anchors when recorded; accepts `file_type`, `language`, `max_results` (default 25, cap 200), and `scope: "knowledge"` for project knowledge only |
-| `file` | A bounded, secret-scanned region of a live file (line or byte range) |
+| `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
+| `file` | Bounded, secret-scanned live-file ranges, JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Structure and statistics of one repository |
 | `status` | Readiness, indexing/watcher state, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
@@ -314,8 +314,40 @@ answers. Identical excerpts share a body while preserving all source citations.
 Rejected-evidence counts/reasons are always present; pass
 `include_diagnostics: true` for individual rejected items. Response `telemetry`
 reports server timings and exact JSON-text bytes, not client/model latency.
-Existing retrieval budgets remain; no extra global response cap is imposed.
+`context` responses are capped at 64 KiB for FAST, 128 KiB for NORMAL,
+SEARCH and REFERENCES, and 256 KiB for DEEP. Omitted material and narrowing
+or continuation guidance appear in `response_budget`.
 See [response quality and latency diagnosis](docs/PERFORMANCE.md).
+
+`SEARCH` combines adjacent terms with ranked OR; `match_mode: "all"` restores
+strict adjacent-term matching. Quoted phrases, uppercase `AND`/`OR`/binary
+`NOT` and parentheses are supported. Use `repository` (unambiguous active
+name, UUID or absolute root), `repository_id`, and one of `path`,
+`path_prefix`, or `path_glob` to limit retrieval. Inferred filename ambiguity
+or missing paths are reported rather than silently treated as an explicit
+scope. Without an explicit path scope, answer modes may supplement a selected
+repository with central knowledge and workspace dependency relationships;
+SEARCH and REFERENCES remain scoped to the selected repository.
+
+JSON search results may include a `json_pointer`, `retrieval_unit_id` and
+indexed source locations. Locations are `indexed_unverified`: expand with
+`file` against current sanitized content, and treat `position_basis` as
+authoritative for byte offsets. Legacy JSON units without source positions
+require reanalysis. Unit expansion can select an indexed array group; indices
+may have changed since indexing.
+
+`REFERENCES` finds literal JSON keys/string values and text matches in bounded
+sanitized indexed files. Its definition/reference labels are syntactic, not
+semantic resolution. An empty result proves absence only when
+`coverage.absence_proven` is true for a fully scanned, current, safe exact
+file. Other coverage can be incomplete; use returned continuation fields or
+narrow the scope. Defaults are 32 files and 100 matches, with maxima of 64
+files and 200 matches.
+
+To use these changes in an existing installation, rebuild/install the server,
+restart the MCP server/daemon, and reindex affected repositories so JSON
+locations use the updated analyzer. Existing legacy locations are not
+presented as verified source positions.
 
 ## How it works
 

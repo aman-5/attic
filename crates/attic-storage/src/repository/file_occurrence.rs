@@ -384,6 +384,66 @@ pub fn latest_active_paths_for_repository(
     Ok(out)
 }
 
+/// Latest indexed file state used for bounded reference scans.
+#[derive(Debug, Clone)]
+pub struct ReferenceFile {
+    /// Repository-relative path.
+    pub path: String,
+    /// Raw-content BLAKE3 hash recorded at indexing time.
+    pub content_hash: String,
+    /// Recorded occurrence freshness.
+    pub freshness_state: String,
+    /// Recorded existence state.
+    pub existence_state: String,
+}
+
+/// Read a deterministic, path-scoped page of latest indexed files.
+pub fn reference_files(
+    conn: &Connection,
+    repository_id: &RepositoryId,
+    scope: Option<&crate::PathScope>,
+    after_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ReferenceFile>, StorageError> {
+    let (scope_kind, scope_path) =
+        scope.map_or_else(|| (0, String::new()), crate::PathScope::sql_parts);
+    let mut stmt = conn.prepare(&format!(
+        "{LATEST_OCCURRENCE_PER_PATH_CTE}
+         SELECT fo.path, fo.content_hash, fo.freshness_state, fo.existence_state
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m
+          WHERE fo.existence_state != 'deleted'
+            AND (?2 IS NULL OR fo.path > ?2)
+            AND (?3 = 0 OR (?3 = 1 AND fo.path = ?4)
+                 OR (?3 = 2 AND (fo.path = ?4 OR substr(fo.path, 1, length(?4) + 1) = ?4 || '/'))
+                 OR (?3 = 3 AND fo.path GLOB ?4))
+          ORDER BY fo.path
+          LIMIT ?5"
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            repository_id.to_string_repr(),
+            after_path,
+            scope_kind,
+            scope_path,
+            limit.min(201) as i64
+        ],
+        |row| {
+            Ok(ReferenceFile {
+                path: row.get(0)?,
+                content_hash: row.get(1)?,
+                freshness_state: row.get(2)?,
+                existence_state: row.get(3)?,
+            })
+        },
+    )?;
+    let mut files = Vec::new();
+    for row in rows {
+        files.push(row?);
+    }
+    Ok(files)
+}
+
 /// Latest-per-path `(path, file_type)` for every occurrence that is both
 /// `present` and `CURRENT` in the given repository — i.e. the file set of the
 /// current generation, never a superseded one. Optionally filtered to a

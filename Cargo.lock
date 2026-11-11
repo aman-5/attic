@@ -182,6 +182,7 @@ name = "attic-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "attic-analyzers",
  "attic-core",
  "attic-crossrepo",
  "attic-discovery",
@@ -189,7 +190,9 @@ dependencies = [
  "attic-indexing",
  "attic-retrieval",
  "attic-storage",
+ "blake3",
  "interprocess",
+ "regex",
  "rmcp",
  "serde",
  "serde_json",

@@ -64,6 +64,10 @@ pub struct AnswerRequest {
     pub mode: AnswerMode,
     /// Repository filter; empty = workspace-wide.
     pub repository_ids: Vec<String>,
+    /// Active workspace membership for cross-repository edges; None leaves library calls unscoped.
+    pub workspace_repository_ids: Option<Vec<String>>,
+    /// Optional repository-relative file scope.
+    pub path_scope: Option<attic_storage::PathScope>,
     pub overrides: Option<PolicyOverrides>,
     /// Central knowledge repository (`[knowledge] dir`). When set, every
     /// answer runs its own knowledge-only search there, independent of
@@ -79,6 +83,8 @@ impl AnswerRequest {
             question: question.into(),
             mode,
             repository_ids: Vec::new(),
+            workspace_repository_ids: None,
+            path_scope: None,
             overrides: None,
             knowledge_repository_id: None,
         }
@@ -349,6 +355,8 @@ impl RetrievalService {
                 &repo_filter,
                 single_repo,
                 central_knowledge,
+                req.path_scope.as_ref(),
+                req.workspace_repository_ids.as_deref(),
             );
             conn.progress_handler(0, None::<fn() -> bool>)?;
             result
@@ -437,6 +445,8 @@ impl RetrievalService {
         repo_filter: &Option<String>,
         single_repo: bool,
         central_knowledge: Option<&str>,
+        path_scope: Option<&attic_storage::PathScope>,
+        workspace_repository_ids: Option<&[String]>,
     ) -> Result<DbPhaseOutcome, StorageError> {
         let qt = classification.query_type;
         let ex = &classification.extracted;
@@ -449,6 +459,7 @@ impl RetrievalService {
         // answers for ANY repository scope, even when `repository_id` is
         // explicitly set — do not gate this on `repo_filter`.
         if let Some(kid) = central_knowledge
+            && path_scope.is_none()
             && !ex.terms.is_empty()
         {
             let mut kn_budget = BudgetAccountant::new(policy);
@@ -483,19 +494,31 @@ impl RetrievalService {
                 budget: &mut budget,
                 collected: &mut collected,
             };
+            match path_scope {
+                Some(attic_storage::PathScope::Exact(path)) => {
+                    ctx.run(plan, SubsystemTag::FtsSearch, "path_lookup", path, |env| {
+                        PathExactGenerator::run(env, path)
+                    });
+                }
+                None => {
+                    for hint in ex.path_hints.iter().take(8) {
+                        let path = hint.replace('\\', "/");
+                        let path = path.trim_start_matches("./");
+                        ctx.run(plan, SubsystemTag::FtsSearch, "path_lookup", path, |env| {
+                            PathExactGenerator::run_inferred(env, path)
+                        });
+                    }
+                }
+                Some(_) => {}
+            }
             if !ex.terms.is_empty() {
                 ctx.run(
                     plan,
                     SubsystemTag::FtsSearch,
                     "lexical_generation",
                     &format!("terms={}", ex.terms.join(",")),
-                    |env| LexicalGenerator::run(env, &ex.terms),
+                    |env| LexicalGenerator::run_scoped(env, &ex.terms, path_scope),
                 );
-            }
-            if let Some(path) = ex.path_hint.clone() {
-                ctx.run(plan, SubsystemTag::FtsSearch, "path_lookup", &path, |env| {
-                    PathExactGenerator::run(env, &path)
-                });
             }
             if let Some(sym) = ex.symbol_hint.clone() {
                 ctx.run(
@@ -503,7 +526,7 @@ impl RetrievalService {
                     SubsystemTag::SymbolLookup,
                     "symbol_search",
                     &sym,
-                    |env| SymbolGenerator::run(env, &sym),
+                    |env| SymbolGenerator::run_scoped(env, &sym, path_scope),
                 );
             }
             if qt == QueryType::KnowledgeQuestion && !ex.terms.is_empty() {
@@ -512,7 +535,7 @@ impl RetrievalService {
                     SubsystemTag::EvidenceAssembler,
                     "knowledge_lookup",
                     "knowledge/docs",
-                    |env| KnowledgeGenerator::run(env, &ex.terms),
+                    |env| KnowledgeGenerator::run_scoped(env, &ex.terms, path_scope),
                 );
             }
             // ctx still borrows budget; seeds read only `collected`, so
@@ -554,7 +577,7 @@ impl RetrievalService {
                         SubsystemTag::GraphWalk,
                         "direct_relationship_edges",
                         "seeds",
-                        |env| RelationshipGenerator::run(env, &seed_files),
+                        |env| RelationshipGenerator::run_scoped(env, &seed_files, path_scope),
                     );
                 }
 
@@ -567,14 +590,22 @@ impl RetrievalService {
                     qt,
                     QueryType::DependencyQuestion | QueryType::CrossRepoQuestion
                 );
-                if !self.crossrepo_degraded && (!seed_files.is_empty() || needs_workspace_crossrepo)
+                if path_scope.is_none()
+                    && !self.crossrepo_degraded
+                    && (!seed_files.is_empty() || needs_workspace_crossrepo)
                 {
                     ctx.run(
                         plan,
                         SubsystemTag::GraphWalk,
                         "cross_repo_dependency_edges",
                         "workspace",
-                        |env| CrossRepoGenerator::run(env, &seed_files),
+                        |env| {
+                            CrossRepoGenerator::run_scoped(
+                                env,
+                                &seed_files,
+                                workspace_repository_ids,
+                            )
+                        },
                     );
                 } else if self.crossrepo_degraded
                     && (!seed_files.is_empty() || needs_workspace_crossrepo)
@@ -592,10 +623,24 @@ impl RetrievalService {
         // EXACT_LOOKUP scope: when a concrete path was requested, candidates
         // outside that path cannot serve the contract; drop them
         // observably instead of diluting the context.
-        if qt == QueryType::ExactLookup
+        if let Some(scope) = path_scope {
+            fused.retain(|candidate| {
+                let matches = scope.matches_path(&candidate.evidence.path);
+                if !matches {
+                    plan.evidence_dropped.push(DroppedEvidence {
+                        evidence_id: candidate.evidence.id.clone(),
+                        source_type: candidate.evidence.source_type.as_str().to_owned(),
+                        drop_reason: crate::plan::DropReason::OutOfScopePath,
+                        score: candidate.evidence.signals.combined_score.unwrap_or(0.0),
+                    });
+                }
+                matches
+            });
+        } else if qt == QueryType::ExactLookup
             && let Some(hint) = &ex.path_hint
         {
-            let hint = hint.trim_start_matches("./");
+            let normalized_hint = hint.replace('\\', "/");
+            let hint = normalized_hint.trim_start_matches("./");
             fused.retain(|c| {
                 let matches =
                     c.evidence.path == hint || c.evidence.path.ends_with(&format!("/{hint}"));
@@ -603,7 +648,7 @@ impl RetrievalService {
                     plan.evidence_dropped.push(DroppedEvidence {
                         evidence_id: c.evidence.id.clone(),
                         source_type: c.evidence.source_type.as_str().to_owned(),
-                        drop_reason: crate::plan::DropReason::PolicyBlockedSourceType,
+                        drop_reason: crate::plan::DropReason::OutOfScopePath,
                         score: c.evidence.signals.combined_score.unwrap_or(0.0),
                     });
                 }
@@ -804,7 +849,7 @@ impl RetrievalService {
                         budget: &mut budget,
                         limit: 48,
                     };
-                    match LexicalGenerator::run(&mut env, &terms) {
+                    match LexicalGenerator::run_scoped(&mut env, &terms, path_scope) {
                         Ok(cands) => {
                             let new_ev: Vec<Evidence> = fuse(cands)
                                 .into_iter()
@@ -850,7 +895,7 @@ impl RetrievalService {
                         budget: &mut budget,
                         limit: 48,
                     };
-                    match KnowledgeGenerator::run(&mut env, &terms) {
+                    match KnowledgeGenerator::run_scoped(&mut env, &terms, path_scope) {
                         Ok(cands) => {
                             let new_ev: Vec<Evidence> = fuse(cands)
                                 .into_iter()
@@ -879,6 +924,17 @@ impl RetrievalService {
                 }
                 ExpansionAction::BoundedGraph(seeds) => {
                     used_fallbacks.push(FallbackStrategy::BoundedGraph);
+                    if path_scope.is_some() {
+                        plan.complete_step(
+                            s_idx,
+                            StepStatus::Skipped,
+                            "graph expansion omitted for explicit file scope",
+                            0,
+                            0,
+                            now_us(),
+                        );
+                        continue;
+                    }
                     match run_graph_expansion(
                         conn,
                         contract,

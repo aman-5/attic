@@ -215,6 +215,15 @@ pub fn build(
             authority_label(ev),
         );
         block.push_str(&freshness_note(ev));
+        if let Some(pointer) = &ev.json_pointer {
+            block.push_str(&format!("- json_pointer: {pointer}\n"));
+        }
+        if let Some(status) = &ev.location_status {
+            block.push_str(&format!("- location_status: {status}\n"));
+        }
+        if let Some(basis) = &ev.position_basis {
+            block.push_str(&format!("- position_basis: {basis}\n"));
+        }
         if let Some(rel) = &ev.relationship {
             block.push_str(&format!(
                 "- relationship: {} ({}, confidence {:.2})\n",

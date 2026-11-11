@@ -1,5 +1,8 @@
 use crate::*;
 
+#[path = "file_search.rs"]
+pub(crate) mod file_search;
+
 // ─── region arguments: checked parsing + validation ────────────────────────────
 
 /// Parsed, validated region request for the `file` tool.  Byte windows take
@@ -349,50 +352,84 @@ pub(crate) fn enforce_response_limit(mut body: String) -> String {
     body
 }
 
-pub(crate) fn handle_file(
-    pool: &DbPool,
-    args: &HashMap<String, Value>,
-    active_ids: &HashSet<String>,
-) -> Result<CallToolResult, ServerError> {
-    let repo_id = args
-        .get("repository_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
-    validate_repository_id(repo_id)?;
+const MAX_JSON_NAVIGATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OUTLINE_ENTRIES: usize = 200;
 
-    let file_path = args
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ServerError::InvalidArg("path required".into()))?;
+fn optional_string<'a>(
+    args: &'a HashMap<String, Value>,
+    name: &str,
+) -> Result<Option<&'a str>, ServerError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(ServerError::InvalidArg(format!("{name} must be a string"))),
+    }
+}
 
-    let region = parse_region(args)?;
+fn optional_bool(args: &HashMap<String, Value>, name: &str) -> Result<bool, ServerError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ServerError::InvalidArg(format!("{name} must be a boolean"))),
+    }
+}
 
-    let parsed_repo_id = repo_id
-        .parse::<attic_core::RepositoryId>()
-        .map_err(|e| ServerError::InvalidArg(format!("invalid repository_id: {e}")))?;
+fn validate_json_pointer(pointer: &str) -> Result<(), ServerError> {
+    if pointer.len() > 4096 || (!pointer.is_empty() && !pointer.starts_with('/')) {
+        return Err(ServerError::InvalidArg(
+            "json_pointer must be an RFC 6901 pointer of at most 4096 bytes".into(),
+        ));
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return Err(ServerError::InvalidArg(
+                "json_pointer contains an invalid ~ escape".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
-    let repo_root_str = pool
-        .with_reader(|c| get_repository_path(c, &parsed_repo_id))?
-        .ok_or_else(|| ServerError::InvalidArg(format!("repository_id {repo_id} not found")))?;
-    require_active_member(active_ids, repo_id)?;
-    let repo_root_raw = PathBuf::from(&repo_root_str);
-    // On Windows, std::fs::canonicalize adds a \\?\ extended-length prefix.
-    // canonicalize_within_root canonicalizes the joined path, so the result
-    // also has \\?\; but repo_root_raw (from the DB) does not.  Normalize
-    // repo_root the same way so that strip_prefix succeeds.
-    let repo_root = repo_root_raw.canonicalize().unwrap_or(repo_root_raw);
+pub(crate) fn json_source(
+    pre: &mut attic_discovery::PreprocessResult,
+) -> Result<String, ServerError> {
+    if let Some(text) = pre.content.take() {
+        if text.len() > MAX_JSON_NAVIGATION_BYTES {
+            return Err(ServerError::InvalidArg(format!(
+                "JSON navigation requires a complete file of at most {MAX_JSON_NAVIGATION_BYTES} bytes"
+            )));
+        }
+        return Ok(text);
+    }
+    let mut stream = pre
+        .stream
+        .take()
+        .ok_or_else(|| ServerError::Retrieval("preprocessed file content is unavailable".into()))?;
+    let mut text = String::new();
+    while let Some(chunk) = stream.next_chunk() {
+        let chunk = chunk.map_err(ServerError::Discovery)?;
+        if text.len().saturating_add(chunk.redacted.len()) > MAX_JSON_NAVIGATION_BYTES {
+            return Err(ServerError::InvalidArg(format!(
+                "JSON navigation requires a complete file of at most {MAX_JSON_NAVIGATION_BYTES} bytes"
+            )));
+        }
+        text.push_str(&chunk.redacted);
+    }
+    Ok(text)
+}
 
-    let abs_path = canonicalize_within_root(&repo_root.join(file_path), &repo_root)
-        .map_err(|e| ServerError::InvalidArg(format!("path rejected: {e}")))?;
-
+pub(crate) fn preprocess_permitted_file(
+    repo_root: &Path,
+    file_path: &str,
+) -> Result<(String, attic_discovery::PreprocessResult), ServerError> {
+    let abs_path = canonicalize_within_root(&repo_root.join(file_path), repo_root)
+        .map_err(|error| ServerError::InvalidArg(format!("path rejected: {error}")))?;
     let repo_relative = abs_path
-        .strip_prefix(&repo_root)
+        .strip_prefix(repo_root)
         .map_err(|_| ServerError::InvalidArg("path outside repo root".into()))?
         .to_string_lossy()
         .replace('\\', "/");
-
-    // Block security-forbidden paths at the server layer regardless of what
-    // preprocess_file_content decides, to ensure consistent policy.
     if is_security_forbidden(&repo_relative) {
         let detail = if repo_relative.eq_ignore_ascii_case(".git")
             || repo_relative
@@ -405,9 +442,243 @@ pub(crate) fn handle_file(
         };
         return Err(ServerError::InvalidArg(format!("path rejected: {detail}")));
     }
-
-    // preprocess handles Excluded/Redacted/secrets internally via the secrets scan layer
     let pre = preprocess_file_content(&abs_path, &repo_relative).map_err(ServerError::Discovery)?;
+    Ok((repo_relative, pre))
+}
+
+fn add_outline_entries(
+    value: &Value,
+    pointer: &str,
+    depth: u64,
+    max_depth: u64,
+    entries: &mut Vec<Value>,
+    truncated: &mut bool,
+) {
+    if entries.len() >= MAX_OUTLINE_ENTRIES || pointer.len() > 4096 {
+        *truncated = true;
+        return;
+    }
+    let kind = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    entries.push(json!({"json_pointer": pointer, "type": kind}));
+    if depth >= max_depth {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                add_outline_entries(
+                    child,
+                    &format!("{pointer}/{escaped}"),
+                    depth + 1,
+                    max_depth,
+                    entries,
+                    truncated,
+                );
+                if *truncated {
+                    return;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                add_outline_entries(
+                    child,
+                    &format!("{pointer}/{index}"),
+                    depth + 1,
+                    max_depth,
+                    entries,
+                    truncated,
+                );
+                if *truncated {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn handle_file(
+    pool: &DbPool,
+    args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
+) -> Result<CallToolResult, ServerError> {
+    let repo_id = args
+        .get("repository_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
+    validate_repository_id(repo_id)?;
+
+    let requested_path = optional_string(args, "path")?;
+    let short_unit_id = optional_string(args, "unit_id")?;
+    let retrieval_unit_id = optional_string(args, "retrieval_unit_id")?;
+    if short_unit_id.is_some() && retrieval_unit_id.is_some() {
+        return Err(ServerError::InvalidArg(
+            "unit_id and retrieval_unit_id are mutually exclusive".into(),
+        ));
+    }
+    let unit_id = retrieval_unit_id.or(short_unit_id);
+    if requested_path.is_none() && unit_id.is_none() {
+        return Err(ServerError::InvalidArg(
+            "path required unless unit_id is supplied".into(),
+        ));
+    }
+    let requested_pointer = optional_string(args, "json_pointer")?;
+    let grep = optional_string(args, "grep")?;
+    let grep_regex = optional_bool(args, "regex")?;
+    let parent = optional_bool(args, "parent")?;
+    let outline = optional_bool(args, "outline")?;
+    if grep.is_some() && (unit_id.is_some() || requested_pointer.is_some() || parent || outline) {
+        return Err(ServerError::InvalidArg(
+            "grep cannot be combined with unit or JSON navigation".into(),
+        ));
+    }
+    if grep.is_none() && (args.contains_key("regex") || args.contains_key("max_matches")) {
+        return Err(ServerError::InvalidArg(
+            "regex and max_matches require grep".into(),
+        ));
+    }
+    let max_matches = parse_u64_arg(args, "max_matches")?.unwrap_or(50);
+    if !(1..=200).contains(&max_matches) {
+        return Err(ServerError::InvalidArg(
+            "max_matches must be 1..=200".into(),
+        ));
+    }
+    if unit_id.is_some() && requested_pointer.is_some() {
+        return Err(ServerError::InvalidArg(
+            "unit_id and json_pointer are mutually exclusive".into(),
+        ));
+    }
+    let outline_depth = parse_u64_arg(args, "outline_depth")?.unwrap_or(2);
+    if !(1..=5).contains(&outline_depth) || (!outline && args.contains_key("outline_depth")) {
+        return Err(ServerError::InvalidArg(
+            "outline_depth requires outline=true and must be 1..=5".into(),
+        ));
+    }
+    let mut region = parse_region(args)?;
+    if (unit_id.is_some() || requested_pointer.is_some() || outline || parent)
+        && region != FileRegion::default()
+    {
+        return Err(ServerError::InvalidArg(
+            "unit and JSON navigation cannot be combined with line or byte regions".into(),
+        ));
+    }
+
+    let parsed_repo_id = repo_id
+        .parse::<attic_core::RepositoryId>()
+        .map_err(|e| ServerError::InvalidArg(format!("invalid repository_id: {e}")))?;
+
+    let repo_root_str = pool
+        .with_reader(|c| get_repository_path(c, &parsed_repo_id))?
+        .ok_or_else(|| ServerError::InvalidArg(format!("repository_id {repo_id} not found")))?;
+    require_active_member(active_ids, repo_id)?;
+    let unit = if let Some(id) = unit_id {
+        id.parse::<attic_core::RetrievalUnitId>()
+            .map_err(|error| ServerError::InvalidArg(format!("invalid unit_id: {error}")))?;
+        Some(
+            pool.with_reader(|conn| attic_storage::retrieval_unit_location(conn, repo_id, id))?
+                .ok_or_else(|| {
+                    ServerError::InvalidArg(
+                        "unit_id not found in the active repository or no longer readable".into(),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let file_path = match (requested_path, unit.as_ref()) {
+        (Some(path), Some(unit)) if path.replace('\\', "/") != unit.path => {
+            return Err(ServerError::InvalidArg(
+                "path does not match the requested unit".into(),
+            ));
+        }
+        (Some(path), _) => path,
+        (None, Some(unit)) => unit.path.as_str(),
+        (None, None) => unreachable!("path or unit_id validated above"),
+    };
+    let mut pointer = requested_pointer.map(str::to_owned);
+    let mut group_range = None;
+    if let Some(unit) = &unit {
+        if unit.analyzer_id == "json" {
+            let metadata: Value = unit
+                .occurrence_metadata
+                .as_deref()
+                .ok_or_else(|| ServerError::Retrieval("JSON unit lacks pointer metadata".into()))
+                .and_then(|value| {
+                    serde_json::from_str(value).map_err(|error| {
+                        ServerError::Retrieval(format!("invalid JSON unit metadata: {error}"))
+                    })
+                })?;
+            pointer = Some(
+                metadata
+                    .get("json_pointer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ServerError::Retrieval("JSON unit lacks pointer metadata".into())
+                    })?
+                    .to_owned(),
+            );
+            if metadata.get("array_start").is_some() || metadata.get("array_end").is_some() {
+                let start = metadata["array_start"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok());
+                let end = metadata["array_end"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok());
+                match (start, end) {
+                    (Some(start), Some(end)) if start < end => group_range = Some((start, end)),
+                    _ => {
+                        return Err(ServerError::Retrieval(
+                            "invalid indexed JSON array group range".into(),
+                        ));
+                    }
+                }
+            }
+        } else if !outline && !parent {
+            region.start_line = unit
+                .start_line
+                .and_then(|line| line.checked_add(1))
+                .map(u64::from);
+            region.end_line = unit.end_line.map(u64::from);
+            if region.start_line.is_none() || region.end_line.is_none() {
+                return Err(ServerError::Retrieval(
+                    "unit has no usable indexed line range".into(),
+                ));
+            }
+        }
+    }
+    if let Some(pointer) = &pointer {
+        validate_json_pointer(pointer)?;
+    }
+    if parent {
+        let current = pointer.as_deref().ok_or_else(|| {
+            ServerError::InvalidArg("parent requires a JSON pointer or unit".into())
+        })?;
+        let index = current
+            .rfind('/')
+            .ok_or_else(|| ServerError::InvalidArg("the JSON root has no parent".into()))?;
+        pointer = Some(current[..index].to_owned());
+        group_range = None;
+    }
+    if outline && pointer.is_none() {
+        pointer = Some(String::new());
+    }
+    let repo_root_raw = PathBuf::from(&repo_root_str);
+    // On Windows, std::fs::canonicalize adds a \\?\ extended-length prefix.
+    // canonicalize_within_root canonicalizes the joined path, so the result
+    // also has \\?\; but repo_root_raw (from the DB) does not.  Normalize
+    // repo_root the same way so that strip_prefix succeeds.
+    let repo_root = repo_root_raw.canonicalize().unwrap_or(repo_root_raw);
+
+    let (repo_relative, mut pre) = preprocess_permitted_file(&repo_root, file_path)?;
 
     if pre.decision == SecretScanDecision::Excluded {
         return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -418,7 +689,97 @@ pub(crate) fn handle_file(
         warn!("file {repo_relative}: partial scan");
     }
 
-    let body: String = if let Some(text) = pre.content {
+    let body: String = if let Some(pattern) = grep {
+        serde_json::to_string_pretty(&file_search::search(
+            &mut pre,
+            pattern,
+            grep_regex,
+            region,
+            max_matches as usize,
+        )?)?
+    } else if let Some(pointer) = &pointer {
+        let text = json_source(&mut pre)?;
+        let document: Value = serde_json::from_str(&text)
+            .map_err(|error| ServerError::InvalidArg(format!("file is not valid JSON: {error}")))?;
+        let selected = document.pointer(pointer).ok_or_else(|| {
+            ServerError::InvalidArg(format!(
+                "JSON pointer {} does not exist in the live file",
+                serde_json::to_string(pointer).unwrap_or_default()
+            ))
+        })?;
+        let group;
+        let selected = if let Some((start, end)) = group_range {
+            let array = selected.as_array().ok_or_else(|| {
+                ServerError::Retrieval(
+                    "indexed JSON array group no longer points to an array".into(),
+                )
+            })?;
+            let items = array.get(start..end).ok_or_else(|| {
+                ServerError::Retrieval(
+                    "indexed JSON array group no longer exists in the live file".into(),
+                )
+            })?;
+            group = Value::Array(items.to_vec());
+            &group
+        } else {
+            selected
+        };
+        if outline {
+            let mut entries = Vec::new();
+            let mut truncated = false;
+            if let Some((start, _)) = group_range {
+                entries.push(json!({"json_pointer": pointer, "type": "array"}));
+                if outline_depth > 0 {
+                    for (index, item) in selected.as_array().into_iter().flatten().enumerate() {
+                        add_outline_entries(
+                            item,
+                            &format!("{pointer}/{}", start + index),
+                            1,
+                            outline_depth,
+                            &mut entries,
+                            &mut truncated,
+                        );
+                        if truncated {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                add_outline_entries(
+                    selected,
+                    pointer,
+                    0,
+                    outline_depth,
+                    &mut entries,
+                    &mut truncated,
+                );
+            }
+            let mut bounded = Vec::new();
+            let mut encoded_bytes = 0usize;
+            for entry in entries {
+                let size = serde_json::to_vec(&entry)?.len() + 1;
+                if encoded_bytes.saturating_add(size) > MAX_RESPONSE_BYTES - 4096 {
+                    truncated = true;
+                    break;
+                }
+                encoded_bytes += size;
+                bounded.push(entry);
+            }
+            serde_json::to_string_pretty(&json!({
+                "entries": bounded,
+                "truncated": truncated,
+                "max_depth": outline_depth,
+            }))?
+        } else {
+            let encoded = serde_json::to_string_pretty(selected)?;
+            if encoded.len() > MAX_RESPONSE_BYTES {
+                return Err(ServerError::InvalidArg(format!(
+                    "selected JSON value exceeds {MAX_RESPONSE_BYTES} bytes; use outline or a more specific json_pointer"
+                )));
+            }
+            encoded
+        }
+    } else if let Some(text) = pre.content {
         // SMALL / Redacted / PartialScan content held fully in memory already.
         let bounded = apply_region_bounds(&text, region)?;
         enforce_response_limit(bounded.into_owned())
@@ -449,7 +810,25 @@ pub(crate) fn handle_file(
         .map(|f| format!("# [index freshness: {f}]\n"))
         .unwrap_or_default();
 
+    let navigation_note = if let Some(pointer) = &pointer {
+        format!(
+            "# [live JSON pointer: {}{}{}]\n",
+            serde_json::to_string(pointer)?,
+            group_range
+                .map(|(start, end)| format!("; array elements {start}..{end}"))
+                .unwrap_or_default(),
+            if unit_id.is_some() {
+                "; indexed selection may have changed"
+            } else {
+                ""
+            }
+        )
+    } else if unit_id.is_some() {
+        "# [unit line range is indexed; content is live and may have changed]\n".to_string()
+    } else {
+        String::new()
+    };
     Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-        "{header}{freshness_note}\n{body}"
+        "{header}{freshness_note}{navigation_note}\n{body}"
     ))]))
 }
