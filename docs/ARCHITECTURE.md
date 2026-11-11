@@ -3,9 +3,9 @@
 This document describes Attic **as it exists in the current codebase**, not
 as a history of how it was built. "Key design decisions" and "Core
 behavioral invariants" below consolidate what used to be a separate ADR/
-contract document set; this file is now the single authoritative
-architecture reference — nothing else needs to be read to understand how
-the system behaves.
+contract document set; this file is the current architecture reference.
+See [`PLAYBOOK.md`](PLAYBOOK.md) for operations and development, and
+[`PERFORMANCE.md`](PERFORMANCE.md) for sizing and measurement guidance.
 
 ## Contents
 
@@ -383,7 +383,8 @@ flowchart LR
 ```
 
 - **Own search, own budget:** `CentralKnowledgeGenerator`
-  (`candidates.rs`) runs on every `context` question with a
+  (`candidates.rs`) runs on each answer-mode question without an explicit
+  path scope, using a
   `repository_id` filter on the knowledge repository and a separate
   `BudgetAccountant` (`pipeline.rs::run_db_phases`). Code matches elsewhere
   cannot crowd it out, and no trigger words are needed.
@@ -600,7 +601,12 @@ Attic does not generate embeddings, download models, run inference, or build a
 vector index. `context` uses SQLite FTS5 lexical candidates together with
 symbols, structural relationships, dependency edges and project knowledge.
 `context(mode="SEARCH")` returns raw lexical matches without evidence assembly;
-the other modes assemble and validate evidence before returning an answer.
+`REFERENCES` performs bounded, syntactic scans of sanitized indexed files;
+answer modes assemble and validate evidence before returning an answer.
+Explicit repository and path scopes are applied before candidate limits.
+JSON units retain pointers and indexed source-location provenance; live-file
+navigation remains subject to freshness and sanitization. Workspace response
+budgets report omissions rather than presenting truncated evidence as complete.
 
 Lexical and graph retrieval are not equivalent to vector similarity. Exact
 identifiers, source text and explicit relationships are supported; vague

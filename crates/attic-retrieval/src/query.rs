@@ -65,6 +65,8 @@ pub struct ExtractedQuery {
     pub terms: Vec<String>,
     /// Path-like token if one appears (contains `/` or a known extension).
     pub path_hint: Option<String>,
+    /// Distinct path-like tokens, retained when the query mentions multiple files.
+    pub path_hints: Vec<String>,
     /// Identifier most likely to be a symbol name (longest identifier token).
     pub symbol_hint: Option<String>,
     /// Config key hint when the query names a setting.
@@ -145,12 +147,23 @@ pub fn classify(raw: &str) -> Result<Classification, crate::error::RetrievalErro
             }
         };
 
-    // Exact/path lookup: explicit path token without definition wording.
-    if extracted.path_hint.is_some() && !lower.contains("defin") && !lower.contains("call") {
+    // A filename inside a behavioral question is a hint, not an instruction
+    // to discard evidence from other files.
+    let path_lookup_words = [
+        "where", "is", "the", "file", "path", "find", "locate", "show", "me", "open", "to",
+    ];
+    let path_only_request = extracted.path_hints.len() == 1
+        && sanitized.split_whitespace().all(|word| {
+            let token =
+                word.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | '?' | ':' | ';'));
+            token == extracted.path_hints[0]
+                || path_lookup_words.contains(&token.to_ascii_lowercase().as_str())
+        });
+    if path_only_request {
         consider(
             QueryType::ExactLookup,
             ClassificationConfidence::High,
-            "path_token_without_intent_words",
+            "explicit_path_lookup",
             &mut detected,
         );
     }
@@ -375,7 +388,11 @@ pub fn classify(raw: &str) -> Result<Classification, crate::error::RetrievalErro
         );
     }
     // Bare identifier → definition-ish lookup (medium confidence).
-    if detected.is_none() && extracted.symbol_hint.is_some() {
+    if detected.is_none()
+        && extracted.path_hints.is_empty()
+        && sanitized.split_whitespace().count() <= 3
+        && extracted.symbol_hint.is_some()
+    {
         consider(
             QueryType::DefinitionLookup,
             ClassificationConfidence::Medium,
@@ -448,14 +465,20 @@ fn extract(sanitized: &str, lower: &str) -> ExtractedQuery {
         }
     }
 
-    // Path hint: first token containing '/' or ending in a known extension.
-    let path_hint = sanitized
-        .split_whitespace()
-        .map(|t| {
-            t.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == ',' || c == '?')
-        })
-        .find(|t| t.contains('/') || looks_like_path(t))
-        .map(str::to_owned);
+    let mut path_hints = Vec::new();
+    for token in sanitized.split_whitespace() {
+        let token = token.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | ',' | '?' | ':' | ';' | '[' | ']')
+        });
+        if !token.contains("://")
+            && (looks_like_path(token)
+                || (token.contains('/') && !token.starts_with('/') && !token.contains('(')))
+            && !path_hints.iter().any(|path| path == token)
+        {
+            path_hints.push(token.to_owned());
+        }
+    }
+    let path_hint = (path_hints.len() == 1).then(|| path_hints[0].clone());
 
     // Symbol hint: longest CamelCase / snake_case / dotted identifier token.
     let symbol_hint = sanitized
@@ -497,6 +520,7 @@ fn extract(sanitized: &str, lower: &str) -> ExtractedQuery {
     ExtractedQuery {
         terms,
         path_hint,
+        path_hints,
         symbol_hint,
         config_key_hint,
     }

@@ -143,6 +143,19 @@ pub struct Evidence {
     #[serde(default)]
     pub excerpt_span: Option<SourceSpan>,
 
+    /// Structured indexed unit identity, when distinct units share a source line.
+    #[serde(default)]
+    pub indexed_unit_id: Option<String>,
+    /// JSON pointer for a structured indexed unit.
+    #[serde(default)]
+    pub json_pointer: Option<String>,
+    /// Whether indexed JSON positions are usable, without asserting live freshness.
+    #[serde(default)]
+    pub location_status: Option<String>,
+    /// Whether JSON positions refer to source or sanitized analyzed content.
+    #[serde(default)]
+    pub position_basis: Option<String>,
+
     #[serde(default)]
     pub snippet_leading_omitted: bool,
     #[serde(default)]
@@ -216,6 +229,10 @@ impl Evidence {
             index_generation_id: None,
             source_span: None,
             excerpt_span: None,
+            indexed_unit_id: None,
+            json_pointer: None,
+            location_status: None,
+            position_basis: None,
             snippet_leading_omitted: false,
             snippet_trailing_omitted: false,
             content_hash: None,
@@ -236,12 +253,13 @@ impl Evidence {
     /// Deterministic dedup key: same logical content discovered through
     /// different retrievers must fuse into ONE evidence item, never multiply
     /// into fake independent support.
-    pub fn fusion_key(&self) -> (String, String, u32) {
+    pub fn fusion_key(&self) -> (String, String, u32, Option<String>) {
         let span_start = self.source_span.map(|s| s.start_line).unwrap_or(u32::MAX);
         (
             self.source_type.as_str().to_owned(),
             self.source_id.clone(),
             span_start,
+            self.indexed_unit_id.clone(),
         )
     }
 }

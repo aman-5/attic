@@ -423,6 +423,18 @@ pub fn delete_all_xrepo_edges_touching(
 /// every indexing profile (Go, Python, JS, etc.). The caller's budget
 /// enforces the real bound; `limit` is the SQL ceiling.
 pub fn cross_edges_all(conn: &Connection, limit: usize) -> Result<Vec<XrepoEdge>, StorageError> {
+    cross_edges_all_scoped(conn, limit, None)
+}
+
+/// Fetch cross-repository edges whose two endpoints belong to the selected workspace.
+pub fn cross_edges_all_scoped(
+    conn: &Connection,
+    limit: usize,
+    allowed_repositories: Option<&[String]>,
+) -> Result<Vec<XrepoEdge>, StorageError> {
+    let allowed = allowed_repositories
+        .map(serde_json::to_string)
+        .transpose()?;
     let sql = "
         SELECT r.id, r.source_repository_id, r.target_repository_id,
                r.source_entity_id, r.target_entity_id, r.resolution,
@@ -432,11 +444,15 @@ pub fn cross_edges_all(conn: &Connection, limit: usize) -> Result<Vec<XrepoEdge>
          WHERE r.rel_type = 'DEPENDS_ON'
            AND r.source_repository_id != r.target_repository_id
            AND r.freshness_state != 'INVALID'
+           AND (?2 IS NULL OR (
+               r.source_repository_id IN (SELECT value FROM json_each(?2))
+               AND r.target_repository_id IN (SELECT value FROM json_each(?2))
+           ))
          ORDER BY r.confidence DESC, r.id ASC
          LIMIT ?1";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
-        .query_map(rusqlite::params![limit as i64], |r| {
+        .query_map(rusqlite::params![limit as i64, allowed], |r| {
             Ok(XrepoEdge {
                 id: r.get(0)?,
                 source_repository_id: r.get(1)?,

@@ -64,6 +64,17 @@ pub fn search_symbols(
     name_fragment: &str,
     limit: usize,
 ) -> Result<Vec<SymbolHit>, StorageError> {
+    search_symbols_scoped(conn, repository_id, name_fragment, limit, None)
+}
+
+/// Search symbols with a repository-relative scope applied before the limit.
+pub fn search_symbols_scoped(
+    conn: &Connection,
+    repository_id: Option<&str>,
+    name_fragment: &str,
+    limit: usize,
+    scope: Option<&crate::PathScope>,
+) -> Result<Vec<SymbolHit>, StorageError> {
     // Escape LIKE metacharacters so caller input is matched literally.
     let escaped = name_fragment
         .replace('\\', "\\\\")
@@ -81,27 +92,35 @@ pub fn search_symbols(
            AND si.qualified_name LIKE ?2 ESCAPE '\\'
            AND fo.existence_state != 'deleted'
            AND fo.freshness_state IN ('CURRENT', 'STALE', 'UNKNOWN', 'PENDING_REFRESH')
+           AND (?4 = 0 OR (?4 = 1 AND fo.path = ?5)
+                OR (?4 = 2 AND (fo.path = ?5 OR substr(fo.path, 1, length(?5) + 1) = ?5 || '/'))
+                OR (?4 = 3 AND fo.path GLOB ?5))
          ORDER BY so.is_definition DESC,
                   LENGTH(si.qualified_name) ASC,
                   so.rowid DESC
          LIMIT ?3";
+    let (scope_kind, scope_path) =
+        scope.map_or_else(|| (0, String::new()), crate::PathScope::sql_parts);
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![repository_id, like, clamp(limit)], |r| {
-        Ok(SymbolHit {
-            identity_id: r.get(0)?,
-            repository_id: r.get(1)?,
-            language: r.get(2)?,
-            qualified_name: r.get(3)?,
-            kind: r.get(4)?,
-            occurrence_id: r.get(5)?,
-            is_definition: r.get::<_, i64>(6)? != 0,
-            span_str: r.get(7)?,
-            signature: r.get(8)?,
-            file_occurrence_id: r.get(9)?,
-            path: r.get(10)?,
-            freshness_state: r.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![repository_id, like, clamp(limit), scope_kind, scope_path],
+        |r| {
+            Ok(SymbolHit {
+                identity_id: r.get(0)?,
+                repository_id: r.get(1)?,
+                language: r.get(2)?,
+                qualified_name: r.get(3)?,
+                kind: r.get(4)?,
+                occurrence_id: r.get(5)?,
+                is_definition: r.get::<_, i64>(6)? != 0,
+                span_str: r.get(7)?,
+                signature: r.get(8)?,
+                file_occurrence_id: r.get(9)?,
+                path: r.get(10)?,
+                freshness_state: r.get(11)?,
+            })
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -116,6 +135,17 @@ pub fn lookup_symbol_exact(
     qualified_name: &str,
     limit: usize,
 ) -> Result<Vec<SymbolHit>, StorageError> {
+    lookup_symbol_exact_scoped(conn, repository_id, qualified_name, limit, None)
+}
+
+/// Look up exact symbol names with a pre-limit repository-relative scope.
+pub fn lookup_symbol_exact_scoped(
+    conn: &Connection,
+    repository_id: Option<&str>,
+    qualified_name: &str,
+    limit: usize,
+    scope: Option<&crate::PathScope>,
+) -> Result<Vec<SymbolHit>, StorageError> {
     let sql = "
         SELECT si.id, si.repository_id, si.language, si.qualified_name, si.kind,
                so.id, so.is_definition, so.source_span, so.signature,
@@ -126,11 +156,23 @@ pub fn lookup_symbol_exact(
          WHERE (?1 IS NULL OR si.repository_id = ?1)
            AND si.qualified_name = ?2
            AND fo.existence_state != 'deleted'
+           AND fo.freshness_state IN ('CURRENT', 'STALE', 'UNKNOWN', 'PENDING_REFRESH')
+           AND (?4 = 0 OR (?4 = 1 AND fo.path = ?5)
+                OR (?4 = 2 AND (fo.path = ?5 OR substr(fo.path, 1, length(?5) + 1) = ?5 || '/'))
+                OR (?4 = 3 AND fo.path GLOB ?5))
          ORDER BY so.is_definition DESC, so.rowid DESC
          LIMIT ?3";
+    let (scope_kind, scope_path) =
+        scope.map_or_else(|| (0, String::new()), crate::PathScope::sql_parts);
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(
-        rusqlite::params![repository_id, qualified_name, clamp(limit)],
+        rusqlite::params![
+            repository_id,
+            qualified_name,
+            clamp(limit),
+            scope_kind,
+            scope_path
+        ],
         |r| {
             Ok(SymbolHit {
                 identity_id: r.get(0)?,
@@ -230,6 +272,66 @@ pub fn relationships_for_entity(
             target_repository_id: r.get(12)?,
         })
     })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Fetch edges whose source file is within the requested path scope.
+pub fn relationships_for_entity_scoped(
+    conn: &Connection,
+    entity_id: &str,
+    limit: usize,
+    scope: &crate::PathScope,
+) -> Result<Vec<(RelationshipEdge, String)>, StorageError> {
+    let sql = "
+        SELECT r.id, r.source_entity_id, r.source_entity_type,
+               r.target_entity_id, r.target_entity_type,
+               r.rel_type, r.resolution, r.confidence, r.provenance_json,
+               r.source_revision_id, r.freshness_state,
+               r.source_repository_id, r.target_repository_id, fo.path
+          FROM core_relationships r
+          LEFT JOIN core_symbol_occurrences so
+            ON r.source_entity_type = 'SYMBOL_OCCURRENCE' AND so.id = r.source_entity_id
+          JOIN core_file_occurrences fo
+            ON fo.id = CASE WHEN r.source_entity_type = 'FILE_OCCURRENCE'
+                            THEN r.source_entity_id ELSE so.file_occurrence_id END
+         WHERE r.freshness_state IN ('CURRENT', 'STALE')
+           AND fo.freshness_state IN ('CURRENT', 'STALE', 'UNKNOWN', 'PENDING_REFRESH')
+           AND fo.existence_state != 'deleted'
+           AND (r.source_entity_id = ?1 OR r.target_entity_id = ?1)
+           AND ((?3 = 1 AND fo.path = ?4)
+                OR (?3 = 2 AND (fo.path = ?4 OR substr(fo.path, 1, length(?4) + 1) = ?4 || '/'))
+                OR (?3 = 3 AND fo.path GLOB ?4))
+         ORDER BY r.confidence DESC, r.id ASC
+         LIMIT ?2";
+    let (scope_kind, scope_path) = scope.sql_parts();
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![entity_id, clamp(limit), scope_kind, scope_path],
+        |r| {
+            Ok((
+                RelationshipEdge {
+                    id: r.get(0)?,
+                    source_entity_id: r.get(1)?,
+                    source_entity_type: r.get(2)?,
+                    target_entity_id: r.get(3)?,
+                    target_entity_type: r.get(4)?,
+                    rel_type: r.get(5)?,
+                    resolution: r.get(6)?,
+                    confidence: r.get(7)?,
+                    provenance_json: r.get(8)?,
+                    source_revision_id: r.get(9)?,
+                    freshness_state: r.get(10)?,
+                    source_repository_id: r.get(11)?,
+                    target_repository_id: r.get(12)?,
+                },
+                r.get(13)?,
+            ))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

@@ -57,7 +57,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{
     Layer, filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
-use validate::{require_active_member, validate_filter, validate_repository_id};
+use validate::{parse_path_scope, require_active_member, validate_filter, validate_repository_id};
 
 /// Runtime kill switch for file logging (see `main`'s subscriber setup and
 /// the `logging` MCP tool) — `None` until `main` initializes it, which
@@ -1894,6 +1894,21 @@ impl ServerHandler for AtticServer {
                 expand_active_ids(&pool, &active_roots, &container_repo_roots).0
             } else {
                 HashSet::new()
+            };
+            let args = if workspace_configured
+                && matches!(name.as_ref(), "file" | "repo_map" | "context")
+            {
+                match crate::validate::resolve_repository_selector(&pool, &args, &active_ids) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(
+                            error.to_string(),
+                        )])
+                        .into());
+                    }
+                }
+            } else {
+                args
             };
             if self.stores.is_some()
                 && (workspace_configured || matches!(name.as_ref(), "status" | "debug_drain_task"))

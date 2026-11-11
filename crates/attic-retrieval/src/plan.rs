@@ -53,6 +53,7 @@ str_enum! {
         SecretContentDetected => "SECRET_CONTENT_DETECTED",
         StaleBeyondThreshold => "STALE_BEYOND_THRESHOLD",
         PolicyBlockedSourceType => "POLICY_BLOCKED_SOURCE_TYPE",
+        OutOfScopePath => "OUT_OF_SCOPE_PATH",
         DuplicateContent => "DUPLICATE_CONTENT",
         CandidatesLimitReached => "CANDIDATES_LIMIT_REACHED",
         ProvenanceInvalid => "PROVENANCE_INVALID",

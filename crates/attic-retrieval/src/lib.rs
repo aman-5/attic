@@ -43,6 +43,7 @@ pub mod verify;
 pub use error::RetrievalError;
 pub use hybrid::{
     HybridSearchOptions, HybridSearchResponse, HybridSearchResult, HybridSearcher, MatchType,
+    SearchMatchMode,
 };
 pub use mode::{AnswerMode, AnswerModePolicy};
 pub use pipeline::{AnswerOutcome, AnswerRequest, RetrievalService};

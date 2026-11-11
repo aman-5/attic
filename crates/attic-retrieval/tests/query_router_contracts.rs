@@ -100,6 +100,40 @@ fn classification_is_deterministic() {
     assert_eq!(a, b);
 }
 
+#[test]
+fn named_paths_do_not_override_behavioral_intent() {
+    for (query, expected) in [
+        (
+            "In forms/entry.json why does the workflow fail?",
+            QueryType::DebuggingRootCause,
+        ),
+        (
+            "How does the workflow in forms/entry.json work?",
+            QueryType::ArchitectureExplanation,
+        ),
+        (
+            "Find references to handler in forms/entry.json",
+            QueryType::SymbolNavigation,
+        ),
+        ("Where is forms/entry.json?", QueryType::ExactLookup),
+    ] {
+        let classification = classify(query).unwrap();
+        assert_eq!(classification.query_type, expected, "{query}");
+        assert_eq!(
+            classification.extracted.path_hints,
+            vec!["forms/entry.json"]
+        );
+    }
+    let multiple =
+        classify("Compare the flow in first.json and second.json across repositories").unwrap();
+    assert_eq!(
+        multiple.extracted.path_hints,
+        vec!["first.json", "second.json"]
+    );
+    assert!(multiple.extracted.path_hint.is_none());
+    assert_ne!(multiple.query_type, QueryType::ExactLookup);
+}
+
 // ─── §4 evidence contracts ───────────────────────────────────────────────────
 
 #[test]

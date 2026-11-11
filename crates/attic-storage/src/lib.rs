@@ -37,17 +37,20 @@ pub use connection::{DbPool, open_db, open_db_with_pragmas};
 pub use crossrepo_ops::{
     CatalogRow, DeclarationRow, WorkspaceSnapshotRevision, WorkspaceSnapshotRow, XrepoEdge,
     all_catalog_entries, all_repository_ids, catalog_entry, create_workspace_snapshot,
-    cross_edges_all, cross_edges_between, cross_edges_for_entities, cross_edges_touching,
-    declarations_for_repository, delete_all_xrepo_edges_touching,
+    cross_edges_all, cross_edges_all_scoped, cross_edges_between, cross_edges_for_entities,
+    cross_edges_touching, declarations_for_repository, delete_all_xrepo_edges_touching,
     delete_declarations_for_repository, delete_xrepo_edges_between, insert_declaration,
     insert_xrepo_edge, latest_workspace_snapshot, providers_of_identity,
     remove_repository_crossrepo_data, snapshot_revisions, upsert_catalog_row,
 };
 pub use error::StorageError;
 pub use fts::{
-    FtsSearchParams, FtsSearchResult, MAX_SEARCH_RESULTS, NewRetrievalUnit, UnitTextEnrichment,
-    delete_retrieval_unit_with_fts, delete_retrieval_units_for_file, fts_path_lookup, fts_search,
-    fts_search_with_timeout, insert_retrieval_unit_with_fts, retrieval_unit_texts,
+    FtsSearchParams, FtsSearchResult, IndexedPathCandidate, MAX_SEARCH_RESULTS, NewRetrievalUnit,
+    PathScope, RetrievalUnitLocation, UnitTextEnrichment, delete_retrieval_unit_with_fts,
+    delete_retrieval_units_for_file, fts_path_lookup, fts_path_lookup_inferred, fts_search,
+    fts_search_scoped, fts_search_with_timeout, fts_search_with_timeout_scoped,
+    fts_search_with_timeout_scoped_allowed, indexed_path_candidates,
+    insert_retrieval_unit_with_fts, retrieval_unit_location, retrieval_unit_texts,
 };
 pub use indexing_publication::{
     IndexPublication, IndexPublicationStats, PublicationFile, PublicationNode,
@@ -84,11 +87,11 @@ pub use writer::{WriterConfig, WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.
 pub use repository::file_occurrence::{
-    NewFileOccurrence, OccurrenceSnapshot, bulk_file_identities_for_repository,
+    NewFileOccurrence, OccurrenceSnapshot, ReferenceFile, bulk_file_identities_for_repository,
     bulk_latest_occurrence_ids_for_repository, current_files_for_repo_map,
     current_path_hashes_for_repository, insert_file_occurrence, latest_active_paths_for_repository,
     lookup_file_identity_by_basis, lookup_latest_file_occurrence_for_path,
-    lookup_occurrence_snapshot, upsert_file_identity,
+    lookup_occurrence_snapshot, reference_files, upsert_file_identity,
 };
 pub use repository::identity_links::{
     NewIdentityLink, basis as identity_basis, confidence as identity_confidence,
@@ -108,7 +111,8 @@ pub use repository::structural::{StructuralCounts, lookup_symbol_definition_occu
 pub use retrieval_reads::{
     FileHeader, NewRetrievalPlanRecord, NodeRow, RelationshipEdge, RetrievalTelemetry, SymbolHit,
     file_header_by_id, get_retrieval_plan_json, insert_retrieval_plan, latest_occurrence_for_path,
-    lookup_symbol_exact, relationships_for_entity, retrieval_plan_stats, search_symbols,
+    lookup_symbol_exact, lookup_symbol_exact_scoped, relationships_for_entity,
+    relationships_for_entity_scoped, retrieval_plan_stats, search_symbols, search_symbols_scoped,
     structural_nodes_for_file,
 };
 pub use semantic_reads::{

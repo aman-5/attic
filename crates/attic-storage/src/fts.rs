@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
@@ -67,8 +67,16 @@ pub struct FtsSearchResult {
     pub score: f64,
     /// Start line (0-based) of the retrieval unit span, if recorded.
     pub start_line: Option<u32>,
-    /// End line (0-based, inclusive) of the retrieval unit span, if recorded.
+    /// End line (0-based, exclusive) of the retrieval unit span, if recorded.
     pub end_line: Option<u32>,
+    /// Analyzer that produced the indexed unit.
+    pub analyzer_id: String,
+    /// Per-occurrence structured provenance, when recorded.
+    pub occurrence_metadata: Option<String>,
+    /// Hash of the canonical unit body.
+    pub canonical_hash: Option<String>,
+    /// Canonical body, if distinct from retrieval text.
+    pub canonical_text: Option<String>,
     /// Freshness of the source file occurrence backing this unit
     /// (`CURRENT | STALE | UNKNOWN | INVALID | PENDING_REFRESH`).
     ///
@@ -151,7 +159,7 @@ pub struct NewRetrievalUnit<'a> {
     pub analyzer_version: &'a str,
     /// Start line within the file (0-based).
     pub start_line: Option<u32>,
-    /// End line within the file (0-based, inclusive).
+    /// End line within the file (0-based, exclusive).
     pub end_line: Option<u32>,
     /// Whether this unit's text was redacted by Phase 1B.
     pub is_redacted: bool,
@@ -290,6 +298,77 @@ pub struct FtsSearchParams<'a> {
     pub max_results: usize,
 }
 
+/// A repository-relative file scope applied before the FTS result limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathScope {
+    /// One exact repository-relative path.
+    Exact(String),
+    /// A directory and its descendants.
+    Prefix(String),
+    /// A path glob using `*` and `?`.
+    Glob(String),
+}
+
+impl PathScope {
+    /// Test whether a normalized repository-relative path belongs to this scope.
+    pub fn matches_path(&self, path: &str) -> bool {
+        match self {
+            Self::Exact(expected) => path == expected,
+            Self::Prefix(prefix) => {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+            Self::Glob(pattern) => glob_matches(pattern, path),
+        }
+    }
+
+    pub(crate) fn sql_parts(&self) -> (i64, String) {
+        match self {
+            Self::Exact(value) => (1, value.clone()),
+            Self::Prefix(value) => (2, value.clone()),
+            Self::Glob(value) => {
+                let mut escaped = String::new();
+                for ch in value.chars() {
+                    match ch {
+                        '[' => escaped.push_str("[[]"),
+                        ']' => escaped.push_str("[]]"),
+                        _ => escaped.push(ch),
+                    }
+                }
+                (3, escaped)
+            }
+        }
+    }
+}
+
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let path: Vec<char> = path.chars().collect();
+    let (mut p, mut s, mut star, mut retry) = (0, 0, None, 0);
+    while s < path.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == path[s]) {
+            p += 1;
+            s += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            retry = s;
+        } else if let Some(position) = star {
+            retry += 1;
+            s = retry;
+            p = position + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 /// Execute a bounded, deterministic FTS5 lexical search over retrieval units.
 ///
 /// # Security
@@ -299,7 +378,16 @@ pub fn fts_search(
     conn: &Connection,
     p: &FtsSearchParams<'_>,
 ) -> Result<Vec<FtsSearchResult>, StorageError> {
-    fts_search_inner(conn, p)
+    fts_search_inner(conn, p, None, None, false, false)
+}
+
+/// Search within an optional repository-relative path scope.
+pub fn fts_search_scoped(
+    conn: &Connection,
+    p: &FtsSearchParams<'_>,
+    scope: Option<&PathScope>,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_search_inner(conn, p, scope, None, false, false)
 }
 
 /// Execute a bounded FTS query, interrupting SQLite if its VM work exceeds
@@ -310,9 +398,39 @@ pub fn fts_search_with_timeout(
     p: &FtsSearchParams<'_>,
     timeout: Duration,
 ) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_search_with_timeout_scoped(conn, p, timeout, None)
+}
+
+/// Search with a deadline and an optional repository-relative path scope.
+pub fn fts_search_with_timeout_scoped(
+    conn: &Connection,
+    p: &FtsSearchParams<'_>,
+    timeout: Duration,
+    scope: Option<&PathScope>,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_search_with_timeout_scoped_allowed(conn, p, timeout, scope, None, false, false)
+}
+
+/// Search with a deadline, path scope, and pre-limit repository/knowledge filters.
+pub fn fts_search_with_timeout_scoped_allowed(
+    conn: &Connection,
+    p: &FtsSearchParams<'_>,
+    timeout: Duration,
+    scope: Option<&PathScope>,
+    allowed_repositories: Option<&[String]>,
+    knowledge_paths_only: bool,
+    exclude_root_readme: bool,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
     let started = Instant::now();
     conn.progress_handler(1_000, Some(move || started.elapsed() >= timeout))?;
-    let result = fts_search_inner(conn, p);
+    let result = fts_search_inner(
+        conn,
+        p,
+        scope,
+        allowed_repositories,
+        knowledge_paths_only,
+        exclude_root_readme,
+    );
     conn.progress_handler(0, None::<fn() -> bool>)?;
     result
 }
@@ -320,8 +438,16 @@ pub fn fts_search_with_timeout(
 fn fts_search_inner(
     conn: &Connection,
     p: &FtsSearchParams<'_>,
+    scope: Option<&PathScope>,
+    allowed_repositories: Option<&[String]>,
+    knowledge_paths_only: bool,
+    exclude_root_readme: bool,
 ) -> Result<Vec<FtsSearchResult>, StorageError> {
     let limit = p.max_results.min(MAX_SEARCH_RESULTS) as i64;
+    let (scope_kind, scope_path) = scope.map_or_else(|| (0, String::new()), PathScope::sql_parts);
+    let allowed_json = allowed_repositories
+        .map(serde_json::to_string)
+        .transpose()?;
 
     // We JOIN fts back to the base table so deleted-but-not-yet-purged FTS
     // entries are excluded via the INNER JOIN condition.
@@ -341,6 +467,10 @@ fn fts_search_inner(
             bm25(fts_retrieval_units) AS score,
             r.start_line             AS start_line,
             r.end_line               AS end_line,
+            r.analyzer_id            AS analyzer_id,
+            r.occurrence_metadata    AS occurrence_metadata,
+            r.canonical_hash         AS canonical_hash,
+            r.canonical_text         AS canonical_text,
             fo.freshness_state       AS freshness_state
         FROM fts_retrieval_units fts
         INNER JOIN core_retrieval_units  r    ON r.rowid = fts.rowid
@@ -352,16 +482,35 @@ fn fts_search_inner(
           AND (?2 IS NULL OR COALESCE(r.repository_id, sr.repository_id) = ?2)
           AND (?3 IS NULL OR fo.file_type = ?3)
           AND (?4 IS NULL OR fo.language  = ?4)
+          AND (?6 = 0
+               OR (?6 = 1 AND fo.path = ?7)
+               OR (?6 = 2 AND (fo.path = ?7 OR substr(fo.path, 1, length(?7) + 1) = ?7 || '/'))
+               OR (?6 = 3 AND fo.path GLOB ?7))
+          AND (?8 IS NULL OR COALESCE(r.repository_id, sr.repository_id) IN
+               (SELECT value FROM json_each(?8)))
+          AND (?9 = 0 OR substr(lower(fo.path), 1, 10) = 'knowledge/')
+          AND (?10 = 0 OR lower(fo.path) != 'readme.md')
           AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
           AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
-          AND fo.existence_state != 'deleted'
+          AND fo.existence_state NOT IN ('deleted', 'excluded')
         ORDER BY bm25(fts_retrieval_units) ASC, fts.rowid ASC
         LIMIT ?5
     ";
 
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(
-        rusqlite::params![p.query, p.repository_id, p.file_type, p.language, limit],
+        rusqlite::params![
+            p.query,
+            p.repository_id,
+            p.file_type,
+            p.language,
+            limit,
+            scope_kind,
+            scope_path,
+            allowed_json,
+            knowledge_paths_only,
+            exclude_root_readme
+        ],
         |row| {
             let raw_score: f64 = row.get("score")?;
             Ok(FtsSearchResult {
@@ -377,6 +526,10 @@ fn fts_search_inner(
                 score: -raw_score,
                 start_line: row.get("start_line")?,
                 end_line: row.get("end_line")?,
+                analyzer_id: row.get("analyzer_id")?,
+                occurrence_metadata: row.get("occurrence_metadata")?,
+                canonical_hash: row.get("canonical_hash")?,
+                canonical_text: row.get("canonical_text")?,
                 freshness_state: row.get("freshness_state")?,
             })
         },
@@ -451,6 +604,26 @@ pub fn fts_path_lookup(
     repository_id: Option<&str>,
     max_results: usize,
 ) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_path_lookup_impl(conn, path, repository_id, max_results, false)
+}
+
+/// Look up an inferred basename or relative suffix without widening an explicit scope.
+pub fn fts_path_lookup_inferred(
+    conn: &Connection,
+    path: &str,
+    repository_id: Option<&str>,
+    max_results: usize,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
+    fts_path_lookup_impl(conn, path, repository_id, max_results, true)
+}
+
+fn fts_path_lookup_impl(
+    conn: &Connection,
+    path: &str,
+    repository_id: Option<&str>,
+    max_results: usize,
+    allow_suffix: bool,
+) -> Result<Vec<FtsSearchResult>, StorageError> {
     let limit = max_results.min(MAX_SEARCH_RESULTS) as i64;
 
     let sql = "
@@ -467,45 +640,160 @@ pub fn fts_path_lookup(
             0.0                      AS score,
             r.start_line             AS start_line,
             r.end_line               AS end_line,
+            r.analyzer_id            AS analyzer_id,
+            r.occurrence_metadata    AS occurrence_metadata,
+            r.canonical_hash         AS canonical_hash,
+            r.canonical_text         AS canonical_text,
             fo.freshness_state       AS freshness_state
         FROM core_retrieval_units  r
         INNER JOIN core_file_occurrences fo   ON fo.id   = r.file_occurrence_id
         INNER JOIN core_source_revisions sr   ON sr.id   = fo.source_revision_id
         LEFT  JOIN core_repositories     repo1 ON repo1.id = sr.repository_id
         LEFT  JOIN core_repositories     repo2 ON repo2.id = r.repository_id
-        WHERE fo.path = ?1
+        WHERE (fo.path = ?1 OR (?4 AND substr(fo.path, -(length(?1) + 1)) = '/' || ?1))
           AND (?2 IS NULL OR COALESCE(r.repository_id, sr.repository_id) = ?2)
           AND r.freshness_state  IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
           AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
-          AND fo.existence_state != 'deleted'
-        ORDER BY r.start_line ASC, r.rowid ASC
+          AND fo.existence_state NOT IN ('deleted', 'excluded')
+        ORDER BY (fo.path = ?1) DESC, fo.path ASC, r.start_line ASC, r.rowid ASC
         LIMIT ?3
     ";
 
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![path, repository_id, limit], |row| {
-        Ok(FtsSearchResult {
-            retrieval_unit_id: row.get("retrieval_unit_id")?,
-            file_occurrence_id: row.get("file_occurrence_id")?,
-            index_generation_id: row.get("index_generation_id")?,
-            repository_id: row.get("repository_id")?,
-            repository_name: row.get("repository_name")?,
-            path: row.get("path")?,
-            language: row.get("language")?,
-            file_type: row.get("file_type")?,
-            body: row.get("body")?,
-            score: 0.0,
-            start_line: row.get("start_line")?,
-            end_line: row.get("end_line")?,
-            freshness_state: row.get("freshness_state")?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![path, repository_id, limit, allow_suffix],
+        |row| {
+            Ok(FtsSearchResult {
+                retrieval_unit_id: row.get("retrieval_unit_id")?,
+                file_occurrence_id: row.get("file_occurrence_id")?,
+                index_generation_id: row.get("index_generation_id")?,
+                repository_id: row.get("repository_id")?,
+                repository_name: row.get("repository_name")?,
+                path: row.get("path")?,
+                language: row.get("language")?,
+                file_type: row.get("file_type")?,
+                body: row.get("body")?,
+                score: 0.0,
+                start_line: row.get("start_line")?,
+                end_line: row.get("end_line")?,
+                analyzer_id: row.get("analyzer_id")?,
+                occurrence_metadata: row.get("occurrence_metadata")?,
+                canonical_hash: row.get("canonical_hash")?,
+                canonical_text: row.get("canonical_text")?,
+                freshness_state: row.get("freshness_state")?,
+            })
+        },
+    )?;
 
     let mut results = Vec::new();
     for row in rows {
         results.push(row?);
     }
     Ok(results)
+}
+
+/// One active indexed path considered for a natural-language path hint.
+#[derive(Debug, Clone)]
+pub struct IndexedPathCandidate {
+    /// Owning repository ID.
+    pub repository_id: String,
+    /// Normalized repository-relative path.
+    pub path: String,
+}
+
+/// Resolve exact or suffix path hints before any retrieval-unit result limit.
+pub fn indexed_path_candidates(
+    conn: &Connection,
+    path: &str,
+    allow_suffix: bool,
+    allowed_repositories: &[String],
+    scope: Option<&PathScope>,
+    limit: usize,
+) -> Result<Vec<IndexedPathCandidate>, StorageError> {
+    let allowed = serde_json::to_string(allowed_repositories)?;
+    let (scope_kind, scope_path) = scope.map_or_else(|| (0, String::new()), PathScope::sql_parts);
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT COALESCE(r.repository_id, sr.repository_id) AS repository_id, fo.path
+           FROM core_retrieval_units r
+           JOIN core_file_occurrences fo ON fo.id = r.file_occurrence_id
+           JOIN core_source_revisions sr ON sr.id = fo.source_revision_id
+          WHERE (fo.path = ?1 OR (?2 AND substr(fo.path, -(length(?1) + 1)) = '/' || ?1))
+            AND COALESCE(r.repository_id, sr.repository_id) IN (SELECT value FROM json_each(?3))
+            AND (?4 = 0 OR (?4 = 1 AND fo.path = ?5)
+                 OR (?4 = 2 AND (fo.path = ?5 OR substr(fo.path, 1, length(?5) + 1) = ?5 || '/'))
+                 OR (?4 = 3 AND fo.path GLOB ?5))
+            AND r.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+            AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+            AND fo.existence_state NOT IN ('deleted', 'excluded')
+          ORDER BY fo.path, repository_id
+          LIMIT ?6",
+    )?;
+    let rows = statement.query_map(
+        params![
+            path,
+            allow_suffix,
+            allowed,
+            scope_kind,
+            scope_path,
+            limit.min(21) as i64
+        ],
+        |row| {
+            Ok(IndexedPathCandidate {
+                repository_id: row.get(0)?,
+                path: row.get(1)?,
+            })
+        },
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Indexed provenance needed to expand a retrieval unit against live source.
+#[derive(Debug, Clone)]
+pub struct RetrievalUnitLocation {
+    /// Repository-relative source path.
+    pub path: String,
+    /// Analyzer that produced the unit.
+    pub analyzer_id: String,
+    /// Per-occurrence structured provenance.
+    pub occurrence_metadata: Option<String>,
+    /// Zero-based first line.
+    pub start_line: Option<u32>,
+    /// Zero-based exclusive end line.
+    pub end_line: Option<u32>,
+    /// Recorded freshness of the backing occurrence.
+    pub freshness_state: String,
+}
+
+/// Locate an eligible unit in its repository without reading source content.
+pub fn retrieval_unit_location(
+    conn: &Connection,
+    repository_id: &str,
+    unit_id: &str,
+) -> Result<Option<RetrievalUnitLocation>, StorageError> {
+    let result = conn
+        .query_row(
+            "SELECT fo.path, r.analyzer_id, r.occurrence_metadata,
+                    r.start_line, r.end_line, fo.freshness_state
+             FROM core_retrieval_units r
+             JOIN core_file_occurrences fo ON fo.id = r.file_occurrence_id
+             WHERE r.id = ?1 AND r.repository_id = ?2
+               AND r.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+               AND fo.freshness_state IN ('CURRENT', 'STALE', 'PENDING_REFRESH')
+               AND fo.existence_state NOT IN ('deleted', 'excluded')",
+            params![unit_id, repository_id],
+            |row| {
+                Ok(RetrievalUnitLocation {
+                    path: row.get(0)?,
+                    analyzer_id: row.get(1)?,
+                    occurrence_metadata: row.get(2)?,
+                    start_line: row.get(3)?,
+                    end_line: row.get(4)?,
+                    freshness_state: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +1166,121 @@ mod tests {
         .unwrap();
         assert_eq!(scoped.len(), 1, "repo-scoped search must return 1 result");
         assert_eq!(scoped[0].retrieval_unit_id, uid_a);
+    }
+
+    #[test]
+    fn path_scope_filters_before_limit_and_respects_directory_boundaries() {
+        let conn = migrated_conn();
+        let (repo, rev, generation) = seed_repo_rev_gen(&conn, "/repo/scoped");
+        for path in [
+            "other/first.json",
+            "src-extra/not-in-directory.json",
+            "src/nested/target.json",
+            "src/target.json",
+        ] {
+            let occurrence = seed_file(&conn, &repo, &rev, &generation, path);
+            let id = uuid::Uuid::new_v4().to_string();
+            insert_retrieval_unit_with_fts(
+                &conn,
+                &NewRetrievalUnit {
+                    id: &id,
+                    file_occurrence_id: &occurrence.to_string_repr(),
+                    index_generation_id: &generation.to_string_repr(),
+                    repository_id: &repo.to_string_repr(),
+                    retrieval_text: "shared needle",
+                    analyzer_id: "generic",
+                    analyzer_version: "1.0.0",
+                    start_line: Some(0),
+                    end_line: Some(1),
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+        }
+        let params = FtsSearchParams {
+            query: "needle",
+            repository_id: None,
+            file_type: None,
+            language: None,
+            max_results: 1,
+        };
+        let exact = PathScope::Exact("src/target.json".into());
+        let hits = fts_search_scoped(&conn, &params, Some(&exact)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/target.json");
+
+        let prefix = PathScope::Prefix("src".into());
+        assert!(prefix.matches_path("src/nested/target.json"));
+        assert!(!prefix.matches_path("src-extra/not-in-directory.json"));
+        let hits = fts_search_scoped(
+            &conn,
+            &FtsSearchParams {
+                max_results: 10,
+                ..params.clone()
+            },
+            Some(&prefix),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| prefix.matches_path(&hit.path)));
+
+        let glob = PathScope::Glob("src/*/target.json".into());
+        let hits = fts_search_scoped(&conn, &params, Some(&glob)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/nested/target.json");
+        assert!(glob.matches_path(&hits[0].path));
+    }
+
+    #[test]
+    fn repository_membership_and_literal_glob_brackets_filter_before_limit() {
+        let conn = migrated_conn();
+        let (inactive, inactive_rev, inactive_gen) = seed_repo_rev_gen(&conn, "/inactive");
+        let (active, active_rev, active_gen) = seed_repo_rev_gen(&conn, "/active");
+        for (repo, rev, generation, path) in [
+            (&inactive, &inactive_rev, &inactive_gen, "src/a.rs"),
+            (&active, &active_rev, &active_gen, "src/[a].rs"),
+        ] {
+            let occurrence = seed_file(&conn, repo, rev, generation, path);
+            insert_retrieval_unit_with_fts(
+                &conn,
+                &NewRetrievalUnit {
+                    id: &uuid::Uuid::new_v4().to_string(),
+                    file_occurrence_id: &occurrence.to_string_repr(),
+                    index_generation_id: &generation.to_string_repr(),
+                    repository_id: &repo.to_string_repr(),
+                    retrieval_text: "shared membershipneedle",
+                    analyzer_id: "generic",
+                    analyzer_version: "1",
+                    start_line: Some(0),
+                    end_line: Some(1),
+                    is_redacted: false,
+                },
+            )
+            .unwrap();
+        }
+        let params = FtsSearchParams {
+            query: "membershipneedle",
+            repository_id: None,
+            file_type: None,
+            language: None,
+            max_results: 1,
+        };
+        let scope = PathScope::Glob("src/[a].rs".into());
+        assert!(scope.matches_path("src/[a].rs"));
+        assert!(!scope.matches_path("src/a.rs"));
+        let hits = fts_search_with_timeout_scoped_allowed(
+            &conn,
+            &params,
+            Duration::from_secs(3),
+            Some(&scope),
+            Some(&[active.to_string_repr()]),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/[a].rs");
+        assert_eq!(hits[0].repository_id, active.to_string_repr());
     }
 
     // -----------------------------------------------------------------------

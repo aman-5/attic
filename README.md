@@ -18,10 +18,10 @@ into your projects.
 |---|---|
 | 🔎 **Hybrid search** | Local lexical search combined with explicit code relationships; no model inference or vector index |
 | 🧬 **Code structure** | Symbols, definitions, imports and call/inheritance relationships for Java, Python, Go, JS/TS and 11 more languages |
-| ⚡ **Always current** | A file watcher re-indexes only what changed, seconds after you save |
+| ⚡ **Always current** | A debounced file watcher re-indexes verified changes; periodic reconciliation is the fallback |
 | ✅ **Evidence, not guesses** | `context` answers cite verified source spans — or say `INSUFFICIENT_EVIDENCE` |
 | 🕸️ **Many repositories** | One workspace spanning unrelated folders, with cross-repo dependency edges from Maven, Gradle, npm, Go, Python, OSGi, AEM and git submodules |
-| 🧠 **Project knowledge** | Drop Markdown notes in `~/.attic/knowledge/` (on by default); every `context` answer gets them, for every repo |
+| 🧠 **Project knowledge** | Drop Markdown notes in `~/.attic/knowledge/` (on by default); answer-mode `context` can include them unless you set an explicit path scope |
 | 🔒 **Local-first** | Indexing and retrieval require no cloud service, model download or external database |
 
 ## Contents
@@ -144,7 +144,8 @@ project) — the same `mcpServers` block as Claude Desktop.
 
 The client calls Attic's `workspace` tool. Attic validates each root, indexes
 it, starts watching it and remembers the workspace (in `~/.attic/config/config.toml`)
-across restarts. Roots can live anywhere — no common parent, no symlinks.
+across restarts. Roots can live anywhere; they do not need a common parent or
+to be Git submodules.
 Ask *"What's Attic's status?"* at any time to see progress.
 
 Prefer configuration to conversation? Set `ATTIC_WORKSPACE_ROOT` (one
@@ -297,8 +298,8 @@ explicit dependency contracts remain grounded in source evidence.
 
 | Tool | What it does |
 |---|---|
-| `context` | One door for answers and retrieval. Default: evidence-backed answer to a question, with verified claims — `FAST` / `NORMAL` / `DEEP`. Includes up to 8 matching notes from the knowledge folder. With `mode: "SEARCH"`: raw lexical retrieval (SQLite FTS5) without evidence assembly — each result has a `source_type`, a bounded ~240-char snippet, and line anchors when recorded; accepts `file_type`, `language`, `max_results` (default 25, cap 200), and `scope: "knowledge"` for project knowledge only |
-| `file` | A bounded, secret-scanned region of a live file (line or byte range) |
+| `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
+| `file` | Bounded, secret-scanned live-file ranges, JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Structure and statistics of one repository |
 | `status` | Readiness, indexing/watcher state, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
@@ -314,8 +315,40 @@ answers. Identical excerpts share a body while preserving all source citations.
 Rejected-evidence counts/reasons are always present; pass
 `include_diagnostics: true` for individual rejected items. Response `telemetry`
 reports server timings and exact JSON-text bytes, not client/model latency.
-Existing retrieval budgets remain; no extra global response cap is imposed.
+`context` responses are capped at 64 KiB for FAST, 128 KiB for NORMAL,
+SEARCH and REFERENCES, and 256 KiB for DEEP. Omitted material and narrowing
+or continuation guidance appear in `response_budget`.
 See [response quality and latency diagnosis](docs/PERFORMANCE.md).
+
+`SEARCH` combines adjacent terms with ranked OR; `match_mode: "all"` restores
+strict adjacent-term matching. Quoted phrases, uppercase `AND`/`OR`/binary
+`NOT` and parentheses are supported. Use `repository` (unambiguous active
+name, UUID or absolute root), `repository_id`, and one of `path`,
+`path_prefix`, or `path_glob` to limit retrieval. Inferred filename ambiguity
+or missing paths are reported rather than silently treated as an explicit
+scope. Without an explicit path scope, answer modes may supplement a selected
+repository with central knowledge and workspace dependency relationships;
+SEARCH and REFERENCES remain scoped to the selected repository.
+
+JSON search results may include a `json_pointer`, `retrieval_unit_id` and
+indexed source locations. Locations are `indexed_unverified`: expand with
+`file` against current sanitized content, and treat `position_basis` as
+authoritative for byte offsets. Legacy JSON units without source positions
+require reanalysis. Unit expansion can select an indexed array group; indices
+may have changed since indexing.
+
+`REFERENCES` finds literal JSON keys/string values and text matches in bounded
+sanitized indexed files. Its definition/reference labels are syntactic, not
+semantic resolution. An empty result proves absence only when
+`coverage.absence_proven` is true for a fully scanned, current, safe exact
+file. Other coverage can be incomplete; use returned continuation fields or
+narrow the scope. Defaults are 32 files and 100 matches, with maxima of 64
+files and 200 matches.
+
+To use these changes in an existing installation, rebuild/install the server,
+restart the MCP server/daemon, and reindex affected repositories so JSON
+locations use the updated analyzer. Existing legacy locations are not
+presented as verified source positions.
 
 ## How it works
 
@@ -354,7 +387,7 @@ files use the same small format:
 path = "/home/you/code/orders-service"
 
 [[repositories]]
-path = "D:\work\shared-libs"
+path = 'D:\work\shared-libs'
 ```
 
 Each root is validated and indexed independently: a missing or unreadable root
@@ -378,7 +411,7 @@ repositories and never in Hugging Face's global `~/.cache/huggingface` cache:
 | `data/repositories/<stable-id>/index.db` (+ `-wal`, `-shm`) | Repository-local graph, lexical index and source evidence |
 | `config/config.toml` | Workspace membership (`[[repositories]]`) |
 | `config/attic.toml` | Tunables (below); a commented template is written on first run |
-| `knowledge/` | Your project-knowledge notes, served to every `context` answer. Created on first start; move or disable it with `[knowledge]` in `attic.toml`. See [`knowledge/README.md`](knowledge/README.md) |
+| `knowledge/` | Your central project-knowledge notes; answer-mode `context` can include them unless an explicit path scope is set. Created on first start; move or disable with `[knowledge]` in `attic.toml`. See [`knowledge/README.md`](knowledge/README.md) |
 | `logs/` | Daily file log — off by default, created only after `logging {"action":"on"}` |
 | `backups/` | Historical backups, preserved; not automatically purged |
 | `run/attic.lock`, `run/attic.ipc` | Daemon election and relay address |
@@ -436,7 +469,13 @@ still fail closed.
 | Key | Default | Effect |
 |---|---|---|
 | `enabled` | `true` | `false` turns project knowledge off; no folder is created |
-| `dir` | `<ATTIC_HOME>/knowledge` | Use another folder instead (must already exist; only the default is created for you). Notes are served to every `context` answer, for every repository; the folder's own `README.md` is skipped. A bad path is reported in `status` → `knowledge` and never stops startup. See [`knowledge/README.md`](knowledge/README.md) |
+| `dir` | `<ATTIC_HOME>/knowledge` | Use another folder instead (must already exist; only the default is created for you). Answer-mode `context` can include central notes unless an explicit path scope is set; the folder's own `README.md` is skipped. A bad path is reported in `status` → `knowledge` and never stops startup. See [`knowledge/README.md`](knowledge/README.md) |
+
+**`[logging]`**
+
+| Key | Default | Effect |
+|---|---|---|
+| `file_level` | off | Persist file logging at `off`, `error`, `warn`, `info`, `debug`, or `trace`; the `logging` tool can override it until the next restart |
 
 </details>
 
