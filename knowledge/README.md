@@ -2,8 +2,8 @@
 
 Your code shows **what** the system does. It rarely says **why**, who owns
 it, or which rule nobody should break. Write that down once, as a Markdown
-note, and Attic gives it to your AI assistant on **every** question, for
-**every** repository.
+note. Attic can include central knowledge in answer-mode `context` results
+for every repository when the query has no explicit path scope.
 
 | | Without notes | With notes |
 |---|---|---|
@@ -24,20 +24,22 @@ It's **on by default**. There's nothing to configure.
 
 1. Start Attic once, and `~/.attic/knowledge/` appears.
 2. Drop `.md` files in it. Edits are picked up automatically.
-3. Ask anything. `status` → `knowledge.state` shows `ready` once it's indexed.
+3. Check `status.knowledge.state`; it shows `ready` once indexing completes.
 
 ## 🔍 What happens when you ask
 
 ```mermaid
 flowchart LR
-  Q["❓ Your question<br/>(about any repo)"] --> C["🔎 Code search<br/>your repositories"]
-  Q --> K["🧠 Knowledge search<br/>your notes only · up to 8"]
+  Q["❓ Answer-mode context question<br/>(no explicit path scope)"] --> C["🔎 Code evidence<br/>your repositories"]
+  Q --> K["🧠 Central knowledge evidence<br/>up to 8 notes"]
   C --> A["📄 One answer"]
   K --> A
 ```
 
-Your notes get **their own search**, so a thousand matching code files can't
-push them out. In the answer, a note looks like this:
+Central notes have a separate, bounded evidence source, so code matches
+cannot crowd them out. Answer-mode `context` can include up to eight central
+notes; an explicit path scope disables this source. In the answer, a note
+looks like this:
 
 ```text
 ## [KNOWLEDGE] billing.md:3:1-3:47
@@ -45,8 +47,8 @@ push them out. In the answer, a note looks like this:
 ```
 
 > [!TIP]
-> Want notes only? Use `search` with `scope: "knowledge"`. Every `search`
-> result also tells you its `source_type`: `knowledge`, `documentation`,
+> Want notes only? Call `context` with `mode: "SEARCH"` and
+> `scope: "knowledge"`. Each result includes `source_type`: `knowledge`, `documentation`,
 > `code`, `config` or `test`.
 
 ## ✍️ What makes a great note
@@ -97,13 +99,16 @@ instructions in it.
 <details>
 <summary>What about <code>knowledge/</code> folders inside a repository?</summary>
 
-They still count as knowledge for that repository. They share the normal
-search, though, so code can crowd them out. The central folder is the
-reliable option.
+They still count as knowledge for that repository. A normal `context` answer
+may rank them alongside code, so use `context` with `mode: "SEARCH"` and
+`scope: "knowledge"` to search central and repository knowledge notes without
+code results. Answer-mode `context` separately reserves up to eight results
+for central knowledge when no explicit path scope is supplied.
 </details>
 
 <details>
 <summary>I changed <code>dir</code>. What happens to the old notes?</summary>
 
-They stay stored in Attic's database but are never shown again.
+They may remain in Attic's managed index, but queries search only the
+currently configured knowledge folder.
 </details>

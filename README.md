@@ -18,10 +18,10 @@ into your projects.
 |---|---|
 | 🔎 **Hybrid search** | Local lexical search combined with explicit code relationships; no model inference or vector index |
 | 🧬 **Code structure** | Symbols, definitions, imports and call/inheritance relationships for Java, Python, Go, JS/TS and 11 more languages |
-| ⚡ **Always current** | A file watcher re-indexes only what changed, seconds after you save |
+| ⚡ **Always current** | A debounced file watcher re-indexes verified changes; periodic reconciliation is the fallback |
 | ✅ **Evidence, not guesses** | `context` answers cite verified source spans — or say `INSUFFICIENT_EVIDENCE` |
 | 🕸️ **Many repositories** | One workspace spanning unrelated folders, with cross-repo dependency edges from Maven, Gradle, npm, Go, Python, OSGi, AEM and git submodules |
-| 🧠 **Project knowledge** | Drop Markdown notes in `~/.attic/knowledge/` (on by default); every `context` answer gets them, for every repo |
+| 🧠 **Project knowledge** | Drop Markdown notes in `~/.attic/knowledge/` (on by default); answer-mode `context` can include them unless you set an explicit path scope |
 | 🔒 **Local-first** | Indexing and retrieval require no cloud service, model download or external database |
 
 ## Contents
@@ -144,7 +144,8 @@ project) — the same `mcpServers` block as Claude Desktop.
 
 The client calls Attic's `workspace` tool. Attic validates each root, indexes
 it, starts watching it and remembers the workspace (in `~/.attic/config/config.toml`)
-across restarts. Roots can live anywhere — no common parent, no symlinks.
+across restarts. Roots can live anywhere; they do not need a common parent or
+to be Git submodules.
 Ask *"What's Attic's status?"* at any time to see progress.
 
 Prefer configuration to conversation? Set `ATTIC_WORKSPACE_ROOT` (one
@@ -386,7 +387,7 @@ files use the same small format:
 path = "/home/you/code/orders-service"
 
 [[repositories]]
-path = "D:\work\shared-libs"
+path = 'D:\work\shared-libs'
 ```
 
 Each root is validated and indexed independently: a missing or unreadable root
@@ -410,7 +411,7 @@ repositories and never in Hugging Face's global `~/.cache/huggingface` cache:
 | `data/repositories/<stable-id>/index.db` (+ `-wal`, `-shm`) | Repository-local graph, lexical index and source evidence |
 | `config/config.toml` | Workspace membership (`[[repositories]]`) |
 | `config/attic.toml` | Tunables (below); a commented template is written on first run |
-| `knowledge/` | Your project-knowledge notes, served to every `context` answer. Created on first start; move or disable it with `[knowledge]` in `attic.toml`. See [`knowledge/README.md`](knowledge/README.md) |
+| `knowledge/` | Your central project-knowledge notes; answer-mode `context` can include them unless an explicit path scope is set. Created on first start; move or disable with `[knowledge]` in `attic.toml`. See [`knowledge/README.md`](knowledge/README.md) |
 | `logs/` | Daily file log — off by default, created only after `logging {"action":"on"}` |
 | `backups/` | Historical backups, preserved; not automatically purged |
 | `run/attic.lock`, `run/attic.ipc` | Daemon election and relay address |
@@ -468,7 +469,13 @@ still fail closed.
 | Key | Default | Effect |
 |---|---|---|
 | `enabled` | `true` | `false` turns project knowledge off; no folder is created |
-| `dir` | `<ATTIC_HOME>/knowledge` | Use another folder instead (must already exist; only the default is created for you). Notes are served to every `context` answer, for every repository; the folder's own `README.md` is skipped. A bad path is reported in `status` → `knowledge` and never stops startup. See [`knowledge/README.md`](knowledge/README.md) |
+| `dir` | `<ATTIC_HOME>/knowledge` | Use another folder instead (must already exist; only the default is created for you). Answer-mode `context` can include central notes unless an explicit path scope is set; the folder's own `README.md` is skipped. A bad path is reported in `status` → `knowledge` and never stops startup. See [`knowledge/README.md`](knowledge/README.md) |
+
+**`[logging]`**
+
+| Key | Default | Effect |
+|---|---|---|
+| `file_level` | off | Persist file logging at `off`, `error`, `warn`, `info`, `debug`, or `trace`; the `logging` tool can override it until the next restart |
 
 </details>
 

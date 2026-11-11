@@ -3,9 +3,9 @@
 This document describes Attic **as it exists in the current codebase**, not
 as a history of how it was built. "Key design decisions" and "Core
 behavioral invariants" below consolidate what used to be a separate ADR/
-contract document set; this file is now the single authoritative
-architecture reference — nothing else needs to be read to understand how
-the system behaves.
+contract document set; this file is the current architecture reference.
+See [`PLAYBOOK.md`](PLAYBOOK.md) for operations and development, and
+[`PERFORMANCE.md`](PERFORMANCE.md) for sizing and measurement guidance.
 
 ## Contents
 
