@@ -58,6 +58,18 @@ pub fn delete_structural_for_occurrences(
         for id in occurrence_ids {
             rels += stmt.execute([id])?;
         }
+        // Edges anchored at this occurrence's symbols carry the symbol id,
+        // not the file-occurrence id, so they must be removed by symbol.
+        let mut by_symbol = conn.prepare(
+            "DELETE FROM core_relationships
+              WHERE (source_entity_type = 'SYMBOL_OCCURRENCE' AND source_entity_id IN (
+                        SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1))
+                 OR (target_entity_type = 'SYMBOL_OCCURRENCE' AND target_entity_id IN (
+                        SELECT id FROM core_symbol_occurrences WHERE file_occurrence_id = ?1))",
+        )?;
+        for id in occurrence_ids {
+            rels += by_symbol.execute([id])?;
+        }
     }
 
     // ── 3. Symbol occurrences (FK → identities + file occurrences) ─────────
@@ -91,6 +103,36 @@ pub fn delete_structural_for_occurrences(
     Ok((links, rels, symbols, nodes))
 }
 
+/// Reclaim derived rows left by older publications, after replacement symbols
+/// have been inserted so unchanged symbols retain their identity IDs.
+pub fn prune_orphan_symbol_artifacts(
+    conn: &Connection,
+    repository_id: &str,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "DELETE FROM core_relationships
+          WHERE source_repository_id = ?1
+            AND source_entity_type = 'SYMBOL_OCCURRENCE'
+            AND NOT EXISTS (
+                SELECT 1 FROM core_symbol_occurrences so
+                 WHERE so.id = core_relationships.source_entity_id)",
+        [repository_id],
+    )?;
+    conn.execute(
+        "DELETE FROM core_symbol_identities
+          WHERE repository_id = ?1
+            AND id NOT IN (SELECT symbol_identity_id FROM core_symbol_occurrences)
+            AND id NOT IN (
+                SELECT source_entity_id FROM core_relationships
+                 WHERE source_entity_type = 'SYMBOL_IDENTITY' AND source_entity_id IS NOT NULL
+                UNION
+                SELECT target_entity_id FROM core_relationships
+                 WHERE target_entity_type = 'SYMBOL_IDENTITY' AND target_entity_id IS NOT NULL)",
+        [repository_id],
+    )?;
+    Ok(())
+}
+
 /// Insert one file's structural payload. Node parent links are resolved via
 /// insertion order (`parent_index` refers to earlier entries in the same vec).
 #[allow(clippy::too_many_arguments)]
@@ -100,6 +142,38 @@ pub fn insert_structural_file(
     source_revision_id: &str,
     sf: &PublicationStructuralFile,
 ) -> Result<StructuralCounts, StorageError> {
+    if let Some(receipt) = &sf.analysis_receipt {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS spec_index_analysis_receipts (
+            file_occurrence_id TEXT PRIMARY KEY REFERENCES core_file_occurrences(id) ON DELETE CASCADE,
+            source_revision_id TEXT NOT NULL,
+            index_generation_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            analyzer_id TEXT NOT NULL,
+            analyzer_version TEXT NOT NULL,
+            structurally_complete INTEGER NOT NULL,
+            symbols_supported INTEGER NOT NULL,
+            capability_used TEXT NOT NULL,
+            fallback_used INTEGER NOT NULL,
+            has_errors INTEGER NOT NULL
+        );",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO spec_index_analysis_receipts
+            SELECT id,source_revision_id,index_generation_id,content_hash,?2,?3,?4,?5,?6,?7,?8
+            FROM core_file_occurrences WHERE id=?1 AND index_generation_id IS NOT NULL",
+            rusqlite::params![
+                sf.file_occurrence_id,
+                sf.analyzer_id,
+                sf.analyzer_version,
+                sf.structurally_complete,
+                receipt.symbols_supported,
+                receipt.capability_used,
+                receipt.fallback_used,
+                receipt.has_errors
+            ],
+        )?;
+    }
     // ── Structural nodes (two passes: uuids then parents) ──────────────────
     let mut node_ids: Vec<String> = Vec::with_capacity(sf.nodes.len());
     for _ in 0..sf.nodes.len() {
@@ -295,49 +369,48 @@ fn merge_partial_marker(metadata: &Option<String>, complete: bool) -> Option<Str
         .or_else(|| metadata.clone())
 }
 
-/// Look up a defining symbol occurrence by qualified name (exact first, then
-/// unqualified-suffix match) restricted to the given `SymbolKind` tokens.
-/// Returns the newest definition occurrence id.
-///
-/// Note: suffix matching uses SQL LIKE; identifier-style qualified names
-/// never contain `%`/`_` metacharacters beyond `_`, which is treated as a
-/// literal by escaping here.
+/// Look up the FILE occurrence defining a symbol by qualified name (exact
+/// first, then a case-sensitive unqualified-suffix match on a `.` or `::`
+/// segment boundary) restricted to the given `SymbolKind` tokens. Returns the
+/// newest defining file occurrence id; relationship targets are always file
+/// occurrences, never symbol rows. The boundary keeps `EventEmitter` from
+/// resolving to an unrelated `PoolEventEmitter` or `Host.eventEmitter`.
 pub fn lookup_symbol_definition_occurrence(
     conn: &Connection,
     repository_id: &str,
     qualified_name: &str,
     kinds: &[&str],
 ) -> Result<Option<String>, StorageError> {
-    let escaped = qualified_name.replace('%', "\\%").replace('_', "\\_");
-    for (mode, needle) in [
-        (QnameMode::Exact, qualified_name),
-        (QnameMode::Suffix, &escaped),
-    ] {
+    for mode in [QnameMode::Exact, QnameMode::Suffix] {
         for kind in kinds {
             let sql = match mode {
                 QnameMode::Exact => {
-                    "SELECT so.id
+                    "SELECT so.file_occurrence_id
                        FROM core_symbol_identities si
                        JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+                       JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
                       WHERE si.repository_id = ?1 AND si.qualified_name = ?2 AND si.kind = ?3
                         AND so.is_definition = 1
-                      ORDER BY so.rowid DESC LIMIT 1"
+                      ORDER BY fo.occurrence_seq DESC, so.rowid DESC LIMIT 1"
                 }
                 QnameMode::Suffix => {
-                    "SELECT so.id
+                    "SELECT so.file_occurrence_id
                        FROM core_symbol_identities si
                        JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+                       JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
                       WHERE si.repository_id = ?1
-                        AND si.qualified_name LIKE '%' || ?2 ESCAPE '\\'
+                        AND (substr(si.qualified_name, -length(?2) - 1) = '.' || ?2
+                             OR substr(si.qualified_name, -length(?2) - 2) = '::' || ?2)
                         AND si.kind = ?3
                         AND so.is_definition = 1
-                      ORDER BY so.rowid DESC LIMIT 1"
+                      ORDER BY fo.occurrence_seq DESC, so.rowid DESC LIMIT 1"
                 }
             };
-            let result: Result<String, _> =
-                conn.query_row(sql, rusqlite::params![repository_id, needle, kind], |r| {
-                    r.get(0)
-                });
+            let result: Result<String, _> = conn.query_row(
+                sql,
+                rusqlite::params![repository_id, qualified_name, kind],
+                |r| r.get(0),
+            );
             match result {
                 Ok(id) => return Ok(Some(id)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => continue,

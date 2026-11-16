@@ -848,7 +848,7 @@ fn partial_redact(token: &str) -> String {
     format!("{}{}{}[redacted]", prefix, "*".repeat(n - 2 * keep), suffix)
 }
 
-pub(crate) fn is_known_secrets_file(repo_relative: &str) -> bool {
+pub fn is_known_secrets_file(repo_relative: &str) -> bool {
     let lower = repo_relative.to_lowercase();
     let known = [
         ".env",

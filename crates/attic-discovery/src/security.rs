@@ -141,19 +141,24 @@ pub fn path_is_within(path: &Path, root: &Path) -> bool {
     if !cfg!(windows) {
         return false;
     }
-    fn norm(p: &Path) -> String {
-        let s = p.to_string_lossy().replace('/', "\\");
-        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s
-        };
-        s.trim_end_matches('\\').to_lowercase()
-    }
-    let (p, r) = (norm(path), norm(root));
+    let (p, r) = (root_identity_key(path), root_identity_key(root));
     !r.is_empty() && (p == r || p.starts_with(&format!("{r}\\")))
+}
+
+/// Stable workspace identity; canonicalize existing paths before using this key.
+pub fn root_identity_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        let text = text.replace('/', "\\");
+        let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+        };
+        text.trim_end_matches('\\').to_lowercase()
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Canonicalize `path`, then verify it stays within `allowed_root`.

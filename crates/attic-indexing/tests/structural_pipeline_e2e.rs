@@ -998,6 +998,162 @@ fn deleted_file_leaves_no_structural_ghosts() {
         )
     });
     assert_eq!(helper_left, 0);
+    assert_eq!(
+        fx.query_i64(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM core_symbol_identities
+                  WHERE qualified_name LIKE '%Helper%'",
+                [],
+                |r| r.get(0),
+            )
+        }),
+        0,
+        "deleted files must not retain unreferenced symbol identities"
+    );
+}
+
+/// Re-analysis must not leave relationships anchored at symbol occurrences
+/// that were deleted with the superseded file occurrence.
+#[test]
+fn modified_file_leaves_no_symbol_sourced_relationship_ghosts() {
+    let src = |i: usize| {
+        format!(
+            "package com.acme;\n\nimport com.acme.shared.Helper;\n\npublic class Main extends BaseService {{\n    public int run{i}() {{\n        Helper.greet();\n        return work{i}();\n    }}\n    private int work{i}() {{ return {i}; }}\n}}\n"
+        )
+    };
+    let fx = Fixture::bootstrap(&[
+        ("src/BaseService.java", JAVA_BASE),
+        ("src/shared/Helper.java", JAVA_HELPER),
+        ("src/Main.java", &src(0)),
+    ]);
+    let symbol_edges = || {
+        fx.query_i64(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM core_relationships
+                  WHERE source_entity_type = 'SYMBOL_OCCURRENCE'",
+                [],
+                |r| r.get(0),
+            )
+        })
+    };
+    let before = symbol_edges();
+    assert!(before > 0, "fixture must produce symbol-sourced edges");
+    let identities_before = fx.query_i64(|c| {
+        c.query_row("SELECT COUNT(*) FROM core_symbol_identities", [], |r| {
+            r.get(0)
+        })
+    });
+    let main_identity = fx.query_str(|c| {
+        c.query_row(
+            "SELECT si.id FROM core_symbol_identities si
+               JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+               JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
+              WHERE fo.path = 'src/Main.java' AND si.kind = ?1 LIMIT 1",
+            [attic_core::SymbolKind::Class.as_str()],
+            |r| r.get(0),
+        )
+    });
+
+    for i in 1..=3 {
+        std::fs::write(fx.root.join("src/Main.java"), src(i)).unwrap();
+        fx.reindex_changed(&["src/Main.java"]);
+        assert_eq!(
+            fx.query_i64(|c| {
+                c.query_row("SELECT COUNT(*) FROM core_symbol_identities", [], |r| {
+                    r.get(0)
+                })
+            }),
+            identities_before,
+            "renamed methods must not accumulate unused symbol identities"
+        );
+    }
+    assert_eq!(
+        fx.query_str(|c| {
+            c.query_row(
+                "SELECT si.id FROM core_symbol_identities si
+                   JOIN core_symbol_occurrences so ON so.symbol_identity_id = si.id
+                   JOIN core_file_occurrences fo ON fo.id = so.file_occurrence_id
+                  WHERE fo.path = 'src/Main.java' AND si.kind = ?1 LIMIT 1",
+                [attic_core::SymbolKind::Class.as_str()],
+                |r| r.get(0),
+            )
+        }),
+        main_identity,
+        "a reinserted class must retain its symbol identity"
+    );
+
+    let dangling: i64 = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_relationships r
+              WHERE r.source_entity_type = 'SYMBOL_OCCURRENCE'
+                AND NOT EXISTS (SELECT 1 FROM core_symbol_occurrences so
+                                 WHERE so.id = r.source_entity_id)",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        dangling, 0,
+        "edges of deleted symbol occurrences must vanish"
+    );
+    assert_eq!(
+        symbol_edges(),
+        before,
+        "symbol-sourced edges must not accumulate"
+    );
+}
+
+#[test]
+fn reindex_reclaims_legacy_orphan_symbol_relationships() {
+    let fx = Fixture::bootstrap(&[
+        ("src/BaseService.java", JAVA_BASE),
+        ("src/shared/Helper.java", JAVA_HELPER),
+        ("src/Main.java", JAVA_MAIN),
+    ]);
+    fx.writer
+        .send(|c| {
+            let inserted = c.execute(
+                "INSERT INTO core_relationships
+                     (id, source_repository_id, source_entity_id, source_entity_type,
+                      target_repository_id, target_entity_id, target_entity_type,
+                      rel_type, dependency_basis, resolution, confidence,
+                      provenance_json, source_revision_id, freshness_state)
+                 SELECT 'legacy-orphan', source_repository_id, 'missing-symbol',
+                        source_entity_type, target_repository_id, target_entity_id,
+                        target_entity_type, rel_type, dependency_basis, resolution,
+                        confidence, provenance_json, source_revision_id, freshness_state
+                   FROM core_relationships
+                  WHERE source_entity_type = 'SYMBOL_OCCURRENCE' LIMIT 1",
+                [],
+            )?;
+            assert_eq!(inserted, 1, "fixture must contain a symbol-sourced edge");
+            Ok(())
+        })
+        .unwrap();
+
+    fx.reindex_changed(&["src/Main.java"]);
+    assert_eq!(
+        fx.query_i64(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM core_relationships WHERE id = 'legacy-orphan'",
+                [],
+                |r| r.get(0),
+            )
+        }),
+        0,
+        "publication must heal already-dangling edges from older indexers"
+    );
+    assert!(
+        fx.query_i64(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM core_relationships
+                  WHERE target_entity_id LIKE 'logical:%'",
+                [],
+                |r| r.get(0),
+            )
+        }) > 0,
+        "unresolved logical targets are not orphan source symbols"
+    );
 }
 
 /// Fix 6 — RENAME ghosts: an identical-content rename removes the old
@@ -1173,4 +1329,118 @@ fn aem_layout_is_indexed_structurally_and_stays_searchable() {
             .unwrap();
         assert_eq!(hits.len(), 1, "{token} must stay lexically searchable");
     }
+}
+
+// ── Edge-target honesty (CALL mislabel + dangling heritage targets) ─────────
+
+#[test]
+fn symbol_resolved_edges_always_target_existing_file_occurrences() {
+    let fx = Fixture::bootstrap(&[(
+        "src/app.js",
+        "function helper() { return 1; }\nfunction main() { helper(); missing(); return 0; }\n",
+    )]);
+
+    let app_occ = fx.query_str(|c| {
+        c.query_row(
+            "SELECT id FROM core_file_occurrences WHERE path = 'src/app.js'
+              ORDER BY occurrence_seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    let local_call_target = fx.query_str(|c| {
+        c.query_row(
+            "SELECT target_entity_id FROM core_relationships
+              WHERE rel_type='CALL' AND resolution='SYMBOL_RESOLVED'
+                AND provenance_json LIKE '%\"target_name\":\"helper\"%'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        local_call_target, app_occ,
+        "local call targets its defining file"
+    );
+
+    let dishonest = fx.query_i64(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_relationships
+              WHERE resolution != 'SYNTACTIC'
+                AND target_entity_id NOT IN (SELECT id FROM core_file_occurrences)",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        dishonest, 0,
+        "non-syntactic edges must target real file occurrences"
+    );
+}
+
+#[test]
+fn heritage_db_fallback_targets_defining_file_occurrence() {
+    let fx = Fixture::bootstrap(&[
+        ("src/base.ts", "export class Base {}\n"),
+        (
+            "src/child.ts",
+            "import { Base } from './base';\nexport class Child extends Base {}\n",
+        ),
+    ]);
+    std::fs::write(
+        fx.root.join("src/child.ts"),
+        "import { Base } from './base';\nexport class Child extends Base { x = 1; }\n",
+    )
+    .unwrap();
+    fx.reindex_changed(&["src/child.ts"]);
+
+    let base_occ = fx.query_str(|c| {
+        c.query_row(
+            "SELECT id FROM core_file_occurrences WHERE path = 'src/base.ts'
+              ORDER BY occurrence_seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+    });
+    let extends_target = fx.query_str(|c| {
+        c.query_row(
+            "SELECT target_entity_id FROM core_relationships
+              WHERE rel_type='EXTENDS' AND resolution='SYMBOL_RESOLVED'",
+            [],
+            |r| r.get(0),
+        )
+    });
+    assert_eq!(
+        extends_target, base_occ,
+        "DB fallback must return the file occurrence"
+    );
+}
+
+#[test]
+fn heritage_db_fallback_requires_qualified_name_segment_boundary() {
+    let fx = Fixture::bootstrap(&[
+        ("src/pool.ts", "export class PoolEventEmitter {}\n"),
+        (
+            "src/lb.ts",
+            "import { EventEmitter } from 'events';\nexport class Lb extends EventEmitter {}\n",
+        ),
+    ]);
+    std::fs::write(
+        fx.root.join("src/lb.ts"),
+        "import { EventEmitter } from 'events';\nexport class Lb extends EventEmitter { x = 1; }\n",
+    )
+    .unwrap();
+    fx.reindex_changed(&["src/lb.ts"]);
+
+    let resolved = fx.query_str(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM core_relationships
+              WHERE rel_type='EXTENDS' AND resolution='SYMBOL_RESOLVED'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n.to_string()),
+        )
+    });
+    assert_eq!(
+        resolved, "0",
+        "EventEmitter must not suffix-match PoolEventEmitter"
+    );
 }

@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 attic-core.workspace      = true
+attic-spec.workspace      = true
+rusqlite.workspace        = true
 attic-storage.workspace   = true
 attic-indexing.workspace  = true
 attic-analyzers.workspace = true
@@ -33,6 +35,7 @@ tracing-appender.workspace = true
 thiserror.workspace       = true
 anyhow.workspace          = true
 interprocess = { workspace = true }
+toml_edit = "0.25"
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

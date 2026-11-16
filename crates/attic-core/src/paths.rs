@@ -285,6 +285,15 @@ impl AtticPaths {
     /// Reads `ATTIC_HOME` from the real environment; delegates to
     /// [`resolve_data_root_from`] for the pure resolution logic.
     pub fn resolve() -> Result<Self, PathResolutionError> {
+        Self::resolve_mode(true)
+    }
+
+    /// Resolve CLI/checker paths without migrations, directory creation or state.
+    pub fn resolve_read_only() -> Result<Self, PathResolutionError> {
+        Self::resolve_mode(false)
+    }
+
+    fn resolve_mode(create: bool) -> Result<Self, PathResolutionError> {
         let attic_home = std::env::var("ATTIC_HOME").ok();
         let db_override = std::env::var("ATTIC_DB_PATH").ok();
         let user_home = home_dir();
@@ -319,6 +328,19 @@ impl AtticPaths {
             ));
         }
 
+        if !create {
+            let structured = db_override.is_none();
+            let database = db_override
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("data").join("catalog.db"));
+            return Ok(Self {
+                config_file: sibling_in(&database, "config.toml", structured),
+                runtime_config: sibling_in(&database, "attic.toml", structured),
+                database,
+                home,
+            });
+        }
         if db_override.is_none() {
             ensure_private_dir(&home).map_err(|e| {
                 PathResolutionError::new(format!(

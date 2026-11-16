@@ -6,8 +6,11 @@
 // arguments, and genuine bounded streaming for LARGE files.
 
 mod daemon;
+mod egm_cli;
 mod eviction;
 mod handlers;
+mod spec_cli;
+mod spec_tool;
 mod startup;
 mod tools;
 mod validate;
@@ -212,6 +215,7 @@ struct BootstrapJob {
 
 #[derive(Clone)]
 pub(crate) struct AtticServer {
+    spec: Option<Arc<attic_spec::service::SpecService>>,
     stores: Option<Arc<attic_storage::RepositoryStoreManager>>,
     repository_lease: Option<Arc<attic_storage::RepositoryStoreLease>>,
     repository_registration_gate: Arc<std::sync::Mutex<()>>,
@@ -470,9 +474,13 @@ impl AtticServer {
         // detected mode > built-in default, then hardware-clamped).
         let resource_monitor =
             ResourceMonitor::from_config(&effective.as_resource_config(monitor_overrides));
+        let spec = attic_spec::service::SpecService::open(db_path, attic_config.planning.clone())
+            .map_err(|e| ServerError::InvalidArg(e.to_string()))?
+            .map(Arc::new);
         // Use the same hardware-clamped limit for bootstrap and incremental work.
         resource_monitor.apply_resource_policy(effective.scheduler_workers);
         Ok(AtticServer {
+            spec,
             stores: None,
             repository_lease: None,
             repository_registration_gate: Arc::new(std::sync::Mutex::new(())),
@@ -509,7 +517,9 @@ impl AtticServer {
     /// Indexing options for every run this server performs (bootstrap and
     /// incremental), derived once from `attic.toml [indexing]`.
     fn index_options(&self) -> IndexOptions {
-        IndexOptions::from_config(&self.attic_config.indexing)
+        let mut options = IndexOptions::from_config(&self.attic_config.indexing);
+        options.record_analysis_receipts = self.attic_config.planning.enabled;
+        options
     }
 
     /// The ONE discovery policy every indexing path uses — bootstrap,
@@ -1732,13 +1742,7 @@ fn normalize_root_lexically(path: &Path) -> std::io::Result<PathBuf> {
 /// casing/prefix can still be recognized as the same root when removed with
 /// another.
 fn root_identity_key(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    if cfg!(windows) {
-        stripped.to_lowercase()
-    } else {
-        stripped.to_string()
-    }
+    attic_discovery::security::root_identity_key(path)
 }
 
 /// Expand configured roots into their fanned-out repository ids.
@@ -1819,7 +1823,10 @@ impl ServerHandler for AtticServer {
         _request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send {
-        let tools = make_tools();
+        let mut tools = make_tools();
+        if self.spec.is_some() {
+            tools.push(spec_tool::tool());
+        }
         async move {
             Ok(ListToolsResult {
                 tools,
@@ -1852,6 +1859,33 @@ impl ServerHandler for AtticServer {
             request.arguments.unwrap_or_default().into_iter().collect();
 
         async move {
+            if name == "egm" {
+                if args.keys().any(|key| key != "action")
+                    || args.get("action").is_some_and(|action| {
+                        !matches!(action.as_str(), Some("status" | "guidance"))
+                    })
+                {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "ERR_INVALID_ARGUMENT: egm accepts action=status|guidance; use attic egm enable|disable in your terminal".to_string(),
+                    )])
+                    .into());
+                }
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    if args.get("action").and_then(Value::as_str) == Some("guidance") {
+                        egm_cli::guidance(
+                            &self.attic_config.planning,
+                            &attic_core::sibling(&self.db_path, "attic.toml"),
+                        )
+                    } else {
+                        egm_cli::status(
+                            &self.attic_config.planning,
+                            &attic_core::sibling(&self.db_path, "attic.toml"),
+                        )
+                    }
+                    .to_string(),
+                )])
+                .into());
+            }
             // Acquire active_roots inside the async block so a poisoned lock
             // returns a structured error via lock_or_call_err! rather than
             // panicking the process or requiring a second async move return
@@ -1951,6 +1985,12 @@ impl ServerHandler for AtticServer {
                         .into()
                     }
                 });
+            }
+            if name.as_ref() == "spec" {
+                return Ok(self
+                    .handle_spec(args, active_ids, workspace_configured)
+                    .await
+                    .into());
             }
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
                 "logging" => Self::handle_logging(&args),
@@ -2496,6 +2536,19 @@ fn install_panic_hook() {
 /// immediately, running no destructors at all, so the runtime's blocking drop
 /// (and whatever it might be stuck waiting on) never gets a chance to run.
 fn main() {
+    if std::env::args_os().nth(1).is_some_and(|s| s == "egm") {
+        std::process::exit(egm_cli::run(std::env::args_os().skip(2).collect()));
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "--help" || s == "-h")
+    {
+        println!("Attic MCP server\n\n{}", egm_cli::HELP);
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|s| s == "spec") {
+        std::process::exit(spec_cli::run(std::env::args_os().skip(2).collect()));
+    }
     install_panic_hook();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

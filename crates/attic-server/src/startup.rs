@@ -3,6 +3,7 @@ use std::sync::RwLock;
 
 #[derive(Clone)]
 pub(crate) struct StartupServer {
+    spec_advertised: bool,
     state: Arc<RwLock<State>>,
     initialization: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -16,9 +17,15 @@ enum State {
 
 impl StartupServer {
     pub(crate) fn start(db_path: &Path, paths: &attic_core::AtticPaths) -> Self {
+        let spec_advertised = std::fs::read_to_string(attic_core::sibling(db_path, "attic.toml"))
+            .ok()
+            .and_then(|text| attic_core::AtticConfig::parse_str(&text).ok())
+            .is_some_and(|cfg| cfg.planning.enabled);
         let db_path = db_path.to_path_buf();
         let paths = paths.clone();
-        Self::initialize(move || build_server_and_enricher(&db_path, &paths))
+        let mut server = Self::initialize(move || build_server_and_enricher(&db_path, &paths));
+        server.spec_advertised = spec_advertised;
+        server
     }
 
     fn initialize(
@@ -42,6 +49,7 @@ impl StartupServer {
             *shared.write().unwrap_or_else(|e| e.into_inner()) = next;
         });
         Self {
+            spec_advertised: false,
             state,
             initialization: Arc::new(Mutex::new(Some(initialization))),
         }
@@ -110,11 +118,18 @@ impl ServerHandler for StartupServer {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
-        _cx: RequestContext<RoleServer>,
+        request: Option<PaginatedRequestParams>,
+        cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        if let Ok(server) = self.engine() {
+            return server.list_tools(request, cx).await;
+        }
+        let mut tools = make_tools();
+        if self.spec_advertised {
+            tools.push(spec_tool::tool());
+        }
         Ok(ListToolsResult {
-            tools: make_tools(),
+            tools,
             ..Default::default()
         })
     }

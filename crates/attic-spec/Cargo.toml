@@ -1,0 +1,27 @@
+[package]
+name = "attic-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+attic-core.workspace = true
+attic-storage.workspace = true
+attic-discovery.workspace = true
+attic-evidence.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+globset.workspace = true
+regex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+attic-indexing = { workspace = true }
+tempfile.workspace = true

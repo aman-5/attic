@@ -9,6 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod planning;
+pub use planning::*;
+
 /// Error parsing or validating `attic.toml`.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigError {
@@ -257,6 +260,9 @@ impl Default for KnowledgeConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AtticConfig {
+    /// Opt-in, user-global spec-first workflow settings.
+    #[serde(default)]
+    pub planning: PlanningConfig,
     /// `[resources]` table.
     #[serde(default)]
     pub resources: ResourceOverrides,
@@ -330,6 +336,7 @@ impl AtticConfig {
     /// resolution (`ResourcePolicy::validate`), because their valid range
     /// depends on the other layers they are merged with.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.planning.validate()?;
         self.indexing.validate()?;
         if let Some(level) = self.logging.file_level()
             && !FILE_LOG_LEVELS.contains(&level.as_str())
@@ -418,6 +425,40 @@ mode = "auto"
 # (default: off). off | error | warn | info | debug | trace.
 # The `logging` MCP tool can still change it until the next restart.
 # file_level = "info"
+#
+# [planning]
+# enabled = false
+# mode = "manual"                 # manual | autopilot; approval is always human
+# roots = []                      # empty = all active roots
+# designs_dir = "docs/designs"
+#
+# [planning.fast_path]
+# enforce = false                 # report-only unless explicitly enabled
+# max_files = 2
+# max_lines = 100
+# allow_binary = false
+# scope = "staged"                # staged | branch
+# # base_branch = "main"          # required for branch scope
+# commit_grace_hours = 24
+#
+# [planning.lease]
+# lease_seconds = 900
+# max_renewals = 8
+#
+# [planning.packs]
+# max_concurrent = 2
+# byte_budget = 65536
+# max_review_rounds = 5
+#
+# [planning.validation]
+# max_verify_attempts = 3
+# allow_file_only_fallback = true
+# require_cross_repo_check = true
+# freshness_wait_ms = 5000
+# max_runs_retained = 20
+#
+# [planning.hooks]
+# fail_closed = false
 "#;
 
 #[cfg(test)]

@@ -298,16 +298,61 @@ explicit dependency contracts remain grounded in source evidence.
 
 | Tool | What it does |
 |---|---|
+| `egm` | Always-available EGM activation status, user enable/disable commands, and mode-aware host reviewer guidance |
 | `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
 | `file` | Bounded, secret-scanned live-file ranges, JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
-| `repo_map` | Structure and statistics of one repository |
+| `repo_map` | Bounded structure/statistics; `path_prefix`, `max_depth`, file pagination and explicit byte budget |
 | `status` | Readiness, indexing/watcher state, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
 | `logging` | Turn the file log on/off or change its level (`error`…`trace`) instantly, no restart. To keep a level across restarts set `[logging] file_level` in `attic.toml` |
 | `debug_drain_task` | Admin: run one pending incremental task synchronously |
+| `spec` | Opt-in EGM citation verification, review packs, human-approved fenced waves and drift checks; advertised only when enabled |
 
 The exact schemas come from `make_tools()` in `crates/attic-server/src/tools.rs`
-and are returned by `tools/list`.
+and the opt-in `spec_tool::tool()` adapter, and are returned by `tools/list`.
+
+### EGM mode: enable, disable, inspect
+
+EGM workflow support is built into Attic, disabled by default. No handwritten
+configuration is required:
+
+```text
+attic egm enable --root PATH --mode manual
+attic egm enable --root PATH --mode autopilot
+attic egm status
+attic egm guidance
+attic egm disable
+```
+
+For the default Windows installation (if `attic` is not on `PATH`):
+
+```powershell
+& "$env:USERPROFILE\.attic\attic-server.exe" egm enable --root "C:\path\to\repo" --mode manual
+& "$env:USERPROFILE\.attic\attic-server.exe" egm status
+& "$env:USERPROFILE\.attic\attic-server.exe" egm disable
+```
+
+Restart the Attic MCP server after a configuration change; reconnecting to an
+already-running daemon does not reload its settings. The `egm` tool reports the
+running server's mode even while the `spec` tool is disabled.
+Enable defaults to the current directory, manual advancement and report-only.
+`--all-roots` explicitly selects all active workspace roots; `--enforce` explicitly
+enables budget enforcement. Neither command adds workspace membership, installs
+hooks/reviewers, starts a daemon, reindexes, nor approves a spec.
+
+Manual mode asks before each workflow step. Autopilot guidance advances
+agent-owned steps but **always stops for human approval**. Your host supplies
+separate reviewer contexts; Attic supplies verified file-delivered packs and
+governance, not an agent runner or a security sandbox. Use `egm action=guidance`
+for the three reviewer missions without requiring an upstream plugin.
+See [the complete EGM workflow](crates/attic-spec/README.md) for citations,
+approval, hooks, leases and recovery.
+
+`repo_map` defaults to 200 matching files, depth 4 and a 32 KiB JSON-text cap.
+Use `coverage.next_offset` with unchanged filters to continue. `max_bytes` is
+4096-131072, `limit` is 1-1000, and `max_depth` is 1-32. Omitted children,
+diagnostics, incomplete coverage and required narrowing are explicit.
+Pagination does not pin an index snapshot across calls; restart after reindexing.
 
 Answer responses keep context, claims and evidence at the top level;
 `repository_answers` contains compact per-repository summaries, not duplicate
