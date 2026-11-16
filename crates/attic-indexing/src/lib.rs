@@ -173,6 +173,8 @@ pub fn repository_display_name(root: &Path, opts: &IndexOptions) -> String {
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
+    /// Opt-in workflow evidence. False neither creates nor migrates receipt state.
+    pub record_analysis_receipts: bool,
     /// Display name for the repository; [`DEFAULT_REPOSITORY_NAME`] means
     /// "use the root folder's name".
     pub repository_name: String,
@@ -242,6 +244,7 @@ const ANALYSIS_STRIPE_MIN_FILES: usize = 32;
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
+            record_analysis_receipts: false,
             repository_name: DEFAULT_REPOSITORY_NAME.to_owned(),
             // Fail-closed per-file unit ceiling (r01). Sized from the measured
             // worst case in the target corpora (~9,700 units for a 4.5 MiB
@@ -302,10 +305,15 @@ impl IndexOptions {
         } else {
             "generic".to_owned()
         };
-        Ok(format!(
+        let version = format!(
             "{}|{plugins}",
             attic_core::constants::ANALYZER_REGISTRY_VERSION
-        ))
+        );
+        Ok(if self.record_analysis_receipts {
+            format!("{version}|receipts=v1")
+        } else {
+            version
+        })
     }
 }
 
@@ -1211,10 +1219,14 @@ pub fn index_repository_with_cancellation(
                     // below, which aborts the whole run rather than publish a
                     // generation that mixes verified content with content nobody
                     // actually verified.
+                    // An analyzer budget overrun is deterministic: retrying the
+                    // same content fails identically, so do not label it transient.
+                    let retryable = !matches!(e, IndexError::IncompleteAnalysis { .. });
                     warn!(
                         path = %rec.repo_relative,
                         error = %e,
-                        "analysis failed (transient); this run cannot become current until resolved"
+                        retryable,
+                        "analysis failed; this run cannot become current until resolved"
                     );
                     transient_failed_paths.push(rec.repo_relative.clone());
                 }
@@ -2025,8 +2037,24 @@ fn analyze_single_file(
         })
         .collect();
 
-    let captured = structural_pipeline::capture_structural(&rec.repo_relative, &fo_id_str, &output)
-        .map(Box::new);
+    let captured = if opts.record_analysis_receipts {
+        let symbols_supported = registry.all_descriptors().iter().any(|d| {
+            d.name == output.analyzer_id
+                && d.version == output.analyzer_version
+                && d.capabilities
+                    .level_for(attic_analyzers::CapabilityKind::SymbolExtraction)
+                    == attic_analyzers::CapabilityLevel::Full
+        });
+        Some(Box::new(structural_pipeline::capture_with_receipt(
+            &rec.repo_relative,
+            &fo_id_str,
+            &output,
+            symbols_supported,
+        )))
+    } else {
+        structural_pipeline::capture_structural(&rec.repo_relative, &fo_id_str, &output)
+            .map(Box::new)
+    };
 
     debug!(
         path = %rec.repo_relative,
@@ -3867,10 +3895,20 @@ mod tests {
         let policy = DiscoveryPolicy::default_git();
         let opts = IndexOptions::default();
         let result = index_repository(&store(&fx), fx._dir.path(), &policy, &opts)
-            .expect("11k-unit file must index completely under the 100k default budget");
-        assert_eq!(result.units_inserted, 11_000);
-        assert!(!search_hits(&fx, "value_0").is_empty());
-        assert!(!search_hits(&fx, "value_10999").is_empty());
+            .expect("11k-member file must index completely under the 100k default budget");
+        // Consecutive scalar members are packed into shared units, so the
+        // unit count is far below the member count while content stays whole.
+        assert!(
+            result.units_inserted > 0 && result.units_inserted < 11_000,
+            "scalar members must be packed: {}",
+            result.units_inserted
+        );
+        for probe in ["value_0", "value_5500", "value_10999"] {
+            assert!(
+                !search_hits(&fx, probe).is_empty(),
+                "{probe} not searchable"
+            );
+        }
     }
 
     /// PR-7 acceptance test: N files, one transiently fails. The first

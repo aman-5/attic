@@ -112,6 +112,8 @@ struct RawRel {
 /// other persistence path.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CapturedFile {
+    #[serde(default)]
+    analysis_receipt: Option<attic_storage::indexing_publication::PublicationAnalysisReceipt>,
     file_occurrence_id: String,
     rel_path: String,
     analyzer_id: String,
@@ -204,6 +206,7 @@ pub(crate) fn capture_structural(
         .collect();
 
     Some(CapturedFile {
+        analysis_receipt: None,
         file_occurrence_id: file_occurrence_id.to_string(),
         rel_path: rel_path.to_string(),
         analyzer_id: output.analyzer_id.clone(),
@@ -228,6 +231,38 @@ pub(crate) struct ResolverDeps<'a> {
     pub symbol_definition: &'a dyn Fn(&str, &[&str]) -> Option<String>,
     /// `repo_relative path -> latest file occurrence UUID`
     pub path_occurrence: &'a dyn Fn(&str) -> Option<String>,
+}
+
+pub(crate) fn capture_with_receipt(
+    rel_path: &str,
+    occurrence: &str,
+    output: &attic_analyzers::AnalyzerOutput,
+    symbols_supported: bool,
+) -> CapturedFile {
+    let mut captured =
+        capture_structural(rel_path, occurrence, output).unwrap_or_else(|| CapturedFile {
+            analysis_receipt: None,
+            file_occurrence_id: occurrence.into(),
+            rel_path: rel_path.into(),
+            analyzer_id: output.analyzer_id.clone(),
+            analyzer_version: output.analyzer_version.clone(),
+            language_tag: output.analyzer_id.clone(),
+            structurally_complete: output.structurally_complete,
+            nodes: Vec::new(),
+            symbols: Vec::new(),
+            raw_rels: Vec::new(),
+            imports: Vec::new(),
+        });
+    captured.analysis_receipt = Some(
+        attic_storage::indexing_publication::PublicationAnalysisReceipt {
+            symbols_supported,
+            capability_used: format!("{:?}", output.capability_used),
+            fallback_used: output.fallback_used,
+            has_errors: output.has_errors()
+                || output.diagnostics.iter().any(|d| d.code == "PARSE_ERROR"),
+        },
+    );
+    captured
 }
 
 pub(crate) struct StructuralPipeline {
@@ -384,6 +419,27 @@ impl StructuralPipeline {
                                 None => (rel.target.clone(), false, rel.resolution, rel.confidence),
                             }
                         }
+                        _ if rel.resolution == ResolutionLevel::SymbolResolved => {
+                            // Analyzers claim SYMBOL_RESOLVED when the callee is a
+                            // local definition. Honour that only when the target
+                            // is defined in this file; otherwise ADR-011 requires
+                            // an unresolved edge to stay SYNTACTIC.
+                            if defines_symbol(&f.symbols, &rel.target) {
+                                (
+                                    f.file_occurrence_id.clone(),
+                                    true,
+                                    ResolutionLevel::SymbolResolved,
+                                    rel.confidence,
+                                )
+                            } else {
+                                (
+                                    rel.target.clone(),
+                                    false,
+                                    ResolutionLevel::Syntactic,
+                                    rel.confidence.min(0.5),
+                                )
+                            }
+                        }
                         _ => (rel.target.clone(), false, rel.resolution, rel.confidence),
                     };
                 relationships.push(PublicationRelationship {
@@ -421,6 +477,7 @@ impl StructuralPipeline {
                 .unwrap_or_default();
 
             out.push(PublicationStructuralFile {
+                analysis_receipt: f.analysis_receipt,
                 file_occurrence_id: occ,
                 structurally_complete: f.structurally_complete,
                 analyzer_id: f.analyzer_id,
@@ -431,6 +488,7 @@ impl StructuralPipeline {
                 unit_links,
             });
         }
+
         out
     }
 
@@ -463,6 +521,16 @@ impl StructuralPipeline {
         // DB fallback by qualified or short name.
         (deps.symbol_definition)(name, kinds)
     }
+}
+
+fn defines_symbol(symbols: &[PublicationSymbolDef], target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let suffix = format!(".{target}");
+    symbols.iter().any(|s| {
+        s.is_definition && (s.qualified_name == target || s.qualified_name.ends_with(&suffix))
+    })
 }
 
 // ---------------------------------------------------------------------------

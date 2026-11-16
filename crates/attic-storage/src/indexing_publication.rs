@@ -239,6 +239,8 @@ pub struct PublicationUnitLink {
 /// Per-file structural payload for a coordinated publication (Phase 3).
 #[derive(Debug, Clone)]
 pub struct PublicationStructuralFile {
+    /// Optional opt-in per-occurrence analysis evidence, including empty files.
+    pub analysis_receipt: Option<PublicationAnalysisReceipt>,
     /// Target file occurrence (UUID string).
     pub file_occurrence_id: String,
     /// `false` when the analyzer reported PARTIAL structural coverage
@@ -258,6 +260,19 @@ pub struct PublicationStructuralFile {
     pub relationships: Vec<PublicationRelationship>,
     /// Retrieval-unit ↔ structural-node associations.
     pub unit_links: Vec<PublicationUnitLink>,
+}
+
+/// Derived evidence only. Old indexes without this optional table are unproven.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PublicationAnalysisReceipt {
+    /// Complete symbol extraction was declared and successfully completed.
+    pub symbols_supported: bool,
+    /// Actual successful capability (capabilities are orthogonal).
+    pub capability_used: String,
+    /// Generic fallback was used.
+    pub fallback_used: bool,
+    /// The invocation emitted an error diagnostic.
+    pub has_errors: bool,
 }
 
 /// Counters returned by a successful coordinated publication.
@@ -410,6 +425,8 @@ fn execute_index_publication(
         stats.relationships_inserted += counts.relationships;
         stats.unit_node_links += counts.links;
     }
+
+    crate::repository::structural::prune_orphan_symbol_artifacts(conn, &repo_str)?;
 
     Ok(stats)
 }

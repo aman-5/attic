@@ -123,6 +123,301 @@ impl Drop for ServerHandle {
     }
 }
 
+#[tokio::test]
+async fn egm_is_available_by_default_over_official_client() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_attic"));
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog.db");
+    let mut srv = connect(&bin, &db, None).await;
+    let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tools.iter().any(|tool| tool.name == "spec"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = call_tool_text(&mut srv, "egm", serde_json::json!({}))
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_str(&response).unwrap();
+        if status["status"] != "initializing" {
+            assert_eq!(status["enabled"], true, "{status}");
+            assert_eq!(status["mode"], "manual");
+            assert_eq!(status["enforce"], false);
+            assert_eq!(status["roots"], serde_json::json!([]));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{status}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_attic"));
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("egm-tests");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let dir = tempfile::tempdir_in(fixtures).unwrap();
+    let disabled_db = dir.path().join("disabled").join("catalog.db");
+    std::fs::create_dir_all(disabled_db.parent().unwrap()).unwrap();
+    std::fs::write(
+        disabled_db.parent().unwrap().join("attic.toml"),
+        "[planning]\nenabled = false\n",
+    )
+    .unwrap();
+    {
+        let mut srv = connect(&bin, &disabled_db, None).await;
+        let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!tools.iter().any(|t| t.name == "spec"));
+        assert!(tools.iter().any(|t| t.name == "egm"));
+        let activation = call_tool_text(&mut srv, "egm", serde_json::json!({}))
+            .await
+            .unwrap();
+        let activation: Value = serde_json::from_str(&activation).unwrap();
+        assert_eq!(activation["enabled"], false);
+        assert!(
+            activation["activation"]["enable"]
+                .as_str()
+                .unwrap()
+                .contains("attic egm enable")
+        );
+        let guessed = call_tool_text(&mut srv, "spec", serde_json::json!({"action":"status"}))
+            .await
+            .unwrap();
+        assert!(guessed.contains("ERR_PLANNING_DISABLED"), "{guessed}");
+        assert!(!disabled_db.parent().unwrap().join("spec_state.db").exists());
+    }
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(root.join("src").join("lib.rs"), "pub fn original() {}\n").unwrap();
+    std::fs::create_dir_all(root.join("docs").join("designs")).unwrap();
+    std::fs::write(
+        root.join("docs").join("designs").join("one.md"),
+        "# One\n```attic-citations\nTARGET_MODIFY repo src/lib.rs\n```\n",
+    )
+    .unwrap();
+    let db = dir.path().join("enabled").join("catalog.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let activation = std::process::Command::new(&bin)
+        .args(["egm", "enable", "--root"])
+        .arg(&root)
+        .args(["--mode", "autopilot"])
+        .env("ATTIC_HOME", dir.path().join("attic-home"))
+        .env("ATTIC_DB_PATH", &db)
+        .env_remove("ATTIC_CONFIG")
+        .env_remove("ATTIC_WORKSPACE_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        activation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&activation.stderr)
+    );
+    assert!(!db.exists());
+    assert!(!db.parent().unwrap().join("spec_state.db").exists());
+    let mut srv = connect(&bin, &db, Some(&root)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let ready = loop {
+        let text = call_tool_text(&mut srv, "status", serde_json::json!({}))
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_str(&text).unwrap();
+        if status["workspace"]["current_repository_count"].as_u64() == Some(1) {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture indexing did not finish: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tools.iter().any(|t| t.name == "spec"));
+    let activation = call_tool_text(&mut srv, "egm", serde_json::json!({"action":"status"}))
+        .await
+        .unwrap();
+    let activation: Value = serde_json::from_str(&activation).unwrap();
+    assert_eq!(activation["enabled"], true);
+    assert_eq!(activation["mode"], "autopilot");
+    let guidance = call_tool_text(&mut srv, "egm", serde_json::json!({"action":"guidance"}))
+        .await
+        .unwrap();
+    let guidance: Value = serde_json::from_str(&guidance).unwrap();
+    assert!(
+        guidance["workflow"]["advance"]
+            .as_str()
+            .unwrap()
+            .contains("automatically")
+    );
+    let call = |action: &str| serde_json::json!({"action":action,"spec_id":"one","root":root});
+    let registered = call_tool_text(&mut srv, "spec", call("register"))
+        .await
+        .unwrap();
+    let registered: Value = serde_json::from_str(&registered).unwrap();
+    assert_eq!(
+        registered["status"], "UNDER_REVIEW",
+        "{registered}; ready={ready}"
+    );
+    let verified = call_tool_text(&mut srv, "spec", call("verify"))
+        .await
+        .unwrap();
+    let verified: Value = serde_json::from_str(&verified).unwrap();
+    assert_eq!(verified["status"], "VERIFIED", "{verified}");
+    let mut pack = call("pack");
+    pack["persona"] = "zoom_out".into();
+    pack["delivery"] = "inline".into();
+    let packed = call_tool_text(&mut srv, "spec", pack).await.unwrap();
+    let packed: Value = serde_json::from_str(&packed).unwrap();
+    assert!(
+        packed["data"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Existing repo_map summary")
+    );
+    let mut pack_paths = Vec::new();
+    for persona in ["zoom_out", "codebase_details", "implementation_readiness"] {
+        let mut pack = call("pack");
+        pack["persona"] = persona.into();
+        pack["delivery"] = "file".into();
+        let packed = call_tool_text(&mut srv, "spec", pack).await.unwrap();
+        let packed: Value = serde_json::from_str(&packed).unwrap();
+        let handle = &packed["data"];
+        let path = PathBuf::from(handle["path"].as_str().expect("file-delivered pack handle"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(handle["bytes"].as_u64(), Some(bytes.len() as u64));
+        assert_eq!(handle["sha256"], attic_spec::sha256(&bytes));
+        assert_eq!(handle["persona"], persona);
+        assert!(!path.starts_with(&root));
+        assert!(handle.get("markdown").is_none());
+        pack_paths.push(path);
+    }
+    let mut unknown = call("verify");
+    unknown["extra"] = true.into();
+    assert!(
+        call_tool_text(&mut srv, "spec", unknown)
+            .await
+            .unwrap()
+            .contains("ERR_INVALID_ARGUMENT")
+    );
+    assert!(
+        call_tool_text(&mut srv, "spec", call("approve"))
+            .await
+            .unwrap()
+            .contains("ERR_INVALID_ARGUMENT")
+    );
+    let mut outside = call("register");
+    outside["root"] = serde_json::json!(dir.path());
+    assert!(
+        call_tool_text(&mut srv, "spec", outside)
+            .await
+            .unwrap()
+            .contains("ERR_ROOT_NOT_ACTIVE")
+    );
+    struct HumanFixture;
+    impl attic_spec::service::ApprovalPrompt for HumanFixture {
+        fn is_interactive(&self) -> bool {
+            true
+        }
+        fn confirm(
+            &mut self,
+            _: &attic_spec::state::Document,
+            _: &attic_spec::verifier::Run,
+            _: &str,
+        ) -> attic_spec::Result<bool> {
+            Ok(true)
+        }
+    }
+    let service = attic_spec::service::SpecService::open(
+        &db,
+        attic_core::config::PlanningConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let doc = service.resolve("one", None).unwrap();
+    service.approve(&doc, &mut HumanFixture).unwrap();
+    let begun = call_tool_text(&mut srv, "spec", call("begin"))
+        .await
+        .unwrap();
+    let begun: Value = serde_json::from_str(&begun).unwrap();
+    assert_eq!(begun["status"], "IMPLEMENTING", "{begun}");
+    let document = &begun["data"]["document"];
+    let mut heartbeat = call("heartbeat");
+    heartbeat["lease_id"] = document["lease_id"].clone();
+    heartbeat["fencing_token"] = document["fencing_token"].clone();
+    let response = call_tool_text(&mut srv, "spec", heartbeat.clone())
+        .await
+        .unwrap();
+    assert!(response.contains("IMPLEMENTING"), "{response}");
+    heartbeat["action"] = "wave_complete".into();
+    heartbeat["wave_number"] = 1.into();
+    heartbeat["repository"] = "repo".into();
+    let response = call_tool_text(&mut srv, "spec", heartbeat.clone())
+        .await
+        .unwrap();
+    assert!(response.contains("COMPLETED"), "{response}");
+    heartbeat["action"] = "drift".into();
+    heartbeat.as_object_mut().unwrap().remove("wave_number");
+    heartbeat.as_object_mut().unwrap().remove("repository");
+    let response = call_tool_text(&mut srv, "spec", heartbeat).await.unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["status"], "IMPLEMENTED", "{response}");
+    let mut reopen = call("reopen");
+    reopen["reason"] = "fixture new scope".into();
+    let response = call_tool_text(&mut srv, "spec", reopen).await.unwrap();
+    assert!(response.contains("UNDER_REVIEW"), "{response}");
+    assert!(pack_paths.iter().all(|path| !path.exists()));
+    let before_disable = service.store.documents().unwrap();
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close())
+        .await
+        .unwrap();
+    drop(srv);
+    let disabled = std::process::Command::new(&bin)
+        .args(["egm", "disable"])
+        .env("ATTIC_HOME", dir.path().join("attic-home"))
+        .env("ATTIC_DB_PATH", &db)
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+    let mut srv = connect(&bin, &db, Some(&root)).await;
+    let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!tools.iter().any(|t| t.name == "spec"));
+    let activation = call_tool_text(&mut srv, "egm", serde_json::json!({}))
+        .await
+        .unwrap();
+    let activation: Value = serde_json::from_str(&activation).unwrap();
+    assert_eq!(activation["enabled"], false);
+    assert_eq!(service.store.documents().unwrap(), before_disable);
+    let denied = call_tool_text(&mut srv, "spec", call("status"))
+        .await
+        .unwrap();
+    assert!(denied.contains("ERR_PLANNING_DISABLED"));
+}
+
 /// Call a tool through the real rmcp client and return its first text block.
 async fn call_tool_text(
     srv: &mut ServerHandle,

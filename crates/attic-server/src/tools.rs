@@ -12,6 +12,20 @@ fn json_schema(v: Value) -> std::sync::Arc<serde_json::Map<String, Value>> {
 pub(crate) fn make_tools() -> Vec<Tool> {
     vec![
         Tool::new(
+            "egm",
+            "Read EGM activation status, user enable/disable commands, or mode-aware reviewer \
+             workflow guidance. Available even when \
+             EGM is disabled. Configuration changes are user CLI operations; this tool never \
+             enables enforcement, installs reviewers/hooks, or approves a spec.",
+            json_schema(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {"type":"string","enum":["status","guidance"],"default":"status"}
+                }
+            })),
+        ),
+        Tool::new(
             "file",
             "Retrieve a bounded region of the live, authoritative source of a file from an \
              indexed repository. Content is read directly from disk through the secrets-scan \
@@ -49,13 +63,19 @@ pub(crate) fn make_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "repo_map",
-            "Return statistics and structure map for an indexed repository.",
+            "Return a bounded, paginated structure map and statistics for an indexed repository. \
+             Use next_offset to continue; narrow with path_prefix or file_type.",
             json_schema(json!({
                 "type": "object",
                 "properties": {
                     "repository_id": {"type":"string","description":"UUID of the repository"},
                     "repository":    {"type":"string","description":"Unambiguous active repository name, UUID, or absolute root path"},
-                    "file_type":     {"type":"string","description":"Optional file-type filter"}
+                    "file_type":     {"type":"string","description":"Optional file-type filter"},
+                    "path_prefix":   {"type":"string","description":"Repo-relative directory prefix, matched at path-component boundaries"},
+                    "offset":        {"type":"integer","minimum":0,"description":"File offset from next_offset (default 0)"},
+                    "limit":         {"type":"integer","minimum":1,"maximum":1000,"default":200},
+                    "max_depth":     {"type":"integer","minimum":1,"maximum":32,"default":4},
+                    "max_bytes":     {"type":"integer","minimum":4096,"maximum":131072,"default":32768}
                 },
                 "anyOf": [{"required":["repository_id"]},{"required":["repository"]}]
             })),

@@ -3,6 +3,7 @@ use std::sync::RwLock;
 
 #[derive(Clone)]
 pub(crate) struct StartupServer {
+    spec_advertised: bool,
     state: Arc<RwLock<State>>,
     initialization: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -14,11 +15,24 @@ enum State {
     Stopping,
 }
 
+fn spec_advertised(db_path: &Path) -> bool {
+    match std::fs::read_to_string(attic_core::sibling(db_path, "attic.toml")) {
+        Ok(text) => attic_core::AtticConfig::parse_str(&text).is_ok_and(|cfg| cfg.planning.enabled),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            attic_core::config::PlanningConfig::default().enabled
+        }
+        Err(_) => false,
+    }
+}
+
 impl StartupServer {
     pub(crate) fn start(db_path: &Path, paths: &attic_core::AtticPaths) -> Self {
+        let spec_advertised = spec_advertised(db_path);
         let db_path = db_path.to_path_buf();
         let paths = paths.clone();
-        Self::initialize(move || build_server_and_enricher(&db_path, &paths))
+        let mut server = Self::initialize(move || build_server_and_enricher(&db_path, &paths));
+        server.spec_advertised = spec_advertised;
+        server
     }
 
     fn initialize(
@@ -42,6 +56,7 @@ impl StartupServer {
             *shared.write().unwrap_or_else(|e| e.into_inner()) = next;
         });
         Self {
+            spec_advertised: false,
             state,
             initialization: Arc::new(Mutex::new(Some(initialization))),
         }
@@ -110,11 +125,18 @@ impl ServerHandler for StartupServer {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
-        _cx: RequestContext<RoleServer>,
+        request: Option<PaginatedRequestParams>,
+        cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        if let Ok(server) = self.engine() {
+            return server.list_tools(request, cx).await;
+        }
+        let mut tools = make_tools();
+        if self.spec_advertised {
+            tools.push(spec_tool::tool());
+        }
         Ok(ListToolsResult {
-            tools: make_tools(),
+            tools,
             ..Default::default()
         })
     }
@@ -143,6 +165,20 @@ impl ServerHandler for StartupServer {
 mod tests {
     use super::*;
     use rmcp::ServiceExt;
+
+    #[test]
+    fn spec_discovery_uses_default_and_respects_explicit_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let config = attic_core::sibling(&db, "attic.toml");
+        assert!(spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nenabled = false\n").unwrap();
+        assert!(!spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nmode = 'manual'\n").unwrap();
+        assert!(spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nenabled = 'invalid'\n").unwrap();
+        assert!(!spec_advertised(&db));
+    }
 
     #[tokio::test]
     async fn mcp_remains_responsive_beyond_client_timeout_and_after_reconnect() {

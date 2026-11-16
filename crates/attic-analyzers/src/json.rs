@@ -487,39 +487,27 @@ fn chunk_value(
     }
 
     // Oversized subtree: decompose into children so units stay within the
-    // character target and dedup works at finer granularity.
+    // character target and dedup works at finer granularity. Runs of
+    // consecutive scalar children are packed into shared units; one unit per
+    // scalar made dense numeric data (embedding vectors) explode past the
+    // per-file unit budget and abort the whole repository publication.
     match value {
         serde_json::Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            for k in keys {
-                let child_ptr = format!("{}/{}", pointer, escape_pointer(k));
-                state.depth += 1;
-                chunk_value(&map[k], &child_ptr, state, ordinal_start, cancel);
-                state.depth -= 1;
-                if state.cancelled {
-                    return;
-                }
-                if state.units.len() >= state.max_units {
-                    state.report_budget_exhausted();
-                    return;
-                }
-            }
+            let children: Vec<(String, Option<&str>, &serde_json::Value)> = keys
+                .into_iter()
+                .map(|k| (escape_pointer(k), Some(k.as_str()), &map[k]))
+                .collect();
+            chunk_children(&children, pointer, &header, state, ordinal_start, cancel);
         }
         serde_json::Value::Array(arr) => {
-            for (i, item) in arr.iter().enumerate() {
-                let child_ptr = format!("{}/{}", pointer, i);
-                state.depth += 1;
-                chunk_value(item, &child_ptr, state, ordinal_start, cancel);
-                state.depth -= 1;
-                if state.cancelled {
-                    return;
-                }
-                if state.units.len() >= state.max_units {
-                    state.report_budget_exhausted();
-                    return;
-                }
-            }
+            let children: Vec<(String, Option<&str>, &serde_json::Value)> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (i.to_string(), None, item))
+                .collect();
+            chunk_children(&children, pointer, &header, state, ordinal_start, cancel);
         }
         // A scalar/primitive that alone exceeds the target (e.g. a huge
         // base64 blob): split the canonical BODY at char boundaries rather
@@ -527,6 +515,171 @@ fn chunk_value(
         // decorates the first piece's retrieval_text.
         _ => push_text_pieces(state, &header, &body, ordinal_start, pointer),
     }
+}
+
+/// One decomposed child: `(pointer segment, object key, value)`. `key` is
+/// `None` for array elements.
+type JsonChild<'a> = (String, Option<&'a str>, &'a serde_json::Value);
+
+/// Chunk the children of an oversized container. Container children recurse;
+/// consecutive scalar children are packed into units of at most
+/// `TARGET_CHUNK_CHARS` addressed by the parent pointer plus range metadata.
+fn chunk_children(
+    children: &[JsonChild<'_>],
+    pointer: &str,
+    header: &str,
+    state: &mut ChunkState,
+    ordinal_start: u32,
+    cancel: &crate::cancellation::CancellationToken,
+) {
+    let capacity = TARGET_CHUNK_CHARS.saturating_sub(header.len() + 2);
+    let mut run: Vec<(usize, String)> = Vec::new();
+    let mut run_len = 0usize;
+    for (index, (_, key, child)) in children.iter().enumerate() {
+        if child.is_object() || child.is_array() {
+            if !flush_scalar_run(
+                children,
+                &mut run,
+                &mut run_len,
+                pointer,
+                header,
+                state,
+                ordinal_start,
+                cancel,
+            ) || !chunk_child(&children[index], pointer, state, ordinal_start, cancel)
+            {
+                return;
+            }
+            continue;
+        }
+        let piece = match key {
+            Some(k) => format!(
+                "{}:{}",
+                serde_json::to_string(k).unwrap_or_default(),
+                canonical(child)
+            ),
+            None => canonical(child),
+        };
+        let added = piece.len() + usize::from(!run.is_empty());
+        if run_len + added > capacity
+            && !flush_scalar_run(
+                children,
+                &mut run,
+                &mut run_len,
+                pointer,
+                header,
+                state,
+                ordinal_start,
+                cancel,
+            )
+        {
+            return;
+        }
+        if piece.len() > capacity {
+            // Oversized scalar: its own pointer, split into text pieces.
+            if !chunk_child(&children[index], pointer, state, ordinal_start, cancel) {
+                return;
+            }
+            continue;
+        }
+        run_len += piece.len() + usize::from(!run.is_empty());
+        run.push((index, piece));
+    }
+    flush_scalar_run(
+        children,
+        &mut run,
+        &mut run_len,
+        pointer,
+        header,
+        state,
+        ordinal_start,
+        cancel,
+    );
+}
+
+/// Recurse into one child; `false` when chunking must stop.
+fn chunk_child(
+    child: &JsonChild<'_>,
+    pointer: &str,
+    state: &mut ChunkState,
+    ordinal_start: u32,
+    cancel: &crate::cancellation::CancellationToken,
+) -> bool {
+    let child_ptr = format!("{}/{}", pointer, child.0);
+    state.depth += 1;
+    chunk_value(child.2, &child_ptr, state, ordinal_start, cancel);
+    state.depth -= 1;
+    if state.cancelled {
+        return false;
+    }
+    if state.units.len() >= state.max_units {
+        state.report_budget_exhausted();
+        return false;
+    }
+    true
+}
+
+/// Emit the pending scalar run. A single scalar keeps its own pointer; two or
+/// more share one unit at the parent pointer. `false` when chunking must stop.
+#[allow(clippy::too_many_arguments)]
+fn flush_scalar_run(
+    children: &[JsonChild<'_>],
+    run: &mut Vec<(usize, String)>,
+    run_len: &mut usize,
+    pointer: &str,
+    header: &str,
+    state: &mut ChunkState,
+    ordinal_start: u32,
+    cancel: &crate::cancellation::CancellationToken,
+) -> bool {
+    let pending = std::mem::take(run);
+    *run_len = 0;
+    match pending.len() {
+        0 => true,
+        1 => chunk_child(
+            &children[pending[0].0],
+            pointer,
+            state,
+            ordinal_start,
+            cancel,
+        ),
+        _ => {
+            if state.units.len() >= state.max_units {
+                state.report_budget_exhausted();
+                return false;
+            }
+            let first = pending[0].0;
+            let last = pending[pending.len() - 1].0;
+            let pieces: Vec<&str> = pending.iter().map(|(_, p)| p.as_str()).collect();
+            let (body, group) = match (children[first].1, children[last].1) {
+                (Some(first_key), Some(last_key)) => (
+                    format!("{{{}}}", pieces.join(",")),
+                    GroupRange::Members(first_key.to_string(), last_key.to_string()),
+                ),
+                _ => (
+                    format!("[{}]", pieces.join(",")),
+                    GroupRange::Array(first, last + 1),
+                ),
+            };
+            push_unit(
+                state,
+                header.to_string(),
+                &body,
+                ordinal_start,
+                pointer,
+                Some(group),
+            );
+            true
+        }
+    }
+}
+
+/// Range metadata for a unit that covers several siblings of `pointer`.
+enum GroupRange {
+    /// Array elements `[start, end)`.
+    Array(usize, usize),
+    /// Object members from the first to the last key (sorted order).
+    Members(String, String),
 }
 
 /// Emit `body` as consecutive char-boundary-safe pieces of at most
@@ -576,7 +729,7 @@ fn push_unit(
     body: &str,
     ordinal_start: u32,
     pointer: &str,
-    group_range: Option<(usize, usize)>,
+    group_range: Option<GroupRange>,
 ) {
     let ordinal = ordinal_start + state.units.len() as u32;
     let text = format!("{header}{body}");
@@ -589,9 +742,16 @@ fn push_unit(
         Some(env) => serde_json::json!({"json_pointer": pointer, "environment": env}),
         None => serde_json::json!({"json_pointer": pointer}),
     };
-    if let Some((start, end)) = group_range {
-        occurrence_metadata["array_start"] = start.into();
-        occurrence_metadata["array_end"] = end.into();
+    match group_range {
+        Some(GroupRange::Array(start, end)) => {
+            occurrence_metadata["array_start"] = start.into();
+            occurrence_metadata["array_end"] = end.into();
+        }
+        Some(GroupRange::Members(first, last)) => {
+            occurrence_metadata["member_first"] = first.into();
+            occurrence_metadata["member_last"] = last.into();
+        }
+        None => {}
     }
     state.units.push(RetrievalUnitSpec {
         span: SourceSpan {
@@ -638,7 +798,7 @@ fn emit_array_group(
         &body,
         0,
         pointer,
-        Some((first, first + elements.len())),
+        Some(GroupRange::Array(first, first + elements.len())),
     );
     budget.remaining_units -= 1;
     budget.remaining_bytes -= size;
@@ -692,7 +852,10 @@ fn add_array_groups(
                 Some(env) => format!("// json-pointer: {pointer} (env: {env})\n"),
                 None => format!("// json-pointer: {pointer}\n"),
             };
-            if header.len() + canonical(value).len() > TARGET_CHUNK_CHARS {
+            // All-scalar arrays are already packed into range units by
+            // `chunk_children`; grouping them again would duplicate units.
+            let has_container = items.iter().any(|i| i.is_object() || i.is_array());
+            if has_container && header.len() + canonical(value).len() > TARGET_CHUNK_CHARS {
                 let capacity = TARGET_CHUNK_CHARS.saturating_sub(header.len() + 2);
                 let mut elements: Vec<String> = Vec::new();
                 let mut group_size = 0usize;
@@ -932,7 +1095,7 @@ mod tests {
         for i in 0..20 {
             obj.insert(
                 format!("key_{i:03}"),
-                serde_json::Value::String("x".repeat(100)),
+                serde_json::Value::String("x".repeat(1500)),
             );
         }
         let text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
@@ -946,6 +1109,86 @@ mod tests {
             .count();
         assert_eq!(hits, 1, "budget exhaustion reported exactly once");
         assert!(out.retrieval_units.len() <= 3);
+    }
+
+    #[test]
+    fn dense_numeric_vectors_pack_scalars_within_unit_budget() {
+        // Shape of an embedding-router seed file: candidates × vectors × floats.
+        let vector: Vec<f64> = (0..384)
+            .map(|i| 0.000_123_456_789 * i as f64 - 0.5)
+            .collect();
+        let candidate = serde_json::json!({
+            "id": "model-a",
+            "refEmbeddings": vec![vector.clone(); 40],
+            "alpha": vec![0.25_f64; 40],
+        });
+        let doc = serde_json::json!({ "candidates": vec![candidate; 7], "qualityBar": 0.8 });
+        let text = serde_json::to_string(&doc).unwrap();
+        let mut input = input_for(&text, "seed-router.json");
+        input.resource_budget.max_retrieval_units = 20_000;
+        let out = JsonAnalyzer::new().analyze(input);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == diagnostic_codes::RESOURCE_EXHAUSTED),
+            "dense vectors must not exhaust the unit budget: {} units",
+            out.retrieval_units.len()
+        );
+        assert!(
+            out.retrieval_units.len() < 7 * 40 * 10,
+            "scalars must be packed, got {} units",
+            out.retrieval_units.len()
+        );
+        // Every float in one vector is represented exactly once in its units.
+        let vec_ptr = "/candidates/0/refEmbeddings/0";
+        let covered: usize = out
+            .retrieval_units
+            .iter()
+            .filter(|u| {
+                u.occurrence_metadata
+                    .as_deref()
+                    .is_some_and(|m| m.contains(&format!("\"json_pointer\":\"{vec_ptr}\"")))
+            })
+            .map(|u| {
+                let body = u.canonical_text.as_deref().unwrap();
+                body.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .count()
+            })
+            .sum();
+        assert_eq!(covered, 384);
+        assert!(
+            out.retrieval_units
+                .iter()
+                .all(|u| u.retrieval_text.len() <= TARGET_CHUNK_CHARS)
+        );
+    }
+
+    #[test]
+    fn oversized_object_packs_scalar_members_with_key_range() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..200 {
+            obj.insert(format!("k{i:03}"), serde_json::Value::from(i));
+        }
+        let text = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap();
+        let out = JsonAnalyzer::new().analyze(input_for(&text, "flat.json"));
+        assert!(out.retrieval_units.len() > 1 && out.retrieval_units.len() < 10);
+        let meta = out.retrieval_units[0]
+            .occurrence_metadata
+            .as_deref()
+            .unwrap();
+        assert!(meta.contains("\"member_first\":\"k000\""), "{meta}");
+        let joined: String = out
+            .retrieval_units
+            .iter()
+            .map(|u| u.canonical_text.clone().unwrap())
+            .collect();
+        for i in 0..200 {
+            assert!(
+                joined.contains(&format!("\"k{i:03}\":{i}")),
+                "member k{i:03} missing"
+            );
+        }
     }
 
     #[test]

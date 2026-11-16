@@ -974,9 +974,9 @@ async fn multiple_relays_create_only_one_replacement_daemon() {
 /// No internal test-only hook exists to force this deterministically fast
 /// (and none should be added purely for a test), so this exercises the REAL
 /// bound (`elect`'s `CLIENT_TOTAL_RETRY_BUDGET` = 40s): correct, but slow by
-/// construction. Simulates "daemon cannot start" by having the TEST PROCESS
-/// itself grab `attic.lock` the instant the original daemon dies, before the
-/// relay's own re-election attempt — so the relay can never win it either.
+/// construction. In this private fixture, replace the lock pathname while
+/// the daemon still owns the old file, then hold the replacement before
+/// killing the daemon. Recovery sees a competing owner without a timing race.
 #[tokio::test]
 async fn recovery_is_bounded_when_daemon_cannot_start() {
     let _test_guard = serialize_daemon_test().await;
@@ -985,45 +985,35 @@ async fn recovery_is_bounded_when_daemon_cannot_start() {
     let (home, db) = attic_home_and_db(tmp.path());
 
     let mut srv1 = connect_daemon(&bin, &home, &db, None).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (mut srv2_child, _srv2_stdin, _srv2_stdout) = spawn_raw_child(&bin, &home, &db, None).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    srv1.child.start_kill().expect("kill daemon process");
-    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+    let mut srv2 = connect_daemon(&bin, &home, &db, None).await;
+    call_tool_text(&mut srv2, "status", serde_json::json!({}))
         .await
-        .expect("killed daemon did not exit in time");
+        .expect("relay must forward a real request before daemon loss");
 
-    // Immediately squat on attic.lock from the TEST process itself so no
-    // relay can ever win the re-election. The killed daemon's lock release is
-    // not instantaneous (OS handle teardown under host load), so poll briefly
-    // instead of a single racy attempt — but give up fast enough that the
-    // relay's own re-election cannot win first and void the premise.
+    // Only this fixture uses these paths. The connected relay cannot race
+    // re-election until its existing daemon connection is terminated.
     let lock_path = db.with_file_name("attic.lock");
+    std::fs::rename(&lock_path, db.with_file_name("attic.lock.original"))
+        .expect("rename the private fixture's still-owned lock file");
     let squat_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&lock_path)
         .expect("open lock file to squat on it");
-    let mut acquired = squat_lock.try_lock();
-    for _ in 0..20 {
-        if acquired.is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        acquired = squat_lock.try_lock();
-    }
-    acquired.expect(
-        "test process must win the lock shortly after the daemon died \
-         (before the relay's own re-election attempt) for this test's premise to hold",
-    );
+    squat_lock
+        .try_lock()
+        .expect("test process owns the replacement lock before daemon loss");
+    srv1.child.start_kill().expect("kill daemon process");
+    let _ = tokio::time::timeout(IO_TIMEOUT, srv1.child.wait())
+        .await
+        .expect("killed daemon did not exit in time");
 
     let probe_start = std::time::Instant::now();
     let deadline = probe_start + Duration::from_secs(90);
     let mut exited = false;
     while std::time::Instant::now() < deadline {
-        match srv2_child.try_wait() {
+        match srv2.child.try_wait() {
             Ok(Some(_status)) => {
                 exited = true;
                 break;

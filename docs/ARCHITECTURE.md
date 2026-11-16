@@ -247,8 +247,16 @@ Deleted-file tombstones, invalidation-audit records, and terminal
 part of maintenance, which operates on the managed catalog and repository
 stores. Clean shutdown runs maintenance and storage checkpointing — process
 exit, SIGINT, and a daemon's idle-timeout exit alike — so on-disk file size
-is expected to shrink after deletes rather than growing unbounded across
-the lifetime of a long-running daemon.
+need not shrink after deletes: SQLite can reuse freed pages without reducing
+the main database's allocated size. Checkpointing is not `VACUUM`.
+
+Full and incremental publication remove superseded structural artifacts and
+symbol-anchored relationships atomically. After inserting replacement symbols,
+publication also removes legacy relationships whose symbol source no longer
+exists and unreferenced symbol identities in the published repository.
+Reinserted and still-referenced symbols keep their identity IDs; unresolved
+logical relationship targets are preserved. File-occurrence, revision and
+generation history remains separate from this derived-artifact reclamation.
 
 ## Language support
 
