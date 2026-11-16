@@ -260,7 +260,7 @@ impl Default for KnowledgeConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AtticConfig {
-    /// Opt-in, user-global spec-first workflow settings.
+    /// User-global spec-first workflow settings.
     #[serde(default)]
     pub planning: PlanningConfig,
     /// `[resources]` table.
@@ -427,7 +427,7 @@ mode = "auto"
 # file_level = "info"
 #
 # [planning]
-# enabled = false
+# enabled = true                  # set false to disable EGM
 # mode = "manual"                 # manual | autopilot; approval is always human
 # roots = []                      # empty = all active roots
 # designs_dir = "docs/designs"

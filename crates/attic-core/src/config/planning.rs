@@ -29,7 +29,7 @@ pub enum FastPathScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-/// Opt-in spec-first workflow settings, independent of workspace membership.
+/// Spec-first workflow settings, independent of workspace membership.
 pub struct PlanningConfig {
     /// Master switch; false must not create workflow state.
     pub enabled: bool,
@@ -54,7 +54,7 @@ pub struct PlanningConfig {
 impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             mode: PlanningMode::Manual,
             roots: Vec::new(),
             designs_dir: "docs/designs".into(),
@@ -244,10 +244,14 @@ mod tests {
     use crate::config::{ATTIC_TOML_TEMPLATE, AtticConfig};
 
     #[test]
-    fn defaults_and_commented_template_preserve_opt_out() {
-        for text in ["", ATTIC_TOML_TEMPLATE] {
+    fn defaults_and_commented_template_enable_planning() {
+        for text in ["", "[planning]", ATTIC_TOML_TEMPLATE] {
             let config = AtticConfig::parse_str(text).unwrap();
             assert_eq!(config.planning, PlanningConfig::default());
+            assert!(config.planning.enabled);
+            assert_eq!(config.planning.mode, PlanningMode::Manual);
+            assert!(!config.planning.fast_path.enforce);
+            assert!(config.planning.roots.is_empty());
         }
         let block = ATTIC_TOML_TEMPLATE.split("# [planning]").nth(1).unwrap();
         let active = format!("[planning]{}", block.replace("\n# ", "\n"));
@@ -255,6 +259,8 @@ mod tests {
             AtticConfig::parse_str(&active).unwrap().planning,
             PlanningConfig::default()
         );
+        let disabled = AtticConfig::parse_str("[planning]\nenabled = false").unwrap();
+        assert!(!disabled.planning.enabled);
     }
 
     #[test]

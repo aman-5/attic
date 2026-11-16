@@ -1,4 +1,4 @@
-# Opt-in spec-first EGM workflow
+# Spec-first EGM workflow
 
 Attic supplies verified source context, human approval, fenced implementation
 waves and optional change-budget hooks. Reviewer contexts run in your agent host;
@@ -19,14 +19,16 @@ semantics. Missing or unreadable design documents invalidate verified/approval
 evidence conservatively, but cannot prevent lease revocation, reopen or abandon;
 historical approval/run records remain available.
 
-## Enable report-only first
+## Activation and report-only defaults
 
-Run `attic egm enable --root PATH --mode manual` (or `--mode autopilot`),
+EGM defaults to enabled for all active roots in manual, report-only mode. An
+explicit `enabled = false` remains disabled. To change activation or restrict
+roots, run `attic egm enable --root PATH --mode manual` (or `--mode autopilot`),
 then restart your Attic MCP server. Use `attic egm status` and the always-available
 MCP `egm` tool to inspect activation; `attic egm disable` preserves all workflow
 history. `attic egm guidance` / MCP `egm action=guidance` supply mode-aware
 reviewer handoff instructions. No configuration hand-editing is needed.
-Bare enable selects the current directory; `--all-roots` is explicit.
+Bare enable selects the current directory; `--all-roots` selects all active roots.
 Enable always defaults to report-only, even after a previous enforced session;
 `--enforce` is required to select enforcement again.
 CLI changes preserve unrelated configuration and comments and never open indexes
@@ -54,7 +56,8 @@ commit_grace_hours = 24
 fail_closed = false
 ```
 
-Default `enabled=false` preserves existing queries/indexing. Disabled hook
+With EGM enabled, server startup opens its workflow state database; later normal
+indexing records analysis receipts. Explicitly disabled hook
 entrypoints exit successfully before parsing payloads or creating directories,
 opening workflow databases, starting a daemon, or migrating a legacy layout.
 Enabling planning records analysis receipts on subsequent **normally authorized**
@@ -173,7 +176,7 @@ Optional `spec_index_analysis_receipts` is lazily added by enabled publication,
 inside existing WriterQueue transactions. It binds analyzer name/version,
 descriptor symbol capability, actual capability/fallback/errors/completeness,
 bytes, source revision and generation to the exact file occurrence—even when
-analysis produces no nodes. Default-disabled publication creates no receipt table
+analysis produces no nodes. Publication with EGM disabled creates no receipt table
 and retains the original cache-version format. Old occurrences without receipts,
 lexical/fallback/partial/syntax-error analysis and misbound receipts cannot prove
 symbol absence. Suffixes or node absence are never negative-symbol evidence.

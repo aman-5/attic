@@ -124,6 +124,35 @@ impl Drop for ServerHandle {
 }
 
 #[tokio::test]
+async fn egm_is_available_by_default_over_official_client() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_attic"));
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog.db");
+    let mut srv = connect(&bin, &db, None).await;
+    let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tools.iter().any(|tool| tool.name == "spec"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = call_tool_text(&mut srv, "egm", serde_json::json!({}))
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_str(&response).unwrap();
+        if status["status"] != "initializing" {
+            assert_eq!(status["enabled"], true, "{status}");
+            assert_eq!(status["mode"], "manual");
+            assert_eq!(status["enforce"], false);
+            assert_eq!(status["roots"], serde_json::json!([]));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{status}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_attic"));
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -135,6 +164,11 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     let dir = tempfile::tempdir_in(fixtures).unwrap();
     let disabled_db = dir.path().join("disabled").join("catalog.db");
     std::fs::create_dir_all(disabled_db.parent().unwrap()).unwrap();
+    std::fs::write(
+        disabled_db.parent().unwrap().join("attic.toml"),
+        "[planning]\nenabled = false\n",
+    )
+    .unwrap();
     {
         let mut srv = connect(&bin, &disabled_db, None).await;
         let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())

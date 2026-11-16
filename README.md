@@ -306,15 +306,16 @@ explicit dependency contracts remain grounded in source evidence.
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
 | `logging` | Turn the file log on/off or change its level (`error`…`trace`) instantly, no restart. To keep a level across restarts set `[logging] file_level` in `attic.toml` |
 | `debug_drain_task` | Admin: run one pending incremental task synchronously |
-| `spec` | Opt-in EGM citation verification, review packs, human-approved fenced waves and drift checks; advertised only when enabled |
+| `spec` | EGM citation verification, review packs, human-approved fenced waves and drift checks; advertised only when enabled |
 
 The exact schemas come from `make_tools()` in `crates/attic-server/src/tools.rs`
-and the opt-in `spec_tool::tool()` adapter, and are returned by `tools/list`.
+and the `spec_tool::tool()` adapter, and are returned by `tools/list`.
 
 ### EGM mode: enable, disable, inspect
 
-EGM workflow support is built into Attic, disabled by default. No handwritten
-configuration is required:
+EGM workflow support is enabled by default for all active roots, in manual,
+report-only mode. An existing `planning.enabled = false` remains disabled;
+explicitly enable it to change that setting. No handwritten configuration is required:
 
 ```text
 attic egm enable --root PATH --mode manual
@@ -335,10 +336,13 @@ For the default Windows installation (if `attic` is not on `PATH`):
 Restart the Attic MCP server after a configuration change; reconnecting to an
 already-running daemon does not reload its settings. The `egm` tool reports the
 running server's mode even while the `spec` tool is disabled.
-Enable defaults to the current directory, manual advancement and report-only.
-`--all-roots` explicitly selects all active workspace roots; `--enforce` explicitly
+The built-in default selects all active roots; the `enable` command defaults to
+the current directory, manual advancement and report-only.
+`--all-roots` selects all active workspace roots; `--enforce` explicitly
 enables budget enforcement. Neither command adds workspace membership, installs
 hooks/reviewers, starts a daemon, reindexes, nor approves a spec.
+With EGM enabled, server startup opens the EGM state database, and subsequent
+normal indexing records analysis receipts. It does not initiate reindexing.
 
 Manual mode asks before each workflow step. Autopilot guidance advances
 agent-owned steps but **always stops for human approval**. Your host supplies

@@ -104,6 +104,9 @@ fn rendered_hook_missing_binary_policy_and_disabled_binary_are_executable() {
     let binary = bin.join(if cfg!(windows) { "attic.exe" } else { "attic" });
     std::fs::hard_link(env!("CARGO_BIN_EXE_attic"), binary).unwrap();
     let path = std::env::join_paths([bin.as_path(), shell_dir]).unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("attic.toml"), "[planning]\nenabled = false\n").unwrap();
     let output = Command::new(&shell)
         .arg("pre-commit")
         .current_dir(dir.path())
@@ -119,5 +122,6 @@ fn rendered_hook_missing_binary_policy_and_disabled_binary_are_executable() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!dir.path().join("data").exists());
+    assert!(!data.join("spec_state.db").exists());
+    assert!(!data.join("catalog.db").exists());
 }

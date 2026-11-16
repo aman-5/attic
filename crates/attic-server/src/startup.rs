@@ -15,12 +15,19 @@ enum State {
     Stopping,
 }
 
+fn spec_advertised(db_path: &Path) -> bool {
+    match std::fs::read_to_string(attic_core::sibling(db_path, "attic.toml")) {
+        Ok(text) => attic_core::AtticConfig::parse_str(&text).is_ok_and(|cfg| cfg.planning.enabled),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            attic_core::config::PlanningConfig::default().enabled
+        }
+        Err(_) => false,
+    }
+}
+
 impl StartupServer {
     pub(crate) fn start(db_path: &Path, paths: &attic_core::AtticPaths) -> Self {
-        let spec_advertised = std::fs::read_to_string(attic_core::sibling(db_path, "attic.toml"))
-            .ok()
-            .and_then(|text| attic_core::AtticConfig::parse_str(&text).ok())
-            .is_some_and(|cfg| cfg.planning.enabled);
+        let spec_advertised = spec_advertised(db_path);
         let db_path = db_path.to_path_buf();
         let paths = paths.clone();
         let mut server = Self::initialize(move || build_server_and_enricher(&db_path, &paths));
@@ -158,6 +165,20 @@ impl ServerHandler for StartupServer {
 mod tests {
     use super::*;
     use rmcp::ServiceExt;
+
+    #[test]
+    fn spec_discovery_uses_default_and_respects_explicit_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let config = attic_core::sibling(&db, "attic.toml");
+        assert!(spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nenabled = false\n").unwrap();
+        assert!(!spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nmode = 'manual'\n").unwrap();
+        assert!(spec_advertised(&db));
+        std::fs::write(&config, "[planning]\nenabled = 'invalid'\n").unwrap();
+        assert!(!spec_advertised(&db));
+    }
 
     #[tokio::test]
     async fn mcp_remains_responsive_beyond_client_timeout_and_after_reconnect() {

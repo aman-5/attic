@@ -37,6 +37,12 @@ fn config(dir: &Path, fail_closed: bool) {
 #[test]
 fn disabled_hooks_ignore_bad_payload_and_create_no_state_or_runtime() {
     let dir = fixture();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    std::fs::write(
+        dir.path().join("data").join("attic.toml"),
+        "[planning]\nenabled = false\n",
+    )
+    .unwrap();
     for action in ["check-write", "baseline-start", "check-commit"] {
         let out = run(dir.path(), &[action, "--host", "claude"], b"not json");
         assert!(
@@ -45,7 +51,8 @@ fn disabled_hooks_ignore_bad_payload_and_create_no_state_or_runtime() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    assert!(!dir.path().join("data").exists());
+    assert!(!dir.path().join("data").join("spec_state.db").exists());
+    assert!(!dir.path().join("data").join("catalog.db").exists());
     assert!(!dir.path().join("home").exists());
     assert!(run(dir.path(), &["--help"], b"").status.success());
 }

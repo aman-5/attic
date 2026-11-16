@@ -31,7 +31,10 @@ fn controls_preserve_settings_and_toggle_without_starting_runtime_or_state() {
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let initial = json(command(&home).arg("status").output().unwrap());
-    assert_eq!(initial["enabled"], false);
+    assert_eq!(initial["enabled"], true);
+    assert_eq!(initial["mode"], "manual");
+    assert_eq!(initial["enforce"], false);
+    assert_eq!(initial["roots"], serde_json::json!([]));
     assert!(!home.exists());
     let config_dir = home.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
