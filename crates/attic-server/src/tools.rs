@@ -27,32 +27,43 @@ pub(crate) fn make_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "file",
-            "Retrieve a bounded region of the live, authoritative source of a file from an \
-             indexed repository. Content is read directly from disk through the secrets-scan \
-             layer; redacted or excluded files are flagged. Supports line-range \
-             (start_line/end_line, 1-indexed, inclusive) and byte-range (start_byte/end_byte, \
-             0-indexed, exclusive; byte ranges override lines). Byte offsets that do not land \
-             on a UTF-8 character boundary are floored to the nearest preceding boundary. \
-             JSON pointers, indexed unit IDs, parent expansion, and bounded JSON outlines \
-             navigate the current sanitized file. Unit locations are indexed and may be stale. \
-             grep supports literal or regex matching in sanitized lines, with bounded \
-             per-line byte columns, explicit coverage, and continuation metadata. \
-             LARGE files are streamed; responses are capped by server-side output limits.",
+            "Read live, authoritative source from an indexed repository through the \
+             secrets-scan layer (redacted/excluded files are flagged). Pick ONE selector: \
+             (1) path + optional start_line/end_line (1-indexed, inclusive) or \
+             start_byte/end_byte (0-indexed, exclusive; overrides lines; floored to UTF-8 \
+             boundaries); (2) ranges: up to 16 {path,start_line?,end_line?} reads in ONE call — \
+             prefer this over repeated calls after SEARCH; output is capped at 128 KiB and \
+             ranges that do not fit are listed as omitted, never cut; (3) unit_id from a \
+             SEARCH result (indexed location, may be stale); (4) JSON navigation: \
+             json_pointer, parent, outline/outline_depth; (5) grep (+regex, max_matches) for \
+             literal/regex matches with coverage metadata. Large files are streamed; output \
+             is capped server-side.",
             json_schema(json!({
                 "type": "object",
                 "properties": {
                     "repository_id": {"type":"string","description":"UUID of the repository"},
                     "repository":    {"type":"string","description":"Unambiguous active repository name, UUID, or absolute root path"},
                     "path":          {"type":"string","description":"Repo-relative path"},
-                    "unit_id":       {"type":"string","description":"Indexed retrieval unit UUID; may replace path"},
-                    "retrieval_unit_id": {"type":"string","description":"Indexed retrieval unit UUID; may replace path (alias: unit_id)"},
-                    "json_pointer":  {"type":"string","description":"RFC 6901 pointer into the live JSON file"},
-                    "parent":        {"type":"boolean","description":"Expand the parent of the selected JSON value"},
-                    "outline":       {"type":"boolean","description":"Return a bounded JSON structural outline"},
-                    "outline_depth": {"type":"integer","minimum":1,"maximum":5,"description":"Outline depth (default 2)"},
+                    "ranges":        {
+                        "type":"array","minItems":1,"maxItems":16,
+                        "description":"Batch read: several line ranges in one call; excludes every other selector",
+                        "items": {
+                            "type":"object","additionalProperties":false,"required":["path"],
+                            "properties": {
+                                "path":       {"type":"string"},
+                                "start_line": {"type":"integer","minimum":1},
+                                "end_line":   {"type":"integer","minimum":1}
+                            }
+                        }
+                    },
+                    "unit_id":       {"type":"string","description":"Indexed retrieval unit UUID (retrieval_unit_id from SEARCH); may replace path"},
+                    "json_pointer":  {"type":"string","description":"JSON only: RFC 6901 pointer into the live file"},
+                    "parent":        {"type":"boolean","description":"JSON only: expand the parent of the selected value"},
+                    "outline":       {"type":"boolean","description":"JSON only: bounded structural outline"},
+                    "outline_depth": {"type":"integer","minimum":1,"maximum":5,"description":"JSON outline only: depth (default 2)"},
                     "grep":          {"type":"string","description":"Find literal text in this file"},
-                    "regex":         {"type":"boolean","description":"Interpret grep as a regular expression"},
-                    "max_matches":   {"type":"integer","minimum":1,"maximum":200,"description":"Maximum matching lines (default 50)"},
+                    "regex":         {"type":"boolean","description":"grep only: treat grep as a regular expression"},
+                    "max_matches":   {"type":"integer","minimum":1,"maximum":200,"description":"grep only: maximum matching lines (default 50)"},
                     "start_line":    {"type":"integer","description":"First line (1-indexed)"},
                     "end_line":      {"type":"integer","description":"Last line (1-indexed, inclusive)"},
                     "start_byte":    {"type":"integer","description":"Start byte offset (0-indexed, overrides lines)"},
@@ -110,59 +121,47 @@ pub(crate) fn make_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "context",
-            "One door for retrieval and answers. Default (NORMAL): evidence-driven context \
-             assembly for a natural-language engineering question — classifies the query, \
-             applies the Query Evidence Contract for its intent (definition/navigation/\
-             configuration/architecture/debugging/impact/dependency/test/knowledge), \
-             retrieves candidates from lexical+symbol+structural+relationship+knowledge \
-             indexes, validates freshness/provenance/confidence, expands bounded (graph \
-             walk or secure source verification) when requirements are unmet, and returns \
-             a secret-free, provenance-stamped context with verified claims — or an \
-             explicit INSUFFICIENT_EVIDENCE verdict. Modes: FAST (index-only, cheapest), \
-             NORMAL (default), DEEP (up to 30 s of work; some MCP clients time out long \
-             requests — prefer NORMAL and escalate to DEEP on INSUFFICIENT_EVIDENCE). \
-             A hard-cancelled query still returns whatever evidence completed validation, \
-             with result POLICY_HARD_CANCELLED and confidence NONE. \
-             mode=\"SEARCH\": raw lexical retrieval (SQLite FTS5) \
-             WITHOUT evidence assembly — for exact-string/identifier lookup, not \
-             questions. Each SEARCH result carries a source_type, a bounded ~240-char \
-             snippet, and start/end line anchors when recorded — use the `file` tool for \
-             full content. SEARCH accepts file_type, language, max_results (default 25, \
-             cap 200), and scope (\"all\"|\"knowledge\"). SEARCH combines plain terms \
-             with ranked OR by default; quoted phrases and explicit AND/OR/NOT groups \
-             are supported. Set match_mode=\"all\" for strict adjacent terms. \
-             path, path_prefix, and path_glob restrict results before ranking. \
-             Answer modes may include central knowledge and workspace relationship \
-             evidence when only a repository is selected; an explicit path scope \
-             disables those additions. \
-             mode=\"REFERENCES\" scans bounded sanitized indexed files for literal references, \
-             distinguishes syntactic JSON keys/string matches and reports incomplete coverage. \
-             Answer modes share identical excerpt bodies while retaining every citation; \
-             repository_answers contains summaries, not duplicate full answers. \
-             Rejected-evidence counts/reasons are always included; set include_diagnostics=true \
-             for individual rejected items. Response budgets preserve whole evidence and \
-             report omitted results; narrow repository/path scope for more. telemetry reports \
-             server timings and UTF-8 response bytes, not client/model processing time.",
+            "One door for code retrieval. MODES: \
+             NORMAL (default) — evidence-driven answer to a natural-language engineering \
+             question: classifies intent, retrieves lexical+symbol+structural+relationship+\
+             knowledge candidates, verifies freshness/provenance, expands bounded when \
+             evidence is short, returns secret-free cited context and verified claims, or \
+             INSUFFICIENT_EVIDENCE. FAST — index-only, cheapest. DEEP — up to 30 s; some \
+             clients time out, so escalate from NORMAL only on INSUFFICIENT_EVIDENCE. \
+             SEARCH — raw lexical (SQLite FTS5) identifier/string lookup, no evidence \
+             assembly; each hit has source_type, a ~240-char snippet and line anchors; \
+             read several hits at once with file(ranges=[...]). Plain terms are ranked OR; \
+             quoted phrases and AND/OR/NOT groups work. REFERENCES — bounded literal \
+             reference scan with explicit coverage and continuation fields. \
+             ALL MODES: repository/repository_id, one of path/path_prefix/path_glob (applied \
+             before ranking), max_bytes (lower the response cap: FAST 64 KiB, NORMAL/SEARCH/\
+             REFERENCES 128 KiB, DEEP 256 KiB). Answer modes may add central knowledge and \
+             workspace relationship evidence unless a path scope is set; identical excerpts \
+             share one body; repository_answers holds summaries only. Budgets keep whole \
+             evidence and report omissions in response_budget. A hard-cancelled query \
+             returns validated evidence with POLICY_HARD_CANCELLED/NONE. telemetry reports \
+             server timings, response bytes and approx_tokens (bytes/4 estimate).",
             json_schema(json!({
                 "type": "object",
                 "properties": {
-                    "query":         {"type":"string","description":"Natural-language question (max 512 chars); SEARCH supports quoted phrases and AND/OR/NOT"},
-                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP","SEARCH","REFERENCES"],"description":"Answer-mode policy (default NORMAL); SEARCH = raw lexical retrieval; REFERENCES = bounded syntactic reference scan"},
+                    "query":         {"type":"string","description":"Question or lookup text (max 512 chars)"},
+                    "mode":          {"type":"string","enum":["FAST","NORMAL","DEEP","SEARCH","REFERENCES"],"description":"Default NORMAL"},
                     "repository_id": {"type":"string","description":"Optional repository UUID scope"},
                     "repository":    {"type":"string","description":"Optional unambiguous active repository name, UUID, or absolute root path"},
                     "path":          {"type":"string","description":"Exact repository-relative file path"},
                     "path_prefix":   {"type":"string","description":"Repository-relative directory and descendants"},
                     "path_glob":     {"type":"string","description":"Repository-relative path glob using * and ?"},
-                    "match_mode":    {"type":"string","enum":["any","all"],"description":"SEARCH: combine adjacent terms with ranked OR (default) or strict AND"},
-                    "file_type":     {"type":"string","description":"SEARCH mode: filter by file extension (max 32)"},
-                    "language":      {"type":"string","description":"SEARCH mode: filter by detected language (max 64)"},
-                    "max_results":   {"type":"integer","minimum":1,"maximum":200,"description":"SEARCH default 25; REFERENCES default 100; maximum 200"},
-                    "max_files":     {"type":"integer","minimum":1,"maximum":64,"description":"REFERENCES: maximum files to scan (default 32)"},
-                    "after_path":    {"type":"string","description":"REFERENCES: continue after this path within one repository"},
-                    "reference_offset": {"type":"integer","minimum":0,"description":"REFERENCES: resume JSON matches in an exact file"},
-                    "reference_start_line": {"type":"integer","minimum":1,"description":"REFERENCES: resume text matches in an exact file"},
-                    "scope":         {"type":"string","enum":["all","knowledge"],"description":"SEARCH mode: \"knowledge\" = only project knowledge (central knowledge folder first, then repository knowledge/ folders). Default \"all\""}
-                    ,"include_diagnostics": {"type":"boolean","default":false,"description":"Answer modes: include individual rejected-evidence diagnostics; counts/reasons are always returned"}
+                    "max_bytes":     {"type":"integer","minimum":8192,"maximum":262144,"description":"Lower the response cap for this call; never raises the mode cap"},
+                    "include_diagnostics": {"type":"boolean","default":false,"description":"Answer modes only: list individual rejected evidence (counts/reasons always returned)"},
+                    "match_mode":    {"type":"string","enum":["any","all"],"description":"SEARCH only: ranked OR (default) or strict AND of adjacent terms"},
+                    "file_type":     {"type":"string","description":"SEARCH only: file extension filter (max 32)"},
+                    "language":      {"type":"string","description":"SEARCH only: detected-language filter (max 64)"},
+                    "scope":         {"type":"string","enum":["all","knowledge"],"description":"SEARCH only: \"knowledge\" = project knowledge only (central folder first, then repository knowledge/ folders). Default \"all\""},
+                    "max_results":   {"type":"integer","minimum":1,"maximum":200,"description":"SEARCH (default 25) and REFERENCES (default 100) only"},
+                    "max_files":     {"type":"integer","minimum":1,"maximum":64,"description":"REFERENCES only: maximum files to scan (default 32)"},
+                    "after_path":    {"type":"string","description":"REFERENCES only: continue after this path within one repository"},
+                    "reference_offset": {"type":"integer","minimum":0,"description":"REFERENCES only: resume JSON matches in an exact file"},
+                    "reference_start_line": {"type":"integer","minimum":1,"description":"REFERENCES only: resume text matches in an exact file"}
                 },
                 "required": ["query"]
             })),

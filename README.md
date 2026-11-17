@@ -300,7 +300,7 @@ explicit dependency contracts remain grounded in source evidence.
 |---|---|
 | `egm` | Always-available EGM activation status, user enable/disable commands, and mode-aware host reviewer guidance |
 | `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
-| `file` | Bounded, secret-scanned live-file ranges, JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
+| `file` | Bounded, secret-scanned live-file ranges (or up to 16 `ranges` in one call), JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Bounded structure/statistics; `path_prefix`, `max_depth`, file pagination and explicit byte budget |
 | `status` | Readiness, indexing/watcher state, resource pressure, retrieval telemetry (`retrieval_telemetry`: recent plan outcomes by mode/result) |
 | `workspace` | `inspect` / `add` / `remove` / `set` repository roots at runtime (persisted) |
@@ -363,10 +363,12 @@ Answer responses keep context, claims and evidence at the top level;
 answers. Identical excerpts share a body while preserving all source citations.
 Rejected-evidence counts/reasons are always present; pass
 `include_diagnostics: true` for individual rejected items. Response `telemetry`
-reports server timings and exact JSON-text bytes, not client/model latency.
+reports server timings, exact JSON-text bytes and `approx_tokens` (bytes/4, an
+estimate of model cost), not client/model latency.
 `context` responses are capped at 64 KiB for FAST, 128 KiB for NORMAL,
-SEARCH and REFERENCES, and 256 KiB for DEEP. Omitted material and narrowing
-or continuation guidance appear in `response_budget`.
+SEARCH and REFERENCES, and 256 KiB for DEEP. Pass `max_bytes` (8192-262144)
+to lower the cap for one call; it never raises the mode cap. Omitted material
+and narrowing or continuation guidance appear in `response_budget`.
 See [response quality and latency diagnosis](docs/PERFORMANCE.md).
 
 `SEARCH` combines adjacent terms with ranked OR; `match_mode: "all"` restores
@@ -379,8 +381,17 @@ scope. Without an explicit path scope, answer modes may supplement a selected
 repository with central knowledge and workspace dependency relationships;
 SEARCH and REFERENCES remain scoped to the selected repository.
 
+`file` accepts `ranges: [{path, start_line?, end_line?}, ...]` (1-16 entries,
+one repository) to read several SEARCH hits in one round trip instead of one
+call per hit. `ranges` cannot be combined with other selectors. Each range
+uses the normal secret-scanned read; a failing range reports an inline error
+without hiding the others. Total output is capped at 128 KiB: ranges that do
+not fit are listed as omitted and never cut mid-range.
+
 JSON search results may include a `json_pointer`, `retrieval_unit_id` and
-indexed source locations. Locations are `indexed_unverified`: expand with
+indexed source locations. Pass that ID to `file` as `unit_id`
+(`retrieval_unit_id` is still accepted as an alias). Locations are
+`indexed_unverified`: expand with
 `file` against current sanitized content, and treat `position_basis` as
 authoritative for byte offsets. Legacy JSON units without source positions
 require reanalysis. Unit expansion can select an indexed array group; indices

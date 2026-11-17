@@ -724,6 +724,62 @@ fn file_rejects_overflow_numeric_arguments() {
     assert!(handle_file(&srv.pool, &b, &ids(&srv)).is_err());
 }
 
+// handle_file: batch ranges
+#[test]
+fn file_batch_reads_ranges_reports_errors_inline_and_omits_overflow() {
+    use std::fs;
+    let tmp = TempDir::new().unwrap();
+    let srv = make_server(&tmp);
+    let repo = tmp.path().join("batch");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("a.txt"), "alpha1\nalpha2\nalpha3\n").unwrap();
+    fs::write(repo.join("b.txt"), "beta1\nbeta2\n").unwrap();
+    let big = "bigline\n".repeat(20_000);
+    fs::write(repo.join("big.txt"), &big).unwrap();
+    let repo_id = srv.bootstrap_workspace(&repo).expect("bootstrap");
+
+    let args = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        (
+            "ranges".into(),
+            json!([
+                {"path": "a.txt", "start_line": 2, "end_line": 2},
+                {"path": "missing.txt"},
+                {"path": "big.txt"},
+                {"path": "b.txt", "start_line": 1, "end_line": 1}
+            ]),
+        ),
+    ]);
+    let text = text_of(&handle_file(&srv.pool, &args, &ids(&srv)).unwrap());
+    assert!(
+        text.contains("alpha2") && !text.contains("alpha1"),
+        "{text}"
+    );
+    assert!(text.contains("beta1") && !text.contains("beta2"), "{text}");
+    assert!(
+        text.contains("# missing.txt") && text.contains("[error:"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("bigline"),
+        "{}",
+        &text[..text.len().min(512)]
+    );
+    assert!(
+        text.contains("omitted ranges") && text.contains("big.txt"),
+        "{text}"
+    );
+
+    let mut mixed = args.clone();
+    mixed.insert("path".into(), json!("a.txt"));
+    assert!(handle_file(&srv.pool, &mixed, &ids(&srv)).is_err());
+    let unknown_field = HashMap::from([
+        ("repository_id".into(), json!(repo_id)),
+        ("ranges".into(), json!([{"path": "a.txt", "grep": "x"}])),
+    ]);
+    assert!(handle_file(&srv.pool, &unknown_field, &ids(&srv)).is_err());
+}
+
 // handle_file: live read + region
 #[test]
 fn file_returns_live_content_and_region() {
