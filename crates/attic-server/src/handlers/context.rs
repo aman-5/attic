@@ -17,6 +17,7 @@ pub(crate) fn handle_context(
     knowledge_repository_id: Option<String>,
 ) -> Result<CallToolResult, ServerError> {
     include_diagnostics(args)?;
+    validate_max_bytes(args)?;
     if matches!(args.get("mode").and_then(Value::as_str), Some("SEARCH")) {
         return crate::handlers::search::handle_search(
             pool,
@@ -476,29 +477,62 @@ pub(crate) fn include_diagnostics(args: &HashMap<String, Value>) -> Result<bool,
     }
 }
 
+/// Same bytes/4 approximation as `attic_evidence::approx_tokens`; model
+/// tokenizers differ, so this is an estimate of the client-side cost.
+fn approx_tokens(bytes: usize) -> u64 {
+    (bytes as u64).div_ceil(4)
+}
+
 pub(crate) fn context_response(mut payload: Value) -> Result<CallToolResult, ServerError> {
     let started = std::time::Instant::now();
     let encoded = serde_json::to_string(&payload)?;
     payload["telemetry"]["serialization_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
     payload["telemetry"]["response_bytes"] = json!(encoded.len());
-    // Include the size field itself in the reported UTF-8 byte count.
+    payload["telemetry"]["approx_tokens"] = json!(approx_tokens(encoded.len()));
+    // Include the size fields themselves in the reported UTF-8 byte count.
     let text = loop {
         let text = serde_json::to_string(&payload)?;
         if payload["telemetry"]["response_bytes"].as_u64() == Some(text.len() as u64) {
             break text;
         }
         payload["telemetry"]["response_bytes"] = json!(text.len());
+        payload["telemetry"]["approx_tokens"] = json!(approx_tokens(text.len()));
     };
     tracing::info!(response_bytes = text.len(), "context response encoded");
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
+pub(crate) const MIN_CLIENT_RESPONSE_BYTES: u64 = 8 * 1024;
+pub(crate) const MAX_CLIENT_RESPONSE_BYTES: u64 = 256 * 1024;
+
+/// Validate the optional client `max_bytes` response budget.
+pub(crate) fn validate_max_bytes(args: &HashMap<String, Value>) -> Result<(), ServerError> {
+    match args.get("max_bytes") {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) => match value.as_u64() {
+            Some(bytes)
+                if (MIN_CLIENT_RESPONSE_BYTES..=MAX_CLIENT_RESPONSE_BYTES).contains(&bytes) =>
+            {
+                Ok(())
+            }
+            _ => Err(ServerError::InvalidArg(format!(
+                "max_bytes must be an integer in {MIN_CLIENT_RESPONSE_BYTES}..={MAX_CLIENT_RESPONSE_BYTES}"
+            ))),
+        },
+    }
+}
+
+/// Per-mode response cap, lowered (never raised) by a client `max_bytes`.
 pub(crate) fn response_limit(args: &HashMap<String, Value>) -> usize {
-    match args.get("mode").and_then(Value::as_str) {
+    let mode_cap = match args.get("mode").and_then(Value::as_str) {
         Some("FAST") => 64 * 1024,
         Some("DEEP") => 256 * 1024,
         _ => 128 * 1024,
-    }
+    };
+    args.get("max_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .map_or(mode_cap, |bytes| bytes.min(mode_cap))
 }
 
 pub(crate) fn apply_document_budget(
@@ -819,6 +853,20 @@ mod tests {
     }
 
     #[test]
+    fn client_max_bytes_lowers_but_never_raises_mode_cap() {
+        let args = |mode: &str, bytes: Value| {
+            HashMap::from([("mode".into(), json!(mode)), ("max_bytes".into(), bytes)])
+        };
+        assert_eq!(response_limit(&args("FAST", json!(16_384))), 16_384);
+        assert_eq!(response_limit(&args("FAST", json!(262_144))), 64 * 1024);
+        assert_eq!(response_limit(&args("DEEP", json!(262_144))), 256 * 1024);
+        assert!(validate_max_bytes(&args("FAST", json!(100))).is_err());
+        assert!(validate_max_bytes(&args("FAST", json!(300_000))).is_err());
+        assert!(validate_max_bytes(&args("FAST", json!("16384"))).is_err());
+        assert!(validate_max_bytes(&args("FAST", json!(16_384))).is_ok());
+    }
+
+    #[test]
     fn response_preserves_unique_content_above_the_rejected_size_cap() {
         let context = "fn unique_content() {}\n".repeat(12_000);
         let evidence = json!([{"evidence_id": "ev-one", "repository_id": "repo-one"}]);
@@ -835,6 +883,10 @@ mod tests {
         assert_eq!(decoded["evidence"], evidence);
         assert_eq!(decoded["claims"][0]["evidence_ids"][0], "ev-one");
         assert_eq!(decoded["telemetry"]["response_bytes"], text.len());
+        assert_eq!(
+            decoded["telemetry"]["approx_tokens"],
+            (text.len() as u64).div_ceil(4)
+        );
     }
 
     #[test]

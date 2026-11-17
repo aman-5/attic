@@ -491,6 +491,7 @@ impl AtticServer {
 
         let started = std::time::Instant::now();
         let diagnostics = crate::handlers::context::include_diagnostics(args)?;
+        crate::handlers::context::validate_max_bytes(args)?;
         let scoped = args.get("repository_id").and_then(Value::as_str);
         let query = args
             .get("query")

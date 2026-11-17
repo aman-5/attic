@@ -506,11 +506,132 @@ fn add_outline_entries(
     }
 }
 
+const MAX_BATCH_RANGES: usize = 16;
+pub(crate) const MAX_BATCH_RESPONSE_BYTES: usize = 128 * 1024;
+const BATCH_EXCLUSIVE_ARGS: [&str; 14] = [
+    "path",
+    "unit_id",
+    "retrieval_unit_id",
+    "json_pointer",
+    "parent",
+    "outline",
+    "outline_depth",
+    "grep",
+    "regex",
+    "max_matches",
+    "start_line",
+    "end_line",
+    "start_byte",
+    "end_byte",
+];
+
+/// Read several line ranges of one repository in a single call. Each range
+/// goes through the normal single-read path; failures are reported inline so
+/// one bad range never hides the others. Whole sections that would exceed the
+/// batch budget are named as omitted rather than cut mid-range.
+fn handle_file_batch(
+    pool: &DbPool,
+    args: &HashMap<String, Value>,
+    active_ids: &HashSet<String>,
+    ranges: &Value,
+) -> Result<CallToolResult, ServerError> {
+    let items = ranges
+        .as_array()
+        .ok_or_else(|| ServerError::InvalidArg("ranges must be an array".into()))?;
+    if items.is_empty() || items.len() > MAX_BATCH_RANGES {
+        return Err(ServerError::InvalidArg(format!(
+            "ranges must contain 1..={MAX_BATCH_RANGES} entries"
+        )));
+    }
+    if let Some(key) = BATCH_EXCLUSIVE_ARGS
+        .iter()
+        .find(|key| args.get(**key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(ServerError::InvalidArg(format!(
+            "ranges cannot be combined with {key}"
+        )));
+    }
+    let repo_id = args
+        .get("repository_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
+    validate_repository_id(repo_id)?;
+    require_active_member(active_ids, repo_id)?;
+
+    let mut requests = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| ServerError::InvalidArg(format!("ranges[{index}] must be an object")))?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "path" | "start_line" | "end_line"))
+        {
+            return Err(ServerError::InvalidArg(format!(
+                "ranges[{index}] has unsupported field {key}"
+            )));
+        }
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServerError::InvalidArg(format!("ranges[{index}].path required")))?;
+        let mut single = args.clone();
+        single.remove("ranges");
+        single.insert("path".into(), json!(path));
+        let mut label = path.to_owned();
+        for key in ["start_line", "end_line"] {
+            if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+                single.insert(key.into(), value.clone());
+            }
+        }
+        if let (Some(start), Some(end)) = (single.get("start_line"), single.get("end_line")) {
+            label = format!("{label}:{start}-{end}");
+        } else if let Some(start) = single.get("start_line") {
+            label = format!("{label}:{start}-");
+        } else if let Some(end) = single.get("end_line") {
+            label = format!("{label}:1-{end}");
+        }
+        requests.push((label, single));
+    }
+
+    let mut sections = Vec::with_capacity(requests.len());
+    let mut used = 0usize;
+    let mut omitted = Vec::new();
+    for (label, single) in requests {
+        let section = match handle_file(pool, &single, active_ids) {
+            Ok(result) => result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|text| text.text.clone())
+                .unwrap_or_default(),
+            Err(error) => format!("# {label}\n\n[error: {error}]"),
+        };
+        if used.saturating_add(section.len()) > MAX_BATCH_RESPONSE_BYTES {
+            omitted.push(label);
+            continue;
+        }
+        used += section.len();
+        sections.push(section);
+    }
+    let mut text = sections.join("\n\n---\n\n");
+    if !omitted.is_empty() {
+        text.push_str(&format!(
+            "\n\n[omitted ranges (batch output limit {MAX_BATCH_RESPONSE_BYTES} bytes): {} — request them in a separate call]",
+            omitted.join(", ")
+        ));
+    }
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
 pub(crate) fn handle_file(
     pool: &DbPool,
     args: &HashMap<String, Value>,
     active_ids: &HashSet<String>,
 ) -> Result<CallToolResult, ServerError> {
+    if let Some(ranges) = args.get("ranges").filter(|value| !value.is_null()) {
+        return handle_file_batch(pool, args, active_ids, ranges);
+    }
     let repo_id = args
         .get("repository_id")
         .and_then(Value::as_str)
