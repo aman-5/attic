@@ -13,6 +13,8 @@
 use serde::Serialize;
 use tracing::{info, warn};
 
+use rusqlite::OptionalExtension;
+
 use attic_discovery::DiscoveryPolicy;
 use attic_storage::{
     DbPool, TASK_RECONCILIATION, WriterQueueHandle, enqueue_task, get_server_state, record_startup,
@@ -133,12 +135,28 @@ pub fn plan_offline_refresh(pool: &DbPool) -> Result<Vec<OfflineRefresh>, Increm
         .collect())
 }
 
+/// Racy-file window: a file whose last-write or change time is within this
+/// distance of (or after) the moment its metadata was captured is always
+/// re-hashed, because a write in that window may not have moved the
+/// timestamp past the capture (Git's racy-git rule; 2 s also covers FAT's
+/// timestamp granularity).
+pub const RACY_WINDOW_NS: i64 = 2_000_000_000;
+
+/// Options for [`reconcile_repository_with`].
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileOptions {
+    /// Skip the metadata fast path and hash every file (configured per
+    /// membership for network / cloud-sync folders whose timestamps cannot
+    /// be trusted).
+    pub always_hash: bool,
+}
+
 /// Authoritative bounded rescan of one repository root.
 ///
-/// Runs a full Phase 1B discovery walk (the only trusted source when events
-/// may have been lost), diffs it against persisted occurrence snapshots, and
-/// returns the verified change set WITHOUT mutating anything — callers apply
-/// invalidation and schedule recomputation separately.
+/// Walks the root (the only trusted source when events may have been lost),
+/// diffs it against persisted occurrence snapshots, and returns the verified
+/// change set WITHOUT mutating anything — callers apply invalidation and
+/// schedule recomputation separately.
 ///
 /// Idempotent: running twice over unchanged trees yields empty change sets.
 pub fn reconcile_repository(
@@ -147,18 +165,88 @@ pub fn reconcile_repository(
     root: &std::path::Path,
     policy: &DiscoveryPolicy,
 ) -> Result<ReconcileReport, IncrementalError> {
-    let discovery = attic_discovery::discover(root, policy)?;
+    reconcile_repository_with(pool, root, policy, &ReconcileOptions::default())
+}
+
+/// [`reconcile_repository`] with explicit options.
+///
+/// Safety rules (R2 — uncertain is never deleted):
+/// - a missing root, or an empty walk over a repository that has indexed
+///   files, is `SOURCE_UNAVAILABLE` (an unmounted drive must not wipe the
+///   index);
+/// - a directory the walker could not read makes every indexed path under it
+///   uncertain; a walk error with no known location suppresses all
+///   deletions for this run;
+/// - a changed root identity (re-clone / different volume) disables the
+///   metadata fast path and suppresses deletions unless the walk was clean.
+///
+/// Fast path: a file is unchanged WITHOUT reading it only when size,
+/// last-write time, change time and file identity all equal the stored
+/// values and both timestamps are older than `captured_at - RACY_WINDOW_NS`.
+pub fn reconcile_repository_with(
+    pool: &DbPool,
+    root: &std::path::Path,
+    policy: &DiscoveryPolicy,
+    opts: &ReconcileOptions,
+) -> Result<ReconcileReport, IncrementalError> {
     let repo_root_str = root.to_string_lossy().to_string();
+    if !root.is_dir() {
+        return Err(IncrementalError::SourceUnavailable(format!(
+            "repository root {repo_root_str} is missing or not a directory"
+        )));
+    }
     let Some(repo_id) =
         pool.with_reader(|c| attic_storage::lookup_repository_by_root_path(c, &repo_root_str))?
     else {
         return Err(IncrementalError::NotBootstrapped(repo_root_str));
     };
 
+    let stored_identity: Option<String> = pool.with_reader(|c| {
+        Ok(c.query_row(
+            "SELECT root_identity FROM core_repositories WHERE id = ?1",
+            [repo_id.to_string_repr()],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+    })?;
+    let observed_identity = attic_discovery::root_identity(root);
+    let identity_changed = matches!(
+        (&stored_identity, &observed_identity),
+        (Some(stored), Some(observed)) if stored != observed
+    );
+    let always_hash = opts.always_hash || identity_changed;
+
+    let canonical = root.canonicalize().map_err(|e| {
+        IncrementalError::SourceUnavailable(format!("cannot resolve {repo_root_str}: {e}"))
+    })?;
+    let walk = attic_discovery::walk::walk(&canonical, policy)?;
+
+    // Directories the walker could not read (R2): everything indexed under
+    // them is uncertain; an error with no location poisons the whole run.
+    let mut uncertain_prefixes: Vec<String> = Vec::new();
+    let mut unknown_walk_error = false;
+    for d in &walk.diagnostics {
+        if d.kind != attic_discovery::DiagnosticKind::IoError {
+            continue;
+        }
+        match d.path.strip_prefix(&canonical) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                let mut rel = rel.to_string_lossy().replace('\\', "/");
+                if !rel.ends_with('/') {
+                    rel.push('/');
+                }
+                uncertain_prefixes.push(rel);
+            }
+            _ => unknown_walk_error = true,
+        }
+    }
+    let walk_had_errors = unknown_walk_error || !uncertain_prefixes.is_empty();
+
     // Persisted latest snapshot per path (any freshness).
     let mut db_paths: std::collections::BTreeMap<String, OccurrenceRow> =
         std::collections::BTreeMap::new();
-    let rows: Vec<(String, String, String, String)> = pool.with_reader(|conn| {
+    let rows: Vec<(String, OccurrenceRow)> = pool.with_reader(|conn| {
         let mut stmt = conn.prepare(
             "WITH latest AS (
                  SELECT fo.path AS p, MAX(fo.occurrence_seq) AS m
@@ -167,16 +255,25 @@ pub fn reconcile_repository(
                   WHERE fi.repository_id = ?1
                   GROUP BY fo.path
              )
-             SELECT fo.path, fo.content_hash, fo.freshness_state, fo.existence_state
+             SELECT fo.path, fo.content_hash, fo.freshness_state, fo.existence_state,
+                    fo.size_bytes, fo.mtime_ns, fo.change_time_ns, fo.file_id,
+                    fo.captured_at_ns
                FROM core_file_occurrences fo
                JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m",
         )?;
         let mapped = stmt.query_map([repo_id.to_string_repr()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
+                OccurrenceRow {
+                    content_hash: r.get(1)?,
+                    freshness: r.get(2)?,
+                    existence: r.get(3)?,
+                    size_bytes: r.get(4)?,
+                    mtime_ns: r.get(5)?,
+                    change_time_ns: r.get(6)?,
+                    file_id: r.get(7)?,
+                    captured_at_ns: r.get(8)?,
+                },
             ))
         })?;
         let mut out = Vec::new();
@@ -185,28 +282,50 @@ pub fn reconcile_repository(
         }
         Ok(out)
     })?;
-    for (path, hash, fresh, exist) in rows {
-        db_paths.insert(
-            path,
-            OccurrenceRow {
-                content_hash: hash,
-                freshness: fresh,
-                existence: exist,
-            },
-        );
+    db_paths.extend(rows);
+
+    // An empty walk over a repository with indexed files is trusted as real
+    // deletions only when the root is provably the same directory object as
+    // at the last publish; an unmounted mount point / replaced folder has a
+    // different identity and must not wipe the index (R2).
+    let indexed_present = db_paths.values().any(|r| r.existence != "deleted");
+    let same_root = stored_identity.is_some() && stored_identity == observed_identity;
+    if walk.entries.is_empty() && indexed_present && !same_root {
+        return Err(IncrementalError::SourceUnavailable(format!(
+            "repository root {repo_root_str} is empty and its identity does not match the indexed root (unmounted or replaced); refusing to infer deletions"
+        )));
     }
+
+    let mut report = ReconcileReport {
+        repository_id: repo_id.to_string_repr(),
+        observed_root_identity: observed_identity,
+        root_identity_changed: identity_changed,
+        ..Default::default()
+    };
 
     // Disk truth from the walk — three-state reads.  Only verified
     // `NotFound`-class absence may later become a deletion; unreadable or
     // hash-failing paths are recorded as UNCERTAIN and degrade to UNKNOWN.
     let mut disk: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let mut uncertain: Vec<String> = Vec::new();
-    for entry in &discovery.entries {
+    let mut uncertain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in &walk.entries {
         if entry.abs_path.is_dir() {
-            uncertain.push(entry.repo_relative.clone());
+            uncertain.insert(entry.repo_relative.clone());
             warn!(path = %entry.repo_relative, "reconcile: path became a directory");
             continue;
         }
+        if !always_hash
+            && let Some(row) = db_paths.get(&entry.repo_relative)
+            && row.existence != "deleted"
+            && row.freshness == "CURRENT"
+            && let Ok(meta) = attic_discovery::file_meta(&entry.abs_path)
+            && row.metadata_unchanged(&meta)
+        {
+            disk.insert(entry.repo_relative.clone(), row.content_hash.clone());
+            report.files_unchanged_by_metadata += 1;
+            continue;
+        }
+        report.files_hashed += 1;
         match changeset::hash_file(&entry.abs_path) {
             Ok(h) => {
                 disk.insert(entry.repo_relative.clone(), h);
@@ -216,16 +335,12 @@ pub fn reconcile_repository(
                 // the DB→disk diff below.
             }
             Err(e) => {
-                uncertain.push(entry.repo_relative.clone());
+                uncertain.insert(entry.repo_relative.clone());
                 warn!(path = %entry.repo_relative, error = %e, "reconcile: read failed → uncertain");
             }
         }
     }
 
-    let mut report = ReconcileReport {
-        repository_id: repo_id.to_string_repr(),
-        ..Default::default()
-    };
     let mut cs = VerifiedChangeSet::default();
 
     // Disk → DB diff: added/modified.
@@ -260,13 +375,21 @@ pub fn reconcile_repository(
 
     // DB → disk diff: deleted or newly excluded by policy.
     for (path, row) in &db_paths {
-        if !disk.contains_key(path) && !uncertain.contains(path) && row.existence != "deleted" {
-            cs.deletes.push(path.clone());
-            report.newly_excluded += 1;
+        if row.existence == "deleted" || disk.contains_key(path) || uncertain.contains(path) {
+            continue;
         }
+        let under_unreadable_dir = uncertain_prefixes.iter().any(|p| path.starts_with(p));
+        if under_unreadable_dir || unknown_walk_error || (identity_changed && walk_had_errors) {
+            // Absent from the walk, but the walk could not see everything:
+            // never a deletion (R2).
+            uncertain.insert(path.clone());
+            continue;
+        }
+        cs.deletes.push(path.clone());
+        report.newly_excluded += 1;
     }
 
-    cs.uncertain = uncertain;
+    cs.uncertain = uncertain.into_iter().collect();
     report.change_set = cs;
     Ok(report)
 }
@@ -276,6 +399,35 @@ struct OccurrenceRow {
     content_hash: String,
     freshness: String,
     existence: String,
+    size_bytes: i64,
+    mtime_ns: Option<i64>,
+    change_time_ns: Option<i64>,
+    file_id: Option<String>,
+    captured_at_ns: Option<i64>,
+}
+
+impl OccurrenceRow {
+    /// Fast-path test (see [`reconcile_repository_with`]). Any unknown
+    /// field (older rows, platforms without change time / file id) fails
+    /// closed and forces a hash.
+    fn metadata_unchanged(&self, meta: &attic_discovery::FileMeta) -> bool {
+        let (Some(mtime), Some(ctime), Some(file_id), Some(captured)) = (
+            self.mtime_ns,
+            self.change_time_ns,
+            self.file_id.as_deref(),
+            self.captured_at_ns,
+        ) else {
+            return false;
+        };
+        let Some(meta_file_id) = meta.file_id.as_deref() else {
+            return false;
+        };
+        u64::try_from(self.size_bytes).ok() == Some(meta.size)
+            && mtime == meta.mtime_ns
+            && Some(ctime) == meta.change_time_ns
+            && file_id == meta_file_id
+            && mtime.max(ctime).saturating_add(RACY_WINDOW_NS) < captured
+    }
 }
 
 /// Result of one reconciliation pass.
@@ -289,6 +441,16 @@ pub struct ReconcileReport {
     pub changed_paths: usize,
     /// Deleted-or-excluded count.
     pub newly_excluded: usize,
+    /// Files whose bytes were read and hashed.
+    pub files_hashed: usize,
+    /// Files proven unchanged by metadata alone (not read).
+    pub files_unchanged_by_metadata: usize,
+    /// Root identity observed during this pass (record after a successful
+    /// publish, or directly when nothing changed).
+    pub observed_root_identity: Option<String>,
+    /// The root's identity differs from the recorded one (re-clone /
+    /// different volume): fast path was disabled for this pass.
+    pub root_identity_changed: bool,
 }
 
 /// Record a clean-shutdown marker through the coordinated writer queue.

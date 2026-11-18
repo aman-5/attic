@@ -95,6 +95,9 @@ impl EdgeDraft {
 pub struct ResolutionDiagnostics {
     /// `(repo, declaration name)` pairs that matched no provider.
     pub missing_targets: Vec<(String, String)>,
+    /// Subset of `missing_targets` that are plain external packages with no
+    /// workspace provider (expected; not persisted as problems).
+    pub external_unmatched: Vec<(String, String)>,
     /// `(repo, declaration name)` → competing provider repositories.
     pub ambiguous_targets: Vec<(String, String, Vec<String>)>,
     /// Repositories skipped because the workspace exceeded run bounds.
@@ -339,6 +342,8 @@ fn resolve_external(
             // No workspace provider — external-world dependency; nothing to
             // persist (Attic does not invent network dependencies).
             diag.missing_targets
+                .push((r.repository_id.clone(), d.name.clone()));
+            diag.external_unmatched
                 .push((r.repository_id.clone(), d.name.clone()));
         }
         1 => {

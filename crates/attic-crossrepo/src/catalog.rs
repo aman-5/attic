@@ -116,6 +116,88 @@ pub struct CatalogScan {
     pub unreadable: Vec<String>,
     /// BLAKE3 hash over sorted (path, content_hash) for incremental refresh.
     pub manifest_hash: String,
+    /// `(ecosystem, provided name, declared version)` read from the same
+    /// manifest bytes (Phase 8 version compatibility).
+    pub provided_versions: Vec<(String, String, String)>,
+}
+
+/// Latest present `(path, content_hash)` per path for one repository,
+/// filtered by `keep` (historical occurrence rows are ignored).
+fn latest_indexed_inputs(
+    conn: &Connection,
+    repository_id: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, CrossRepoError> {
+    let mut stmt = conn.prepare(
+        "WITH latest AS (
+             SELECT fo.path AS p, MAX(fo.occurrence_seq) AS m
+               FROM core_file_occurrences fo
+               JOIN core_file_identities fi ON fi.id = fo.file_identity_id
+              WHERE fi.repository_id = ?1
+              GROUP BY fo.path
+         )
+         SELECT fo.path, fo.content_hash
+           FROM core_file_occurrences fo
+           JOIN latest ON fo.path = latest.p AND fo.occurrence_seq = latest.m
+          WHERE fo.existence_state != 'deleted'
+          ORDER BY fo.path",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![repository_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, hash) = row?;
+        if keep(&path) {
+            out.push((path, hash));
+        }
+    }
+    Ok(out)
+}
+
+/// The exact indexed bytes of a catalog input.
+///
+/// Prefers the bytes stored at index time (`core_manifest_contents`). When
+/// they were not stored (file not clean / too large), reads through the
+/// bounded safe-content layer, but only when the raw file on disk still
+/// hashes to the indexed hash — the catalog never parses content the index
+/// has not verified.
+fn indexed_input_bytes(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    rel_path: &str,
+    content_hash: &str,
+    read_safe: impl Fn(&std::path::Path, &str) -> Result<Option<Vec<u8>>, CrossRepoError>,
+) -> Result<Option<Vec<u8>>, CrossRepoError> {
+    use rusqlite::OptionalExtension;
+    let stored: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT content FROM core_manifest_contents WHERE content_hash = ?1",
+            [content_hash],
+            |r| r.get(0),
+        )
+        .optional()
+        .or_else(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(ref m)) if m.contains("no such table") => {
+                Ok(None)
+            }
+            other => Err(other),
+        })?;
+    if let Some(bytes) = stored {
+        if bytes.len() as u64 > limits::MAX_MANIFEST_BYTES {
+            return Err(CrossRepoError::LimitExceeded {
+                limit: "MAX_MANIFEST_BYTES",
+                context: format!("{rel_path} exceeds {} bytes", limits::MAX_MANIFEST_BYTES),
+            });
+        }
+        return Ok(Some(bytes));
+    }
+    let raw_matches = std::fs::read(repo_root.join(rel_path))
+        .is_ok_and(|raw| blake3::hash(&raw).to_hex().as_str() == content_hash);
+    if !raw_matches {
+        return Ok(None);
+    }
+    read_safe(repo_root, rel_path)
 }
 
 /// Scan every indexed manifest of one repository into parsed form.
@@ -124,7 +206,15 @@ pub fn scan_repository_manifests(
     repository_id: &str,
 ) -> Result<CatalogScan, CrossRepoError> {
     let mut scan = CatalogScan::default();
-    let paths = indexed_manifest_paths(conn, repository_id)?;
+    let inputs = latest_indexed_inputs(conn, repository_id, manifest::is_manifest_path)?;
+    if inputs.len() > MAX_MANIFESTS_PER_REPO {
+        return Err(CrossRepoError::LimitExceeded {
+            limit: "MAX_MANIFESTS_PER_REPO",
+            context: format!(
+                "{repository_id} contains more than {MAX_MANIFESTS_PER_REPO} manifests"
+            ),
+        });
+    }
     let repo_id = repository_id
         .parse::<attic_core::RepositoryId>()
         .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
@@ -135,11 +225,20 @@ pub fn scan_repository_manifests(
 
     // Sort paths for deterministic manifest_hash computation.
     let mut hashes: Vec<(String, Vec<u8>)> = Vec::new();
-    for p in &paths {
-        match read_manifest_bounded(&root_path, p) {
+    for (p, content_hash) in &inputs {
+        match indexed_input_bytes(conn, &root_path, p, content_hash, read_manifest_bounded) {
             Ok(Some(bytes)) => {
                 hashes.push((p.clone(), blake3::hash(&bytes).as_bytes().to_vec()));
                 let parsed = manifest::parse_manifest(p, &bytes);
+                if let Some(version) = crate::version_compat::provided_version(p, &bytes) {
+                    for provide in &parsed.provides {
+                        scan.provided_versions.push((
+                            provide.ecosystem.as_str().to_owned(),
+                            provide.name.clone(),
+                            version.clone(),
+                        ));
+                    }
+                }
                 scan.manifests.push(parsed);
             }
             Ok(None) => scan.unreadable.push(p.clone()),
@@ -171,31 +270,19 @@ pub fn scan_proto_imports(
         return Ok(Vec::new());
     };
     let root_path = std::path::PathBuf::from(root);
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT fo.path
-           FROM core_file_occurrences fo
-           JOIN core_file_identities fi ON fi.id = fo.file_identity_id
-          WHERE fi.repository_id = ?1
-            AND fo.path LIKE '%.proto'
-            AND fo.existence_state != 'deleted'
-          ORDER BY fo.path
-          LIMIT ?2",
-    )?;
-    let cap = MAX_MANIFESTS_PER_REPO as i64 + 1;
-    let rows = stmt.query_map(rusqlite::params![repository_id, cap], |r| {
-        r.get::<_, String>(0)
-    })?;
+    let inputs = latest_indexed_inputs(conn, repository_id, |p| p.ends_with(".proto"))?;
+    if inputs.len() > MAX_MANIFESTS_PER_REPO {
+        return Err(CrossRepoError::LimitExceeded {
+            limit: "MAX_MANIFESTS_PER_REPO",
+            context: format!("too many protobuf paths in repository {repository_id}"),
+        });
+    }
     let mut specifiers = Vec::new();
-    for (index, row) in rows.enumerate() {
-        if index >= MAX_MANIFESTS_PER_REPO {
-            return Err(CrossRepoError::LimitExceeded {
-                limit: "MAX_MANIFESTS_PER_REPO",
-                context: format!("too many protobuf paths in repository {repository_id}"),
-            });
-        }
-        let p = row?;
-        if let Ok(Some(bytes)) = read_proto_bounded(&root_path, &p) {
-            let parse = manifest::parse_proto_imports(&p, &bytes);
+    for (p, content_hash) in &inputs {
+        if let Ok(Some(bytes)) =
+            indexed_input_bytes(conn, &root_path, p, content_hash, read_proto_bounded)
+        {
+            let parse = manifest::parse_proto_imports(p, &bytes);
             for d in &parse.declarations {
                 specifiers.push(d.name.clone());
             }
@@ -204,6 +291,47 @@ pub fn scan_proto_imports(
     specifiers.sort();
     specifiers.dedup();
     Ok(specifiers)
+}
+
+/// Version of the cross-repository catalog for `repository_ids`: BLAKE3
+/// over the sorted selected repositories, their roots, every indexed
+/// dependency-manifest and `.proto` `(path, content hash)`, and each
+/// provider's primary anchor. Links built from a catalog whose version
+/// differs from this value are stale (R4).
+pub fn catalog_version(
+    conn: &Connection,
+    repository_ids: &[String],
+) -> Result<String, CrossRepoError> {
+    let mut ids: Vec<&String> = repository_ids.iter().collect();
+    ids.sort();
+    ids.dedup();
+    let mut hasher = blake3::Hasher::new();
+    for id in ids {
+        hasher.update(b"repo\0");
+        hasher.update(id.as_bytes());
+        if let Ok(typed) = id.parse::<attic_core::RepositoryId>()
+            && let Some(root) = attic_storage::get_repository_path(conn, &typed)?
+        {
+            hasher.update(b"\0root\0");
+            hasher.update(root.as_bytes());
+        }
+        for (path, hash) in latest_indexed_inputs(
+            conn,
+            id,
+            attic_discovery::catalog_inputs::is_catalog_input_path,
+        )? {
+            hasher.update(b"\0in\0");
+            hasher.update(path.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(hash.as_bytes());
+        }
+        if let Some(anchor) = primary_anchor_for_repo(conn, id) {
+            hasher.update(b"\0anchor\0");
+            hasher.update(anchor.as_bytes());
+        }
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Find the primary anchor occurrence id for a repository.

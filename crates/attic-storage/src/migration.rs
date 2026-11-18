@@ -106,14 +106,123 @@ fn is_current_schema(conn: &Connection) -> Result<bool, StorageError> {
     if applied != [BASELINE_VERSION] {
         return Ok(false);
     }
-    // An earlier baseline carried the same id but not the canonical columns.
-    let has_canonical_hash: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('core_retrieval_units')
-          WHERE name = 'canonical_hash'",
+    has_current_columns(conn)
+}
+
+/// Column/table probe distinguishing this baseline from earlier baselines
+/// that recorded the same migration id.
+fn has_current_columns(conn: &Connection) -> Result<bool, StorageError> {
+    let probe: i64 = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM pragma_table_info('core_retrieval_units')
+               WHERE name = 'canonical_hash')
+           + (SELECT COUNT(*) FROM pragma_table_info('core_file_occurrences')
+               WHERE name IN ('mtime_ns', 'change_time_ns', 'file_id', 'captured_at_ns'))
+           + (SELECT COUNT(*) FROM pragma_table_info('core_repositories')
+               WHERE name = 'root_identity')
+           + (SELECT COUNT(*) FROM sqlite_master
+               WHERE type = 'table' AND name IN (
+                   'ops_store_version', 'core_manifest_contents',
+                   'core_crossrepo_diagnostics', 'core_import_targets'))",
         [],
         |row| row.get(0),
     )?;
-    Ok(has_canonical_hash == 1)
+    Ok(probe == 10)
+}
+
+/// `true` when `conn` holds exactly the current baseline schema (used by
+/// repository-store verification so a store created by an older build is
+/// re-initialized instead of failing at the first write).
+pub fn schema_is_current(conn: &Connection) -> Result<bool, StorageError> {
+    let has_migrations: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+          WHERE type = 'table' AND name = 'core_schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_migrations && is_current_schema(conn)?)
+}
+
+/// Upgrade reset: when the catalog database at `db_path` was created by a
+/// different schema, delete it (with its `-wal`/`-shm` side files) and every
+/// per-repository index under `<data dir>/repositories`, so the server starts
+/// clean and re-derives all index data from the configured roots.
+///
+/// Must run before any connection to `db_path` is opened. Spec documents
+/// live in a separate store and are untouched. Returns `true` when a reset
+/// happened.
+pub fn reset_outdated_catalog(db_path: &std::path::Path) -> Result<bool, StorageError> {
+    if !db_path.is_file() {
+        return Ok(false);
+    }
+    let outdated = {
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        tables != 0 && !schema_is_current(&conn)?
+    };
+    if !outdated {
+        return Ok(false);
+    }
+    warn!(
+        path = %db_path.display(),
+        "catalog schema is outdated; deleting all Attic index data for a full reindex"
+    );
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        let path = std::path::PathBuf::from(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(parent) = db_path.parent() {
+        remove_owned_store_dirs(&parent.join("repositories"))?;
+        // Pinned-commit stores: <commits>/<repository uuid>/<sha>/...
+        let commits = parent.join("commits");
+        if let Ok(repos) = std::fs::read_dir(&commits) {
+            for repo in repos.flatten() {
+                if uuid::Uuid::parse_str(&repo.file_name().to_string_lossy()).is_ok() {
+                    std::fs::remove_dir_all(repo.path())?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Delete only Attic-owned repository store directories under `root`:
+/// entries named by a UUID that contain nothing but `index.db*` files.
+/// Anything else (a user folder that happens to be called `repositories`)
+/// is left untouched.
+fn remove_owned_store_dirs(root: &std::path::Path) -> Result<(), StorageError> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err() {
+            continue;
+        }
+        let only_index_files = std::fs::read_dir(&path)?
+            .flatten()
+            .all(|f| f.path().is_file() && f.file_name().to_string_lossy().starts_with("index.db"));
+        if only_index_files {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+    // Remove the container only if it is now empty.
+    let _ = std::fs::remove_dir(root);
+    Ok(())
 }
 
 /// Drop every table and view in `conn` (virtual tables first, which also
@@ -209,6 +318,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(epoch, 7, "a current database must not be rebuilt");
+    }
+
+    #[test]
+    fn outdated_catalog_and_repository_indexes_are_deleted_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("attic.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE core_schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER);
+                 INSERT INTO core_schema_migrations VALUES ('0001_initial', 0);
+                 CREATE TABLE core_retrieval_units (id TEXT, canonical_hash TEXT);",
+            )
+            .unwrap();
+        }
+        let repo_dir = dir
+            .path()
+            .join("repositories")
+            .join("5a12aced-2c4f-81db-aea2-b8816b62551a");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("index.db"), b"old").unwrap();
+        // A user folder that merely shares the name must survive.
+        let user_dir = dir.path().join("repositories").join("my-notes");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join("todo.txt"), b"keep").unwrap();
+        std::fs::write(dir.path().join("attic.db-wal"), b"").unwrap();
+
+        assert!(reset_outdated_catalog(&db).unwrap());
+        assert!(!db.exists());
+        assert!(!dir.path().join("attic.db-wal").exists());
+        assert!(!repo_dir.exists());
+        assert!(user_dir.join("todo.txt").exists());
+
+        // A current catalog is left alone.
+        {
+            let conn = Connection::open(&db).unwrap();
+            run_migrations(&conn).unwrap();
+            assert!(schema_is_current(&conn).unwrap());
+        }
+        assert!(!reset_outdated_catalog(&db).unwrap());
+        assert!(db.exists());
     }
 
     #[test]

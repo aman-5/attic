@@ -461,6 +461,10 @@ fn execute_task(
         };
     };
     let root: &std::path::Path = &resolved_root;
+    // R6: one check / index run per repository across the gate and the
+    // scheduler, so a background run can never interleave with a gate run.
+    let repo_lock = crate::gate::repository_lock(root);
+    let _repo_guard = repo_lock.lock().unwrap_or_else(|p| p.into_inner());
     match task.task_type.as_str() {
         TASK_INCREMENTAL_INDEX => {
             let payload: Option<IncrementalTaskPayload> =

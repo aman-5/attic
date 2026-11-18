@@ -317,10 +317,16 @@ impl StructuralPipeline {
     }
 
     /// Run the resolution pass and produce publication payloads.
+    ///
+    /// `import_targets` receives one `(importer_path, specifier,
+    /// candidate)` row per import: `candidate` is the resolved repo path, or
+    /// `stem:<name>` for an import that resolved to no file, so importers
+    /// can be found again when a matching file appears (Phase 6).
     pub(crate) fn finish(
         mut self,
         deps: &ResolverDeps<'_>,
         unit_links_by_occ: &HashMap<String, Vec<(String, usize)>>,
+        import_targets: &mut Vec<(String, String, String)>,
     ) -> Vec<PublicationStructuralFile> {
         let mut out = Vec::with_capacity(self.files.len());
         // Deterministic order: by repo-relative path.
@@ -349,6 +355,13 @@ impl StructuralPipeline {
                     &go_prefix,
                     &&symbols_known,
                 );
+                let candidate = match &upgrade {
+                    Some(u) => match &u.target {
+                        ResolvedTarget::Path(p) => p.clone(),
+                    },
+                    None => format!("stem:{}", specifier_stem(&imp.raw_specifier)),
+                };
+                import_targets.push((f.rel_path.clone(), imp.raw_specifier.clone(), candidate));
                 let (resolved, target_id, resolution, basis, confidence): (
                     bool,
                     String,
@@ -1273,4 +1286,49 @@ fn read_go_module_prefix(root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Lower-case module stem of an import specifier: the last path segment
+/// without extension (`./lib/utils.js` → `utils`), or the last dotted
+/// component of a module name (`com.acme.Utils` → `utils`).
+pub(crate) fn specifier_stem(specifier: &str) -> String {
+    let s = specifier
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    let last = if s.contains('/') || s.contains('\\') {
+        let seg = s.rsplit(['/', '\\']).next().unwrap_or(s);
+        seg.split('.').next().unwrap_or(seg)
+    } else {
+        s.rsplit('.').next().unwrap_or(s)
+    };
+    last.to_ascii_lowercase()
+}
+
+/// Stems under which a repo path can satisfy an unresolved import:
+/// the file stem, plus the directory name for index-style files.
+pub fn path_stems(path: &str) -> Vec<String> {
+    let mut parts = path.rsplit('/');
+    let file = parts.next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file).to_ascii_lowercase();
+    let mut out = vec![stem.clone()];
+    if matches!(stem.as_str(), "index" | "__init__" | "mod" | "main" | "lib")
+        && let Some(dir) = parts.next()
+    {
+        out.push(dir.to_ascii_lowercase());
+    }
+    out
+}
+
+#[cfg(test)]
+mod stem_tests {
+    use super::*;
+
+    #[test]
+    fn specifier_and_path_stems_meet() {
+        assert_eq!(specifier_stem("./lib/utils.js"), "utils");
+        assert_eq!(specifier_stem("com.acme.Utils"), "utils");
+        assert_eq!(specifier_stem("'../helpers'"), "helpers");
+        assert_eq!(path_stems("lib/utils.js"), vec!["utils"]);
+        assert_eq!(path_stems("pkg/helpers/index.ts"), vec!["index", "helpers"]);
+    }
 }

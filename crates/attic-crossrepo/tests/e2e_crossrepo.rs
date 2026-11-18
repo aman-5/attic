@@ -1005,9 +1005,42 @@ fn e2e_manifest_change_edge_visible_via_mcp() {
         "module example.com/mcp/app\n",
     )
     .unwrap();
-
-    // Trigger incremental sync (manifest changed) — edge should be removed.
     let changed = vec!["go.mod".to_owned()];
+
+    // R4: links are built from INDEXED dependency content only. An edit on
+    // disk that has not been indexed yet must not change the links.
+    let consumer_id_clone = consumer_id.clone();
+    let changed_clone = changed.clone();
+    writer_handle
+        .send(move |conn| {
+            attic_crossrepo::maintenance::incremental_sync(conn, &consumer_id_clone, &changed_clone)
+                .map(|_| ())
+                .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))
+        })
+        .unwrap();
+    pool.with_reader(|conn| {
+        let edges =
+            attic_storage::crossrepo_ops::cross_edges_touching(conn, &consumer_id, 100).unwrap();
+        assert!(
+            !edges.is_empty(),
+            "un-indexed disk edits must not alter cross-repo links"
+        );
+        Ok::<(), attic_storage::StorageError>(())
+    })
+    .unwrap();
+
+    // Index the manifest change, then re-sync — edge should be removed.
+    attic_indexing::index_changes(
+        &store,
+        consumer_dir.path(),
+        &policy,
+        &opts,
+        &attic_indexing::ScopedChanges {
+            upserts: changed.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let consumer_id_clone = consumer_id.clone();
     writer_handle
         .send(move |conn| {
@@ -1569,4 +1602,80 @@ fn e2e_osgi_import_export_links_bundles() {
         .expect("consumer must link to provider");
     assert_eq!(edge.target_repository_id, tid("osgi-provider"));
     assert_eq!(edge.dependency_basis, "OSGI_BUNDLE");
+}
+
+/// S23 (Phase 8): a resolved package link records whether the provider's
+/// declared version satisfies the consumer's requirement.
+#[test]
+fn e2e_version_compatibility_is_recorded_on_links() {
+    let provider = tempfile::TempDir::new().unwrap();
+    let consumer = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        provider.path().join("package.json"),
+        r#"{"name":"@acme/lib","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(provider.path().join("index.js"), "export const lib = 1;\n").unwrap();
+    std::fs::write(
+        consumer.path().join("package.json"),
+        r#"{"name":"@acme/app","version":"1.0.0","dependencies":{"@acme/lib":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(consumer.path().join("index.js"), "import '@acme/lib';\n").unwrap();
+
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let (pool_conn, pool) = attic_storage::open_db(db_file.path()).unwrap();
+    attic_storage::migration::run_migrations(&pool_conn).unwrap();
+    drop(pool_conn);
+    let writer_conn = rusqlite::Connection::open(db_file.path()).unwrap();
+    attic_storage::connection::configure_connection(&writer_conn).unwrap();
+    let writer_queue = attic_storage::WriterQueue::new(writer_conn).unwrap();
+    let writer = writer_queue.handle();
+    let store = attic_indexing::IndexingStore {
+        readers: &pool,
+        writer: &writer,
+    };
+    let policy = attic_discovery::DiscoveryPolicy::default_git();
+    let opts = attic_indexing::IndexOptions::default();
+    attic_indexing::index_repository(&store, provider.path(), &policy, &opts).unwrap();
+    let consumer_id = attic_indexing::index_repository(&store, consumer.path(), &policy, &opts)
+        .unwrap()
+        .repository_id;
+
+    let compat = || -> Vec<Option<String>> {
+        pool.with_reader(|conn| {
+            attic_crossrepo::maintenance::sync_workspace(
+                conn,
+                &writer,
+                &attic_crossrepo::maintenance::WorkspaceSyncOptions::default(),
+            )
+            .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
+            let mut stmt = conn.prepare(
+                "SELECT version_compat FROM core_relationships
+                  WHERE rel_type = 'DEPENDS_ON' AND source_repository_id = ?1",
+            )?;
+            let rows = stmt.query_map([&consumer_id], |r| r.get::<_, Option<String>>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap()
+    };
+    assert_eq!(compat(), vec![Some("INCOMPATIBLE".to_owned())]);
+
+    std::fs::write(
+        consumer.path().join("package.json"),
+        r#"{"name":"@acme/app","version":"1.0.0","dependencies":{"@acme/lib":"^2.0.0"}}"#,
+    )
+    .unwrap();
+    attic_indexing::index_changes(
+        &store,
+        consumer.path(),
+        &policy,
+        &opts,
+        &attic_indexing::ScopedChanges {
+            upserts: vec!["package.json".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(compat(), vec![Some("COMPATIBLE".to_owned())]);
 }

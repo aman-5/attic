@@ -198,6 +198,20 @@ pub fn walk_with_cancellation(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Absolute path a walker error refers to (a directory that could not be
+/// read, or the looping child), if the error carries one.
+fn walk_error_path(err: &ignore::Error) -> Option<PathBuf> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::Loop { child, .. } => Some(child.clone()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Partial(errs) if errs.len() == 1 => walk_error_path(&errs[0]),
+        _ => None,
+    }
+}
+
 /// Dot-files that carry source content and are indexed even though hidden
 /// entries are otherwise skipped (compared ASCII case-insensitively).
 ///
@@ -306,7 +320,9 @@ where
                 result.counters.transient_failures += 1;
                 result.diagnostics.push(Diagnostic {
                     kind: DiagnosticKind::IoError,
-                    path: PathBuf::new(),
+                    // Empty path = location unknown; callers must then treat
+                    // the whole tree as uncertain (no deletions).
+                    path: walk_error_path(&walk_err).unwrap_or_default(),
                     message: walk_err.to_string(),
                 });
             }

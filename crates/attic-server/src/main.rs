@@ -5,9 +5,12 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
+mod commit_mode;
 mod daemon;
 mod egm_cli;
 mod eviction;
+mod freshness;
+use freshness::gate_scope_ids;
 mod handlers;
 mod spec_cli;
 mod spec_tool;
@@ -205,6 +208,15 @@ enum ServerError {
     InvalidArg(String),
     #[error("retrieval error: {0}")]
     Retrieval(String),
+    /// Freshness-gate refusal rendered as structured JSON
+    /// `{code, retryable, message, ...}` so agents can act on it.
+    #[error("{}", freshness::error_json(code, *retryable, message, detail))]
+    Freshness {
+        code: &'static str,
+        retryable: bool,
+        message: String,
+        detail: Value,
+    },
 }
 
 struct BootstrapJob {
@@ -450,6 +462,11 @@ impl AtticServer {
             "resolved Phase 8 resource configuration"
         );
 
+        if attic_storage::reset_outdated_catalog(db_path).map_err(ServerError::Storage)? {
+            warn!(
+                "index data from an older Attic schema was deleted; all repositories will be fully reindexed"
+            );
+        }
         let (conn, pool) = attic_storage::open_db_with_pragmas(
             db_path,
             effective.sqlite_cache_pages,
@@ -690,6 +707,10 @@ impl AtticServer {
         };
         let policy = self.discovery_policy();
         let opts = self.index_options();
+        // R6: the full index and the freshness gate never run on the same
+        // repository at the same time.
+        let repo_lock = attic_incremental::repository_lock(root);
+        let _repo_guard = repo_lock.lock().unwrap_or_else(|p| p.into_inner());
         let result = attic_indexing::index_repository_with_cancellation(
             &store,
             root,
@@ -1993,6 +2014,17 @@ impl ServerHandler for AtticServer {
                     .into());
             }
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
+                "file" | "repo_map" | "context"
+                    if workspace_configured && args.contains_key("at_commit") =>
+                {
+                    match commit_mode::parse_at_commit(&args) {
+                        Ok(Some(commits)) => {
+                            self.commit_mode_tool(&name, &args, &active_ids, &commits, advisory)
+                        }
+                        Ok(None) => Err(ServerError::InvalidArg("at_commit is empty".into())),
+                        Err(e) => Err(e),
+                    }
+                }
                 "logging" => Self::handle_logging(&args),
                 "debug_drain_task" => self.handle_debug_drain_task(),
                 "workspace" => self.handle_workspace(&args).await,
@@ -2012,7 +2044,9 @@ impl ServerHandler for AtticServer {
                     )])
                     .into());
                 }
-                "file" => handle_file(&pool, &args, &active_ids),
+                "file" => self.gated_read(&gate_scope_ids(&args, &active_ids), &args, |_| {
+                    freshness::gated_file_read(&pool, &args, &active_ids)
+                }),
                 "repo_map" => {
                     let discovery_counters = lock_or_call_err!(
                         self.last_discovery_counters.read(),
@@ -2022,13 +2056,15 @@ impl ServerHandler for AtticServer {
                         self.last_discovery_diagnostics.read(),
                         "last_discovery_diagnostics"
                     );
-                    handle_repo_map(
-                        &pool,
-                        &args,
-                        &active_ids,
-                        &discovery_counters,
-                        &discovery_diagnostics,
-                    )
+                    self.gated_read(&gate_scope_ids(&args, &active_ids), &args, |_| {
+                        handle_repo_map(
+                            &pool,
+                            &args,
+                            &active_ids,
+                            &discovery_counters,
+                            &discovery_diagnostics,
+                        )
+                    })
                 }
                 "status" => {
                     let inc = lock_or_call_err!(incremental.read(), "incremental");
@@ -2084,15 +2120,20 @@ impl ServerHandler for AtticServer {
                         },
                     )
                 }
-                "context" => handle_context(
-                    &pool,
-                    &writer,
-                    crossrepo_degraded,
-                    &args,
-                    &active_ids,
-                    advisory,
-                    self.knowledge_repository_id(),
-                ),
+                "context" => self.gated_read(&gate_scope_ids(&args, &active_ids), &args, |_| {
+                    // Single store: links live next to the indexes and are
+                    // rebuilt here when their catalog version changed.
+                    let links_current = self.ensure_single_store_catalog(&active_ids)?;
+                    handle_context(
+                        &pool,
+                        &writer,
+                        crossrepo_degraded && !links_current,
+                        &args,
+                        &active_ids,
+                        advisory,
+                        self.knowledge_repository_id(),
+                    )
+                }),
                 other => Err(ServerError::InvalidArg(format!("unknown tool: {other}"))),
             };
             drop(admission);

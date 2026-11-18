@@ -341,7 +341,7 @@ pub fn insert_structural_file(
 }
 
 /// Deterministic logical-id encoding for unresolved targets (ADR-011).
-fn logical_target_id(target: &str) -> String {
+pub(crate) fn logical_target_id(target: &str) -> String {
     let hex = blake3::hash(target.as_bytes()).to_hex();
     format!("logical:{}", &hex[..32])
 }

@@ -516,27 +516,10 @@ impl IncrementalService {
                 report.queue_saturated = true;
             }
         }
-        // Phase 6 cross-repo incremental recomputation:
-        // If any changed path is a dependency manifest, resync the
-        // repository's catalog/declarations/edges so cross-repo data
-        // stays current without a full workspace rebuild.
-        let touched: Vec<String> = cs.touched_paths().into_iter().collect();
-        let has_manifest = touched
-            .iter()
-            .any(|p| attic_crossrepo::manifest::is_manifest_path(p));
-        if has_manifest {
-            let rid = repo_id.clone();
-            let paths = touched;
-            writer
-                .send(move |conn| {
-                    attic_crossrepo::maintenance::incremental_sync(conn, &rid, &paths)
-                        .map_err(|e| attic_storage::StorageError::Worker(e.to_string()))?;
-                    Ok(())
-                })
-                .map_err(|e| {
-                    IncrementalError::Storage(attic_storage::StorageError::Worker(e.to_string()))
-                })?;
-        }
+        // Cross-repo links are NOT written from here (R5): the catalog is
+        // refreshed from the indexed dependency files by the answer-time
+        // freshness check (and its background prefetch), stamped with the
+        // catalog version it was built from.
         self.metrics
             .changesets_applied
             .fetch_add(1, Ordering::Relaxed);
@@ -894,7 +877,7 @@ fn schedule_reconciliation_for_service(
 }
 
 /// Mark specific paths' latest occurrences UNKNOWN (trust degradation).
-fn mark_paths_unknown(
+pub(crate) fn mark_paths_unknown(
     writer: &WriterQueueHandle,
     repo_id: &str,
     paths: &[String],

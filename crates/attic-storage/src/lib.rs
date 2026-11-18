@@ -26,6 +26,7 @@ pub mod resource_policy;
 pub mod retrieval_reads;
 pub mod semantic_reads;
 pub mod server_state;
+pub mod store_version;
 pub mod writer;
 
 pub use analysis_cache::{
@@ -53,7 +54,7 @@ pub use fts::{
     insert_retrieval_unit_with_fts, retrieval_unit_location, retrieval_unit_texts,
 };
 pub use indexing_publication::{
-    IndexPublication, IndexPublicationStats, PublicationFile, PublicationNode,
+    IndexPublication, IndexPublicationStats, OccurrenceMeta, PublicationFile, PublicationNode,
     PublicationOccurrence, PublicationRelationship, PublicationRetrievalUnit,
     PublicationStructuralFile, PublicationSymbolDef, PublicationUnitLink, submit_index_publication,
 };
@@ -62,7 +63,9 @@ pub use invalidation_ops::{
     get_freshness_totals, get_freshness_totals_for_repo, invalidate_for_occurrences,
     record_invalidation, record_recomputed,
 };
-pub use migration::{migrate_new_or_compatible_catalog, run_migrations};
+pub use migration::{
+    migrate_new_or_compatible_catalog, reset_outdated_catalog, run_migrations, schema_is_current,
+};
 pub use ops_tasks::{
     ClaimedTask, EnqueueOutcome, IncrementalTaskPayload, TASK_INCREMENTAL_INDEX,
     TASK_RECONCILIATION, TaskCounts, TaskOutcome, cancel_pending_task, claim_next_pending_task,
@@ -83,6 +86,7 @@ pub use resource_policy::{
     env_monitor_overrides, env_resource_overrides, resolve_effective_config,
 };
 pub use server_state::{ServerState, get_server_state, record_clean_shutdown, record_startup};
+pub use store_version::{StoreVersion, read_at_version, read_store_version};
 pub use writer::{WriterConfig, WriterQueue, WriterQueueHandle};
 
 // Repository sub-module re-exports for use by attic-indexing and attic-server.

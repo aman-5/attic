@@ -89,6 +89,13 @@ pub struct ScopedIndexResult {
     pub units_deleted: usize,
     /// New retrieval units inserted.
     pub units_inserted: usize,
+    /// `true` when the publication fence no longer matched the store and
+    /// nothing was written; the caller re-runs against the newer state.
+    pub rejected: bool,
+    /// Upsert paths whose state could not be established (unreadable,
+    /// locked, became a directory). They were left out of this publication:
+    /// their previous rows are untouched and they must be re-checked later.
+    pub uncertain: Vec<String>,
 }
 
 /// A cheap (size, mtime) fingerprint used to detect a file changing between
@@ -115,6 +122,58 @@ fn hash_file_content(path: &Path) -> std::io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Importers (repo-relative paths) whose currently unresolved imports may
+/// resolve to a file that appears in `changes`, found through the reverse
+/// import index; limited to unchanged, still-indexed importers.
+fn importers_to_reresolve(
+    store: &IndexingStore<'_>,
+    repo_id: &RepositoryId,
+    changes: &ScopedChanges,
+    trusted: &BTreeMap<String, String>,
+) -> Result<Vec<String>, IndexError> {
+    let appearing: Vec<&String> = changes
+        .upserts
+        .iter()
+        .filter(|p| !trusted.contains_key(*p))
+        .chain(changes.rename_hints.iter().map(|(_, to)| to))
+        .collect();
+    if appearing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let touched = changes.touched_paths();
+    let repo = repo_id.to_string_repr();
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    store
+        .readers
+        .with_reader(|c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT importer_path FROM core_import_targets
+                  WHERE repository_id = ?1 AND candidate_path = ?2",
+            )?;
+            for path in &appearing {
+                let mut keys = vec![(*path).clone()];
+                keys.extend(
+                    crate::structural_pipeline::path_stems(path)
+                        .into_iter()
+                        .map(|s| format!("stem:{s}")),
+                );
+                for key in keys {
+                    for row in
+                        stmt.query_map(rusqlite::params![repo, key], |r| r.get::<_, String>(0))?
+                    {
+                        let importer = row?;
+                        if trusted.contains_key(&importer) && !touched.contains(&importer) {
+                            out.insert(importer);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(IndexError::Storage)?;
+    Ok(out.into_iter().collect())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -131,6 +190,22 @@ pub fn index_changes(
     opts: &IndexOptions,
     changes: &ScopedChanges,
 ) -> Result<ScopedIndexResult, IndexError> {
+    index_changes_fenced(store, root, policy, opts, changes, None)
+}
+
+/// [`index_changes`] with a publication fence: when `fence` is `Some`, the
+/// publication is applied only if the store is still at that version
+/// (otherwise `rejected` is set and nothing is written).
+pub fn index_changes_fenced(
+    store: &IndexingStore<'_>,
+    root: &Path,
+    policy: &DiscoveryPolicy,
+    opts: &IndexOptions,
+    changes: &ScopedChanges,
+    fence: Option<attic_storage::StoreVersion>,
+) -> Result<ScopedIndexResult, IndexError> {
+    // Racy-file anchor: taken before any changed file is hashed.
+    let capture_started_ns = crate::now_ns();
     let root_str = root.to_string_lossy().to_string();
     let repo_id: RepositoryId = store
         .readers
@@ -146,6 +221,26 @@ pub fn index_changes(
         .into_iter()
         .collect();
 
+    // Phase 6: files appearing (added / restored / renamed-to) may satisfy
+    // imports that currently resolve to nothing — re-index those importers
+    // in this same publication so their edges reconnect.
+    let with_importers;
+    let changes = {
+        let extra = importers_to_reresolve(store, &repo_id, changes, &trusted)?;
+        if extra.is_empty() {
+            changes
+        } else {
+            let mut upserts = changes.upserts.clone();
+            upserts.extend(extra);
+            with_importers = ScopedChanges {
+                upserts,
+                deletes: changes.deletes.clone(),
+                rename_hints: changes.rename_hints.clone(),
+            };
+            &with_importers
+        }
+    };
+
     // ── 2. Hash every changed file NOW (canonical detection: content only) ──
     //
     // Three-state rule: ONLY a verified NotFound may become a deletion
@@ -159,15 +254,15 @@ pub fn index_changes(
     let mut upsert_stat_before: BTreeMap<String, Option<(u64, std::time::SystemTime)>> =
         BTreeMap::new();
     let mut vanished: Vec<String> = Vec::new();
+    let mut uncertain: Vec<String> = Vec::new();
     for rel in &changes.upserts {
         let abs = root.join(rel);
         if abs.is_dir() {
             // A directory where an indexed file used to be is uncertain, not
             // a clean deletion.
-            return Err(IndexError::Io {
-                path: rel.clone(),
-                source: std::io::Error::other("indexed file path became a directory"),
-            });
+            debug!(path = %rel, "upsert path became a directory → uncertain");
+            uncertain.push(rel.clone());
+            continue;
         }
         let stat_before = file_fingerprint(&abs);
         match hash_file_content(&abs) {
@@ -179,16 +274,36 @@ pub fn index_changes(
                 debug!(path = %rel, "upsert target verifiably gone before publication");
                 vanished.push(rel.clone());
             }
-            Err(source) => {
-                // No silent fallback: previous state stays STALE/INVALID and
-                // the scheduler retries the task.
-                return Err(IndexError::Io {
-                    path: rel.clone(),
-                    source,
-                });
+            Err(e) => {
+                // Unreadable / locked: never a deletion and never a reason
+                // to block the rest of the batch. The previous rows stay and
+                // the path is reported back for a later re-check.
+                debug!(path = %rel, error = %e, "upsert unreadable → uncertain");
+                uncertain.push(rel.clone());
             }
         }
     }
+    let effective;
+    let changes = if uncertain.is_empty() {
+        changes
+    } else {
+        effective = ScopedChanges {
+            upserts: changes
+                .upserts
+                .iter()
+                .filter(|p| !uncertain.contains(p))
+                .cloned()
+                .collect(),
+            deletes: changes.deletes.clone(),
+            rename_hints: changes
+                .rename_hints
+                .iter()
+                .filter(|(_, to)| !uncertain.contains(to))
+                .cloned()
+                .collect(),
+        };
+        &effective
+    };
 
     // ── 3. Compose the incremental manifest pair set ────────────────────────
     let excluded = changes.touched_paths();
@@ -386,9 +501,19 @@ pub fn index_changes(
                 discovery_class: DiscoveryClass::Vcs,
                 security_state: rec.security_state,
                 existence_state: ExistenceState::Present,
+                meta: crate::occurrence_meta(&rec.abs_path, capture_started_ns),
             },
         })
         .collect();
+    let manifest_contents = crate::catalog_input_contents(file_records.iter().map(|rec| {
+        (
+            rec.repo_relative.as_str(),
+            rec.abs_path.as_path(),
+            rec.content_hash.as_str(),
+            rec.security_state,
+        )
+    }));
+    let git_meta = attic_discovery::git::read_git_meta(root).ok();
 
     for rel in changes.deletes.iter().chain(vanished.iter()) {
         let snap = old_snapshots.get(rel);
@@ -456,7 +581,37 @@ pub fn index_changes(
                 .flatten()
         },
     };
-    let structural_files = pipeline.finish(&deps, &unit_links_by_occ);
+    let mut import_targets: Vec<(String, String, String)> = Vec::new();
+    let structural_files = pipeline.finish(&deps, &unit_links_by_occ, &mut import_targets);
+    // Phase 6: incoming import edges follow republished files; edges to
+    // removed files become `target_missing`.
+    let retarget_occurrences: Vec<(String, String)> = file_records
+        .iter()
+        .filter_map(|r| {
+            r.old_fo_id
+                .clone()
+                .map(|old| (old, r.fo_id.to_string_repr()))
+        })
+        .collect();
+    let retargeted: BTreeSet<&str> = retarget_occurrences
+        .iter()
+        .map(|(o, _)| o.as_str())
+        .collect();
+    let missing_occurrences: Vec<(String, String)> = old_snapshots
+        .iter()
+        .filter(|(_, s)| !retargeted.contains(s.id.as_str()) && s.existence_state != "deleted")
+        .filter(|(path, _)| {
+            changes.deletes.contains(path)
+                || vanished.contains(path)
+                || tombstones.iter().any(|t| &t.occurrence.path == *path)
+        })
+        .map(|(path, s)| (s.id.clone(), path.clone()))
+        .collect();
+    let mut import_targets_cleared_for: Vec<String> = file_records
+        .iter()
+        .map(|r| r.repo_relative.clone())
+        .collect();
+    import_targets_cleared_for.extend(missing_occurrences.iter().map(|(_, p)| p.clone()));
 
     let mut files = publication_files;
     files.extend(tombstones);
@@ -471,7 +626,7 @@ pub fn index_changes(
             repository_id: repo_id,
             repository_upsert: None,
             source_revision_id: rev_id,
-            commit_sha: None,
+            commit_sha: git_meta.as_ref().and_then(|g| g.head_sha.clone()),
             working_tree_manifest_hash: manifest_hash,
             discovery_policy_hash: policy_hash,
             unstable_capture: false,
@@ -505,9 +660,25 @@ pub fn index_changes(
             // Replacement semantics: wipe prior structural artifacts of every
             // refreshed occurrence (and of tombstoned files) in-txn.
             delete_structural_for_occurrences: old_occurrence_ids,
+            branch: git_meta.as_ref().and_then(|g| g.branch.clone()),
+            manifest_contents,
+            expected_store_version: fence,
+            root_identity: attic_discovery::root_identity(root),
+            retarget_occurrences,
+            missing_occurrences,
+            import_targets,
+            import_targets_cleared_for,
         },
     )
     .map_err(IndexError::Storage)?;
+    if stats.rejected {
+        return Ok(ScopedIndexResult {
+            repository_id: repo_id.to_string_repr(),
+            rejected: true,
+            uncertain,
+            ..Default::default()
+        });
+    }
 
     // ── 8. Identity links for identical-content renames (ADR-009) ───────────
     // Runs AFTER the successful publication so links only ever reference
@@ -573,6 +744,8 @@ pub fn index_changes(
         files_deleted: deleted_count,
         units_deleted: stats.units_deleted,
         units_inserted: stats.units_inserted,
+        rejected: false,
+        uncertain,
     })
 }
 

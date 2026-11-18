@@ -1080,6 +1080,12 @@ fn verify_store(conn: &Connection) -> Result<(), StorageError> {
             "repository index is missing canonical schema tables".into(),
         ));
     }
+    if !crate::migration::schema_is_current(conn)? {
+        return Err(StorageError::Worker(
+            "repository index was created by an older schema; restart the server to rebuild it"
+                .into(),
+        ));
+    }
     Ok(())
 }
 

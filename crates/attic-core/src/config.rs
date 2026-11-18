@@ -280,6 +280,32 @@ pub struct AtticConfig {
     /// tool turns it on.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// `[freshness]` table: answer-time freshness check tuning.
+    #[serde(default)]
+    pub freshness: FreshnessConfig,
+}
+
+/// `[freshness]` — the check Attic runs before every answer.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessConfig {
+    /// Repository roots (or parent folders of repositories) whose files are
+    /// always hashed instead of trusting unchanged size / timestamps / file
+    /// id — for network drives and cloud-sync folders whose timestamps
+    /// cannot be trusted.
+    #[serde(default)]
+    pub always_hash_paths: Vec<String>,
+}
+
+impl FreshnessConfig {
+    /// `true` when `root` is (or is under) a configured always-hash path.
+    pub fn always_hash(&self, root: &std::path::Path) -> bool {
+        let root = root.to_string_lossy().replace('\\', "/").to_lowercase();
+        self.always_hash_paths.iter().any(|p| {
+            let p = p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+            !p.is_empty() && (root == p || root.starts_with(&format!("{p}/")))
+        })
+    }
 }
 
 /// `[logging]` — persistent file-log level applied at every start. The
@@ -419,6 +445,13 @@ mode = "auto"
 #
 # Turn the feature off:
 # enabled = false
+
+[freshness]
+# Before every answer Attic checks the saved files of the repositories it reads
+# and re-indexes anything that changed. Unchanged files are recognized by size,
+# timestamps and file id without being read. For network drives or cloud-sync
+# folders whose timestamps cannot be trusted, list them here to always hash.
+# always_hash_paths = ["\\\\server\\share\\repo", "C:\\Users\\me\\OneDrive\\code"]
 
 [logging]
 # Level of the file log in <ATTIC_HOME>/logs, applied at every start
@@ -648,5 +681,27 @@ mod tests {
         ));
         assert_eq!(cfg.resources.total_memory_budget_mib, Some(8192));
         assert_eq!(cfg.resources.max_io_ops_per_sec, Some(400));
+    }
+}
+
+#[cfg(test)]
+mod freshness_config_tests {
+    use super::*;
+
+    #[test]
+    fn always_hash_paths_match_roots_and_children() {
+        let cfg = AtticConfig::parse_str(
+            "[freshness]\nalways_hash_paths = [\"C:\\\\Users\\\\me\\\\OneDrive\"]\n",
+        )
+        .unwrap();
+        let f = &cfg.freshness;
+        assert!(f.always_hash(std::path::Path::new(r"C:\Users\me\OneDrive")));
+        assert!(f.always_hash(std::path::Path::new(r"c:\users\me\onedrive\repo")));
+        assert!(!f.always_hash(std::path::Path::new(r"C:\Users\me\OneDriveOther")));
+        assert!(
+            !AtticConfig::default()
+                .freshness
+                .always_hash(std::path::Path::new("C:\\x"))
+        );
     }
 }

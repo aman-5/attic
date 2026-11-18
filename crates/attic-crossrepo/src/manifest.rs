@@ -62,29 +62,9 @@ pub fn parse_manifest(rel_path: &str, bytes: &[u8]) -> ManifestParse {
 }
 
 /// Repo-relative paths Attic treats as dependency-declaration files for
-/// freshness/invalidation purposes.
+/// freshness/invalidation purposes (shared list in `attic-discovery`).
 pub fn is_manifest_path(rel_path: &str) -> bool {
-    matches!(
-        rel_path,
-        "go.mod"
-            | "package.json"
-            | "pom.xml"
-            | "build.gradle"
-            | "build.gradle.kts"
-            | "settings.gradle"
-            | "settings.gradle.kts"
-            | "pyproject.toml"
-            | "requirements.txt"
-            | "requirements-dev.txt"
-            | "requirements_dev.txt"
-            | ".gitmodules"
-    ) || rel_path.ends_with("/package.json")
-        || rel_path.ends_with("/pom.xml")
-        || rel_path.ends_with("/go.mod")
-        || rel_path.ends_with("/pyproject.toml")
-        || rel_path.ends_with("/MANIFEST.MF")
-        || rel_path == "MANIFEST.MF"
-        || rel_path.ends_with("/.content.xml")
+    attic_discovery::catalog_inputs::is_manifest_path(rel_path)
 }
 
 // ---------------------------------------------------------------------------

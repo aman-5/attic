@@ -274,6 +274,37 @@ MCP initialization, tool discovery and process status do not wait for database
 verification. An initializing request returns an explicit retryable response;
 a verification failure returns an error, never unchecked content.
 
+## Freshness: every answer is checked against your files
+
+Before `context`, `file` or `repo_map` read any index data, Attic checks the
+saved files of every repository the answer uses — Git repositories and plain
+folders alike — and re-indexes whatever changed (branch switch, pull, edits,
+deletes, renames). File watchers only make this check faster; they never decide
+whether an answer is current.
+
+- Unchanged files are recognized by size, timestamps and file id without being
+  read (Git's racy-file rule protects edits made right after a check).
+- Every response carries a `freshness` block: which code was used
+  (`branch` + `commit`, or a folder fingerprint) and a `version_token`.
+  Pass the token to later calls of the same answer; if the code changed in
+  between, the call fails with `VERSION_EXPIRED` instead of mixing versions.
+- `expected_branch` / `expected_commit` refuse with `BRANCH_MISMATCH` when a
+  different branch is checked out.
+- `at_commit` answers from a named commit (e.g. the deployed production SHA)
+  without touching your checkout; with `{repository_id: commit}` cross-repository
+  links are resolved for exactly those commits.
+- Cross-repository links are rebuilt from the indexed dependency files
+  (`package.json`, `pom.xml`, `go.mod`, OSGi manifests, `.proto`, …) before an
+  answer uses them, with `UNRESOLVED` / `AMBIGUOUS` outcomes and a
+  `version_compat` verdict (`COMPATIBLE` / `INCOMPATIBLE` / `UNCHECKED`).
+- A missing, unmounted or unreadable folder is reported
+  (`SOURCE_UNAVAILABLE`), never treated as "everything was deleted".
+- `deep_verify: true`, or `[freshness] always_hash_paths` in `attic.toml`,
+  hashes every file (network drives, cloud-sync folders).
+
+Errors are JSON `{code, retryable, message}`. Measured cost and the full design:
+[docs/freshness.md](docs/freshness.md).
+
 ## Storage and startup
 
 SQLite stores graph relationships as nodes and edges alongside lexical indexes

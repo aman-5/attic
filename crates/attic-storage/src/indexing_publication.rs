@@ -70,6 +70,22 @@ pub struct PublicationOccurrence {
     pub security_state: SecurityState,
     /// Whether the file is present or deleted in this revision.
     pub existence_state: ExistenceState,
+    /// Freshness fast-path metadata captured before hashing (`None` forces
+    /// a content hash on the next check).
+    pub meta: Option<OccurrenceMeta>,
+}
+
+/// Filesystem metadata recorded on an occurrence for the freshness fast path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OccurrenceMeta {
+    /// Last-write time, ns since the Unix epoch.
+    pub mtime_ns: i64,
+    /// NTFS ChangeTime / Unix ctime, ns since the Unix epoch.
+    pub change_time_ns: Option<i64>,
+    /// `volume:fileid` / `dev:ino`.
+    pub file_id: Option<String>,
+    /// When the metadata was observed, ns since the Unix epoch.
+    pub captured_at_ns: i64,
 }
 
 /// One file's identity + occurrence pair, mirroring
@@ -159,6 +175,29 @@ pub struct IndexPublication {
     /// Phase 3 — occurrences whose previous structural rows are deleted first
     /// (replacement semantics).
     pub delete_structural_for_occurrences: Vec<String>,
+    /// Git branch of the captured working tree (`None` for non-Git or
+    /// detached HEAD).
+    pub branch: Option<String>,
+    /// Indexed bytes of dependency manifests / `.proto` files, keyed by
+    /// content hash, so the cross-repo catalog is built from indexed content.
+    pub manifest_contents: Vec<(String, Vec<u8>)>,
+    /// Publication fence: when `Some`, the publication is applied only if
+    /// the store still has exactly this version; otherwise nothing is
+    /// written and [`IndexPublicationStats::rejected`] is set (never an
+    /// error, which would roll back unrelated co-batched writes).
+    pub expected_store_version: Option<crate::StoreVersion>,
+    /// Root directory identity to record after a successful publish.
+    pub root_identity: Option<String>,
+    /// `(old occurrence id, new occurrence id)` of republished files whose
+    /// incoming import edges must follow them.
+    pub retarget_occurrences: Vec<(String, String)>,
+    /// `(old occurrence id, path)` of deleted files whose incoming import
+    /// edges become unresolved (`target_missing`).
+    pub missing_occurrences: Vec<(String, String)>,
+    /// Reverse import index rows `(importer_path, specifier, candidate)`.
+    pub import_targets: Vec<(String, String, String)>,
+    /// Importer paths whose previous reverse-index rows are replaced.
+    pub import_targets_cleared_for: Vec<String>,
 }
 
 /// One canonical structural node, ready for persistence (Phase 3).
@@ -294,6 +333,9 @@ pub struct IndexPublicationStats {
     pub unit_node_links: usize,
     /// Phase 3 — prior structural rows removed (nodes+symbols+rels).
     pub structural_deleted: usize,
+    /// `true` when the publication fence did not match and nothing was
+    /// written; the caller must re-run against the newer store state.
+    pub rejected: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +350,21 @@ fn execute_index_publication(
     conn: &Connection,
     p: &IndexPublication,
 ) -> Result<IndexPublicationStats, StorageError> {
+    if let Some(expected) = &p.expected_store_version {
+        if crate::read_store_version(conn)?.as_ref() != Some(expected) {
+            return Ok(IndexPublicationStats {
+                rejected: true,
+                ..Default::default()
+            });
+        }
+        // Claim the version inside this transaction: a second publication
+        // fenced on the same version in the same writer batch (the commit
+        // bump only lands at COMMIT) must now be rejected.
+        conn.execute(
+            "UPDATE ops_store_version SET version = version + 1 WHERE id = 'singleton'",
+            [],
+        )?;
+    }
     if let Some((root_path, display_name)) = &p.repository_upsert {
         upsert_repository(conn, &p.repository_id, root_path, display_name)?;
     }
@@ -321,6 +378,24 @@ fn execute_index_publication(
         &p.discovery_policy_hash,
         p.unstable_capture,
     )?;
+    if p.branch.is_some() {
+        conn.execute(
+            "UPDATE core_source_revisions SET branch = ?1 WHERE id = ?2",
+            rusqlite::params![p.branch, p.source_revision_id.to_string_repr()],
+        )?;
+    }
+    if let Some(identity) = &p.root_identity {
+        conn.execute(
+            "UPDATE core_repositories SET root_identity = ?1 WHERE id = ?2",
+            rusqlite::params![identity, p.repository_id.to_string_repr()],
+        )?;
+    }
+    for (hash, content) in &p.manifest_contents {
+        conn.execute(
+            "INSERT OR IGNORE INTO core_manifest_contents (content_hash, content) VALUES (?1, ?2)",
+            rusqlite::params![hash, content],
+        )?;
+    }
 
     insert_index_generation(
         conn,
@@ -371,12 +446,31 @@ fn execute_index_publication(
             FreshnessState::Current
         };
         insert_file_occurrence_with_freshness(conn, &occurrence, freshness)?;
+        if let Some(meta) = &occ.meta {
+            conn.execute(
+                "UPDATE core_file_occurrences
+                    SET mtime_ns = ?1, change_time_ns = ?2, file_id = ?3, captured_at_ns = ?4
+                  WHERE id = ?5",
+                rusqlite::params![
+                    meta.mtime_ns,
+                    meta.change_time_ns,
+                    meta.file_id,
+                    meta.captured_at_ns,
+                    occ.id.to_string_repr()
+                ],
+            )?;
+        }
     }
 
     let mut stats = IndexPublicationStats {
         files_published: p.files.len(),
         ..Default::default()
     };
+
+    // Phase 6 — BEFORE the structural replacement below (which deletes every
+    // edge touching a replaced occurrence): rewrite OTHER files' incoming
+    // import edges so they follow the file or record that it is gone.
+    follow_incoming_imports(conn, p)?;
 
     // ── Phase 3 FIRST: structural replacement + unit↔node link cleanup.
     // Dependent state (links → relationships → symbol occurrences → leaf
@@ -428,12 +522,109 @@ fn execute_index_publication(
 
     crate::repository::structural::prune_orphan_symbol_artifacts(conn, &repo_str)?;
 
+    // Reverse import index for the files of this publication ("*" = the
+    // whole repository is being republished).
+    for importer in &p.import_targets_cleared_for {
+        if importer == "*" {
+            conn.execute(
+                "DELETE FROM core_import_targets WHERE repository_id = ?1",
+                rusqlite::params![repo_str],
+            )?;
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM core_import_targets WHERE repository_id = ?1 AND importer_path = ?2",
+            rusqlite::params![repo_str, importer],
+        )?;
+    }
+    for (importer, specifier, candidate) in &p.import_targets {
+        conn.execute(
+            "INSERT OR IGNORE INTO core_import_targets
+                (repository_id, importer_path, specifier, candidate_path)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![repo_str, importer, specifier, candidate],
+        )?;
+    }
+
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
+
+/// Phase 6: keep OTHER files' import edges pointing at real files.
+///
+/// A republished file got a new occurrence id: incoming import edges move to
+/// it (no re-parse of the importers). A deleted file: incoming import edges
+/// become unresolved logical targets carrying `target_missing`. Edges whose
+/// source is itself being replaced are left alone (the importer's own new
+/// edges are published with this run).
+fn follow_incoming_imports(conn: &Connection, p: &IndexPublication) -> Result<(), StorageError> {
+    let replaced: std::collections::HashSet<&str> = p
+        .delete_structural_for_occurrences
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let incoming = |old: &str| -> Result<Vec<(String, String, Option<String>)>, StorageError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, source_entity_id, provenance_json FROM core_relationships
+              WHERE target_entity_id = ?1 AND target_entity_type = 'FILE_OCCURRENCE'
+                AND rel_type = 'IMPORT'",
+        )?;
+        let rows = stmt
+            .query_map([old], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, source, _): &(String, String, Option<String>)| {
+                !replaced.contains(source.as_str())
+            })
+            .collect())
+    };
+    for (old, new) in &p.retarget_occurrences {
+        for (id, _, _) in incoming(old)? {
+            conn.execute(
+                "UPDATE core_relationships
+                    SET target_entity_id = ?2, freshness_state = 'CURRENT'
+                  WHERE id = ?1",
+                rusqlite::params![id, new],
+            )?;
+        }
+    }
+    for (old, path) in &p.missing_occurrences {
+        let path: String = if path.is_empty() {
+            conn.query_row(
+                "SELECT path FROM core_file_occurrences WHERE id = ?1",
+                [old],
+                |r| r.get(0),
+            )
+            .unwrap_or_default()
+        } else {
+            path.clone()
+        };
+        for (id, _, provenance) in incoming(old)? {
+            let mut prov: serde_json::Value = provenance
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let specifier = prov["specifier"].as_str().unwrap_or(&path).to_owned();
+            prov["target_missing"] = serde_json::json!(path);
+            conn.execute(
+                "UPDATE core_relationships
+                    SET target_entity_id = ?2, resolution = 'SYNTACTIC', confidence = 0.5,
+                        provenance_json = ?3, freshness_state = 'CURRENT'
+                  WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    crate::repository::structural::logical_target_id(&specifier),
+                    prov.to_string()
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// Submit one full indexing publication through the coordinated writer queue.
 ///
@@ -525,6 +716,7 @@ mod tests {
                 discovery_class: DiscoveryClass::Vcs,
                 security_state: SecurityState::Clean,
                 existence_state: ExistenceState::Present,
+                meta: None,
             },
         }];
         let units = vec![PublicationRetrievalUnit {
@@ -559,7 +751,48 @@ mod tests {
             retrieval_units: units,
             structural_files: vec![],
             delete_structural_for_occurrences: vec![],
+            branch: None,
+            manifest_contents: vec![],
+            expected_store_version: None,
+            root_identity: None,
+            retarget_occurrences: vec![],
+            missing_occurrences: vec![],
+            import_targets: vec![],
+            import_targets_cleared_for: vec![],
         }
+    }
+
+    #[test]
+    fn stale_fence_rejects_without_writing_or_failing() {
+        let dir = TempDir::new().unwrap();
+        let (queue, pool, _db_path) = make_queue(&dir);
+        let handle = queue.handle();
+        let mut p = sample_publication();
+        p.expected_store_version = Some(crate::StoreVersion {
+            epoch: "not-this-store".into(),
+            version: 0,
+        });
+        let stats = submit_index_publication(&handle, p).unwrap();
+        assert!(stats.rejected);
+        let units: i64 = pool
+            .with_reader(|c| {
+                Ok(
+                    c.query_row("SELECT COUNT(*) FROM core_retrieval_units", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(units, 0, "a rejected publication must write nothing");
+
+        let current = pool
+            .with_reader(crate::read_store_version)
+            .unwrap()
+            .unwrap();
+        let mut p = sample_publication();
+        p.expected_store_version = Some(current);
+        let stats = submit_index_publication(&handle, p).unwrap();
+        assert!(!stats.rejected);
     }
 
     #[test]

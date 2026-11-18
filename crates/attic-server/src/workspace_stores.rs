@@ -155,6 +155,10 @@ impl AtticServer {
         &self,
         observed: &HashMap<String, u64>,
     ) -> Result<HashMap<String, u64>, ServerError> {
+        // One refresh at a time: the background poller and answer-time
+        // refreshes share this lock.
+        static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _refresh = REFRESH.lock().unwrap_or_else(|p| p.into_inner());
         let ids = {
             let roots = self
                 .active_roots
@@ -177,23 +181,34 @@ impl AtticServer {
             next.insert(id.clone(), generation);
             if observed.get(id) != Some(&generation) {
                 changed = true;
-                self.crossrepo_degraded
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 self.project_repository(&local, id)?;
             }
         }
         if changed {
-            self.pool.with_reader(|conn| {
-                attic_crossrepo::maintenance::sync_workspace(
-                    conn,
-                    &self.writer,
-                    &attic_crossrepo::maintenance::WorkspaceSyncOptions {
-                        active_repository_ids: Some(ids.into_iter().collect()),
-                        ..Default::default()
-                    },
-                )
-                .map_err(|error| StorageError::Worker(error.to_string()))
+            let ids: Vec<String> = ids.into_iter().collect();
+            // Relink only when what the links are built from changed
+            // (dependency / .proto content, roots, membership) — ordinary
+            // source edits leave the catalog version, and the links, as is.
+            let (version, latest) = self.pool.with_reader(|conn| {
+                let version = attic_crossrepo::catalog::catalog_version(conn, &ids)
+                    .map_err(|error| StorageError::Worker(error.to_string()))?;
+                Ok((version, latest_catalog_version(conn)?))
             })?;
+            if latest.as_deref() != Some(version.as_str()) {
+                self.crossrepo_degraded
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.pool.with_reader(|conn| {
+                    attic_crossrepo::maintenance::sync_workspace(
+                        conn,
+                        &self.writer,
+                        &attic_crossrepo::maintenance::WorkspaceSyncOptions {
+                            active_repository_ids: Some(ids),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|error| StorageError::Worker(error.to_string()))
+                })?;
+            }
             *self
                 .catalog_generations
                 .write()
@@ -203,6 +218,55 @@ impl AtticServer {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(next)
+    }
+
+    /// R4 at answer time: bring the cross-repository catalog and links up
+    /// to date with the (just gated) repository indexes. Returns the
+    /// snapshot id the links belong to.
+    pub(crate) fn ensure_catalog_current(&self) -> Result<Option<String>, ServerError> {
+        let observed = self
+            .catalog_generations
+            .read()
+            .map_err(|_| ServerError::Retrieval("catalog generation lock poisoned".into()))?
+            .clone();
+        self.refresh_repository_catalogs(&observed)?;
+        self.latest_snapshot_id()
+    }
+
+    /// Persisted unresolved / ambiguous cross-repository dependencies of
+    /// the latest snapshot (bounded).
+    pub(crate) fn crossrepo_diagnostics_json(&self) -> Result<Value, ServerError> {
+        Ok(self.pool.with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT source_repository_id, declaration, kind, detail_json
+                   FROM core_crossrepo_diagnostics
+                  ORDER BY kind, source_repository_id, declaration LIMIT 50",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(json!({
+                    "repository_id": r.get::<_, String>(0)?,
+                    "declaration": r.get::<_, String>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "detail": r.get::<_, Option<String>>(3)?
+                        .and_then(|d| serde_json::from_str::<Value>(&d).ok()),
+                }))
+            })?;
+            Ok(Value::Array(rows.collect::<Result<Vec<_>, _>>()?))
+        })?)
+    }
+
+    pub(crate) fn latest_snapshot_id(&self) -> Result<Option<String>, ServerError> {
+        Ok(self.pool.with_reader(|conn| {
+            use rusqlite::OptionalExtension;
+            Ok(conn
+                .query_row(
+                    "SELECT id FROM core_workspace_snapshots
+                      ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?)
+        })?)
     }
 
     pub(crate) fn project_repository(
@@ -452,25 +516,30 @@ impl AtticServer {
         }
 
         if name == "file" || name == "repo_map" {
+            if let Some(commits) = crate::commit_mode::parse_at_commit(args)? {
+                return self.commit_mode_tool(name, args, active_ids, &commits, advisory);
+            }
             let id = args
                 .get("repository_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ServerError::InvalidArg("repository_id required".into()))?;
             require_active_member(active_ids, id)?;
-            let local = self.repository_server(id)?;
-            return if name == "file" {
-                handle_file(&local.pool, args, active_ids)
-            } else {
-                let counters = self
-                    .last_discovery_counters
-                    .read()
-                    .map_err(|_| ServerError::Retrieval("discovery lock poisoned".into()))?;
-                let diagnostics = self
-                    .last_discovery_diagnostics
-                    .read()
-                    .map_err(|_| ServerError::Retrieval("discovery lock poisoned".into()))?;
-                handle_repo_map(&local.pool, args, active_ids, &counters, &diagnostics)
-            };
+            return self.gated_read(&[id.to_owned()], args, |_pass| {
+                let local = self.repository_server(id)?;
+                if name == "file" {
+                    crate::freshness::gated_file_read(&local.pool, args, active_ids)
+                } else {
+                    let counters = self
+                        .last_discovery_counters
+                        .read()
+                        .map_err(|_| ServerError::Retrieval("discovery lock poisoned".into()))?;
+                    let diagnostics = self
+                        .last_discovery_diagnostics
+                        .read()
+                        .map_err(|_| ServerError::Retrieval("discovery lock poisoned".into()))?;
+                    handle_repo_map(&local.pool, args, active_ids, &counters, &diagnostics)
+                }
+            });
         }
 
         if name == "debug_drain_task" {
@@ -509,8 +578,22 @@ impl AtticServer {
         if let Some(id) = scoped {
             require_active_member(active_ids, id)?;
         }
+        if let Some(commits) = crate::commit_mode::parse_at_commit(args)? {
+            return self.commit_mode_tool(name, args, active_ids, &commits, advisory);
+        }
         if args.get("mode").and_then(Value::as_str) == Some("REFERENCES") {
-            return crate::handlers::references::handle_managed_references(self, args, active_ids);
+            let ids: Vec<String> = match scoped {
+                Some(id) => vec![id.to_owned()],
+                None => {
+                    let mut ids: Vec<String> = active_ids.iter().cloned().collect();
+                    ids.sort();
+                    ids
+                }
+            };
+            return self.gated_read(&ids, args, |pass| {
+                let passed: HashSet<String> = pass.passed_ids().into_iter().collect();
+                crate::handlers::references::handle_managed_references(self, args, &passed)
+            });
         }
         let mut ids: Vec<String> = match scoped {
             Some(id) => vec![id.to_string()],
@@ -531,9 +614,58 @@ impl AtticServer {
             ids.push(knowledge);
         }
         ids.sort();
+        // R1: every repository is verified current before any of its index
+        // data is read; repositories that cannot be verified are reported
+        // and not read. Answers that include workspace relationships also
+        // verify every active repository, because links depend on all of
+        // their dependency files (R4).
+        let include_relationships = !search && !explicit_path_scope;
+        let mut gate_ids = ids.clone();
+        if include_relationships {
+            gate_ids.extend(active_ids.iter().cloned());
+            gate_ids.sort();
+            gate_ids.dedup();
+        }
+        self.gated_read(&gate_ids, args, |pass| {
+            let passed: HashSet<String> = pass.passed_ids().into_iter().collect();
+            self.managed_context_read(
+                args,
+                active_ids,
+                advisory,
+                ManagedContextScope {
+                    ids: ids
+                        .iter()
+                        .filter(|id| passed.contains(*id))
+                        .cloned()
+                        .collect(),
+                    unavailable: pass.unavailable.clone(),
+                    started,
+                    diagnostics,
+                    search,
+                    explicit_path_scope,
+                },
+            )
+        })
+    }
+
+    fn managed_context_read(
+        &self,
+        args: &HashMap<String, Value>,
+        active_ids: &HashSet<String>,
+        advisory: attic_storage::resource_manager::ResourceAdvisory,
+        scope: ManagedContextScope,
+    ) -> Result<CallToolResult, ServerError> {
+        let ManagedContextScope {
+            ids,
+            unavailable,
+            started,
+            diagnostics,
+            search,
+            explicit_path_scope,
+        } = scope;
         let mut outputs = Vec::new();
         let mut documents = Vec::new();
-        let mut missing = Vec::new();
+        let mut missing = unavailable;
         let mut lexical_results = Vec::new();
         let mut search_diagnostics = Vec::new();
         for batch in ids.chunks(WORKSPACE_QUERY_CONCURRENCY) {
@@ -638,12 +770,11 @@ impl AtticServer {
         }
         let fanout_ms = started.elapsed().as_secs_f64() * 1000.0;
         let catalog_started = std::time::Instant::now();
-        if !search
-            && !explicit_path_scope
-            && !self
-                .crossrepo_degraded
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        let mut crossrepo_ready = false;
+        if !search && !explicit_path_scope {
+            // R4: links are refreshed to match the gated indexes before they
+            // are read, and refused if they change while being read.
+            let snapshot_before = self.ensure_catalog_current()?;
             let catalog_args = args.clone();
             let (catalog, document) = crate::handlers::context::prepare_context(
                 &self.pool,
@@ -654,15 +785,25 @@ impl AtticServer {
                 advisory,
                 None,
             )?;
-            if self.catalog_is_current(active_ids)? {
-                if let Some(document) = document {
-                    documents.push(document);
-                }
-                outputs.push(json!({"scope": "workspace_relationships", "answer": catalog}));
-            } else {
-                self.crossrepo_degraded
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.latest_snapshot_id()? != snapshot_before {
+                return Err(crate::freshness::freshness_error(
+                    "VERSION_EXPIRED",
+                    true,
+                    "cross-repository links changed while the answer was being read; retry",
+                    Value::Null,
+                ));
             }
+            if let Some(document) = document {
+                documents.push(document);
+            }
+            let mut answer = catalog;
+            answer["crossrepo_diagnostics"] = self.crossrepo_diagnostics_json()?;
+            // R2: an unavailable repository keeps its last indexed links
+            // (never deleted on an unmounted drive) but is flagged here so
+            // links through it are not presented as verified.
+            answer["unavailable_repositories"] = json!(missing);
+            outputs.push(json!({"scope": "workspace_relationships", "answer": answer}));
+            crossrepo_ready = true;
         }
         let catalog_ms = catalog_started.elapsed().as_secs_f64() * 1000.0;
         let aggregation_started = std::time::Instant::now();
@@ -712,10 +853,13 @@ impl AtticServer {
         } else {
             "not_applicable"
         });
+        // true when this answer read freshly refreshed links; for modes that
+        // do not read links, whether the background catalog has caught up.
         payload["crossrepo_ready"] = json!(
-            !self
-                .crossrepo_degraded
-                .load(std::sync::atomic::Ordering::SeqCst)
+            crossrepo_ready
+                || !self
+                    .crossrepo_degraded
+                    .load(std::sync::atomic::Ordering::SeqCst)
         );
         payload["telemetry"] = json!({
             "fanout_ms": fanout_ms,
@@ -741,9 +885,649 @@ impl AtticServer {
 
 pub(crate) type RuntimeMap = Arc<RwLock<HashMap<String, RepositoryRuntime>>>;
 
+/// `catalog_version` of the most recent workspace snapshot, if any.
+fn latest_catalog_version(conn: &rusqlite::Connection) -> Result<Option<String>, StorageError> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT catalog_version FROM core_workspace_snapshots
+              ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Repositories a managed context read covers after the freshness gate.
+pub(crate) struct ManagedContextScope {
+    ids: Vec<String>,
+    unavailable: Vec<Value>,
+    started: std::time::Instant,
+    diagnostics: bool,
+    search: bool,
+    explicit_path_scope: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_server(dir: &tempfile::TempDir) -> AtticServer {
+        let mut server = AtticServer::new(&dir.path().join("catalog.db")).unwrap();
+        server.stores = Some(Arc::new(
+            attic_storage::RepositoryStoreManager::open_with_catalog_writer(
+                &server.db_path,
+                dir.path(),
+                4,
+                server.writer.clone(),
+            )
+            .unwrap(),
+        ));
+        server
+    }
+
+    fn call(
+        server: &AtticServer,
+        tool: &str,
+        args: &[(&str, Value)],
+        active: &HashSet<String>,
+    ) -> Result<Value, ServerError> {
+        let args: HashMap<String, Value> = args
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        AtticServer::response_json(server.managed_tool(
+            tool,
+            &args,
+            active,
+            attic_storage::resource_manager::ResourceAdvisory::Ok,
+        )?)
+    }
+
+    /// Text blocks of a tool result (plain-text tools such as `file` carry
+    /// their freshness block as the last JSON block).
+    fn call_blocks(
+        server: &AtticServer,
+        tool: &str,
+        args: &[(&str, Value)],
+        active: &HashSet<String>,
+    ) -> Result<Vec<String>, ServerError> {
+        let args: HashMap<String, Value> = args
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        let result = server.managed_tool(
+            tool,
+            &args,
+            active,
+            attic_storage::resource_manager::ResourceAdvisory::Ok,
+        )?;
+        Ok(result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect())
+    }
+
+    #[test]
+    fn every_index_reading_tool_answers_from_freshly_checked_code() {
+        // S1–S5 through the managed tools: no watcher, no scheduler — the
+        // gate alone brings the index to the saved files before reading.
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = managed_server(&dir);
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn stale_branch_token() {}\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "pub fn removed_file_token() {}\n").unwrap();
+        *server.active_roots.write().unwrap() = vec![root.clone()];
+        let id = server.bootstrap_workspace(&root).unwrap();
+        let active = HashSet::from([id.clone()]);
+
+        // "Switch branch": rewrite, delete and add files, then ask at once.
+        std::fs::write(root.join("lib.rs"), "pub fn fresh_branch_token() {}\n").unwrap();
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        std::fs::write(root.join("new.rs"), "pub fn added_file_token() {}\n").unwrap();
+
+        let search = |q: &str| {
+            call(
+                &server,
+                "context",
+                &[("query", json!(q)), ("mode", json!("SEARCH"))],
+                &active,
+            )
+            .unwrap()
+        };
+        let fresh = search("fresh_branch_token");
+        assert_eq!(fresh["results"].as_array().unwrap().len(), 1, "{fresh}");
+        let f = &fresh["freshness"];
+        assert_eq!(f["repositories"][0]["repository_id"], id);
+        assert_eq!(f["repositories"][0]["source_label"]["kind"], "folder");
+        assert_eq!(f["repositories"][0]["verification"]["files_reindexed"], 3);
+        let token = f["version_token"].as_str().unwrap().to_owned();
+        assert!(
+            search("stale_branch_token")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search("removed_file_token")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            search("added_file_token")["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Same answer, later call, nothing changed: token accepted.
+        let file = call_blocks(
+            &server,
+            "file",
+            &[
+                ("repository_id", json!(id)),
+                ("path", json!("lib.rs")),
+                ("version_token", json!(token)),
+            ],
+            &active,
+        )
+        .unwrap();
+        assert!(file[0].contains("fresh_branch_token"), "{file:?}");
+        let file_freshness: Value = serde_json::from_str(file.last().unwrap()).unwrap();
+        assert_eq!(file_freshness["freshness"]["version_token"], json!(token));
+        let map = call(
+            &server,
+            "repo_map",
+            &[("repository_id", json!(id))],
+            &active,
+        )
+        .unwrap();
+        assert!(!map["freshness"]["version_token"].is_null());
+        let refs = call(
+            &server,
+            "context",
+            &[
+                ("query", json!("fresh_branch_token")),
+                ("mode", json!("REFERENCES")),
+            ],
+            &active,
+        )
+        .unwrap();
+        assert!(!refs["freshness"]["version_token"].is_null(), "{refs}");
+        for mode in ["FAST", "NORMAL"] {
+            let answer = call(
+                &server,
+                "context",
+                &[
+                    ("query", json!("where is fresh_branch_token")),
+                    ("mode", json!(mode)),
+                ],
+                &active,
+            )
+            .unwrap();
+            assert!(
+                !answer["freshness"]["version_token"].is_null(),
+                "{mode}: {answer}"
+            );
+        }
+        let deep = call(
+            &server,
+            "context",
+            &[
+                ("query", json!("fresh_branch_token")),
+                ("mode", json!("SEARCH")),
+                ("deep_verify", json!(true)),
+            ],
+            &active,
+        )
+        .unwrap();
+        assert_eq!(
+            deep["freshness"]["repositories"][0]["verification"]["status"],
+            "full_hash"
+        );
+
+        // S14: the code changed between two calls of one answer.
+        std::fs::write(root.join("lib.rs"), "pub fn third_token() {}\n").unwrap();
+        let err = call(
+            &server,
+            "file",
+            &[
+                ("repository_id", json!(id)),
+                ("path", json!("lib.rs")),
+                ("version_token", json!(token)),
+            ],
+            &active,
+        )
+        .unwrap_err()
+        .to_string();
+        let err: Value = serde_json::from_str(&err).expect("structured error");
+        assert_eq!(err["code"], "VERSION_EXPIRED");
+        assert_eq!(err["retryable"], true);
+
+        // S21: asking about a branch that is not checked out is refused.
+        let err = call(
+            &server,
+            "context",
+            &[
+                ("query", json!("third_token")),
+                ("mode", json!("SEARCH")),
+                ("expected_branch", json!("prod")),
+            ],
+            &active,
+        )
+        .unwrap_err()
+        .to_string();
+        let err: Value = serde_json::from_str(&err).expect("structured error");
+        assert_eq!(err["code"], "BRANCH_MISMATCH");
+        assert_eq!(err["retryable"], false);
+    }
+
+    #[test]
+    fn unavailable_root_is_reported_and_never_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = managed_server(&dir);
+        let mut roots = Vec::new();
+        for name in ["kept", "unplugged"] {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(
+                root.join("lib.rs"),
+                format!("pub fn {name}_shared_token() {{}}\n"),
+            )
+            .unwrap();
+            roots.push(root);
+        }
+        *server.active_roots.write().unwrap() = roots.clone();
+        let kept = server.bootstrap_workspace(&roots[0]).unwrap();
+        let unplugged = server.bootstrap_workspace(&roots[1]).unwrap();
+        std::fs::remove_dir_all(&roots[1]).unwrap();
+        let active = HashSet::from([kept.clone(), unplugged.clone()]);
+        let answer = call(
+            &server,
+            "context",
+            &[("query", json!("shared_token")), ("mode", json!("SEARCH"))],
+            &active,
+        )
+        .unwrap();
+        let unavailable = answer["freshness"]["unavailable_repositories"]
+            .as_array()
+            .unwrap();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0]["repository_id"], unplugged);
+        assert_eq!(unavailable[0]["code"], "SOURCE_UNAVAILABLE");
+        assert!(
+            answer["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["repository_id"] == kept),
+            "{answer}"
+        );
+        // Its index was not deleted: re-attaching the folder restores it.
+        std::fs::create_dir(&roots[1]).unwrap();
+        std::fs::write(
+            roots[1].join("lib.rs"),
+            "pub fn unplugged_shared_token() {}\n",
+        )
+        .unwrap();
+        let served = call_blocks(
+            &server,
+            "file",
+            &[
+                ("repository_id", json!(unplugged)),
+                ("path", json!("lib.rs")),
+            ],
+            &active,
+        );
+        // New directory object with identical content → full-hash check
+        // succeeds and the file is served.
+        let served = served.unwrap();
+        assert!(served[0].contains("unplugged_shared_token"), "{served:?}");
+    }
+
+    #[test]
+    fn cross_repository_links_follow_dependency_changes_at_answer_time() {
+        // S12/S18/S19/S20/S29: links are rebuilt from the indexed
+        // dependency files before the very next answer — no poller.
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = managed_server(&dir);
+        let mk = |name: &str, files: &[(&str, &str)]| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            for (rel, body) in files {
+                std::fs::write(root.join(rel), body).unwrap();
+            }
+            root
+        };
+        let lib = mk(
+            "lib",
+            &[
+                ("go.mod", "module example.com/acme/lib\n"),
+                ("lib.go", "package lib\nfunc Pay() {}\n"),
+            ],
+        );
+        let app = mk(
+            "app",
+            &[
+                (
+                    "go.mod",
+                    "module example.com/acme/app\nrequire example.com/acme/lib v1.0.0\n",
+                ),
+                ("main.go", "package main\nfunc main() { checkout_flow() }\n"),
+            ],
+        );
+        *server.active_roots.write().unwrap() = vec![lib.clone(), app.clone()];
+        let lib_id = server.bootstrap_workspace(&lib).unwrap();
+        let app_id = server.bootstrap_workspace(&app).unwrap();
+        let active = HashSet::from([lib_id.clone(), app_id.clone()]);
+        let ask = || {
+            call(
+                &server,
+                "context",
+                &[("query", json!("checkout_flow")), ("mode", json!("NORMAL"))],
+                &active,
+            )
+            .unwrap()
+        };
+        let edges = || {
+            server
+                .pool
+                .with_reader(|c| {
+                    Ok(
+                        attic_storage::crossrepo_ops::cross_edges_touching(c, &app_id, 100)?
+                            .into_iter()
+                            .filter(|e| e.source_repository_id == app_id)
+                            .map(|e| e.target_repository_id)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap()
+        };
+        let snapshot = || server.latest_snapshot_id().unwrap();
+
+        let answer = ask();
+        assert_eq!(answer["crossrepo_ready"], true);
+        assert_eq!(
+            edges(),
+            vec![lib_id.clone()],
+            "app → lib after first answer"
+        );
+        let s0 = snapshot();
+
+        // Ordinary source edit: index changes, links are NOT rebuilt.
+        std::fs::write(
+            app.join("main.go"),
+            "package main\nfunc main() { checkout_flow2() }\n",
+        )
+        .unwrap();
+        ask();
+        assert_eq!(snapshot(), s0, "source-only edits must not relink");
+
+        // S18: a second repository starts providing the same module.
+        let fork = mk(
+            "fork",
+            &[
+                ("go.mod", "module example.com/acme/lib\n"),
+                ("lib.go", "package lib\nfunc Pay() {}\n"),
+            ],
+        );
+        server.active_roots.write().unwrap().push(fork.clone());
+        let fork_id = server.bootstrap_workspace(&fork).unwrap();
+        let active3 = HashSet::from([lib_id.clone(), app_id.clone(), fork_id.clone()]);
+        let answer = call(
+            &server,
+            "context",
+            &[
+                ("query", json!("checkout_flow2")),
+                ("mode", json!("NORMAL")),
+            ],
+            &active3,
+        )
+        .unwrap();
+        let diagnostics = server.crossrepo_diagnostics_json().unwrap();
+        assert!(
+            diagnostics
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["kind"] == "AMBIGUOUS" && d["repository_id"] == app_id),
+            "{diagnostics} / {answer}"
+        );
+        assert!(edges().is_empty(), "an ambiguous provider is never guessed");
+        std::fs::remove_dir_all(&fork).unwrap();
+        server.active_roots.write().unwrap().pop();
+
+        // S12/S20: the consumer drops the dependency; ask immediately.
+        std::fs::write(app.join("go.mod"), "module example.com/acme/app\n").unwrap();
+        ask();
+        assert!(edges().is_empty(), "dropped dependency must unlink at once");
+        let s1 = snapshot();
+
+        // Re-add it, then S19: the provider is renamed away.
+        std::fs::write(
+            app.join("go.mod"),
+            "module example.com/acme/app\nrequire example.com/acme/lib v1.0.0\n",
+        )
+        .unwrap();
+        ask();
+        assert_eq!(edges(), vec![lib_id.clone()]);
+        std::fs::write(lib.join("go.mod"), "module example.com/acme/renamed\n").unwrap();
+        ask();
+        assert!(edges().is_empty(), "renamed provider must unlink consumers");
+
+        // S29: a .proto change alone produces a new link snapshot.
+        let before_proto = snapshot();
+        std::fs::write(lib.join("api.proto"), "syntax = \"proto3\";\n").unwrap();
+        ask();
+        assert_ne!(snapshot(), before_proto, ".proto changes must relink");
+        assert_ne!(s1, snapshot());
+    }
+
+    #[test]
+    fn at_commit_answers_from_the_named_commit_without_checkout() {
+        // S22: investigate the deployed commit while another branch (with
+        // uncommitted edits) is checked out.
+        let git = |root: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = managed_server(&dir);
+        let mk_repo = |name: &str, gomod: &str, code: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            std::fs::write(root.join("go.mod"), gomod).unwrap();
+            std::fs::write(root.join("pay.go"), code).unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-q", "-m", "release"]);
+            root
+        };
+        let app = mk_repo(
+            "app",
+            "module example.com/acme/app\nrequire example.com/acme/lib v1.0.0\n",
+            "package main\nfunc release_pay_token() {}\n",
+        );
+        let lib = mk_repo(
+            "lib",
+            "module example.com/acme/lib\n",
+            "package lib\nfunc Lib() {}\n",
+        );
+        git(&app, &["checkout", "-q", "-b", "dev"]);
+        std::fs::write(
+            app.join("pay.go"),
+            "package main\nfunc dev_pay_token() {}\n",
+        )
+        .unwrap();
+        git(&app, &["commit", "-q", "-am", "dev"]);
+        std::fs::write(
+            app.join("pay.go"),
+            "package main\nfunc uncommitted_token() {}\n",
+        )
+        .unwrap();
+
+        *server.active_roots.write().unwrap() = vec![app.clone(), lib.clone()];
+        let app_id = server.bootstrap_workspace(&app).unwrap();
+        let lib_id = server.bootstrap_workspace(&lib).unwrap();
+        let active = HashSet::from([app_id.clone(), lib_id.clone()]);
+
+        let search = |q: &str, at: Value| {
+            call(
+                &server,
+                "context",
+                &[
+                    ("query", json!(q)),
+                    ("mode", json!("SEARCH")),
+                    ("repository_id", json!(app_id)),
+                    ("at_commit", at),
+                ],
+                &active,
+            )
+            .unwrap()
+        };
+        let hit = search("release_pay_token", json!("main"));
+        assert_eq!(hit["results"].as_array().unwrap().len(), 1, "{hit}");
+        assert_eq!(
+            hit["freshness"]["repositories"][0]["source_label"]["kind"],
+            "commit"
+        );
+        assert!(
+            search("dev_pay_token", json!("main"))["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search("uncommitted_token", json!("main"))["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let file = call_blocks(
+            &server,
+            "file",
+            &[
+                ("repository_id", json!(app_id)),
+                ("path", json!("pay.go")),
+                ("at_commit", json!("main")),
+            ],
+            &active,
+        )
+        .unwrap();
+        assert!(file[0].contains("release_pay_token"), "{file:?}");
+
+        // The user's checkout was not touched.
+        assert_eq!(git(&app, &["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+        assert!(
+            std::fs::read_to_string(app.join("pay.go"))
+                .unwrap()
+                .contains("uncommitted_token")
+        );
+
+        // Several repositories at pinned commits: links for exactly those.
+        let multi = call(
+            &server,
+            "context",
+            &[
+                ("query", json!("release_pay_token")),
+                ("mode", json!("NORMAL")),
+                (
+                    "at_commit",
+                    json!({app_id.clone(): "main", lib_id.clone(): "main"}),
+                ),
+            ],
+            &active,
+        )
+        .unwrap();
+        let links = multi["commit_links"].as_array().unwrap();
+        assert!(
+            links
+                .iter()
+                .any(|l| l["source_repository_id"] == app_id && l["target_repository_id"] == lib_id),
+            "{multi}"
+        );
+
+        // Plain folders have no commits.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.txt"), "x").unwrap();
+        server.active_roots.write().unwrap().push(plain.clone());
+        let plain_id = server.bootstrap_workspace(&plain).unwrap();
+        let err = call(
+            &server,
+            "file",
+            &[
+                ("repository_id", json!(plain_id)),
+                ("path", json!("a.txt")),
+                ("at_commit", json!("main")),
+            ],
+            &HashSet::from([plain_id.clone()]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("COMMIT_UNAVAILABLE"), "{err}");
+    }
+
+    #[test]
+    fn concurrent_callers_share_checks_and_never_get_an_older_one() {
+        // Many simultaneous calls → at most one running + one queued check
+        // per repository; every caller still sees its own changes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = managed_server(&dir);
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn before_token() {}\n").unwrap();
+        *server.active_roots.write().unwrap() = vec![root.clone()];
+        let id = server.bootstrap_workspace(&root).unwrap();
+        let active = HashSet::from([id.clone()]);
+        std::fs::write(root.join("lib.rs"), "pub fn after_token() {}\n").unwrap();
+        let results: Vec<Value> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        call(
+                            &server,
+                            "context",
+                            &[("query", json!("after_token")), ("mode", json!("SEARCH"))],
+                            &active,
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in &results {
+            assert_eq!(r["results"].as_array().unwrap().len(), 1, "{r}");
+        }
+        let reindexed: u64 = results
+            .iter()
+            .map(|r| {
+                r["freshness"]["repositories"][0]["verification"]["files_reindexed"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .sum();
+        assert!(reindexed >= 1, "the change was indexed");
+    }
 
     #[test]
     fn managed_bootstrap_routes_index_and_search_to_separate_stores() {
@@ -913,7 +1697,15 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(answer["repository_answers"].as_array().unwrap().len(), 2);
+        let repository_answers: Vec<_> = answer["repository_answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a.get("repository_id").is_some_and(|id| !id.is_null()))
+            .collect();
+        assert_eq!(repository_answers.len(), 2, "{answer}");
+        // The answer refreshed the cross-repository catalog itself (R4).
+        assert_eq!(answer["crossrepo_ready"], true);
         assert!(answer["evidence_dropped"].as_array().unwrap().is_empty());
         assert_eq!(
             answer["evidence_dropped_summary"]["details_included"],
