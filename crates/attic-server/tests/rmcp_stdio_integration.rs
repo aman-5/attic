@@ -129,6 +129,13 @@ async fn egm_is_available_by_default_over_official_client() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("catalog.db");
     let mut srv = connect(&bin, &db, None).await;
+    let peer = srv.service.peer().peer_info().unwrap();
+    assert!(
+        peer.instructions
+            .as_deref()
+            .unwrap()
+            .contains("answer_review")
+    );
     let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
         .await
         .unwrap()
@@ -142,7 +149,7 @@ async fn egm_is_available_by_default_over_official_client() {
         let status: Value = serde_json::from_str(&response).unwrap();
         if status["status"] != "initializing" {
             assert_eq!(status["enabled"], true, "{status}");
-            assert_eq!(status["mode"], "manual");
+            assert_eq!(status["mode"], "autopilot");
             assert_eq!(status["enforce"], false);
             assert_eq!(status["roots"], serde_json::json!([]));
             break;
@@ -150,6 +157,20 @@ async fn egm_is_available_by_default_over_official_client() {
         assert!(tokio::time::Instant::now() < deadline, "{status}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let unconfigured: Value = serde_json::from_str(
+        &call_tool_text(
+            &mut srv,
+            "answer_review",
+            serde_json::json!({
+                "action":"prepare","draft":"Example answer.",
+                "sources":[{"repository_id":"missing","path":"src/lib.rs"}]
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unconfigured["status"], "unreviewed");
 }
 
 #[tokio::test]
@@ -171,6 +192,14 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     .unwrap();
     {
         let mut srv = connect(&bin, &disabled_db, None).await;
+        assert!(
+            srv.service
+                .peer()
+                .peer_info()
+                .unwrap()
+                .instructions
+                .is_none()
+        );
         let tools = tokio::time::timeout(IO_TIMEOUT, srv.service.peer().list_all_tools())
             .await
             .unwrap()
@@ -209,7 +238,7 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     std::fs::create_dir_all(root.join("docs").join("designs")).unwrap();
     std::fs::write(
         root.join("docs").join("designs").join("one.md"),
-        "# One\n```attic-citations\nTARGET_MODIFY repo src/lib.rs\n```\n",
+        "# One\n```attic-citations\nTARGET_MODIFY repo src/lib.rs\n```\n## Implementation Plan\nImplement the change.\n",
     )
     .unwrap();
     let db = dir.path().join("enabled").join("catalog.db");
@@ -324,6 +353,38 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
             .unwrap()
             .contains("ERR_INVALID_ARGUMENT")
     );
+    let started: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "spec", call("review_start"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(started["ok"], true, "{started}");
+    let mut prepared = started["data"].clone();
+    for round in 1..=2 {
+        let reviewers: Vec<_> = attic_spec::review::REQUIRED_REVIEWERS
+            .iter()
+            .enumerate()
+            .map(|(i, (stage, persona))| {
+                serde_json::json!({"stage":stage,"persona":persona,"completed":true,
+                    "context_id":format!("mock-{round}-{i}"),"findings":[]})
+            })
+            .collect();
+        let mut submit = call("review_submit");
+        submit["review_report"] = serde_json::json!({
+            "protocol_version":1,"host":"mock integration client",
+            "upstream_revision":prepared["upstream_revision"],
+            "document_sha256":prepared["document_sha256"],
+            "verification_run_id":prepared["verification_run_id"],
+            "evidence_sha256":prepared["evidence_sha256"],
+            "attempt_id":prepared["attempt_id"],"round":round,"reviewers":reviewers
+        });
+        let result: Value =
+            serde_json::from_str(&call_tool_text(&mut srv, "spec", submit).await.unwrap()).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        prepared = result["data"].clone();
+    }
+    assert_eq!(prepared["status"], "review_passed_host_attested");
     let mut outside = call("register");
     outside["root"] = serde_json::json!(dir.path());
     assert!(
@@ -388,6 +449,93 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     let response = call_tool_text(&mut srv, "spec", reopen).await.unwrap();
     assert!(response.contains("UNDER_REVIEW"), "{response}");
     assert!(pack_paths.iter().all(|path| !path.exists()));
+    let repository_id = verified["data"]["latest_run"]["citations"][0]["repository_id"]
+        .as_str()
+        .unwrap();
+    let mut answer = serde_json::json!({
+        "action":"prepare","draft":"The original function exists.",
+        "sources":[{"repository_id":repository_id,"path":"src/lib.rs"}]
+    });
+    let prepared: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", answer.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prepared["status"], "unreviewed", "{prepared}");
+    let mut outside_source = answer.clone();
+    outside_source["sources"][0]["repository_id"] = "not-an-active-repository".into();
+    let refused: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", outside_source)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refused["status"], "unreviewed");
+    std::fs::write(root.join("private.key"), "test-only private file").unwrap();
+    let mut private_source = answer.clone();
+    private_source["sources"][0]["path"] = "private.key".into();
+    let refused: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", private_source)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refused["status"], "unreviewed");
+    assert!(!refused.to_string().contains("test-only private file"));
+    answer["action"] = "finish".into();
+    answer["answer_sha256"] = prepared["answer_sha256"].clone();
+    answer["evidence_sha256"] = prepared["evidence_sha256"].clone();
+    let unavailable: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", answer.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unavailable["status"], "unreviewed");
+    answer["reviewer"] = serde_json::json!({
+        "completed":true,"context_id":"mock-answer-reviewer","reason":null,
+        "answer_sha256":prepared["answer_sha256"],"evidence_sha256":prepared["evidence_sha256"],
+        "findings":[]
+    });
+    let reviewed: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", answer.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reviewed["status"], "reviewed_host_attested", "{reviewed}");
+    let mut issue = answer.clone();
+    issue["reviewer"]["findings"] = serde_json::json!([{
+        "severity":"major","description":"The answer omits a relevant caller.",
+        "disposition":"open","rationale":null
+    }]);
+    let blocked: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", issue)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blocked["status"], "unreviewed");
+    assert_eq!(blocked["findings"][0]["severity"], "major");
+    let mut changed_draft = answer.clone();
+    changed_draft["draft"] = "A different answer.".into();
+    let changed: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", changed_draft)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(changed["status"], "unreviewed");
+    std::fs::write(root.join("src").join("lib.rs"), "pub fn changed() {}\n").unwrap();
+    let stale: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", answer)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale["status"], "unreviewed", "{stale}");
+    assert!(stale["reason"].as_str().unwrap().contains("changed"));
     let before_disable = service.store.documents().unwrap();
     let _ = tokio::time::timeout(IO_TIMEOUT, srv.service.close())
         .await

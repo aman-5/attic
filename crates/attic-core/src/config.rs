@@ -461,7 +461,7 @@ mode = "auto"
 #
 # [planning]
 # enabled = true                  # set false to disable EGM
-# mode = "manual"                 # manual | autopilot; approval is always human
+# mode = "autopilot"              # manual | autopilot; approval is always human
 # roots = []                      # empty = all active roots
 # designs_dir = "docs/designs"
 #

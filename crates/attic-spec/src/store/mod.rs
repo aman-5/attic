@@ -14,7 +14,8 @@ use std::{
 };
 
 const SCHEMA: &str = include_str!("schema_v1.sql");
-const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA)];
+const REVIEW_SCHEMA: &str = include_str!("schema_v2.sql");
+const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA), (2, REVIEW_SCHEMA)];
 const DOCUMENT_COLUMNS: &str = "spec_uid,spec_id,owner_root_path,canonical_rel_path,title,
     revision,state_version,status,status_reason,latest_run_id,latest_passing_run_id,
     verified_doc_sha256,verified_fingerprint,verify_attempts,attempts_doc_sha256,
@@ -583,6 +584,7 @@ pub fn retain_runs(tx: &Transaction<'_>, doc: &Document, recent: u32) -> Result<
     tx.execute("DELETE FROM spec_verification_runs WHERE spec_uid=?1
       AND run_id NOT IN (SELECT run_id FROM spec_verification_runs WHERE spec_uid=?1 ORDER BY checked_at DESC,run_id DESC LIMIT ?2)
       AND run_id NOT IN (SELECT run_id FROM spec_approvals WHERE spec_uid=?1)
+      AND run_id NOT IN (SELECT run_id FROM spec_review_rounds WHERE spec_uid=?1)
       AND run_id IS NOT ?3 AND run_id IS NOT ?4 AND run_id IS NOT ?5
       AND run_id NOT IN (SELECT approved_run_id FROM spec_content_receipts WHERE spec_uid=?1)",
       params![doc.spec_uid,recent,doc.latest_run_id,doc.latest_passing_run_id,doc.approved_run_id])?;
@@ -604,14 +606,51 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_backs_up_before_applying_and_preserves_every_previous_backup() {
+    fn review_migration_preserves_documents_and_approval_triggers() {
         let dir = fixture();
         let path = dir.path().join("spec_state.db");
-        let store = SpecStore::open(&path).unwrap();
+        let store = SpecStore::open_with_migrations(&path, &[(1, SCHEMA)]).unwrap();
         let doc = Document::new("one", "root", "docs/designs/one.md", "one", 1);
         store.write(|tx| insert(tx, &doc)).unwrap();
         drop(store);
-        let upgrades = [(1, SCHEMA), (2, "CREATE TABLE v2_marker(value TEXT);")];
+        let store = SpecStore::open(&path).unwrap();
+        assert_eq!(store.documents().unwrap()[0].spec_uid, doc.spec_uid);
+        store
+            .read(|conn| {
+                let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                assert_eq!(version, 2);
+                for name in [
+                    "approval_run_matches_document",
+                    "approval_bindings_immutable",
+                    "approval_no_delete",
+                ] {
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1",
+                            [name],
+                            |r| r.get::<_, i64>(0)
+                        )?,
+                        1
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn upgrade_backs_up_before_applying_and_preserves_every_previous_backup() {
+        let dir = fixture();
+        let path = dir.path().join("spec_state.db");
+        let store = SpecStore::open_with_migrations(&path, &[(1, SCHEMA)]).unwrap();
+        let doc = Document::new("one", "root", "docs/designs/one.md", "one", 1);
+        store.write(|tx| insert(tx, &doc)).unwrap();
+        drop(store);
+        let upgrades = [
+            (1, SCHEMA),
+            (2, REVIEW_SCHEMA),
+            (3, "CREATE TABLE v3_marker(value TEXT);"),
+        ];
         let store = SpecStore::open_with_migrations(&path, &upgrades).unwrap();
         assert_eq!(store.documents().unwrap()[0].spec_uid, doc.spec_uid);
         drop(store);
@@ -653,13 +692,13 @@ mod tests {
     fn failing_upgrade_rolls_back_schema_and_data_and_keeps_backup() {
         let dir = fixture();
         let path = dir.path().join("spec_state.db");
-        drop(SpecStore::open(&path).unwrap());
+        drop(SpecStore::open_with_migrations(&path, &[(1, SCHEMA)]).unwrap());
         let upgrades = [
             (1, SCHEMA),
             (2, "CREATE TABLE partial(value); INVALID SQL;"),
         ];
         assert!(SpecStore::open_with_migrations(&path, &upgrades).is_err());
-        let store = SpecStore::open(&path).unwrap();
+        let store = SpecStore::open_with_migrations(&path, &[(1, SCHEMA)]).unwrap();
         store
             .read(|conn| {
                 assert_eq!(

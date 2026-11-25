@@ -69,6 +69,29 @@ impl ApprovalPrompt for Prompt {
         Ok(self.0)
     }
 }
+pub fn clean_report(prepared: &serde_json::Value, round: u32) -> attic_spec::review::RoundReport {
+    attic_spec::review::RoundReport {
+        protocol_version: 1,
+        host: "test fixture".into(),
+        upstream_revision: attic_spec::review::UPSTREAM_REVISION.into(),
+        document_sha256: prepared["document_sha256"].as_str().unwrap().into(),
+        verification_run_id: prepared["verification_run_id"].as_str().unwrap().into(),
+        evidence_sha256: prepared["evidence_sha256"].as_str().unwrap().into(),
+        attempt_id: prepared["attempt_id"].as_str().unwrap().into(),
+        round,
+        reviewers: attic_spec::review::REQUIRED_REVIEWERS
+            .iter()
+            .enumerate()
+            .map(|(i, (stage, persona))| attic_spec::review::ReviewerReport {
+                stage: (*stage).into(),
+                persona: (*persona).into(),
+                completed: true,
+                context_id: Some(format!("round-{round}-reviewer-{i}")),
+                findings: vec![],
+            })
+            .collect(),
+    }
+}
 pub struct Fixture {
     pub root: PathBuf,
     pub repo: Repository,
@@ -89,7 +112,7 @@ impl Fixture {
         std::fs::create_dir_all(root.join("docs").join("designs")).unwrap();
         std::fs::write(
             root.join("docs").join("designs").join("one.md"),
-            format!("# One\n```attic-citations\n{citations}\n```\n"),
+            format!("# One\n```attic-citations\n{citations}\n```\n## Implementation Plan\nImplement the change.\n"),
         )
         .unwrap();
         let data = dir.path().join("data");
@@ -168,8 +191,26 @@ impl Fixture {
     }
     pub fn approved(&self) -> Document {
         self.service
-            .approve(&self.verified(), &mut Prompt(true))
+            .approve(&self.reviewed(), &mut Prompt(true))
             .unwrap()
+    }
+    pub fn reviewed(&self) -> Document {
+        let doc = self.verified();
+        let mut prepared = self.service.review_prepare(&doc).unwrap();
+        if prepared["attempt_id"].is_null()
+            || prepared["next_round"].as_u64().unwrap()
+                > prepared["max_review_rounds"].as_u64().unwrap()
+        {
+            prepared = self.service.review_start(&doc).unwrap();
+        }
+        let first = prepared["next_round"].as_u64().unwrap() as u32;
+        for round in first..first + 2 {
+            let doc = self.service.resolve("one", None).unwrap();
+            let report = clean_report(&prepared, round);
+            prepared = self.service.review_submit(&doc, &report).unwrap();
+        }
+        assert_eq!(prepared["status"], "review_passed_host_attested");
+        self.service.resolve("one", None).unwrap()
     }
     pub fn begun(&self) -> Document {
         self.service

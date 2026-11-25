@@ -75,10 +75,15 @@ pub(crate) const UNGATED_TOOLS: &[(&str, &str)] = &[
     ("debug_drain_task", "admin: runs background indexing work"),
     ("workspace", "manages membership"),
     ("spec", "spec documents live in their own store"),
+    (
+        "answer_review",
+        "checks live source bytes and active membership directly",
+    ),
 ];
 
 fn make_base_tools() -> Vec<Tool> {
     vec![
+        crate::answer_review::tool(),
         Tool::new(
             "egm",
             "Read EGM activation status, user enable/disable commands, or mode-aware reviewer \

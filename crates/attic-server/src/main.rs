@@ -5,6 +5,7 @@
 // tool serves bounded regions with UTF-8-safe offsets, checked numeric
 // arguments, and genuine bounded streaming for LARGE files.
 
+mod answer_review;
 mod commit_mode;
 mod daemon;
 mod egm_cli;
@@ -1833,10 +1834,29 @@ struct WorkspaceChange {
 }
 // ─── ServerHandler impl ────────────────────────────────────────────────────────
 
+fn server_info(planning_enabled: bool) -> InitializeResult {
+    let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+        .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION));
+    if planning_enabled {
+        info.instructions = Some(concat!(
+            "Check the EGM mode using the egm tool. In autopilot mode, for codebase answers ",
+            "using Attic, prepare an answer_review with the draft and cited active-repository ",
+            "files, then use a fresh independent reviewer context to check the draft against ",
+            "the evidence. Submit its report with answer_review finish before answering. ",
+            "Resolve substantive findings and repeat. If independent review is unavailable, ",
+            "state that the answer is unreviewed and why. These reports are host attestations, ",
+            "not proof of reviewer isolation or correctness. For implementation plans, use ",
+            "the spec review workflow, show the findings, and obtain the user's explicit ",
+            "approval before implementing; never run the terminal approval command on the ",
+            "user's behalf. In manual mode use review when requested."
+        ).into());
+    }
+    info
+}
+
 impl ServerHandler for AtticServer {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
+        server_info(self.attic_config.planning.enabled)
     }
 
     fn list_tools(
@@ -2012,6 +2032,22 @@ impl ServerHandler for AtticServer {
                     .handle_spec(args, active_ids, workspace_configured)
                     .await
                     .into());
+            }
+            if name.as_ref() == "answer_review" {
+                let server = self.clone();
+                return Ok(
+                    match tokio::task::spawn_blocking(move || {
+                        server.handle_answer_review(args, &active_ids, workspace_configured)
+                    })
+                    .await
+                    {
+                        Ok(result) => result.into(),
+                        Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
+                            "ERR_ANSWER_REVIEW_TASK: {error}"
+                        ))])
+                        .into(),
+                    },
+                );
             }
             let result: Result<CallToolResult, ServerError> = match name.as_ref() {
                 "file" | "repo_map" | "context"

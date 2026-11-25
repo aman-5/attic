@@ -9,9 +9,9 @@ use super::ConfigError;
 #[serde(rename_all = "lowercase")]
 /// Who advances the workflow between steps; approval always requires the user.
 pub enum PlanningMode {
-    #[default]
     /// Ask the user before advancing each step.
     Manual,
+    #[default]
     /// Advance agent-owned steps automatically, stopping for human approval.
     Autopilot,
 }
@@ -55,7 +55,7 @@ impl Default for PlanningConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: PlanningMode::Manual,
+            mode: PlanningMode::default(),
             roots: Vec::new(),
             designs_dir: "docs/designs".into(),
             fast_path: FastPathConfig::default(),
@@ -128,7 +128,7 @@ pub struct PackConfig {
     pub max_concurrent: usize,
     /// Maximum UTF-8 output size, including headers and truncation markers.
     pub byte_budget: usize,
-    /// Advisory maximum reviewer rounds surfaced to the host.
+    /// Maximum reviewer rounds per attempt; at least two are required to pass.
     pub max_review_rounds: u32,
 }
 
@@ -249,7 +249,7 @@ mod tests {
             let config = AtticConfig::parse_str(text).unwrap();
             assert_eq!(config.planning, PlanningConfig::default());
             assert!(config.planning.enabled);
-            assert_eq!(config.planning.mode, PlanningMode::Manual);
+            assert_eq!(config.planning.mode, PlanningMode::Autopilot);
             assert!(!config.planning.fast_path.enforce);
             assert!(config.planning.roots.is_empty());
         }
@@ -261,6 +261,8 @@ mod tests {
         );
         let disabled = AtticConfig::parse_str("[planning]\nenabled = false").unwrap();
         assert!(!disabled.planning.enabled);
+        let manual = AtticConfig::parse_str("[planning]\nmode = 'manual'").unwrap();
+        assert_eq!(manual.planning.mode, PlanningMode::Manual);
     }
 
     #[test]

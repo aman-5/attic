@@ -2,8 +2,8 @@
 
 Attic supplies verified source context, human approval, fenced implementation
 waves and optional change-budget hooks. Reviewer contexts run in your agent host;
-the built-in `egm` guidance supplies their three missions and pack handoff.
-The pinned upstream EGM plugin is an optional host adapter, not installed by Attic.
+the built-in `egm` guidance supplies the pack handoff. The host supplies the
+pinned upstream EGM personas; Attic does not install them.
 No upstream tool allowlist or host settings are changed.
 This is workflow governance, not a security sandbox or proof of code correctness.
 
@@ -21,16 +21,18 @@ historical approval/run records remain available.
 
 ## Activation and report-only defaults
 
-EGM defaults to enabled for all active roots in manual, report-only mode. An
+EGM defaults to enabled for all active roots in autopilot, report-only mode. An
 explicit `enabled = false` remains disabled. To change activation or restrict
 roots, run `attic egm enable --root PATH --mode manual` (or `--mode autopilot`),
 then restart your Attic MCP server. Use `attic egm status` and the always-available
 MCP `egm` tool to inspect activation; `attic egm disable` preserves all workflow
 history. `attic egm guidance` / MCP `egm action=guidance` supply mode-aware
 reviewer handoff instructions. No configuration hand-editing is needed.
-Bare enable selects the current directory; `--all-roots` selects all active roots.
-Enable always defaults to report-only, even after a previous enforced session;
-`--enforce` is required to select enforcement again.
+Bare enable preserves an existing root selection, mode and enforcement; if roots
+are unspecified, it selects the current directory. `--all-roots` selects all
+active roots, and `--enforce` explicitly enables enforcement. An omitted mode
+defaults to autopilot, including in existing configurations; an explicit manual
+mode remains manual. Autopilot does not itself run reviewers or validate answers.
 CLI changes preserve unrelated configuration and comments and never open indexes
 or workflow state. Reconnecting to an existing daemon is not a restart.
 
@@ -41,7 +43,7 @@ In the existing runtime `attic.toml` (not the workspace-membership `config.toml`
 ```toml
 [planning]
 enabled = true
-mode = "manual" # or "autopilot"; human approval is still mandatory
+mode = "autopilot" # or "manual"; human approval is still mandatory
 designs_dir = "docs/designs"
 
 [planning.fast_path]
@@ -68,6 +70,27 @@ roots; an empty list selects all active roots. Nested settings reject unknown
 fields. See the commented runtime configuration template for bounded lease,
 verification-attempt, freshness, retention, and pack settings.
 
+## Codebase answer review
+
+For codebase answers, a cooperating host calls `answer_review` with
+`action="prepare"`, the draft, and `sources` containing active `repository_id`
+and repository-relative `path` pairs. Attic checks permitted live files and
+returns draft and evidence hashes. The host gives the draft and evidence to a
+fresh independent reviewer, then calls `answer_review` with `action="finish"`,
+the same draft and sources, both hashes, and the reviewer's report. The MCP
+tool schema specifies all report fields. A changed draft or source, missing
+reviewer, substantive finding, excluded file, or other failure returns
+`status="unreviewed"` with a reason; the host must show that label and reason.
+Resolve findings and prepare a fresh review rather than presenting an incomplete
+review as passed.
+
+`reviewed_host_attested` means the host reports that a separate review occurred;
+it is not proof of isolation, complete evidence, or correctness. Reports and
+answers are not persisted by this tool. Files are checked at prepare and finish,
+not locked afterward; unsupported or uncooperative clients may ignore MCP
+instructions, so automatic coverage is not guaranteed. Other conversations do
+not need this workflow. The extra review adds model latency and cost.
+
 ## Workflow
 
 1. Author `docs/designs/<spec_id>.md`; IDs are 1–63 lowercase letters/digits,
@@ -93,15 +116,36 @@ verification-attempt, freshness, retention, and pack settings.
    hash and byte count; explicit `delivery="inline"` discloses caller-context cost.
    The server reuses existing repository-map summaries for zoom-out, current
    non-inferred consumer→provider edges, and preprocessed/redacted source excerpts.
-4. The **user**, not an agent, runs `attic spec approve <id> [--root PATH]` in their
+4. Call `spec` with `action="review_start"` and then `action="review_prepare"`.
+   The host runs the pinned upstream personas in fresh independent contexts:
+   initial zoom-out (`zoom_out`, `inventive_catalyst`), comprehension
+   (`comprehension`, document only), critique (`design`, `structural`, `style`),
+   intermediate zoom-out (`zoom_out`), and implementation readiness
+   (`implementation_readiness`, `codebase_details`, `style`). The host supplies
+   the persona definitions; the three built-in packs are evidence, not the full
+   persona set. Call `review_submit` with the prepared binding and one report per
+   stage/persona. The MCP tool schema defines the complete report structure.
+   `review_prepare` reports the latest findings and whether review passed.
+   Repeat with fresh contexts until two consecutive clean rounds. Unavailable
+   reviewers, open Blocker/Major findings, stale evidence, or an exhausted
+   `[planning.packs].max_review_rounds` prevent approval. An exhausted attempt
+   can be restarted with `review_start`; changing the document or evidence resets
+   the clean streak. Values below two cannot satisfy the two-round requirement:
+   raise `max_review_rounds` to at least two before starting a review.
+   A unique level-two implementation-plan heading is required.
+   Reports are **host attestations**: Attic does not prove reviewer independence
+   or automatically run reviewers. Review reports may persist in the local state
+   database; sensitive material is rejected rather than stored.
+5. The **user**, not an agent, runs `attic spec approve <id> [--root PATH]` in their
    terminal. All three standard streams must be terminals. A six-character random
    challenge binds the verified document/run; concurrent document/state changes
    reject approval. There is no MCP approval action or production test bypass.
-5. MCP `begin` re-verifies approval, creates provider-first waves and returns a
+   The environment-derived OS username is a label, not authenticated identity.
+6. MCP `begin` re-verifies approval, creates provider-first waves and returns a
    lease/fence. Send both on `heartbeat`, `wave_complete` and implementation
    `drift`. Transit through non-written repositories and dependency SCCs are
    preserved. Expired workers must stop; `resume` obtains a new fenced lease.
-6. Complete every current-revision wave, **stage intended content**, then `drift`.
+7. Complete every current-revision wave, **stage intended content**, then `drift`.
    Only unchanged approved scope with completed waves can become `IMPLEMENTED`.
    Drift checks citations, not tests. `reopen` needs a reason and renewed human
    approval. `attic spec abandon <id> --reason TEXT` is also available.
@@ -180,6 +224,10 @@ analysis produces no nodes. Publication with EGM disabled creates no receipt tab
 and retains the original cache-version format. Old occurrences without receipts,
 lexical/fallback/partial/syntax-error analysis and misbound receipts cannot prove
 symbol absence. Suffixes or node absence are never negative-symbol evidence.
+If an older index lacks receipts, request an explicitly authorized reindex of the
+affected repository with EGM enabled, then verify again. If the analyzer still
+cannot produce complete evidence, resolve that limitation or avoid a
+`TARGET_CREATE_SYMBOL` claim; do not delete the index or state database blindly.
 
 Verification uses one read snapshot per repository plus before/after raw-byte
 hashes; there is no claimed global atomic snapshot. Exact qualified definitions

@@ -330,6 +330,7 @@ explicit dependency contracts remain grounded in source evidence.
 | Tool | What it does |
 |---|---|
 | `egm` | Always-available EGM activation status, user enable/disable commands, and mode-aware host reviewer guidance |
+| `answer_review` | Prepare and finalize host-attested review of a codebase answer against current permitted source files |
 | `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
 | `file` | Bounded, secret-scanned live-file ranges (or up to 16 `ranges` in one call), JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Bounded structure/statistics; `path_prefix`, `max_depth`, file pagination and explicit byte budget |
@@ -344,7 +345,7 @@ and the `spec_tool::tool()` adapter, and are returned by `tools/list`.
 
 ### EGM mode: enable, disable, inspect
 
-EGM workflow support is enabled by default for all active roots, in manual,
+EGM workflow support is enabled by default for all active roots, in autopilot,
 report-only mode. An existing `planning.enabled = false` remains disabled;
 explicitly enable it to change that setting. No handwritten configuration is required:
 
@@ -367,8 +368,9 @@ For the default Windows installation (if `attic` is not on `PATH`):
 Restart the Attic MCP server after a configuration change; reconnecting to an
 already-running daemon does not reload its settings. The `egm` tool reports the
 running server's mode even while the `spec` tool is disabled.
-The built-in default selects all active roots; the `enable` command defaults to
-the current directory, manual advancement and report-only.
+The built-in default selects all active roots. With no existing root selection,
+`enable` selects the current directory; otherwise it preserves the configured
+roots, mode and enforcement. An unspecified mode defaults to autopilot.
 `--all-roots` selects all active workspace roots; `--enforce` explicitly
 enables budget enforcement. Neither command adds workspace membership, installs
 hooks/reviewers, starts a daemon, reindexes, nor approves a spec.
@@ -380,6 +382,11 @@ agent-owned steps but **always stops for human approval**. Your host supplies
 separate reviewer contexts; Attic supplies verified file-delivered packs and
 governance, not an agent runner or a security sandbox. Use `egm action=guidance`
 for the three reviewer missions without requiring an upstream plugin.
+MCP initialization asks cooperating hosts to review codebase answers via
+`answer_review` and label unavailable reviews **unreviewed**. Attic cannot
+force clients to follow these instructions or launch independent reviewers.
+Plan approval requires two clean host-attested rounds; Attic cannot prove
+reviewer independence. Enabling EGM alone does not review an answer or plan.
 See [the complete EGM workflow](crates/attic-spec/README.md) for citations,
 approval, hooks, leases and recovery.
 

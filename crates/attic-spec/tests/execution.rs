@@ -5,7 +5,124 @@ use attic_spec::{
     state::{Document, Status},
     verifier::{self, Run},
 };
-use common::{Fixture, Prompt};
+use common::{Fixture, Prompt, clean_report};
+
+#[test]
+fn approval_requires_two_fresh_complete_review_rounds() {
+    let f = Fixture::new(
+        "pub fn original() {}\n",
+        "TARGET_MODIFY repo src/lib.rs",
+        true,
+    );
+    let doc = f.verified();
+    assert_eq!(
+        f.service.approve(&doc, &mut Prompt(true)).unwrap_err().code,
+        "ERR_REVIEW_REQUIRED"
+    );
+    let prepared = f.service.review_start(&doc).unwrap();
+    let doc = f.service.resolve("one", None).unwrap();
+    let first = clean_report(&prepared, 1);
+    let prepared = f.service.review_submit(&doc, &first).unwrap();
+    assert_eq!(
+        f.service.review_submit(&doc, &first).unwrap_err().code,
+        "ERR_STATE_CHANGED_DURING_APPROVAL"
+    );
+    let doc = f.service.resolve("one", None).unwrap();
+    assert_eq!(
+        f.service.approve(&doc, &mut Prompt(true)).unwrap_err().code,
+        "ERR_REVIEW_REQUIRED"
+    );
+    let mut second = clean_report(&prepared, 2);
+    second.reviewers[0].context_id = first.reviewers[0].context_id.clone();
+    assert_eq!(
+        f.service.review_submit(&doc, &second).unwrap_err().code,
+        "ERR_REVIEW_REPORT"
+    );
+    let second = clean_report(&prepared, 2);
+    assert_eq!(
+        f.service.review_submit(&doc, &second).unwrap()["status"],
+        "review_passed_host_attested"
+    );
+    let doc = f.service.resolve("one", None).unwrap();
+    std::fs::write(f.root.join("src").join("lib.rs"), "changed\n").unwrap();
+    assert_eq!(
+        f.service.approve(&doc, &mut Prompt(true)).unwrap_err().code,
+        "ERR_REVIEW_STALE"
+    );
+}
+
+#[test]
+fn review_requires_a_feasible_round_limit() {
+    let mut f = Fixture::new(
+        "pub fn original() {}\n",
+        "TARGET_MODIFY repo src/lib.rs",
+        true,
+    );
+    f.service.config.packs.max_review_rounds = 1;
+    assert_eq!(
+        f.service.review_start(&f.verified()).unwrap_err().code,
+        "ERR_REVIEW_CONFIG"
+    );
+}
+
+#[test]
+fn review_history_cannot_be_modified_or_deleted() {
+    let f = Fixture::new(
+        "pub fn original() {}\n",
+        "TARGET_MODIFY repo src/lib.rs",
+        true,
+    );
+    let doc = f.reviewed();
+    for sql in [
+        "UPDATE spec_review_rounds SET clean=0",
+        "DELETE FROM spec_review_rounds",
+        "UPDATE spec_review_attempts SET created_at=0",
+        "DELETE FROM spec_review_attempts",
+    ] {
+        assert!(
+            f.service
+                .store
+                .write(|tx| {
+                    tx.execute(sql, [])?;
+                    Ok(())
+                })
+                .is_err(),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        f.service.review_prepare(&doc).unwrap()["status"],
+        "review_passed_host_attested"
+    );
+}
+
+#[test]
+fn incomplete_rounds_reach_cap_and_require_a_new_attempt() {
+    let mut f = Fixture::new(
+        "pub fn original() {}\n",
+        "TARGET_MODIFY repo src/lib.rs",
+        true,
+    );
+    f.service.config.packs.max_review_rounds = 2;
+    let mut prepared = f.service.review_start(&f.verified()).unwrap();
+    let attempt = prepared["attempt_id"].clone();
+    for round in 1..=2 {
+        let doc = f.service.resolve("one", None).unwrap();
+        let mut report = clean_report(&prepared, round);
+        report.reviewers[0].completed = false;
+        report.reviewers[0].context_id = None;
+        prepared = f.service.review_submit(&doc, &report).unwrap();
+    }
+    assert_eq!(prepared["status"], "review_exhausted");
+    let doc = f.service.resolve("one", None).unwrap();
+    assert_eq!(
+        f.service.approve(&doc, &mut Prompt(true)).unwrap_err().code,
+        "ERR_REVIEW_REQUIRED"
+    );
+    let restarted = f.service.review_start(&doc).unwrap();
+    assert_ne!(restarted["attempt_id"], attempt);
+    assert_eq!(restarted["next_round"], 1);
+}
 
 #[test]
 fn complete_fenced_flow_pins_approval_and_resumes_with_new_fence() {
@@ -97,7 +214,7 @@ fn approval_cancellation_non_tty_and_prompt_races_do_not_approve() {
         "TARGET_MODIFY repo src/lib.rs",
         true,
     );
-    let doc = f.verified();
+    let doc = f.reviewed();
     assert_eq!(
         f.service
             .approve(&doc, &mut Prompt(false))
@@ -147,7 +264,7 @@ fn approval_cancellation_non_tty_and_prompt_races_do_not_approve() {
         f.service.resolve("one", None).unwrap().status,
         Status::Abandoned
     );
-    let doc = f.verified();
+    let doc = f.reviewed();
     struct Edit(std::path::PathBuf);
     impl ApprovalPrompt for Edit {
         fn is_interactive(&self) -> bool {
