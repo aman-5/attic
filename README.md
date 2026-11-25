@@ -274,6 +274,37 @@ MCP initialization, tool discovery and process status do not wait for database
 verification. An initializing request returns an explicit retryable response;
 a verification failure returns an error, never unchecked content.
 
+## Freshness: every answer is checked against your files
+
+Before `context`, `file` or `repo_map` read any index data, Attic checks the
+saved files of every repository the answer uses — Git repositories and plain
+folders alike — and re-indexes whatever changed (branch switch, pull, edits,
+deletes, renames). File watchers only make this check faster; they never decide
+whether an answer is current.
+
+- Unchanged files are recognized by size, timestamps and file id without being
+  read (Git's racy-file rule protects edits made right after a check).
+- Every response carries a `freshness` block: which code was used
+  (`branch` + `commit`, or a folder fingerprint) and a `version_token`.
+  Pass the token to later calls of the same answer; if the code changed in
+  between, the call fails with `VERSION_EXPIRED` instead of mixing versions.
+- `expected_branch` / `expected_commit` refuse with `BRANCH_MISMATCH` when a
+  different branch is checked out.
+- `at_commit` answers from a named commit (e.g. the deployed production SHA)
+  without touching your checkout; with `{repository_id: commit}` cross-repository
+  links are resolved for exactly those commits.
+- Cross-repository links are rebuilt from the indexed dependency files
+  (`package.json`, `pom.xml`, `go.mod`, OSGi manifests, `.proto`, …) before an
+  answer uses them, with `UNRESOLVED` / `AMBIGUOUS` outcomes and a
+  `version_compat` verdict (`COMPATIBLE` / `INCOMPATIBLE` / `UNCHECKED`).
+- A missing, unmounted or unreadable folder is reported
+  (`SOURCE_UNAVAILABLE`), never treated as "everything was deleted".
+- `deep_verify: true`, or `[freshness] always_hash_paths` in `attic.toml`,
+  hashes every file (network drives, cloud-sync folders).
+
+Errors are JSON `{code, retryable, message}`. Measured cost and the full design:
+[docs/freshness.md](docs/freshness.md).
+
 ## Storage and startup
 
 SQLite stores graph relationships as nodes and edges alongside lexical indexes
@@ -299,6 +330,7 @@ explicit dependency contracts remain grounded in source evidence.
 | Tool | What it does |
 |---|---|
 | `egm` | Always-available EGM activation status, user enable/disable commands, and mode-aware host reviewer guidance |
+| `answer_review` | Prepare and finalize host-attested review of a codebase answer against current permitted source files |
 | `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
 | `file` | Bounded, secret-scanned live-file ranges (or up to 16 `ranges` in one call), JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Bounded structure/statistics; `path_prefix`, `max_depth`, file pagination and explicit byte budget |
@@ -313,7 +345,7 @@ and the `spec_tool::tool()` adapter, and are returned by `tools/list`.
 
 ### EGM mode: enable, disable, inspect
 
-EGM workflow support is enabled by default for all active roots, in manual,
+EGM workflow support is enabled by default for all active roots, in autopilot,
 report-only mode. An existing `planning.enabled = false` remains disabled;
 explicitly enable it to change that setting. No handwritten configuration is required:
 
@@ -336,8 +368,9 @@ For the default Windows installation (if `attic` is not on `PATH`):
 Restart the Attic MCP server after a configuration change; reconnecting to an
 already-running daemon does not reload its settings. The `egm` tool reports the
 running server's mode even while the `spec` tool is disabled.
-The built-in default selects all active roots; the `enable` command defaults to
-the current directory, manual advancement and report-only.
+The built-in default selects all active roots. With no existing root selection,
+`enable` selects the current directory; otherwise it preserves the configured
+roots, mode and enforcement. An unspecified mode defaults to autopilot.
 `--all-roots` selects all active workspace roots; `--enforce` explicitly
 enables budget enforcement. Neither command adds workspace membership, installs
 hooks/reviewers, starts a daemon, reindexes, nor approves a spec.
@@ -349,6 +382,11 @@ agent-owned steps but **always stops for human approval**. Your host supplies
 separate reviewer contexts; Attic supplies verified file-delivered packs and
 governance, not an agent runner or a security sandbox. Use `egm action=guidance`
 for the three reviewer missions without requiring an upstream plugin.
+MCP initialization asks cooperating hosts to review codebase answers via
+`answer_review` and label unavailable reviews **unreviewed**. Attic cannot
+force clients to follow these instructions or launch independent reviewers.
+Plan approval requires two clean host-attested rounds; Attic cannot prove
+reviewer independence. Enabling EGM alone does not review an answer or plan.
 See [the complete EGM workflow](crates/attic-spec/README.md) for citations,
 approval, hooks, leases and recovery.
 

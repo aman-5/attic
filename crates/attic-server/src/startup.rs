@@ -119,8 +119,7 @@ impl StartupServer {
 
 impl ServerHandler for StartupServer {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
+        server_info(self.spec_advertised)
     }
 
     async fn list_tools(

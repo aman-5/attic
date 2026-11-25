@@ -27,6 +27,7 @@ pub mod changeset;
 pub mod coalesce;
 pub mod events;
 pub mod freshness;
+pub mod gate;
 pub mod invalidation;
 pub mod recovery;
 pub mod scheduler;
@@ -36,9 +37,14 @@ pub use changeset::{FileChange, VerifiedChangeSet};
 pub use coalesce::{CoalescedChange, EventCoalescer};
 pub use events::{FsEventKind, NormalizedEvent};
 pub use freshness::assert_transition;
+pub use gate::{
+    ExpectedSource, GateConfig, GateOutcome, SourceLabel, check_expected, ensure_current,
+    repository_lock,
+};
 pub use recovery::{
-    ReconcileReport, RecoveryReport, plan_offline_refresh, reconcile_repository,
-    record_clean_shutdown_marker, run_startup_recovery,
+    RACY_WINDOW_NS, ReconcileOptions, ReconcileReport, RecoveryReport, plan_offline_refresh,
+    reconcile_repository, reconcile_repository_with, record_clean_shutdown_marker,
+    run_startup_recovery,
 };
 pub use scheduler::{
     SchedulerConfig, SchedulerHandle, TaskOrigin, run_next_task_synchronously, spawn_scheduler,
@@ -74,6 +80,16 @@ pub enum IncrementalError {
     /// Scheduler could not start (zero or failed worker threads).
     #[error("scheduler startup failed: {0}")]
     Scheduler(String),
+    /// The repository root is missing, empty, or no longer readable;
+    /// deletions are never inferred from it (R2).
+    #[error("SOURCE_UNAVAILABLE: {0}")]
+    SourceUnavailable(String),
+    /// Files kept changing during the check after all retries.
+    #[error("SOURCE_CHANGING: {0}")]
+    SourceChanging(String),
+    /// The freshness check did not finish within its deadline.
+    #[error("TIMEOUT: {0}")]
+    Timeout(String),
 }
 
 /// Monotonic-ish wall clock in microseconds (failure-tolerant).

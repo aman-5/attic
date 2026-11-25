@@ -6,6 +6,7 @@ pub mod error;
 pub mod git;
 pub mod hooks;
 pub mod pack;
+pub mod review;
 pub mod service;
 pub mod state;
 pub mod store;

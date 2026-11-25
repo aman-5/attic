@@ -56,9 +56,11 @@
 //! - any non-fatal [`Diagnostic`] events,
 //! - per-file [`DownstreamClassification`] — classification without content.
 
+pub mod catalog_inputs;
 pub mod classification;
 pub mod diagnostics;
 pub mod error;
+pub mod file_meta;
 pub mod git;
 pub mod manifest;
 pub mod policy;
@@ -72,6 +74,7 @@ pub mod walk;
 
 pub use diagnostics::{Diagnostic, DiagnosticKind, WalkCounters};
 pub use error::DiscoveryError;
+pub use file_meta::{FileMeta, file_meta, root_identity};
 pub use git::{GitRepoMeta, discover_nested_git_roots};
 pub use manifest::{ManifestEntry, SourceManifest, manifest_hash_from_pairs};
 pub use policy::DiscoveryPriority;

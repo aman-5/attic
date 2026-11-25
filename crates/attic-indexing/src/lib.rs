@@ -132,7 +132,7 @@ pub enum IndexError {
 pub mod incremental;
 pub(crate) mod structural_pipeline;
 
-pub use incremental::{ScopedChanges, ScopedIndexResult, index_changes};
+pub use incremental::{ScopedChanges, ScopedIndexResult, index_changes, index_changes_fenced};
 
 // ---------------------------------------------------------------------------
 // Store handle — the ONLY way callers provide database access
@@ -597,8 +597,71 @@ pub(crate) fn build_tombstone(
             discovery_class: DiscoveryClass::Vcs,
             security_state: SecurityState::Skipped,
             existence_state: ExistenceState::Deleted,
+            meta: None,
         },
     }
+}
+
+/// Wall clock in nanoseconds since the Unix epoch.
+pub(crate) fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Freshness fast-path metadata for an indexed file.
+///
+/// `captured_at_ns` MUST be a time taken before the file's bytes were hashed
+/// (Git's racy-file rule): the metadata itself may be read later, because
+/// any write after `captured_at_ns` leaves a write/change time at or after
+/// it, which forces the next check to re-hash the file.
+pub(crate) fn occurrence_meta(
+    path: &Path,
+    captured_at_ns: i64,
+) -> Option<attic_storage::OccurrenceMeta> {
+    let m = attic_discovery::file_meta(path).ok()?;
+    Some(attic_storage::OccurrenceMeta {
+        mtime_ns: m.mtime_ns,
+        change_time_ns: m.change_time_ns,
+        file_id: m.file_id,
+        captured_at_ns,
+    })
+}
+
+/// Largest catalog-input file whose bytes are stored for the catalog.
+const MAX_CATALOG_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Indexed bytes of dependency-manifest / `.proto` files among
+/// `(repo_relative, abs_path, content_hash, security_state)` records. Only
+/// files the secret scan found clean are stored (raw bytes are never
+/// persisted for anything else). Bytes are stored only when they still hash
+/// to the indexed hash, so the catalog never parses content newer than the
+/// index; a mismatch is left for the next check.
+pub(crate) fn catalog_input_contents<'a>(
+    records: impl Iterator<Item = (&'a str, &'a Path, &'a str, SecurityState)>,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (rel, abs, hash, security) in records {
+        if security != SecurityState::Clean
+            || !attic_discovery::catalog_inputs::is_catalog_input_path(rel)
+        {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(abs) else {
+            continue;
+        };
+        if md.len() > MAX_CATALOG_INPUT_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(abs) else {
+            continue;
+        };
+        if blake3::hash(&bytes).to_hex().as_str() == hash {
+            out.push((hash.to_owned(), bytes));
+        }
+    }
+    out
 }
 
 /// Retire the current occurrence of `path` (deleted from disk, newly
@@ -681,6 +744,8 @@ pub fn index_repository_with_cancellation(
     // Phase 0 instrumentation. `run_start` anchors `total_ms`; `stage_start`
     // is reset at each stage boundary. Both are measurement-only.
     let run_start = std::time::Instant::now();
+    // Racy-file anchor: taken before discovery hashes any file.
+    let capture_started_ns = now_ns();
     let mut timings = IndexStageTimings::default();
     let mut rss = RssTracker::start();
     let mut stage_start = run_start;
@@ -780,6 +845,7 @@ pub fn index_repository_with_cancellation(
         .hash()
         .map_err(|e| IndexError::PolicyHash(e.to_string()))?;
     let commit_sha: Option<String> = discovery.git_meta.as_ref().and_then(|g| g.head_sha.clone());
+    let branch: Option<String> = discovery.git_meta.as_ref().and_then(|g| g.branch.clone());
     let unstable_capture = !discovery.manifest.unstable_captures.is_empty();
 
     // 4. Index generation: real subsystem versions from attic_core::constants.
@@ -1281,9 +1347,18 @@ pub fn index_repository_with_cancellation(
                 discovery_class: DiscoveryClass::Vcs,
                 security_state: rec.security_state,
                 existence_state: ExistenceState::Present,
+                meta: occurrence_meta(&rec.abs_path, capture_started_ns),
             },
         })
         .collect();
+    let manifest_contents = catalog_input_contents(indexed_records.iter().map(|rec| {
+        (
+            rec.repo_relative.as_str(),
+            rec.abs_path.as_path(),
+            rec.content_hash.as_str(),
+            rec.security_state,
+        )
+    }));
     publication_files.extend(tombstones);
 
     let repo_id_str = repo_id.to_string_repr();
@@ -1351,7 +1426,16 @@ pub fn index_repository_with_cancellation(
     if cancellation.is_cancelled() {
         return Err(IndexError::Cancelled);
     }
-    let structural_files = pipeline.finish(&deps, &unit_links_by_occ);
+    let mut import_targets: Vec<(String, String, String)> = Vec::new();
+    let structural_files = pipeline.finish(&deps, &unit_links_by_occ, &mut import_targets);
+    let retarget_occurrences: Vec<(String, String)> = indexed_records
+        .iter()
+        .filter_map(|r| {
+            r.old_fo_id
+                .clone()
+                .map(|old| (old, r.fo_id.to_string_repr()))
+        })
+        .collect();
     if cancellation.is_cancelled() {
         return Err(IndexError::Cancelled);
     }
@@ -1385,7 +1469,25 @@ pub fn index_repository_with_cancellation(
             close_audit_for_occurrences: stale_occurrences.clone(),
             retrieval_units,
             structural_files,
+            missing_occurrences: {
+                let retargeted: std::collections::HashSet<&str> = retarget_occurrences
+                    .iter()
+                    .map(|(o, _)| o.as_str())
+                    .collect();
+                stale_occurrences
+                    .iter()
+                    .filter(|o| !retargeted.contains(o.as_str()))
+                    .map(|o| (o.clone(), String::new()))
+                    .collect()
+            },
             delete_structural_for_occurrences: stale_occurrences,
+            branch,
+            manifest_contents,
+            expected_store_version: None,
+            root_identity: attic_discovery::root_identity(root),
+            retarget_occurrences,
+            import_targets,
+            import_targets_cleared_for: vec!["*".to_owned()],
         },
     )
     .map_err(IndexError::Storage)?;

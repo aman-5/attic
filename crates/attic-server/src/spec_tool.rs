@@ -224,18 +224,44 @@ pub(crate) struct Request {
     pub wave_number: Option<u32>,
     pub repository: Option<String>,
     pub reason: Option<String>,
+    pub review_report: Option<attic_spec::review::RoundReport>,
 }
 
 pub(crate) fn tool() -> Tool {
+    let finding = json!({"type":"object","additionalProperties":false,
+    "required":["severity","description","disposition","rationale"],
+    "properties":{
+        "severity":{"type":"string","enum":["blocker","major","nit"]},
+        "description":{"type":"string","maxLength":4096},
+        "disposition":{"type":"string","enum":["open","fixed","contested","accepted_risk"]},
+        "rationale":{"type":["string","null"],"maxLength":4096}
+    }});
+    let reviewer = json!({"type":"object","additionalProperties":false,
+    "required":["stage","persona","completed","context_id","findings"],
+    "properties":{
+        "stage":{"type":"string"},"persona":{"type":"string"},
+        "completed":{"type":"boolean"},"context_id":{"type":["string","null"]},
+        "findings":{"type":"array","maxItems":100,"items":finding}
+    }});
+    let report = json!({"type":"object","additionalProperties":false,
+    "required":["protocol_version","host","upstream_revision","document_sha256","verification_run_id","evidence_sha256","attempt_id","round","reviewers"],
+    "properties":{
+        "protocol_version":{"type":"integer","const":1},
+        "host":{"type":"string","minLength":1,"maxLength":200},
+        "upstream_revision":{"type":"string"},"document_sha256":{"type":"string"},
+        "verification_run_id":{"type":"string"},"evidence_sha256":{"type":"string"},
+        "attempt_id":{"type":"string"},"round":{"type":"integer","minimum":1},
+        "reviewers":{"type":"array","minItems":10,"maxItems":10,"items":reviewer}
+    }});
     Tool::new("spec","Spec-first EGM workflow. Human-only approval is available ONLY via attic spec approve; never run approval yourself.",
         std::sync::Arc::new(json!({"type":"object","additionalProperties":false,"required":["action"],"properties":{
-            "action":{"type":"string","enum":["register","status","verify","pack","begin","heartbeat","wave_complete","resume","drift","reopen","abandon"]},
+            "action":{"type":"string","enum":["register","status","verify","pack","review_start","review_prepare","review_submit","begin","heartbeat","wave_complete","resume","drift","reopen","abandon"]},
             "spec_id":{"type":"string","pattern":"^[a-z0-9][a-z0-9_-]{0,62}$"},"root":{"type":"string"},
             "persona":{"type":"string","enum":["zoom_out","codebase_details","implementation_readiness"]},
             "delivery":{"type":"string","enum":["file","inline"],"default":"file"},
             "lease_id":{"type":"string"},"fencing_token":{"type":"integer","minimum":0},
             "wave_number":{"type":"integer","minimum":1},"repository":{"type":"string"},
-            "reason":{"type":"string","maxLength":500}
+            "reason":{"type":"string","maxLength":500},"review_report":report
         }}).as_object().cloned().unwrap_or_default()))
 }
 
@@ -408,6 +434,16 @@ impl AtticServer {
         }
         let metadata_update = match request.action.as_str() {
             "status" => return service.status(&doc),
+            "review_start" => return service.review_start(&doc),
+            "review_prepare" => return service.review_prepare(&doc),
+            "review_submit" => {
+                return service.review_submit(
+                    &doc,
+                    request.review_report.as_ref().ok_or_else(|| {
+                        SpecError::new("ERR_INVALID_ARGUMENT", "review_report is required")
+                    })?,
+                );
+            }
             "heartbeat" => Some(service.heartbeat(
                 &doc,
                 required(request.lease_id.as_deref(), "lease_id")?,

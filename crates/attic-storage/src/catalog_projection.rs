@@ -14,6 +14,9 @@ struct Projection {
     revisions: Vec<Vec<Value>>,
     identities: Vec<Vec<Value>>,
     occurrences: Vec<Vec<Value>>,
+    /// Indexed bytes of the projected dependency / `.proto` occurrences,
+    /// keyed by content hash (the catalog parses exactly these bytes).
+    contents: Vec<(String, Vec<u8>)>,
 }
 
 /// Publish selected cross-repository provenance metadata into the catalog.
@@ -22,8 +25,10 @@ struct Projection {
 /// caller, with at most 4,005 entries (2,000 each for manifests and protobufs,
 /// plus the five root manifest anchors). Root manifest anchors are also included.
 /// Only the repository record, the latest revision and revisions needed by
-/// selected latest occurrences, their identities, and occurrence metadata are
-/// copied. No retrieval units, FTS text, analysis JSON or file contents are read.
+/// selected latest occurrences, their identities, occurrence metadata and the
+/// indexed bytes of those (dependency / `.proto`) files are copied — the
+/// catalog parses exactly the indexed content, never newer disk bytes. No
+/// retrieval units, FTS text or analysis JSON are read.
 ///
 /// The indexed canonical repository ID must equal the lease's stable ID.
 /// The catalog writer applies the projection in its ambient atomic transaction.
@@ -100,6 +105,13 @@ pub fn export_repository_catalog(
                     params_from_iter(occurrence.iter()),
                 )?;
             }
+            for (hash, content) in &projection.contents {
+                catalog.execute(
+                    "INSERT OR IGNORE INTO core_manifest_contents (content_hash, content)
+                     VALUES (?1, ?2)",
+                    params![hash, content],
+                )?;
+            }
             Ok(())
         })
     })?;
@@ -169,7 +181,10 @@ fn read_snapshot(
         revisions: Vec::new(),
         identities: Vec::new(),
         occurrences: Vec::new(),
+        contents: Vec::new(),
     };
+    let mut content_statement =
+        conn.prepare_cached("SELECT content FROM core_manifest_contents WHERE content_hash = ?1")?;
     let mut occurrence_statement = conn.prepare_cached(
         "SELECT fo.id, fo.file_identity_id, fo.source_revision_id, fo.path,
                 fo.content_hash, fo.size_bytes, fo.language, fo.file_type,
@@ -206,6 +221,13 @@ fn read_snapshot(
                 ));
             };
             revision_ids.insert(revision_id.clone());
+            if let Value::Text(hash) = &occurrence[4]
+                && let Some(content) = content_statement
+                    .query_row(params![hash], |row| row.get::<_, Vec<u8>>(0))
+                    .optional()?
+            {
+                projection.contents.push((hash.clone(), content));
+            }
             projection.occurrences.push(occurrence);
         }
     }

@@ -53,7 +53,13 @@ CREATE TABLE core_file_occurrences (
     secret_scan_state   TEXT    NOT NULL DEFAULT 'PENDING',
     -- OQ-007 (ADR-002): which secret detector pattern version last scanned this file to CLEAN/HAS_SECRETS
     secret_pattern_version  INTEGER NOT NULL DEFAULT 1,
-    last_indexed_at     INTEGER   -- microseconds since Unix epoch; NULL if never indexed
+    last_indexed_at     INTEGER,  -- microseconds since Unix epoch; NULL if never indexed
+    -- Freshness fast-path metadata captured BEFORE hashing (NULL = unknown,
+    -- forces a content hash on the next check).
+    mtime_ns            INTEGER,  -- last-write time, nanoseconds since Unix epoch
+    change_time_ns      INTEGER,  -- NTFS ChangeTime / Unix ctime, nanoseconds since Unix epoch
+    file_id             TEXT,     -- volume serial + file id (Windows) / dev:ino (Unix)
+    captured_at_ns      INTEGER   -- when the metadata above was observed
 );
 
 CREATE TABLE core_identity_links (
@@ -113,6 +119,8 @@ CREATE TABLE core_relationships (
     target_entity_type    TEXT    NOT NULL,
     -- rel_type enum: IMPORT | CALL | EXTENDS | IMPLEMENTS | DEPENDS_ON | OVERRIDES | REFERENCES | TESTS | CONFIGURES | OTHER
     rel_type              TEXT    NOT NULL,
+    -- Cross-repo dependency version check: COMPATIBLE | INCOMPATIBLE | UNCHECKED (NULL = not applicable)
+    version_compat        TEXT,
     -- dependency_basis enum: MAVEN | GRADLE | GO_MODULE | NPM | PYTHON_PACKAGE | IMPORT | HEURISTIC | OTHER
     dependency_basis      TEXT    NOT NULL,
     -- resolution enum: SYNTACTIC | PACKAGE_RESOLVED | SYMBOL_RESOLVED | BUILD_RESOLVED | FRAMEWORK_RESOLVED | INFERRED
@@ -130,6 +138,10 @@ CREATE TABLE core_repositories (
     display_name    TEXT    NOT NULL,
     is_git          INTEGER NOT NULL DEFAULT 1,     -- BOOLEAN: 1=true, 0=false
     case_sensitive  INTEGER NOT NULL DEFAULT 1,     -- BOOLEAN: filesystem case sensitivity
+    -- Root directory identity (volume serial + file id / dev:ino) recorded
+    -- after a successful publish; a mismatch means the root was replaced or
+    -- unmounted and deletions must not be inferred from an empty walk.
+    root_identity   TEXT,
     created_at      INTEGER NOT NULL,               -- microseconds since Unix epoch (UTC)
     updated_at      INTEGER NOT NULL                -- microseconds since Unix epoch (UTC)
 );
@@ -256,8 +268,60 @@ CREATE TABLE core_workspace_snapshots (
     id              TEXT    NOT NULL PRIMARY KEY,
     created_at      INTEGER NOT NULL,
     repo_count      INTEGER NOT NULL DEFAULT 0,
-    edges_emitted   INTEGER NOT NULL DEFAULT 0
+    edges_emitted   INTEGER NOT NULL DEFAULT 0,
+    -- BLAKE3 over the selected repositories, their roots, dependency/.proto
+    -- content hashes and provider anchors. Cross-repo answers require the
+    -- latest snapshot's catalog_version to equal the freshly computed one.
+    catalog_version TEXT    NOT NULL DEFAULT ''
 );
+
+-- Indexed content of dependency manifests and .proto files, addressed by
+-- content hash, so the cross-repo catalog is built from exactly the indexed
+-- bytes rather than whatever is on disk at catalog time.
+CREATE TABLE core_manifest_contents (
+    content_hash    TEXT    NOT NULL PRIMARY KEY,
+    content         BLOB    NOT NULL
+);
+
+-- Persisted cross-repo resolution outcomes that produce no edge.
+CREATE TABLE core_crossrepo_diagnostics (
+    id                    TEXT    NOT NULL PRIMARY KEY,
+    snapshot_id           TEXT    NOT NULL,
+    source_repository_id  TEXT    NOT NULL,
+    declaration           TEXT    NOT NULL,
+    -- UNRESOLVED | AMBIGUOUS | REPOSITORY_UNAVAILABLE
+    kind                  TEXT    NOT NULL,
+    detail_json           TEXT,
+    created_at            INTEGER NOT NULL
+);
+CREATE INDEX idx_crossrepo_diagnostics_source
+    ON core_crossrepo_diagnostics(source_repository_id);
+
+-- Reverse import index: every import specifier and the repo-relative paths
+-- it could resolve to, so importers can be re-resolved without re-parsing
+-- when a target file is added, deleted, renamed, restored or edited.
+CREATE TABLE core_import_targets (
+    repository_id       TEXT    NOT NULL,
+    importer_path       TEXT    NOT NULL,
+    specifier           TEXT    NOT NULL,
+    candidate_path      TEXT    NOT NULL,
+    PRIMARY KEY (repository_id, importer_path, specifier, candidate_path)
+);
+CREATE INDEX idx_import_targets_candidate
+    ON core_import_targets(repository_id, candidate_path);
+
+-- Persisted store identity and monotonic version. `epoch` changes only when
+-- the database file is recreated; `version` is bumped inside every writer
+-- transaction that changes index-visible (non-ops_) tables. Version tokens
+-- pin (epoch, version) and reads compare against it.
+CREATE TABLE ops_store_version (
+    id              TEXT    NOT NULL PRIMARY KEY DEFAULT 'singleton'
+                            CHECK (id = 'singleton'),
+    epoch           TEXT    NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO ops_store_version (id, epoch, version)
+    VALUES ('singleton', lower(hex(randomblob(16))), 0);
 
 CREATE VIRTUAL TABLE fts_retrieval_units USING fts5(
     retrieval_text,

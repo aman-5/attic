@@ -32,9 +32,11 @@ fn controls_preserve_settings_and_toggle_without_starting_runtime_or_state() {
     std::fs::create_dir(&root).unwrap();
     let initial = json(command(&home).arg("status").output().unwrap());
     assert_eq!(initial["enabled"], true);
-    assert_eq!(initial["mode"], "manual");
+    assert_eq!(initial["mode"], "autopilot");
     assert_eq!(initial["enforce"], false);
     assert_eq!(initial["roots"], serde_json::json!([]));
+    assert_eq!(initial["review_completion"], "host_attested");
+    assert_eq!(initial["answer_review"], "host_attested");
     assert!(!home.exists());
     let config_dir = home.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -88,7 +90,7 @@ fn controls_preserve_settings_and_toggle_without_starting_runtime_or_state() {
             .output()
             .unwrap(),
     );
-    assert_eq!(enabled["mode"], "manual");
+    assert_eq!(enabled["mode"], "autopilot");
     assert_eq!(enabled["enforce"], true);
     assert_eq!(enabled["roots"], serde_json::json!([]));
     let guidance = json(command(&home).arg("guidance").output().unwrap());
@@ -96,8 +98,37 @@ fn controls_preserve_settings_and_toggle_without_starting_runtime_or_state() {
         guidance["workflow"]["advance"]
             .as_str()
             .unwrap()
-            .starts_with("Ask the user")
+            .contains("automatically")
     );
+}
+
+#[test]
+fn bare_enable_preserves_explicit_manual_enforcement_and_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let enabled = json(
+        command(&home)
+            .args(["enable", "--root"])
+            .arg(&root)
+            .args(["--mode", "manual", "--enforce"])
+            .output()
+            .unwrap(),
+    );
+    let repeated = json(command(&home).arg("enable").output().unwrap());
+    assert_eq!(repeated["mode"], "manual");
+    assert_eq!(repeated["enforce"], true);
+    assert_eq!(repeated["roots"], enabled["roots"]);
+    let all_roots = json(
+        command(&home)
+            .args(["enable", "--all-roots"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(all_roots["roots"], serde_json::json!([]));
+    let repeated = json(command(&home).arg("enable").output().unwrap());
+    assert_eq!(repeated["roots"], serde_json::json!([]));
 }
 
 #[test]
@@ -107,6 +138,7 @@ fn invalid_controls_never_overwrite_config_or_create_state() {
     for args in [
         vec!["enable", "--mode", "invalid"],
         vec!["enable", "--root"],
+        vec!["enable", "--root", "missing"],
         vec!["enable", "--root", "missing", "--all-roots"],
         vec!["disable", "--enforce"],
         vec!["status", "--unexpected"],

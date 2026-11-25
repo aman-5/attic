@@ -7,10 +7,83 @@ fn json_schema(v: Value) -> std::sync::Arc<serde_json::Map<String, Value>> {
     std::sync::Arc::new(v.as_object().cloned().unwrap_or_default())
 }
 
+/// Freshness-gate arguments shared by every index-reading tool.
+fn with_freshness_args(mut v: Value) -> Value {
+    if let Some(props) = v["properties"].as_object_mut() {
+        props.insert(
+            "version_token".into(),
+            json!({"type":"string","description":"Pin this call to the code version of an earlier call in the same answer (freshness.version_token). If the code changed since, the call fails with VERSION_EXPIRED: restart the answer without a token"}),
+        );
+        props.insert(
+            "expected_branch".into(),
+            json!({"type":"string","description":"Refuse with BRANCH_MISMATCH unless this Git branch is checked out (e.g. the production branch you are investigating)"}),
+        );
+        props.insert(
+            "expected_commit".into(),
+            json!({"type":"string","description":"Refuse with BRANCH_MISMATCH unless HEAD is this commit (full SHA or 7+ char prefix)"}),
+        );
+        props.insert(
+            "deep_verify".into(),
+            json!({"type":"boolean","description":"Hash every file instead of trusting unchanged size/timestamps/file id (slower; for network or cloud-sync folders)"}),
+        );
+        props.insert(
+            "at_commit".into(),
+            json!({
+                "description":"Answer from a named Git commit (e.g. the deployed production SHA or tag) instead of the working tree, without checking it out. A string (with repository_id/repository) or {repository_id: commit} for several repositories (context only; cross-repository links are resolved for exactly those commits).",
+                "oneOf":[{"type":"string"},{"type":"object","additionalProperties":{"type":"string"}}]
+            }),
+        );
+    }
+    v
+}
+
+/// Shared tail of index-reading tool descriptions.
+const FRESHNESS_NOTE: &str = " FRESHNESS: before reading, Attic checks the saved files of every \
+     repository it reads (Git or plain folder) and re-indexes anything that changed; the \
+     response's `freshness` block names the code (branch/commit or folder fingerprint) and \
+     carries `version_token`. Errors are JSON {code, retryable}: SOURCE_CHANGING, \
+     SOURCE_UNAVAILABLE, INDEX_NOT_READY, TIMEOUT (retry), VERSION_EXPIRED (restart the \
+     answer), BRANCH_MISMATCH.";
+
 // ─── build the tool list once ──────────────────────────────────────────────────
 
 pub(crate) fn make_tools() -> Vec<Tool> {
+    let mut tools = make_base_tools();
+    for tool in &mut tools {
+        if GATED_TOOLS.contains(&tool.name.as_ref()) {
+            let schema = with_freshness_args(Value::Object((*tool.input_schema).clone()));
+            tool.input_schema = json_schema(schema);
+            let description = format!(
+                "{}{FRESHNESS_NOTE}",
+                tool.description.as_deref().unwrap_or_default()
+            );
+            tool.description = Some(description.into());
+        }
+    }
+    tools
+}
+
+/// Tools that read index data and therefore pass the freshness gate (R1).
+pub(crate) const GATED_TOOLS: &[&str] = &["file", "repo_map", "context"];
+
+/// Tools that never read index data, with the reason they skip the gate.
+#[cfg(test)]
+pub(crate) const UNGATED_TOOLS: &[(&str, &str)] = &[
+    ("egm", "reads planning configuration only"),
+    ("status", "reports server/index health, not code"),
+    ("logging", "controls log files"),
+    ("debug_drain_task", "admin: runs background indexing work"),
+    ("workspace", "manages membership"),
+    ("spec", "spec documents live in their own store"),
+    (
+        "answer_review",
+        "checks live source bytes and active membership directly",
+    ),
+];
+
+fn make_base_tools() -> Vec<Tool> {
     vec![
+        crate::answer_review::tool(),
         Tool::new(
             "egm",
             "Read EGM activation status, user enable/disable commands, or mode-aware reviewer \
@@ -188,4 +261,37 @@ pub(crate) fn make_tools() -> Vec<Tool> {
             })),
         ),
     ]
+}
+
+#[cfg(test)]
+mod freshness_coverage_tests {
+    use super::*;
+
+    /// R1 guard: every registered tool is classified exactly once as gated
+    /// (reads index data through the freshness gate) or exempt with a
+    /// reason, so a new tool cannot silently skip the gate.
+    #[test]
+    fn every_tool_is_classified_for_the_freshness_gate() {
+        let mut names: Vec<String> = make_tools().iter().map(|t| t.name.to_string()).collect();
+        names.push(crate::spec_tool::tool().name.to_string());
+        for name in &names {
+            let gated = GATED_TOOLS.contains(&name.as_str());
+            let exempt = UNGATED_TOOLS.iter().any(|(n, _)| n == name);
+            assert!(
+                gated ^ exempt,
+                "tool `{name}` must be listed in exactly one of GATED_TOOLS / UNGATED_TOOLS"
+            );
+        }
+        for tool in make_tools() {
+            let has_token = tool.input_schema["properties"]
+                .get("version_token")
+                .is_some();
+            assert_eq!(
+                has_token,
+                GATED_TOOLS.contains(&tool.name.as_ref()),
+                "{}",
+                tool.name
+            );
+        }
+    }
 }

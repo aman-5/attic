@@ -265,6 +265,11 @@ fn execute(args: &Args) -> Result<()> {
     }
     match command {
         "approve" => {
+            println!("Host-attested review reports (not proof of reviewer independence):");
+            service.visit_review_reports(&doc, |report| {
+                println!("{}", serde_json::to_string(report)?);
+                Ok(())
+            })?;
             let approved = service.approve(&doc, &mut TerminalPrompt)?;
             println!(
                 "Approved {} rev {}. Agent may begin.",

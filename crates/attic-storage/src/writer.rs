@@ -618,9 +618,22 @@ fn flush_batch(
         // ----------------------------------------------------------------
         // All mutations succeeded — attempt COMMIT
         // ----------------------------------------------------------------
+        // Persisted, monotonic store version: bumped inside this same
+        // transaction whenever an index-visible (non-`ops_`) table changed,
+        // so readers comparing it inside a read transaction can never see
+        // new rows with an old version. Stores without the table (ad-hoc
+        // test schemas) simply skip the bump.
+        let index_write =
+            conn.total_changes() != changes_before && index_changed.load(Ordering::Acquire);
+        if index_write {
+            let _ = conn.execute(
+                "UPDATE ops_store_version SET version = version + 1 WHERE id = 'singleton'",
+                [],
+            );
+        }
         match finalizer.commit(conn) {
             Ok(()) => {
-                if conn.total_changes() != changes_before && index_changed.load(Ordering::Acquire) {
+                if index_write {
                     generation.fetch_add(1, Ordering::Release);
                 }
             }

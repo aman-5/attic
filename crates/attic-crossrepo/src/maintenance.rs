@@ -191,6 +191,13 @@ pub fn sync_workspace(
     // though no fresh edges are computed for them: outside the active set,
     // or skipped below (manifest scan failed / not indexed yet).
     let mut stale_repo_ids: Vec<String> = inactive_ids;
+    // R4: stamp the snapshot with the catalog version observed BEFORE
+    // scanning. If a projection lands during the scan, the stamp is older
+    // than the catalog and the next check resyncs — never the reverse.
+    let catalog_version = crate::catalog::catalog_version(
+        reader_conn,
+        opts.active_repository_ids.as_deref().unwrap_or(&repo_ids),
+    )?;
     let total = repo_ids.len();
     let mut all_repo_data: Vec<RepoCatalogData> = Vec::with_capacity(total);
     let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
@@ -301,7 +308,12 @@ pub fn sync_workspace(
     }
 
     // ── Pure computation: resolve cross-repo edges ────────────────────
-    let (edges, diagnostics) = resolver::resolve_workspace(&all_repo_data, &proto_index);
+    let (mut edges, diagnostics) = resolver::resolve_workspace(&all_repo_data, &proto_index);
+    let provided_versions: HashMap<String, Vec<(String, String, String)>> = scans
+        .iter()
+        .map(|(id, (scan, _, _))| (id.clone(), scan.provided_versions.clone()))
+        .collect();
+    crate::version_compat::annotate_edges(&mut edges, &provided_versions);
     // Keep the reader-phase diagnostics (e.g. no_source_revision) — the
     // resolver's own report used to overwrite them.
     let reader_missing = std::mem::take(&mut result.diagnostics.missing_targets);
@@ -324,6 +336,7 @@ pub fn sync_workspace(
         .iter()
         .map(|r| (r.repository_id.clone(), r.source_revision_id.clone()))
         .collect();
+    let persisted_diagnostics = result.diagnostics.clone();
 
     // ── Stage 2: Writer phase (single atomic closure) ─────────────────
     let edges_clone = edges.clone();
@@ -381,6 +394,54 @@ pub fn sync_workspace(
                 &snapshot_revisions_input,
                 edges_clone.len(),
             )?;
+            conn.execute(
+                "UPDATE core_workspace_snapshots SET catalog_version = ?1 WHERE id = ?2",
+                rusqlite::params![catalog_version, snapshot_id],
+            )?;
+            // Persist resolution outcomes that produce no edge, replacing
+            // the previous snapshot's set.
+            conn.execute("DELETE FROM core_crossrepo_diagnostics", [])?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            for (repo, name) in &persisted_diagnostics.missing_targets {
+                if persisted_diagnostics
+                    .external_unmatched
+                    .iter()
+                    .any(|(r, n)| r == repo && n == name)
+                {
+                    // External-world package: expected, not a problem.
+                    continue;
+                }
+                conn.execute(
+                    "INSERT INTO core_crossrepo_diagnostics
+                        (id, snapshot_id, source_repository_id, declaration, kind, detail_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'UNRESOLVED', NULL, ?5)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        snapshot_id,
+                        repo,
+                        name,
+                        now
+                    ],
+                )?;
+            }
+            for (repo, name, providers) in &persisted_diagnostics.ambiguous_targets {
+                conn.execute(
+                    "INSERT INTO core_crossrepo_diagnostics
+                        (id, snapshot_id, source_repository_id, declaration, kind, detail_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'AMBIGUOUS', ?5, ?6)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        snapshot_id,
+                        repo,
+                        name,
+                        serde_json::json!({"providers": providers}).to_string(),
+                        now
+                    ],
+                )?;
+            }
 
             // Return the snapshot_id to the caller via the channel.
             // send() can only fail (Disconnected) if snap_rx was dropped, which
@@ -421,6 +482,14 @@ pub fn sync_workspace(
                     &e.source_revision_id,
                 )?;
             }
+            // Phase 8: surface the version check as a column.
+            conn.execute(
+                "UPDATE core_relationships
+                    SET version_compat = json_extract(provenance_json, '$.version_compat')
+                  WHERE rel_type = 'DEPENDS_ON'
+                    AND json_extract(provenance_json, '$.version_compat') IS NOT NULL",
+                [],
+            )?;
 
             Ok(())
         })
@@ -442,6 +511,57 @@ pub fn sync_workspace(
 // ---------------------------------------------------------------------------
 // Convenience wrapper: membership-scoped workspace maintenance
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Repository removal
+// ---------------------------------------------------------------------------
+
+/// Resolve cross-repository edges between repositories that each live in
+/// their own store (e.g. pinned-commit indexes) WITHOUT persisting
+/// anything: a temporary catalog for one answer. Each entry is
+/// `(store connection, repository id)`.
+pub fn resolve_in_memory(
+    stores: &[(&rusqlite::Connection, String)],
+) -> Result<(Vec<crate::resolver::EdgeDraft>, ResolutionDiagnostics), CrossRepoError> {
+    let mut repos: Vec<RepoCatalogData> = Vec::with_capacity(stores.len());
+    let mut proto_index: HashMap<String, Vec<String>> = HashMap::new();
+    let mut provided_versions: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for (conn, repo_id) in stores {
+        let scan = crate::catalog::scan_repository_manifests(conn, repo_id)?;
+        provided_versions.insert(repo_id.clone(), scan.provided_versions.clone());
+        let mut provides = Vec::new();
+        let mut declarations = Vec::new();
+        for m in &scan.manifests {
+            provides.extend(m.provides.clone());
+            declarations.extend(m.declarations.clone());
+        }
+        let source_revision_id = resolve_source_revision(conn, repo_id)?;
+        let typed = repo_id
+            .parse::<attic_core::RepositoryId>()
+            .map_err(|e| CrossRepoError::InvalidRoot(format!("bad repo id: {e}")))?;
+        let root_path = attic_storage::get_repository_path(conn, &typed)?.unwrap_or_default();
+        let go_module_prefix = provides
+            .iter()
+            .find(|p| p.ecosystem == crate::Ecosystem::Go)
+            .map(|p| p.name.clone());
+        let proto_specs = crate::catalog::scan_proto_imports(conn, repo_id)?;
+        if !proto_specs.is_empty() {
+            proto_index.insert(repo_id.clone(), proto_specs);
+        }
+        repos.push(RepoCatalogData {
+            repository_id: repo_id.clone(),
+            root_path,
+            source_revision_id,
+            provides,
+            declarations,
+            primary_anchor_occurrence: crate::catalog::primary_anchor_for_repo(conn, repo_id),
+            go_module_prefix,
+        });
+    }
+    let (mut edges, diagnostics) = resolver::resolve_workspace(&repos, &proto_index);
+    crate::version_compat::annotate_edges(&mut edges, &provided_versions);
+    Ok((edges, diagnostics))
+}
 
 // ---------------------------------------------------------------------------
 // Repository removal

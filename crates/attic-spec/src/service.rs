@@ -139,11 +139,30 @@ impl SpecService {
     }
     pub fn status(&self, doc: &Document) -> Result<Value> {
         let effective = self.effective(doc)?;
+        let review = if effective.status == Status::Verified {
+            match self.review_prepare(&effective) {
+                Ok(value) => value,
+                Err(error) => json!({"status":"review_pending","error":error}),
+            }
+        } else {
+            json!({"status":"not_applicable"})
+        };
+        let mut next = self.next_action(&effective);
+        if effective.status == Status::Verified && review["status"] != "review_passed_host_attested"
+        {
+            let actor = if self.config.mode == attic_core::config::PlanningMode::Manual {
+                "user"
+            } else {
+                "agent"
+            };
+            next = json!({"action":"review","actor":actor,
+                "message":"Complete two clean host-attested review rounds before requesting user approval."});
+        }
         Ok(
             json!({"spec_id":doc.spec_id,"status":effective.status,"persisted_status":doc.status,
             "revision":doc.revision,"document":effective,"waves":self.waves(doc)?,
             "latest_run":doc.latest_run_id.as_ref().map(|id|self.run(id)).transpose()?,
-            "next_required_action":self.next_action(&effective)}),
+            "review":review,"next_required_action":next}),
         )
     }
     pub fn next_action(&self, doc: &Document) -> Value {
@@ -218,6 +237,16 @@ impl SpecService {
         }
         let bytes = Self::doc_bytes(&doc)?;
         let hash = sha256(&bytes);
+        let reviewed_run = if begin {
+            let run = self.run(doc.approved_run_id.as_deref().ok_or_else(|| {
+                SpecError::new("ERR_APPROVAL_STALE", "approved run is missing")
+            })?)?;
+            self.store
+                .read(|conn| self.require_review_binding(conn, &doc, &run))?;
+            Some(run)
+        } else {
+            None
+        };
         if begin {
             state::transition(doc.status, Operation::Begin)?;
         } else if post {
@@ -277,7 +306,12 @@ impl SpecService {
         let stale = begin
             && (!run.passed
                 || doc.approved_doc_sha256.as_deref() != Some(&run.doc_sha256)
-                || doc.approved_fingerprint.as_deref() != Some(&run.citation_fingerprint));
+                || doc.approved_fingerprint.as_deref() != Some(&run.citation_fingerprint)
+                || reviewed_run
+                    .as_ref()
+                    .map(crate::review::evidence_hash)
+                    .transpose()?
+                    != Some(crate::review::evidence_hash(&run)?));
         let changed_approval = doc.status == Status::Approved
             && (!run.passed
                 || doc.approved_doc_sha256.as_deref() != Some(&run.doc_sha256)
@@ -341,6 +375,13 @@ impl SpecService {
             ));
         }
         self.lease_write(&doc,|tx| {
+            if let Some(reviewed) = &reviewed_run {
+                if stale {
+                    self.require_review_binding(tx, &doc, reviewed)?;
+                } else {
+                    self.require_review(tx, &doc, reviewed)?;
+                }
+            }
             persist_run(tx,&doc,&run)?;
             if stale||changed_approval{store::void_approval(tx,&doc.spec_uid,"APPROVAL_STALE",self.clock.now()?)?;}
             if begin&&!stale{for wave in &planned {
@@ -517,6 +558,8 @@ impl SpecService {
                 "document/run changed since verification",
             ));
         }
+        self.store
+            .read(|conn| self.require_review(conn, &doc, &run))?;
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         let random = uuid::Uuid::new_v4();
         let code: String = random.as_bytes()[..6]
@@ -542,6 +585,7 @@ impl SpecService {
         next.approved_doc_sha256 = Some(run.doc_sha256.clone());
         next.approved_fingerprint = Some(run.citation_fingerprint.clone());
         self.store.write(|tx|{
+            self.require_review(tx,&doc,&run)?;
             store::save(tx,&doc,&mut next,"approve","CLI",&json!({"run_id":run.run_id}),self.clock.now()?)?;
             tx.execute("INSERT INTO spec_approvals(approval_id,spec_uid,spec_revision,run_id,doc_sha256,citation_fingerprint,approved_via,os_user,approved_at)
                 VALUES(?1,?2,?3,?4,?5,?6,'CLI_TTY_CHALLENGE',?7,?8)",params![uuid::Uuid::new_v4().to_string(),doc.spec_uid,doc.revision,run.run_id,run.doc_sha256,run.citation_fingerprint,

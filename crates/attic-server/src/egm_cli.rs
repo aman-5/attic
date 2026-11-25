@@ -15,7 +15,8 @@ attic egm enable [--root PATH | --all-roots] [--mode manual|autopilot] [--enforc
 attic egm disable
 attic spec --help
 
-Enable defaults to the current directory, manual mode, and report-only.
+Enable preserves existing settings. New configurations default to the current
+directory, autopilot mode, and report-only; an omitted mode defaults to autopilot.
 These commands change only attic.toml; they never install hooks, index repositories,
 start/stop a daemon, or approve a spec. Restart your Attic MCP server after changes.
 Autopilot advances agent-owned workflow steps; human approval remains mandatory.
@@ -25,8 +26,8 @@ struct Options {
     action: String,
     root: Option<PathBuf>,
     all_roots: bool,
-    mode: PlanningMode,
-    enforce: bool,
+    mode: Option<PlanningMode>,
+    enforce: Option<bool>,
 }
 
 impl Options {
@@ -50,8 +51,8 @@ impl Options {
             action,
             root: None,
             all_roots: false,
-            mode: PlanningMode::Manual,
-            enforce: false,
+            mode: None,
+            enforce: None,
         };
         let mut seen = std::collections::HashSet::new();
         while let Some(arg) = args.next() {
@@ -71,12 +72,12 @@ impl Options {
                     })?));
                 }
                 "--all-roots" => options.all_roots = true,
-                "--enforce" => options.enforce = true,
+                "--enforce" => options.enforce = Some(true),
                 "--mode" => {
                     let mode = args.next().ok_or_else(|| {
                         SpecError::new("ERR_INVALID_ARGUMENT", "--mode requires a value")
                     })?;
-                    options.mode = match mode.to_str() {
+                    options.mode = Some(match mode.to_str() {
                         Some("manual") => PlanningMode::Manual,
                         Some("autopilot") => PlanningMode::Autopilot,
                         _ => {
@@ -85,7 +86,7 @@ impl Options {
                                 "--mode must be manual or autopilot",
                             ));
                         }
-                    };
+                    });
                 }
                 _ => {
                     return Err(SpecError::new(
@@ -146,8 +147,12 @@ pub(crate) fn status(config: &PlanningConfig, path: &Path) -> Value {
         "config_path": path,
         "approval": "human_only",
         "reviewers": "host_driven",
+        "review_completion": "host_attested",
+        "answer_review": "host_attested",
+        "host_review_support": "unknown",
+        "automatic_review_guaranteed": false,
         "activation": {
-            "enable": "attic egm enable --root PATH --mode manual",
+            "enable": "attic egm enable --root PATH",
             "autopilot": "attic egm enable --root PATH --mode autopilot",
             "disable": "attic egm disable",
             "guidance": "attic egm guidance",
@@ -166,8 +171,8 @@ pub(crate) fn guidance(config: &PlanningConfig, path: &Path) -> Value {
         "steps": [
             "Author a bounded spec with an attic-citations fence.",
             "Call spec register, then verify. Resolve verification failures before review.",
-            "Request file-delivered packs for the three reviewer personas. Pass only the spec path and pack handles to separate host agent contexts.",
-            "Run the reviewers independently, synthesize findings, and revise/reverify until substantive findings are addressed.",
+            "Call spec review_start, then review_prepare. Use the pinned upstream persona definitions in fresh host reviewer contexts for every required stage.",
+            "Submit each round with spec review_submit. Resolve findings and reverify as needed; two clean rounds are required before approval.",
             "Ask the user to run attic spec approve SPEC_ID in their own terminal. Never automate approval.",
             "Call begin, heartbeat, and provider-first wave_complete using the returned lease and fence.",
             "Run affected checks, stage intended content, then call drift. Drift verifies citation consistency, not test success."
@@ -189,8 +194,9 @@ pub(crate) fn guidance(config: &PlanningConfig, path: &Path) -> Value {
                 "mission": "Read the spec and supplied pack. Check execution order, edge cases, acceptance criteria, tests, recovery and remaining implementation ambiguity."
             }
         ],
-        "isolation": "The host creates separate reviewer contexts; Attic does not launch agents or install a host plugin.",
-        "pack_fallback": "Use inline delivery only when the host cannot read private pack files; it consumes caller context."
+        "isolation": "The host creates separate reviewer contexts; Attic records host attestations but cannot prove isolation, launch agents, or install a host plugin.",
+        "pack_fallback": "Use inline delivery only when the host cannot read private pack files; it consumes caller context.",
+        "answer_review": "For each codebase answer, call answer_review prepare with the draft and cited files, run a fresh independent reviewer, then call finish with the returned hashes and reviewer report. If review is unavailable or incomplete, explicitly label the answer unreviewed and include the reason."
     });
     response
 }
@@ -207,23 +213,20 @@ fn execute(options: &Options) -> Result<Value> {
             status(&config, path)
         });
     }
-    let root = if options.action == "enable" && !options.all_roots {
-        let root = options
-            .root
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(std::env::current_dir)?
-            .canonicalize()?;
-        if !root.is_dir() {
-            return Err(SpecError::new(
-                "ERR_INVALID_ARGUMENT",
-                "EGM root must be an existing directory",
-            ));
-        }
-        Some(root)
-    } else {
-        None
-    };
+    let explicit_root = options
+        .root
+        .as_ref()
+        .map(|root| -> Result<PathBuf> {
+            let root = root.canonicalize()?;
+            if !root.is_dir() {
+                return Err(SpecError::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "EGM root must be an existing directory",
+                ));
+            }
+            Ok(root)
+        })
+        .transpose()?;
     let parent = path
         .parent()
         .ok_or_else(|| SpecError::new("ERR_CONFIG", "configuration has no parent directory"))?;
@@ -256,23 +259,40 @@ fn execute(options: &Options) -> Result<Value> {
     }
     document["planning"]["enabled"] = value(options.action == "enable");
     if options.action == "enable" {
-        document["planning"]["mode"] = value(match options.mode {
-            PlanningMode::Manual => "manual",
-            PlanningMode::Autopilot => "autopilot",
-        });
-        let mut roots = toml_edit::Array::new();
-        if let Some(root) = root {
+        if let Some(mode) = options.mode {
+            document["planning"]["mode"] = value(match mode {
+                PlanningMode::Manual => "manual",
+                PlanningMode::Autopilot => "autopilot",
+            });
+        }
+        if options.all_roots {
+            document["planning"]["roots"] = value(toml_edit::Array::new());
+        } else if options.root.is_some() || document["planning"].get("roots").is_none() {
+            let root = explicit_root
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)?
+                .canonicalize()?;
+            if !root.is_dir() {
+                return Err(SpecError::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "EGM root must be an existing directory",
+                ));
+            }
+            let mut roots = toml_edit::Array::new();
             roots.push(
                 root.to_str().ok_or_else(|| {
                     SpecError::new("ERR_INVALID_ARGUMENT", "EGM root must be UTF-8")
                 })?,
             );
+            document["planning"]["roots"] = value(roots);
         }
-        document["planning"]["roots"] = value(roots);
-        if document["planning"].get("fast_path").is_none() {
-            document["planning"]["fast_path"] = Item::Table(Table::new());
+        if let Some(enforce) = options.enforce {
+            if document["planning"].get("fast_path").is_none() {
+                document["planning"]["fast_path"] = Item::Table(Table::new());
+            }
+            document["planning"]["fast_path"]["enforce"] = value(enforce);
         }
-        document["planning"]["fast_path"]["enforce"] = value(options.enforce);
     }
     let updated = document.to_string();
     let config = planning(Some(&updated))?;

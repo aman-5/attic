@@ -48,6 +48,7 @@ pub mod maintenance;
 pub mod manifest;
 pub mod resolver;
 pub mod traversal;
+pub mod version_compat;
 
 pub use error::CrossRepoError;
 
