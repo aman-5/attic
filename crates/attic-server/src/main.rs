@@ -1840,12 +1840,16 @@ fn server_info(planning_enabled: bool) -> InitializeResult {
     if planning_enabled {
         info.instructions = Some(concat!(
             "Check the EGM mode using the egm tool. In autopilot mode, for codebase answers ",
-            "using Attic, prepare an answer_review with the draft and cited active-repository ",
-            "files, then use a fresh independent reviewer context to check the draft against ",
-            "the evidence. Submit its report with answer_review finish before answering. ",
-            "Resolve substantive findings and repeat. If independent review is unavailable, ",
-            "state that the answer is unreviewed and why. These reports are host attestations, ",
-            "not proof of reviewer isolation or correctness. For implementation plans, use ",
+            "using Attic, call answer_review prepare with the draft and cited active-repository ",
+            "files. Review the exact sanitized evidence returned; never fetch raw values or ",
+            "silently truncate evidence. Review-result JSON is limited to 512 KiB. For ",
+            "redacted sources, pass each limitation to the fresh reviewer and require its ",
+            "report to acknowledge redaction and confirm every claim remains assessable. ",
+            "Submit its report with answer_review finish before answering. If any claim ",
+            "depends on hidden evidence, or review is unavailable or incomplete, state that ",
+            "the answer is unreviewed and why. Limited results are explicitly labeled. Host ",
+            "reports do not prove reviewer independence, complete access, or correctness. ",
+            "For implementation plans, use ",
             "the spec review workflow, show the findings, and obtain the user's explicit ",
             "approval before implementing; never run the terminal approval command on the ",
             "user's behalf. In manual mode use review when requested."

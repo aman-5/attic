@@ -177,8 +177,13 @@ pub fn reconcile_repository(
 /// - a directory the walker could not read makes every indexed path under it
 ///   uncertain; a walk error with no known location suppresses all
 ///   deletions for this run;
-/// - a changed root identity (re-clone / different volume) disables the
-///   metadata fast path and suppresses deletions unless the walk was clean.
+/// - an unknown or changed root identity disables the metadata fast path;
+///   a changed identity suppresses deletions unless the walk was clean.
+///
+/// Legacy root identities lack creation time and are treated as changed
+/// until a successful index publication records the new identity. An empty
+/// root with a legacy or unavailable identity requires explicit verification
+/// and reindexing rather than inferring deletions.
 ///
 /// Fast path: a file is unchanged WITHOUT reading it only when size,
 /// last-write time, change time and file identity all equal the stored
@@ -215,7 +220,8 @@ pub fn reconcile_repository_with(
         (&stored_identity, &observed_identity),
         (Some(stored), Some(observed)) if stored != observed
     );
-    let always_hash = opts.always_hash || identity_changed;
+    let same_root = stored_identity.is_some() && stored_identity == observed_identity;
+    let always_hash = opts.always_hash || !same_root;
 
     let canonical = root.canonicalize().map_err(|e| {
         IncrementalError::SourceUnavailable(format!("cannot resolve {repo_root_str}: {e}"))
@@ -285,11 +291,9 @@ pub fn reconcile_repository_with(
     db_paths.extend(rows);
 
     // An empty walk over a repository with indexed files is trusted as real
-    // deletions only when the root is provably the same directory object as
-    // at the last publish; an unmounted mount point / replaced folder has a
-    // different identity and must not wipe the index (R2).
+    // deletions only when the best available root identity matches the last
+    // publish; an unknown or changed identity must not wipe the index (R2).
     let indexed_present = db_paths.values().any(|r| r.existence != "deleted");
-    let same_root = stored_identity.is_some() && stored_identity == observed_identity;
     if walk.entries.is_empty() && indexed_present && !same_root {
         return Err(IncrementalError::SourceUnavailable(format!(
             "repository root {repo_root_str} is empty and its identity does not match the indexed root (unmounted or replaced); refusing to infer deletions"

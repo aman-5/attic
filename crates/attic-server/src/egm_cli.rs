@@ -196,7 +196,7 @@ pub(crate) fn guidance(config: &PlanningConfig, path: &Path) -> Value {
         ],
         "isolation": "The host creates separate reviewer contexts; Attic records host attestations but cannot prove isolation, launch agents, or install a host plugin.",
         "pack_fallback": "Use inline delivery only when the host cannot read private pack files; it consumes caller context.",
-        "answer_review": "For each codebase answer, call answer_review prepare with the draft and cited files, run a fresh independent reviewer, then call finish with the returned hashes and reviewer report. If review is unavailable or incomplete, explicitly label the answer unreviewed and include the reason."
+        "answer_review": "For each codebase answer, call answer_review prepare with the draft and cited files; review the exact sanitized evidence returned, never raw values or a truncated copy. Review-result JSON is limited to 512 KiB; the server also caps encoded MCP results. For redacted sources, give the reviewer each limitation and require redaction_acknowledged=true and claims_assessable=true only when all claims remain assessable. Finish with the returned hashes and report. If evidence is incomplete, a claim depends on hidden text, or review is unavailable, explicitly label the answer unreviewed and include the reason. Limited reviews have status reviewed_host_attested_limited; host attestations do not prove reviewer independence, complete access, or correctness."
     });
     response
 }

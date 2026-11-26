@@ -7,7 +7,7 @@
 //! full official handshake, framing, and request/response correlation are
 //! exercised end-to-end.
 //!
-//! Every await is bounded by a 10-second timeout; on timeout the child
+//! Every await is bounded by a timeout; on timeout the child
 //! process is killed immediately so a wedged server can never hang the test
 //! suite.  If the server binary cannot be located this test FAILS — it never
 //! silently passes.
@@ -26,6 +26,8 @@ use rmcp::{
 use serde_json::Value;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+// File delivery applies private ACLs using external processes on Windows.
+const PACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Locate the required `attic` binary.  Fails loudly when absent.
 fn require_bin() -> PathBuf {
@@ -505,6 +507,169 @@ async fn egm_spec_off_and_full_enabled_flow_over_official_client() {
     )
     .unwrap();
     assert_eq!(reviewed["status"], "reviewed_host_attested", "{reviewed}");
+    std::fs::write(
+        root.join("src").join("redacted.rs"),
+        "api_token = \"sk-live-abcdefgh12345678\"\n",
+    )
+    .unwrap();
+    let redacted_source = serde_json::json!({
+        "action":"prepare","draft":"The token assignment is present.",
+        "sources":[{"repository_id":repository_id,"path":"src/redacted.rs"}]
+    });
+    let redacted_prepared: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", redacted_source.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        redacted_prepared["limited_review"], true,
+        "{redacted_prepared}"
+    );
+    assert_eq!(redacted_prepared["evidence_version"], 1);
+    assert_eq!(redacted_prepared["sources"][0]["scan_decision"], "redacted");
+    assert!(
+        redacted_prepared["sources"][0]["content"]
+            .as_str()
+            .is_some_and(|content| !content.is_empty())
+    );
+    assert!(
+        !redacted_prepared
+            .to_string()
+            .contains("sk-live-abcdefgh12345678")
+    );
+    let leaked_draft: Value = serde_json::from_str(
+        &call_tool_text(
+            &mut srv,
+            "answer_review",
+            serde_json::json!({
+                "action":"prepare","draft":"Token sk-live-abcdefgh12345678 must not be echoed.",
+                "sources":[{"repository_id":repository_id,"path":"src/redacted.rs"}]
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(leaked_draft["status"], "unreviewed");
+    assert!(
+        !leaked_draft
+            .to_string()
+            .contains("sk-live-abcdefgh12345678")
+    );
+    let mut redacted_finish = redacted_source.clone();
+    redacted_finish["action"] = "finish".into();
+    redacted_finish["answer_sha256"] = redacted_prepared["answer_sha256"].clone();
+    redacted_finish["evidence_sha256"] = redacted_prepared["evidence_sha256"].clone();
+    redacted_finish["reviewer"] = serde_json::json!({
+        "completed":true,"context_id":"mock-redacted-reviewer","reason":null,
+        "answer_sha256":redacted_prepared["answer_sha256"],
+        "evidence_sha256":redacted_prepared["evidence_sha256"],"findings":[]
+    });
+    let unacknowledged: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", redacted_finish.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unacknowledged["status"], "unreviewed");
+    redacted_finish["reviewer"]["redaction_acknowledged"] = true.into();
+    redacted_finish["reviewer"]["claims_assessable"] = true.into();
+    let limited_review: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", redacted_finish.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        limited_review["status"], "reviewed_host_attested_limited",
+        "{limited_review}"
+    );
+    assert_eq!(limited_review["evidence_version"], 1);
+    assert_eq!(limited_review["limitations"][0]["path"], "src/redacted.rs");
+    assert!(
+        !limited_review
+            .to_string()
+            .contains("sk-live-abcdefgh12345678")
+    );
+    let mut secret_finding = redacted_finish.clone();
+    secret_finding["reviewer"]["findings"] = serde_json::json!([{
+        "severity":"major","description":"Leaked key sk-live-abcdefgh12345678",
+        "disposition":"open","rationale":null
+    }]);
+    let sanitized_finding: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", secret_finding)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sanitized_finding["status"], "unreviewed");
+    assert!(
+        !sanitized_finding
+            .to_string()
+            .contains("sk-live-abcdefgh12345678")
+    );
+    let mut unassessable = redacted_finish.clone();
+    unassessable["reviewer"]["claims_assessable"] = false.into();
+    let blocked_redacted_claim: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", unassessable)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blocked_redacted_claim["status"], "unreviewed");
+    let first_sanitized = redacted_prepared["sources"][0]["content"].clone();
+    std::fs::write(
+        root.join("src").join("redacted.rs"),
+        "api_token = \"sk-live-ijklmnop12345678\"\n",
+    )
+    .unwrap();
+    let changed_redaction: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", redacted_source)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        changed_redaction["sources"][0]["content"], first_sanitized,
+        "{changed_redaction}"
+    );
+    assert_ne!(
+        changed_redaction["evidence_sha256"],
+        redacted_prepared["evidence_sha256"]
+    );
+    let stale_redaction: Value = serde_json::from_str(
+        &call_tool_text(&mut srv, "answer_review", redacted_finish)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale_redaction["status"], "unreviewed", "{stale_redaction}");
+    std::fs::write(
+        root.join("src").join("oversized_review.rs"),
+        format!("// {}\n", "x".repeat(600 * 1024)),
+    )
+    .unwrap();
+    let oversized: Value = serde_json::from_str(
+        &call_tool_text(
+            &mut srv,
+            "answer_review",
+            serde_json::json!({
+                "action":"prepare","draft":"This evidence must not be truncated.",
+                "sources":[{"repository_id":repository_id,"path":"src/oversized_review.rs"}]
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(oversized["status"], "unreviewed", "{oversized}");
+    assert!(
+        oversized["reason"]
+            .as_str()
+            .unwrap()
+            .contains("delivery limit")
+    );
     let mut issue = answer.clone();
     issue["reviewer"]["findings"] = serde_json::json!([{
         "severity":"major","description":"The answer omits a relevant caller.",
@@ -572,7 +737,13 @@ async fn call_tool_text(
     tool: &str,
     arguments: Value,
 ) -> Result<String, String> {
-    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    let timeout =
+        if tool == "spec" && arguments["action"] == "pack" && arguments["delivery"] == "file" {
+            PACK_FILE_TIMEOUT
+        } else {
+            IO_TIMEOUT
+        };
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let mut params = CallToolRequestParams::new(tool.to_owned());
         params.arguments = arguments.as_object().cloned();
@@ -589,7 +760,7 @@ async fn call_tool_text(
             Err(_) => {
                 let _ = srv.child.start_kill();
                 return Err(format!(
-                    "`{tool}` call exceeded {IO_TIMEOUT:?} — server killed"
+                    "`{tool}` call exceeded {timeout:?} — server killed"
                 ));
             }
         };
