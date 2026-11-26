@@ -48,15 +48,27 @@ pub fn file_meta(path: &Path) -> std::io::Result<FileMeta> {
     })
 }
 
-/// Identity of a repository root directory (`volume:fileid` / `dev:ino`).
-/// A different value for the same path means the directory was replaced
-/// (re-cloned, remounted elsewhere); `None` when it does not exist.
+/// Best available identity of a repository root directory, including its
+/// creation time to distinguish recycled file IDs. Returns `None` if the
+/// identity or creation time is unavailable. Filesystems with coarse or
+/// mutable creation times can still produce identity collisions.
 pub fn root_identity(path: &Path) -> Option<String> {
     let md = std::fs::metadata(path).ok()?;
     if !md.is_dir() {
         return None;
     }
-    platform::change_time_and_id(path, &md).1
+    root_identity_from_parts(
+        platform::change_time_and_id(path, &md).1.as_deref(),
+        md.created().ok(),
+    )
+}
+
+fn root_identity_from_parts(
+    id: Option<&str>,
+    created: Option<std::time::SystemTime>,
+) -> Option<String> {
+    let created = created?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    Some(format!("v2:{}:{created}", id?))
 }
 
 #[cfg(unix)]
@@ -202,5 +214,17 @@ mod tests {
         let r1 = root_identity(dir.path()).unwrap();
         assert_eq!(Some(r1), root_identity(dir.path()));
         assert_eq!(root_identity(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn root_identity_distinguishes_reused_file_ids() {
+        let created = UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let replaced = created + std::time::Duration::from_micros(1);
+        assert_ne!(
+            root_identity_from_parts(Some("1:2"), Some(created)),
+            root_identity_from_parts(Some("1:2"), Some(replaced))
+        );
+        assert!(root_identity_from_parts(Some("1:2"), None).is_none());
+        assert!(root_identity_from_parts(None, Some(created)).is_none());
     }
 }

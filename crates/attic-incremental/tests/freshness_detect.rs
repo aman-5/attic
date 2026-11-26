@@ -120,7 +120,8 @@ fn missing_or_replaced_empty_root_is_unavailable_not_deleted() {
     // S27: an unmounted / replaced root must never wipe the index.
     let fx = Fixture::new(&[("a.rs", "fn a() {}")]);
     let root = fx.root().to_path_buf();
-    std::fs::remove_dir_all(&root).unwrap();
+    let old_root = root.with_file_name("previous-root");
+    std::fs::rename(&root, &old_root).unwrap();
     let err =
         reconcile_repository_with(&fx.pool, &root, &fx.policy(), &Default::default()).unwrap_err();
     assert!(
@@ -148,12 +149,46 @@ fn emptied_root_with_same_identity_deletes_normally() {
 }
 
 #[test]
+fn unknown_or_legacy_root_identity_never_trusts_metadata_or_empty_walk() {
+    let fx = Fixture::new(&[("a.rs", "fn a() {}")]);
+    settle(&fx);
+    let conn = rusqlite::Connection::open(&fx.db_path).unwrap();
+    for identity in [None, Some("legacy-device:inode")] {
+        conn.execute(
+            "UPDATE core_repositories SET root_identity = ?1 WHERE id = ?2",
+            rusqlite::params![identity, fx.repo_id],
+        )
+        .unwrap();
+        let report = reconcile(&fx, &ReconcileOptions::default());
+        assert_eq!(report.files_hashed, 1);
+        assert_eq!(report.files_unchanged_by_metadata, 0);
+    }
+
+    std::fs::remove_file(fx.root().join("a.rs")).unwrap();
+    for identity in [None, Some("legacy-device:inode")] {
+        conn.execute(
+            "UPDATE core_repositories SET root_identity = ?1 WHERE id = ?2",
+            rusqlite::params![identity, fx.repo_id],
+        )
+        .unwrap();
+        let err = reconcile_repository_with(&fx.pool, fx.root(), &fx.policy(), &Default::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, IncrementalError::SourceUnavailable(_)),
+            "{err}"
+        );
+    }
+    assert!(fx.occurrence("a.rs").is_some());
+}
+
+#[test]
 fn recloned_root_is_fully_hashed() {
-    // S35: delete + re-create at the same path → new identity → full hash.
+    // S35: replace the root at the same path → new identity → full hash.
     let fx = Fixture::new(&[("a.rs", "fn a() {}"), ("b.rs", "fn b() {}")]);
     settle(&fx);
     let root = fx.root().to_path_buf();
-    std::fs::remove_dir_all(&root).unwrap();
+    let old_root = root.with_file_name("previous-root");
+    std::fs::rename(&root, &old_root).unwrap();
     std::fs::create_dir_all(&root).unwrap();
     write_file(&root, "a.rs", "fn a() {}");
     write_file(&root, "b.rs", "fn b() { changed() }");

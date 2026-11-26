@@ -330,7 +330,7 @@ explicit dependency contracts remain grounded in source evidence.
 | Tool | What it does |
 |---|---|
 | `egm` | Always-available EGM activation status, user enable/disable commands, and mode-aware host reviewer guidance |
-| `answer_review` | Prepare and finalize host-attested review of a codebase answer against current permitted source files |
+| `answer_review` | Deliver bounded sanitized source evidence and finalize clean or explicitly limited host-attested codebase-answer reviews |
 | `context` | Evidence-backed answers (`FAST` / `NORMAL` / `DEEP`), lexical `SEARCH`, or bounded syntactic `REFERENCES` |
 | `file` | Bounded, secret-scanned live-file ranges (or up to 16 `ranges` in one call), JSON pointers and indexed units; JSON outlines and in-file literal/regex search |
 | `repo_map` | Bounded structure/statistics; `path_prefix`, `max_depth`, file pagination and explicit byte budget |
@@ -383,10 +383,18 @@ separate reviewer contexts; Attic supplies verified file-delivered packs and
 governance, not an agent runner or a security sandbox. Use `egm action=guidance`
 for the three reviewer missions without requiring an upstream plugin.
 MCP initialization asks cooperating hosts to review codebase answers via
-`answer_review` and label unavailable reviews **unreviewed**. Attic cannot
-force clients to follow these instructions or launch independent reviewers.
-Plan approval requires two clean host-attested rounds; Attic cannot prove
-reviewer independence. Enabling EGM alone does not review an answer or plan.
+`answer_review` and label unavailable or incomplete reviews **unreviewed**.
+Preparation delivers the exact versioned sanitized evidence to be reviewed.
+Review-result JSON is capped at 512 KiB and encoded MCP results at the server's
+1 MiB output limit; oversized evidence is rejected, never truncated. Drafts
+containing detected secret-like text are refused and safely redacted in the
+unreviewed response; reviewer findings are redacted before return. Redacted evidence
+requires explicit reviewer acknowledgment and a claim-assessability attestation,
+and successful results are labeled `reviewed_host_attested_limited`. Attic
+cannot force clients to follow these instructions or launch independent
+reviewers. Neither host-attested status proves reviewer isolation, complete
+reviewer access, or correctness. Plan approval requires two clean host-attested
+rounds. Enabling EGM alone does not review an answer or plan.
 See [the complete EGM workflow](crates/attic-spec/README.md) for citations,
 approval, hooks, leases and recovery.
 

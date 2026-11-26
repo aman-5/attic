@@ -75,21 +75,43 @@ verification-attempt, freshness, retention, and pack settings.
 For codebase answers, a cooperating host calls `answer_review` with
 `action="prepare"`, the draft, and `sources` containing active `repository_id`
 and repository-relative `path` pairs. Attic checks permitted live files and
-returns draft and evidence hashes. The host gives the draft and evidence to a
-fresh independent reviewer, then calls `answer_review` with `action="finish"`,
-the same draft and sources, both hashes, and the reviewer's report. The MCP
-tool schema specifies all report fields. A changed draft or source, missing
-reviewer, substantive finding, excluded file, or other failure returns
-`status="unreviewed"` with a reason; the host must show that label and reason.
-Resolve findings and prepare a fresh review rather than presenting an incomplete
-review as passed.
+returns the exact sanitized contents, original live-source hashes, scan
+decisions, and draft/evidence hashes. The evidence hash covers a deterministic,
+versioned envelope and the same complete sanitized evidence shown to the host.
+The host must give that complete returned
+evidence—not a separately fetched or truncated copy—to a fresh independent
+reviewer, then call `answer_review` with `action="finish"`, the same draft and
+sources, both hashes, and the reviewer's report. The MCP tool schema specifies
+all report fields. The review-result JSON is capped at 512 KiB, and the encoded
+MCP result is checked against the server's 1 MiB output limit; evidence that
+exceeds either limit is unreviewed and is never silently truncated.
+Drafts containing detected secret-like text are refused and safely redacted in
+the unreviewed response. Reviewer findings are also redacted before returning.
+
+Fully scanned redacted sources can be reviewed only as limited evidence. The
+host must relay the explicit per-source limitation and require the reviewer to
+set both `redaction_acknowledged` and `claims_assessable` to `true`. These are
+host attestations, not proof that the reviewer received or independently
+assessed the evidence. If any claim depends on hidden text, the answer must
+remain unreviewed until the claim is qualified or supported by visible evidence.
+Successful reviews containing redacted sources return
+`status="reviewed_host_attested_limited"`; clean reviews retain
+`status="reviewed_host_attested"`.
+
+A changed draft or original source (including changes confined to redacted
+regions), incomplete scan, unavailable sanitized content, missing reviewer or
+required acknowledgment, substantive finding, excluded file, oversized result,
+or other failure returns `status="unreviewed"` with a reason; the host must show
+that label and reason. Resolve findings and prepare a fresh review rather than
+presenting an incomplete review as passed.
 
 `reviewed_host_attested` means the host reports that a separate review occurred;
-it is not proof of isolation, complete evidence, or correctness. Reports and
-answers are not persisted by this tool. Files are checked at prepare and finish,
-not locked afterward; unsupported or uncooperative clients may ignore MCP
-instructions, so automatic coverage is not guaranteed. Other conversations do
-not need this workflow. The extra review adds model latency and cost.
+neither it nor `reviewed_host_attested_limited` proves reviewer isolation,
+complete reviewer access, or answer correctness. Reports and answers are not
+persisted by this tool. Files are checked at prepare and finish, not locked
+afterward; unsupported or uncooperative clients may ignore MCP instructions, so
+automatic coverage is not guaranteed. Other conversations do not need this
+workflow. The extra review adds model latency and cost.
 
 ## Workflow
 
